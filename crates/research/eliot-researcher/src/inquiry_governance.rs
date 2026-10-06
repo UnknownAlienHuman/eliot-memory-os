@@ -74,8 +74,8 @@ use crate::evidence_portfolio::{
     MaterialClaimRoster, NoMatchEvaluation, ObservedOutsideScope, PortfolioError,
     PrecisionAssertion, PrecisionKind, PresentedEvaluation, RiskState, SourceDisposition,
     SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text,
-    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
-    push_field, reject_vague, text,
+    check_citation_graph, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank,
+    push_count, push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -743,12 +743,17 @@ pub enum CounterSearchStatus {
 /// ran over a closed population; when nothing was enumerated the same empty
 /// eligible set is an absent measurement and stays `Uninitialised`.
 ///
-/// A *verified empty* eligible scope is a state this vocabulary cannot
-/// currently express, and no placeholder member is invented to close that gap:
-/// [`crate::evidence_portfolio::CoverageAccount::open`] refuses a zero-member
-/// denominator and [`CoverageReceipt::compute`] refuses a zero expected-member
-/// count, so an inquiry whose admitted manifest declares no member produces no
-/// record at all rather than a record stating that the eligible scope is empty.
+/// A *verified empty* eligible scope is a state this vocabulary now expresses
+/// through the [`Self::VerifiedEmpty`] variant, and no placeholder member is
+/// invented to carry it. The two construction gates open only with run
+/// evidence: [`crate::evidence_portfolio::CoverageAccount::open`] still
+/// refuses a zero-member denominator, and only an account opened over
+/// run-examined candidates
+/// ([`crate::evidence_portfolio::CoverageAccount::open_verified_empty`],
+/// refused when the run examined nothing) passes
+/// [`CoverageReceipt::compute`]'s zero expected-member gate, so an inquiry
+/// whose admitted manifest declares no member produces no record at all
+/// unless the run examined candidates and found none eligible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnumerationState {
     /// Nothing was observed against the frozen scope, so an empty eligible set
@@ -758,6 +763,11 @@ pub enum EnumerationState {
     Incomplete,
     /// The enumeration ran and every declared member closed intact.
     Complete,
+    /// The enumeration ran over the closed population and the eligible set is
+    /// provably empty. Distinct from `Uninitialised`: an enumeration that never
+    /// ran leaves an absent measurement, never this state. No placeholder member
+    /// is ever invented to carry it.
+    VerifiedEmpty,
 }
 
 impl EnumerationState {
@@ -768,6 +778,7 @@ impl EnumerationState {
             Self::Uninitialised => "uninitialised",
             Self::Incomplete => "incomplete",
             Self::Complete => "complete",
+            Self::VerifiedEmpty => "verified_empty",
         }
     }
 }
@@ -785,10 +796,62 @@ impl std::fmt::Display for EnumerationState {
 /// the observed population that is provably outside the frozen scope, keeps
 /// those two facts apart instead of letting an enumeration that never ran read
 /// as a verified empty scope.
+/// Norm-required source populations of one coverage receipt (I21.6, #1767 W2).
+///
+/// Derived from the same account + records the rest of the receipt binds,
+/// never restated: `eligible` is every admitted record's handle, `represented`
+/// the eligible handles the account observed, `omitted` the eligible handles
+/// it did not, `cited` the deduplicated citations that resolve to an eligible
+/// handle. Route staleness/skips and page cursors have no admitted input on
+/// this path, so they are not synthesized here.
+fn receipt_populations(
+    account: &CoverageAccount,
+    records: &[SourceAdmissibilityRecord],
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut eligible_handles: Vec<String> = records
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .map(|record| record.record.handle.clone())
+        .collect();
+    eligible_handles.sort();
+    eligible_handles.dedup();
+    let observed = account.observed_members();
+    let represented_handles: Vec<String> = eligible_handles
+        .iter()
+        .filter(|handle| observed.contains(*handle))
+        .cloned()
+        .collect();
+    let omitted_handles: Vec<String> = eligible_handles
+        .iter()
+        .filter(|handle| !observed.contains(*handle))
+        .cloned()
+        .collect();
+    let mut cited_handles: Vec<String> = records
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .flat_map(|record| record.record.cites.iter().cloned())
+        .collect();
+    cited_handles.retain(|handle| eligible_handles.contains(handle));
+    cited_handles.sort();
+    cited_handles.dedup();
+    (
+        eligible_handles,
+        represented_handles,
+        cited_handles,
+        omitted_handles,
+    )
+}
+
 fn enumeration_state(
     account: &CoverageAccount,
     observed_outside_scope: &[ObservedOutsideScope],
 ) -> EnumerationState {
+    // Read before `all_closed`: accounting over an empty denominator is
+    // vacuously closed, and a verified empty scope must never misread as
+    // `Complete`.
+    if account.is_verified_empty() {
+        return EnumerationState::VerifiedEmpty;
+    }
     if account.all_closed() {
         return EnumerationState::Complete;
     }
@@ -2730,7 +2793,9 @@ impl SourcePortfolio {
     ///
     /// Returns a field error when the inquiry identity is blank and
     /// [`InquiryError::UnknownHandle`] when a record belongs to another inquiry
-    /// or profile revision.
+    /// or profile revision. A citation cycle or an edge to an unrecorded
+    /// handle in the admitted set refuses through the citation closure
+    /// (`source.cites`).
     pub fn assemble(
         inquiry_id: &str,
         profile: &InquiryProtocolProfile,
@@ -2813,6 +2878,17 @@ impl SourcePortfolio {
             .filter(|record| record.is_admitted_to(profile))
             .map(|record| record.record.handle.clone())
             .collect();
+        // W4 (#1767): the citation relation closes inside the projection. A
+        // cycle or an edge to an unrecorded handle refuses the portfolio
+        // fail-closed; only the admitted set is checked, so a stale edge on a
+        // skipped record cannot kill the run. Unknown lineage stays unknown
+        // through the independence axes below, never counted as support.
+        let eligible_records: BTreeMap<String, SourceRecord> = records
+            .iter()
+            .filter(|record| record.is_admitted_to(profile))
+            .map(|record| (record.record.handle.clone(), record.record.clone()))
+            .collect();
+        check_citation_graph(&eligible_records)?;
         portfolio.independence = IndependenceProfile::derive(
             &eligible,
             &records_by_handle,
@@ -3043,7 +3119,7 @@ pub struct AbsenceEvidence {
 /// * the receipt already retains the record's identity
 ///   ([`CoverageReceipt::absence_evidence_digest`]) and its ceiling
 ///   ([`CoverageReceipt::absence_proof_ceiling_grade`]) inside
-///   `coverage-receipt/v3`, and it re-proves the record itself inside
+///   `coverage-receipt/v4`, and it re-proves the record itself inside
 ///   [`AbsencePreconditions::derive`] before the verdict is derived. A third copy
 ///   of the same fact on the receipt would be a second owner of it;
 /// * a closure decision needs the *record*, not its digest. "The digest of a
@@ -3220,6 +3296,14 @@ pub struct CoverageReceipt {
     pub enumeration_state: EnumerationState,
     /// Eligible handles the receipt represents.
     pub eligible_handles: Vec<String>,
+    /// Eligible handles carrying a visible account disposition (I21.6
+    /// `represented` population: eligible intersected with observed members).
+    pub represented_handles: Vec<String>,
+    /// Eligible handles another eligible record cites (I21.6 `cited`
+    /// population: cites edges resolving inside the eligible set).
+    pub cited_handles: Vec<String>,
+    /// Eligible handles no observation reached (I21.6 `omitted` population).
+    pub omitted_handles: Vec<String>,
     /// Explicit coverage unknowns, preserved rather than smoothed.
     pub unknown_coverage: Vec<String>,
     /// Routes the run used.
@@ -3248,6 +3332,15 @@ pub struct CoverageReceipt {
     /// claim stronger than the evidence's own ceiling allows, rather than
     /// re-deriving that ceiling from records it may no longer hold.
     pub absence_proof_ceiling_grade: Option<u8>,
+    /// Digest of the source-assurance summary assessed over this run's frozen
+    /// evidence set, when the route presented one (issue #1767 A7).
+    ///
+    /// This is the link, not the summary: the full denominator stays on this
+    /// receipt, and the assurance result itself stays with its own owner
+    /// (`eliot-dreamer-source-assurance`). `None` is the fail-closed state —
+    /// no summary was presented on this path — and digests explicitly as
+    /// `absent`, so "no summary" is a bound fact rather than an omission.
+    pub source_assurance_digest: Option<String>,
     /// Declared denominator kind.
     pub denominator_kind: DenominatorKind,
     /// Budget limitation that bounded the run, when one applied.
@@ -3258,8 +3351,8 @@ pub struct CoverageReceipt {
 
 /// Named arguments for [`CoverageReceipt::compute`].
 ///
-/// A parameter list here is not cosmetic. The eleven inputs a coverage receipt
-/// consumes are eleven chances to transpose two of them, and the seam argument
+/// A parameter list here is not cosmetic. The twelve inputs a coverage receipt
+/// consumes are twelve chances to transpose two of them, and the seam argument
 /// added by #2893 is the one whose order matters most: an evaluation presented
 /// against the wrong account is exactly the caller-constructed negative this
 /// issue exists to refuse. Named fields make that a compile error instead.
@@ -3285,6 +3378,8 @@ pub struct CoverageReceiptParams<'a> {
     pub unknown_coverage: Vec<String>,
     /// Budget limitation that bounded the run, when one applied.
     pub budget_limitation: Option<String>,
+    /// Digest of the source-assurance summary presented for this run, if any.
+    pub source_assurance_digest: Option<String>,
     /// The run's own assessment instant.
     pub assessment_time_ms: i64,
 }
@@ -3321,25 +3416,28 @@ impl CoverageReceipt {
             provider_degradation,
             unknown_coverage,
             budget_limitation,
+            source_assurance_digest,
             assessment_time_ms,
         } = params;
+        if let Some(link) = &source_assurance_digest {
+            digest(link, "coverage.source_assurance_digest")?;
+        }
         require_scope(requested_scope, "coverage.requested_scope")?;
         require_digest(frozen_scope_digest, "coverage.frozen_scope_digest")?;
         let expected_members = account.denominator_size();
-        if expected_members == 0 {
+        // A bare empty denominator is still an absent measurement, never a
+        // verified empty scope: only an account opened over run-examined
+        // candidates ([`CoverageAccount::open_verified_empty`]) may receipt a
+        // zero-member denominator.
+        if expected_members == 0 && !account.is_verified_empty() {
             return Err(InquiryError::IncompleteDenominator {
                 field: "coverage.expected_members",
             });
         }
         let accounted = account.is_accounted();
         let all_closed = account.all_closed();
-        let mut eligible_handles: Vec<String> = records
-            .iter()
-            .filter(|record| record.eligibility == SourceEligibility::Eligible)
-            .map(|record| record.record.handle.clone())
-            .collect();
-        eligible_handles.sort();
-        eligible_handles.dedup();
+        let (eligible_handles, represented_handles, cited_handles, omitted_handles) =
+            receipt_populations(account, records);
         let observed_outside_scope = account.observed_outside_scope();
         let enumeration_state = enumeration_state(account, &observed_outside_scope);
         // The evaluation and the manifest it was issued under arrive together or
@@ -3405,6 +3503,9 @@ impl CoverageReceipt {
             observed_outside_scope,
             enumeration_state,
             eligible_handles,
+            represented_handles,
+            cited_handles,
+            omitted_handles,
             unknown_coverage,
             routes_used,
             provider_degradation,
@@ -3412,6 +3513,7 @@ impl CoverageReceipt {
             absence_verdict,
             absence_evidence_digest,
             absence_proof_ceiling_grade,
+            source_assurance_digest,
             denominator_kind,
             budget_limitation,
             digest: String::new(),
@@ -3445,7 +3547,14 @@ impl CoverageReceipt {
         // freeze, the claim audit and the unsupported-precision residue became
         // carried fields. `research-debt/v1` is unaffected because its preimage
         // never named the receipt digest.
-        let mut preimage = String::from("coverage-receipt/v3;");
+        // `coverage-receipt/v3` -> `v4` by #1767 for the same field-set reason:
+        // the I21.6 represented/cited/omitted source populations are now
+        // carried fields, so one name must not cover both field sets.
+        // Transitively, `evidence-freeze/*` and `inquiry-terminal-record/*`
+        // bind this digest and produce different values for the same run.
+        // `coverage-receipt/v4` -> `v5` by #1767 for the same field-set reason:
+        // the source-assurance summary link is now a carried field.
+        let mut preimage = String::from("coverage-receipt/v5;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
         push_field(&mut preimage, "requested_scope", &self.requested_scope);
@@ -3538,6 +3647,12 @@ impl CoverageReceipt {
             Some(ceiling) => push_field(&mut preimage, "absence_ceiling", &ceiling.to_string()),
             None => push_field(&mut preimage, "absence_ceiling", "unknown"),
         }
+        // The presented summary link, or its bound absence: a receipt that
+        // presented no summary digests differently from one that did.
+        match &self.source_assurance_digest {
+            Some(link) => push_field(&mut preimage, "source_assurance", link),
+            None => push_field(&mut preimage, "source_assurance", "absent"),
+        }
         push_field(
             &mut preimage,
             "denominator_kind",
@@ -3550,7 +3665,7 @@ impl CoverageReceipt {
     }
 }
 
-/// Pushes the receipt's three free-valued retained lists onto a digest preimage.
+/// Pushes the receipt's six free-valued retained lists onto a digest preimage.
 ///
 /// Each list is bound as a count followed by that many values under the same
 /// tag, so a reader of the preimage can tell an empty list from a list whose
@@ -3558,6 +3673,9 @@ impl CoverageReceipt {
 /// of the values within each list is the order the receipt itself carries.
 fn push_repeated_fields(preimage: &mut String, receipt: &CoverageReceipt) {
     for (tag, values) in [
+        ("represented_handle", &receipt.represented_handles),
+        ("cited_handle", &receipt.cited_handles),
+        ("omitted_handle", &receipt.omitted_handles),
         ("unknown_coverage", &receipt.unknown_coverage),
         ("route_used", &receipt.routes_used),
         ("degradation", &receipt.provider_degradation),
@@ -7235,6 +7353,11 @@ impl InquiryGovernance {
             provider_degradation: degradation.provider_degradation,
             unknown_coverage: degradation.unknown_coverage,
             budget_limitation: degradation.budget_limitation,
+            // A7 (#1767): no source-assurance summary is presented on this
+            // path — the composition that freezes researcher output into an
+            // assurance set is unowned, so the link stays fail-closed `None`
+            // rather than naming a summary nobody assessed.
+            source_assurance_digest: None,
             assessment_time_ms: observation.assessment_time_ms,
         })?;
         let precision = EvidenceSetPrecision::evaluate(
@@ -7722,6 +7845,7 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
+        self.validate_coverage_accounting()?;
         self.validate_source_admission_requests()?;
         self.validate_committed_freeze_and_synthesis_input()?;
         for diagnostic in &self.unadmitted_references {
@@ -7771,6 +7895,30 @@ impl InquiryGovernance {
         if recorded != derived {
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.certified_obligations",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves the receipt's accounting from the retained run material
+    /// (W6, #1767).
+    ///
+    /// The carried receipt binds `account_digest`, but a binding alone cannot
+    /// catch an account swapped after compute: rebuilding from the retained
+    /// manifest + admissibility and comparing digests makes the substitution
+    /// observable. This runs on the live path because `record` ends with
+    /// `validate_integrity`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming
+    /// `inquiry.coverage_accounting` when the re-derived digest disagrees.
+    fn validate_coverage_accounting(&self) -> Result<(), InquiryError> {
+        let rederived_account_digest =
+            rederive_coverage_account_digest(&self.run_reference_manifest, &self.admissibility)?;
+        if rederived_account_digest != self.coverage_receipt.account_digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.coverage_accounting",
             });
         }
         Ok(())
@@ -9731,7 +9879,16 @@ fn coverage_account(
     observation: &InquiryObservation,
     admissibility: &[SourceAdmissibilityRecord],
 ) -> Result<CoverageAccount, InquiryError> {
-    let manifest = &observation.reference_manifest;
+    build_coverage_account(&observation.reference_manifest, admissibility)
+        .map_err(InquiryError::from)
+}
+
+/// Rebuilds the exact coverage accounting the live path opens, from the
+/// retained manifest + admissibility rather than from a fresh observation.
+fn build_coverage_account(
+    manifest: &AllowedReferenceManifest,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<CoverageAccount, PortfolioError> {
     let mut members: BTreeSet<String> = BTreeSet::new();
     for handle in manifest
         .source_handles
@@ -9741,7 +9898,28 @@ fn coverage_account(
     {
         members.insert(handle.clone());
     }
-    let mut account = CoverageAccount::open(members).map_err(InquiryError::from)?;
+    // An admitted manifest that declares no member is not an error when the run
+    // examined candidates: the examined records are the run evidence the
+    // verified-empty account is opened over, and an empty manifest with an
+    // empty run still refuses below (an enumeration that never ran leaves an
+    // absent measurement, never a verified-empty scope). The observe loop then
+    // replays the same bindings idempotently: with an empty denominator every
+    // candidate lands outside the frozen scope, exactly as retained at open.
+    let mut account = if members.is_empty() {
+        let examined: Vec<ObservedOutsideScope> = admissibility
+            .iter()
+            .map(|record| ObservedOutsideScope {
+                handle: record.record.handle.clone(),
+                disposition: record.record.acquisition,
+                content_digest: record.record.content_digest.clone(),
+                operation_id: record.record.operation_id.clone(),
+                admitted_manifest_digest: manifest.digest.clone(),
+            })
+            .collect();
+        CoverageAccount::open_verified_empty(&examined)?
+    } else {
+        CoverageAccount::open(members)?
+    };
     for record in admissibility {
         account.observe(
             &record.record.handle,
@@ -9752,6 +9930,22 @@ fn coverage_account(
         )?;
     }
     Ok(account)
+}
+
+/// Re-proves the coverage-account digest from retained run material.
+///
+/// Holder re-proof primitive for W6 (#1767): the carried receipt binds
+/// `account_digest`, and this rebuilds the exact accounting the receipt was
+/// computed over from the retained manifest + admissibility — the same
+/// construction the live path runs, no new semantics — so a holder (and
+/// `validate_integrity` below) observes an account swapped after compute
+/// instead of trusting the binding. Absence-dependent verdict fields stay
+/// under `AbsencePreconditions::derive`, not here.
+pub fn rederive_coverage_account_digest(
+    manifest: &AllowedReferenceManifest,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<String, InquiryError> {
+    Ok(build_coverage_account(manifest, admissibility)?.digest())
 }
 
 /// The claim audit this run actually produced, plus the coverage map that says

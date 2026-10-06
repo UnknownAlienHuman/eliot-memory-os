@@ -203,6 +203,51 @@ pub fn project_actual_coverage_manifest(
     }
 }
 
+/// Retains one published shared coverage manifest in the owner spool (#1755
+/// W6).
+///
+/// `true` when the payload reached durable owner evidence. `false` when the
+/// interval was omitted (nothing to retain, and the previously retained row
+/// stands) or when no owner spool is bound or the retain failed: the tick
+/// traces the miss, and an omission never clears a previously published
+/// manifest, so the reader always sees a complete retained row or nothing.
+fn retain_published_shared_manifest(
+    port: Option<&WatchdogBackupPort>,
+    outcome: &crate::coverage_manifest_projection::CoverageManifestOutcome,
+) -> bool {
+    let crate::coverage_manifest_projection::CoverageManifestOutcome::Published {
+        manifest, ..
+    } = outcome
+    else {
+        return false;
+    };
+    let Some(port) = port else {
+        return false;
+    };
+    port.retain_shared_coverage_manifest(manifest).is_ok()
+}
+
+/// Retains one tick's gated downstream verdicts in the owner spool for
+/// downstream consumers (#1755 W7).
+///
+/// The verdicts the gate just decided are snapshotted under the consulted
+/// profile revision and retained through the owner backup port. Returns
+/// `false` when no owner spool is bound or the retain failed: the tick
+/// traces the miss, and an omission never clears a previously retained row,
+/// so the reader always sees a complete retained row or nothing.
+fn retain_gated_downstream_claims(
+    port: Option<&WatchdogBackupPort>,
+    profile_revision: Option<String>,
+    claims: &[crate::observation_coverage::DownstreamChannelClaim],
+) -> bool {
+    let Some(port) = port else {
+        return false;
+    };
+    let gated =
+        crate::watchdog_spool::RetainedGatedDownstreamClaims::gated(profile_revision, claims);
+    port.retain_gated_downstream_claims(&gated).is_ok()
+}
+
 /// The actual manifest's own interval identity: the declared owner-clock
 /// bounds under the sensor map revision they were derived under.
 ///
@@ -544,18 +589,93 @@ impl WatchdogComposition {
                                     kernel.allowed_manifest_digest(),
                                     &closed,
                                 );
-                            match shared {
+                            // Issue #1755 (W7): gate every channel's
+                            // downstream absence/compliance claim on the
+                            // exact active profile the admitted port
+                            // supplies, if any. The verdicts are operator
+                            // evidence on the same tick, like the gap
+                            // verdict above: a channel without a named
+                            // competent sensor keeps its gap and earns no
+                            // claim downstream (#1756/#1758), and a port
+                            // that resolved no profile disables every
+                            // claim rather than substituting one.
+                            let active_profile = kernel.active_coverage_profile();
+                            let gated_claims =
+                                crate::observation_coverage::gate_downstream_claims(
+                                    &closed,
+                                    active_profile.as_ref(),
+                                );
+                            tracing::debug!(
+                                event = "watchdog.downstream_claims_gated",
+                                observation = "gated",
+                                gated_allowed = gated_claims
+                                    .iter()
+                                    .filter(|claim| claim.claim_allowed)
+                                    .count(),
+                                gated_blocked = gated_claims
+                                    .iter()
+                                    .filter(|claim| !claim.claim_allowed)
+                                    .map(|claim| claim.channel.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                "downstream absence/compliance claims gated on the active coverage profile for this interval"
+                            );
+                            // The typed verdicts reach the owner spool on this
+                            // tick (#1755 W7); the log keeps the summary only.
+                            // A retain miss is warned: verdicts that were
+                            // decided but not retained must be visible, and
+                            // the next gated interval replaces the row anyway.
+                            let claims_retained = retain_gated_downstream_claims(
+                                kernel.spool_backup_port().as_deref(),
+                                active_profile.map(|profile| profile.profile_revision.clone()),
+                                &gated_claims,
+                            );
+                            if claims_retained {
+                                tracing::debug!(
+                                    event = "watchdog.gated_claims_retained",
+                                    observation = "retained",
+                                    "gated downstream claims retained for this interval"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event = "watchdog.gated_claims_retain_missed",
+                                    observation = "unretained",
+                                    "gated downstream claims decided but not retained in the owner spool"
+                                );
+                            }
+                            // The payload reaches the owner spool on this
+                            // tick (#1755 W6); the log keeps the summary
+                            // only. A retain miss is warned: evidence that
+                            // was built but not retained must be visible, and
+                            // the next published interval replaces the row
+                            // anyway.
+                            let retained = retain_published_shared_manifest(
+                                kernel.spool_backup_port().as_deref(),
+                                &shared,
+                            );
+                            match &shared {
                                 crate::coverage_manifest_projection::CoverageManifestOutcome::Published {
                                     completeness,
                                     streams,
+                                    ..
                                 } => {
-                                    tracing::debug!(
-                                        event = "watchdog.shared_coverage_manifest_published",
-                                        observation = "published",
-                                        completeness = ?completeness,
-                                        streams = streams,
-                                        "shared ObservationCoverageManifest built from this interval"
-                                    );
+                                    if retained {
+                                        tracing::debug!(
+                                            event = "watchdog.shared_coverage_manifest_published",
+                                            observation = "published",
+                                            completeness = ?completeness,
+                                            streams = streams,
+                                            "shared ObservationCoverageManifest built and retained from this interval"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            event = "watchdog.shared_coverage_manifest_retain_missed",
+                                            observation = "unretained",
+                                            completeness = ?completeness,
+                                            streams = streams,
+                                            "shared ObservationCoverageManifest built but not retained in the owner spool"
+                                        );
+                                    }
                                 }
                                 crate::coverage_manifest_projection::CoverageManifestOutcome::Omitted(
                                     reason,
@@ -641,6 +761,51 @@ impl WatchdogComposition {
                                 &coverage,
                                 ObservationChannel::ArtifactConfigIdentity,
                                 ObservationClass::ArtifactDigest,
+                            );
+                        }
+                        // I8.2 (#1755 W2-rem): this tick exercises the store-endpoint
+                        // probe feeding the StoreProcessHealth and
+                        // ListenerInventory channels (manifest-shaped target ->
+                        // OS listener-owner table -> platform PID-to-identity
+                        // binding -> approved-image match; see
+                        // `store_endpoint_observation`). A refused probe
+                        // records no sample, so both channels stay UNKNOWN
+                        // rather than healthy-by-absence.
+                        if let Some(store) = host.observe_store_endpoint() {
+                            tracing::debug!(
+                                event = "watchdog.store_endpoint_observed",
+                                observation = "observed",
+                                endpoint = store.endpoint().to_string(),
+                                process_id = store.process_id(),
+                                readiness = store.readiness().as_str(),
+                                "store loopback listener owned by the approved store image process"
+                            );
+                            record_coverage_sample(
+                                &coverage,
+                                ObservationChannel::StoreProcessHealth,
+                                ObservationClass::ReadOnlyProbe,
+                            );
+                            record_coverage_sample(
+                                &coverage,
+                                ObservationChannel::ListenerInventory,
+                                ObservationClass::ListenerBinding,
+                            );
+                        }
+                        // I8.2 (#1755 W3/C6): one registered-scope journal-replay
+                        // step over the admitted scopes. No production registrar
+                        // issues scopes, so the admitted set is empty here and
+                        // the step is a measured no-op; the disposable scopes
+                        // that prove it are owner-issued test-side. The step
+                        // takes no daemon handle: with `eliotd` down this still
+                        // runs on the owner spool and platform reads alone.
+                        if let Some(port) = kernel.spool_backup_port() {
+                            let _ = crate::registered_scope_replay::replay_registered_scopes(
+                                port.spool.as_ref(),
+                                &coverage,
+                                &[],
+                                &[],
+                                &[],
+                                crate::registered_scope_replay::JOURNAL_REPLAY_PAGE_BYTES,
                             );
                         }
                         let admission = match admission.reload() {
@@ -1697,6 +1862,68 @@ impl WatchdogBackupPort {
         self.spool.high_water_sequence()
     }
 
+    /// Retains the newest published shared I8.2 coverage manifest (#1755 W6).
+    ///
+    /// Thin delegation to
+    /// [`WatchdogSpool::retain_shared_coverage_manifest`](crate::watchdog_spool::WatchdogSpool::retain_shared_coverage_manifest):
+    /// the same owner spool every heartbeat and gap record is appended
+    /// through, so the wrapper-built payload reaches durable owner evidence on
+    /// the supervision tick instead of only a debug-log summary. Carries no
+    /// backup, restore, or export semantics: backup captures and export
+    /// batches never read the manifest row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the manifest does not validate or the row
+    /// cannot be committed.
+    pub(crate) fn retain_shared_coverage_manifest(
+        &self,
+        manifest: &eliot_evaluation_contracts::ObservationCoverageManifest,
+    ) -> Result<(), SpoolError> {
+        self.spool.retain_shared_coverage_manifest(manifest)
+    }
+
+    /// Retains the newest gated downstream verdicts (#1755 W7).
+    ///
+    /// Thin delegation to
+    /// [`WatchdogSpool::retain_gated_downstream_claims`](crate::watchdog_spool::WatchdogSpool::retain_gated_downstream_claims):
+    /// the same owner spool the manifest row reaches, so the typed
+    /// profile/sensor/subject/generation/interval handoff reaches durable
+    /// owner evidence on the supervision tick for downstream consumers
+    /// (#1756/#1758) instead of only a debug-log summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the verdicts do not validate or the row
+    /// cannot be committed.
+    pub(crate) fn retain_gated_downstream_claims(
+        &self,
+        gated: &crate::watchdog_spool::RetainedGatedDownstreamClaims,
+    ) -> Result<(), SpoolError> {
+        self.spool.retain_gated_downstream_claims(gated)
+    }
+
+    /// Reads the latest retained gated downstream verdicts (#1755 W7).
+    ///
+    /// Thin delegation to
+    /// [`WatchdogSpool::read_gated_downstream_claims`](crate::watchdog_spool::WatchdogSpool::read_gated_downstream_claims):
+    /// the consumer handoff for the typed profile/sensor/subject/generation/interval
+    /// verdicts the tick retains — downstream absence/compliance readers (#1756/#1758)
+    /// take the latest complete interval here instead of reconstructing it from the
+    /// debug-log summary. `Ok(None)` when no interval has retained one yet; a stored
+    /// row that no longer parses or validates is refused as corrupt, never served
+    /// best-effort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the owner database cannot be read or the stored
+    /// row is corrupt.
+    pub fn read_gated_downstream_claims(
+        &self,
+    ) -> Result<Option<crate::watchdog_spool::RetainedGatedDownstreamClaims>, SpoolError> {
+        self.spool.read_gated_downstream_claims()
+    }
+
     /// Binds one capture request against the owner's retained identity.
     ///
     /// The requested source installation and watchdog generation are compared
@@ -2029,6 +2256,305 @@ mod boundary_evidence_tests {
         assert_eq!(
             revalidate_boundary(&target, &evidence),
             Err(BoundaryRefusal::RegistrationUnavailable)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_manifest_tick_tests {
+    use super::*;
+
+    use crate::coverage_manifest_projection::{
+        CoverageManifestOutcome, publish_interval_coverage_manifest,
+    };
+    use crate::observation_coverage::{
+        IntervalCoveragePublisher, ObservationChannel, channel_capability,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_port(name: &str) -> Result<WatchdogBackupPort, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-watchdog-manifest-port-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let spool = Arc::new(crate::watchdog_spool::WatchdogSpool::open_test(&path)?);
+        Ok(WatchdogBackupPort::new(
+            Arc::clone(&spool),
+            "installation-1755".to_owned(),
+            7,
+            WatchdogSpoolBackupLimits::default(),
+            Arc::new(IntervalCoverageCell::new(1_000)),
+        )?)
+    }
+
+    /// The owner's own fully observed interval, published through the same
+    /// wrapper the tick calls.
+    fn published_outcome() -> CoverageManifestOutcome {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        let report = publisher.close(2_000);
+        publish_interval_coverage_manifest(
+            Some("installation-1755"),
+            Some(&"a".repeat(64)),
+            &report,
+        )
+    }
+
+    /// A published interval reaches the owner spool through the port: the
+    /// payload the tick retains reads back identical (#1755 W6).
+    #[test]
+    fn published_interval_reaches_owner_spool_through_port() -> TestResult {
+        let port = test_port("tick")?;
+        let outcome = published_outcome();
+        let CoverageManifestOutcome::Published { ref manifest, .. } = outcome else {
+            return Err("both owner identities are present, expected a manifest".into());
+        };
+        assert!(retain_published_shared_manifest(Some(&port), &outcome));
+        assert_eq!(
+            port.spool.read_shared_coverage_manifest()?,
+            Some(manifest.as_ref().clone())
+        );
+        Ok(())
+    }
+
+    /// An omitted interval retains nothing and clears nothing: the reader
+    /// sees no manifest rather than a fabricated one.
+    #[test]
+    fn omitted_interval_retains_nothing() -> TestResult {
+        let port = test_port("omitted")?;
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        let report = publisher.close(2_000);
+        let outcome = publish_interval_coverage_manifest(None, None, &report);
+        assert!(matches!(outcome, CoverageManifestOutcome::Omitted(_)));
+        assert!(!retain_published_shared_manifest(Some(&port), &outcome));
+        assert_eq!(port.spool.read_shared_coverage_manifest()?, None);
+        Ok(())
+    }
+
+    /// Without a bound owner spool nothing is retained and nothing fails:
+    /// the miss is for the tick to trace, not a refusal.
+    #[test]
+    fn missing_port_retains_nothing() {
+        let outcome = published_outcome();
+        assert!(matches!(outcome, CoverageManifestOutcome::Published { .. }));
+        assert!(!retain_published_shared_manifest(None, &outcome));
+    }
+}
+
+#[cfg(test)]
+mod gated_claims_tick_tests {
+    use super::*;
+    use crate::observation_coverage::{
+        ActiveCoverageProfile, IntervalCoveragePublisher, IntervalCoverageReport,
+        ObservationChannel, channel_capability, gate_downstream_claims,
+        owner_active_coverage_profile,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_port(name: &str) -> Result<WatchdogBackupPort, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-watchdog-gated-port-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let spool = Arc::new(crate::watchdog_spool::WatchdogSpool::open_test(&path)?);
+        Ok(WatchdogBackupPort::new(
+            Arc::clone(&spool),
+            "installation-1755".to_owned(),
+            7,
+            WatchdogSpoolBackupLimits::default(),
+            Arc::new(IntervalCoverageCell::new(1_000)),
+        )?)
+    }
+
+    /// Every channel observed once: the closed report the tick gates over.
+    fn closed_report(start_ms: u64, end_ms: u64) -> IntervalCoverageReport {
+        let mut publisher = IntervalCoveragePublisher::new(start_ms);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        publisher.close(end_ms)
+    }
+
+    /// The admitted sensor-profile source: the owner's own measured sensor
+    /// map, never a test-local profile.
+    fn admitted_profile() -> Result<ActiveCoverageProfile, Box<dyn std::error::Error>> {
+        let Some(profile) = owner_active_coverage_profile("installation-1755", 7) else {
+            return Err("a bound sensor resolves the admitted owner profile".into());
+        };
+        Ok(profile)
+    }
+
+    /// The tick's gated verdicts on the admitted owner profile reach the
+    /// owner spool through the port, typed per channel: a named competent
+    /// sensor allows exactly its own channel's claim, bound to the admitted
+    /// subject and generation (#1755 W7).
+    #[test]
+    fn gated_verdicts_reach_owner_spool_through_port() -> TestResult {
+        let port = test_port("tick")?;
+        let profile = admitted_profile()?;
+        let report = closed_report(1_000, 2_000);
+        let claims = gate_downstream_claims(&report, Some(&profile));
+        let revision = Some(profile.profile_revision.clone());
+        assert!(retain_gated_downstream_claims(
+            Some(&port),
+            revision.clone(),
+            &claims
+        ));
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the tick retained one interval".into());
+        };
+        assert_eq!(
+            read,
+            crate::watchdog_spool::RetainedGatedDownstreamClaims::gated(revision, &claims)
+        );
+        for claim in &claims {
+            let named = profile.sensor_for(claim.channel).is_some();
+            assert_eq!(
+                claim.claim_allowed,
+                named,
+                "channel {}",
+                claim.channel.as_str()
+            );
+        }
+        assert!(claims.iter().any(|claim| claim.claim_allowed));
+        for kept in &read.claims {
+            if kept.claim_allowed {
+                assert_eq!(kept.observed_subject.as_deref(), Some("installation-1755"));
+                assert_eq!(
+                    kept.observed_generation.as_deref(),
+                    Some("watchdog-generation-7")
+                );
+                assert!(kept.profile_revision == read.profile_revision);
+            }
+        }
+        Ok(())
+    }
+
+    /// Without a bound owner spool nothing is retained and nothing fails:
+    /// the miss is for the tick to trace, not a refusal.
+    #[test]
+    fn missing_port_retains_nothing() -> TestResult {
+        let profile = admitted_profile()?;
+        let report = closed_report(1_000, 2_000);
+        let claims = gate_downstream_claims(&report, Some(&profile));
+        assert!(!retain_gated_downstream_claims(
+            None,
+            Some(profile.profile_revision.clone()),
+            &claims
+        ));
+        Ok(())
+    }
+
+    /// No admitted profile disables every claim in the retained row itself:
+    /// the fail-closed verdict is durable evidence, not only tick-local.
+    #[test]
+    fn no_profile_disables_every_claim_in_retained_row() -> TestResult {
+        let port = test_port("no-profile")?;
+        let report = closed_report(1_000, 2_000);
+        let claims = gate_downstream_claims(&report, None);
+        assert!(claims.iter().all(|claim| !claim.claim_allowed));
+        assert!(
+            claims
+                .iter()
+                .all(|claim| claim.reason == "NO_ACTIVE_PROFILE")
+        );
+        assert!(retain_gated_downstream_claims(Some(&port), None, &claims));
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the refused interval still retains its verdicts".into());
+        };
+        assert_eq!(read.profile_revision, None);
+        assert!(read.claims.iter().all(|claim| !claim.claim_allowed));
+        Ok(())
+    }
+
+    /// A sensor a newer revision stops naming expires by removal: exactly
+    /// its channel flips to SENSOR_NOT_NAMED while every other retained
+    /// verdict stands unchanged.
+    #[test]
+    fn removed_sensor_disables_only_its_channel() -> TestResult {
+        let port = test_port("removal")?;
+        let profile = admitted_profile()?;
+        let Some(dropped) = profile.competent_sensors.first().cloned() else {
+            return Err("the admitted profile names at least one sensor".into());
+        };
+        let mut narrowed = profile.clone();
+        narrowed
+            .competent_sensors
+            .retain(|sensor| sensor.channel != dropped.channel);
+        let report = closed_report(1_000, 2_000);
+        let before = gate_downstream_claims(&report, Some(&profile));
+        let after = gate_downstream_claims(&report, Some(&narrowed));
+        assert!(retain_gated_downstream_claims(
+            Some(&port),
+            Some(narrowed.profile_revision.clone()),
+            &after
+        ));
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the narrowed interval retains its verdicts".into());
+        };
+        assert_eq!(read.claims.len(), before.len());
+        for (old, kept) in before.iter().zip(read.claims.iter()) {
+            assert_eq!(kept.channel, old.channel.as_str());
+            if kept.channel == dropped.channel.as_str() {
+                assert!(!kept.claim_allowed);
+                assert_eq!(kept.reason, "SENSOR_NOT_NAMED");
+            } else {
+                assert_eq!(kept.claim_allowed, old.claim_allowed);
+                assert_eq!(kept.reason, old.reason);
+            }
+        }
+        let Some(dropped_before) = before.iter().find(|claim| claim.channel == dropped.channel)
+        else {
+            return Err("the dropped channel is gated".into());
+        };
+        assert!(dropped_before.claim_allowed);
+        Ok(())
+    }
+
+    /// A newer interval replaces the older row whole through the same port
+    /// path the tick retains through: the reader never sees a merged
+    /// interval.
+    #[test]
+    fn newer_interval_supersedes_older() -> TestResult {
+        let port = test_port("supersede")?;
+        let profile = admitted_profile()?;
+        for (start, end) in [(1_000_u64, 2_000_u64), (2_000_u64, 3_000_u64)] {
+            let report = closed_report(start, end);
+            let claims = gate_downstream_claims(&report, Some(&profile));
+            assert!(retain_gated_downstream_claims(
+                Some(&port),
+                Some(profile.profile_revision.clone()),
+                &claims
+            ));
+        }
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the newer interval retains its verdicts".into());
+        };
+        assert!(
+            read.claims
+                .iter()
+                .all(|claim| claim.interval_start_ms == 2_000)
+        );
+        assert!(
+            read.claims
+                .iter()
+                .all(|claim| claim.interval_end_ms == 3_000)
         );
         Ok(())
     }
