@@ -88,8 +88,8 @@ pub use module::control_reserve_front_door::{
 pub use module::control_reserve_ors_evidence::join_ors_owner_evidence;
 pub use module::control_reserve_process_owner::{
     PROCESS_CANCEL_BOTTLENECK, PROCESS_LAUNCH_BOTTLENECK, PROCESS_TREE_OWNER, ProcessOwnerBoundary,
-    ProcessPermit, ProcessReleaseEvidence, ProcessTreeOwnerEvidenceContext, ProcessTreeReserve,
-    is_process_bottleneck,
+    ProcessPermit, ProcessPermitWireVerdict, ProcessReleaseEvidence,
+    ProcessTreeOwnerEvidenceContext, ProcessTreeReserve, is_process_bottleneck,
 };
 pub use module::control_reserve_profile_compiler::{
     BottleneckOwnerEvidence, ControlReserveProfileIdentity, ControlReserveStatusRow,

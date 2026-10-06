@@ -368,6 +368,41 @@ impl ProcessOwnerBoundary {
     }
 }
 
+/// Provider answer for one retained process permit (issue #1679, W11).
+///
+/// The exact verdict vocabulary the `native_worker.capacity_verify` Kernel
+/// route echoes and the #1701 consumer maps: only `verified` admits, every
+/// other verdict refuses with its typed error. `not_held` is answered by
+/// the route itself (no holding under the queried identity) and is not
+/// produced here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessPermitWireVerdict {
+    /// The retained holding verifies live and current.
+    Verified,
+    /// The permit is held elsewhere or names another owner.
+    ForeignOwner,
+    /// The binding epoch moved past the live Authority Epoch.
+    StaleEpoch,
+    /// The owner generation or compiled profile moved past the binding.
+    StaleOwner,
+    /// Changed content, a released holding, or any other refusal.
+    Conflict,
+}
+
+impl ProcessPermitWireVerdict {
+    /// Returns the wire string the capacity-verify answer carries.
+    #[must_use]
+    pub const fn as_verdict_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::ForeignOwner => "foreign_owner",
+            Self::StaleEpoch => "stale_epoch",
+            Self::StaleOwner => "stale_owner",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
 /// Returns the configured partition capacity for one dimension and class.
 fn partition_capacity(
     inner: &ProcessPartitionsInner,
@@ -1006,6 +1041,44 @@ impl ProcessTreeReserve {
             });
         }
         Ok(())
+    }
+
+    /// Classifies one [`ProcessTreeReserve::verify_process_permit`] outcome
+    /// into the provider answer the `native_worker.capacity_verify` Kernel
+    /// route serves (issue #1679, W11 provider side; consumed by
+    /// `bins/eliot-kernel/src/native_worker_capacity_verify_route.rs`).
+    ///
+    /// The mapping is total: `verified` only on full currency; a moved epoch
+    /// tuple or sequence reads `stale_epoch`; a rotated owner generation or
+    /// profile reads `stale_owner`; a binding held elsewhere or naming
+    /// another owner reads `foreign_owner`; every other refusal (changed
+    /// content, released holding, illegal shape) reads `conflict`, never a
+    /// silent pass. The caller answers `not_held` itself when no holding
+    /// exists under the queried identity.
+    pub fn check_process_permit_wire_verdict(
+        &self,
+        permit: &ProcessPermit,
+        binding: &CapacityPermitBinding,
+        request: &CapacityRequest,
+        boundary: &ProcessOwnerBoundary,
+    ) -> ProcessPermitWireVerdict {
+        match self.verify_process_permit(permit, binding, request, boundary) {
+            Ok(()) => ProcessPermitWireVerdict::Verified,
+            Err(KernelError::StaleEpochTuple { .. } | KernelError::StaleEpoch { .. }) => {
+                ProcessPermitWireVerdict::StaleEpoch
+            }
+            Err(KernelError::InvalidField { reason, .. })
+                if reason.starts_with("FOREIGN_OWNER") =>
+            {
+                ProcessPermitWireVerdict::ForeignOwner
+            }
+            Err(KernelError::InvalidField { reason, .. })
+                if reason.starts_with("STALE_OWNER") || reason.starts_with("STALE_PROFILE") =>
+            {
+                ProcessPermitWireVerdict::StaleOwner
+            }
+            Err(_) => ProcessPermitWireVerdict::Conflict,
+        }
     }
 
     /// Records the owner's contemporaneous partition observation for one issuance.
@@ -1798,6 +1871,139 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    fn wire_pair(
+        operation_id: &str,
+    ) -> Result<
+        (
+            ProcessTreeReserve,
+            ProcessPermit,
+            CapacityPermitBinding,
+            CapacityRequest,
+            ProcessOwnerBoundary,
+        ),
+        KernelError,
+    > {
+        let owner = reserve()?;
+        let epoch = genesis_epoch();
+        let request = make_request(
+            PROCESS_LAUNCH_BOTTLENECK,
+            RequestedOperationClass::Normal(NormalWorkClass::NormalBackground),
+            operation_id,
+            epoch.clone(),
+        );
+        let live = boundary(epoch)?;
+        let (permit, binding) = owner.issue_process_permit(&request, &live)?;
+        Ok((owner, permit, binding, request, live))
+    }
+
+    #[test]
+    fn process_wire_verdict_verified_on_current_holding() -> Result<(), KernelError> {
+        let (owner, permit, binding, request, live) = wire_pair("op-wire-1")?;
+        assert_eq!(
+            owner.check_process_permit_wire_verdict(&permit, &binding, &request, &live),
+            ProcessPermitWireVerdict::Verified
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_wire_verdict_conflict_on_tampered_binding() -> Result<(), KernelError> {
+        let (owner, permit, binding, request, live) = wire_pair("op-wire-2")?;
+        let mut tampered = binding.clone();
+        tampered.operation_id = "tampered-operation".to_owned();
+        assert_eq!(
+            owner.check_process_permit_wire_verdict(&permit, &tampered, &request, &live),
+            ProcessPermitWireVerdict::Conflict
+        );
+        assert_eq!(
+            ProcessPermitWireVerdict::Conflict.as_verdict_str(),
+            "conflict"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_wire_verdict_foreign_owner_on_other_instance() -> Result<(), KernelError> {
+        let (owner, permit, binding, request, live) = wire_pair("op-wire-3")?;
+        let other = reserve()?;
+        assert_eq!(
+            other.check_process_permit_wire_verdict(&permit, &binding, &request, &live),
+            ProcessPermitWireVerdict::ForeignOwner
+        );
+        assert_eq!(
+            ProcessPermitWireVerdict::Verified.as_verdict_str(),
+            "verified"
+        );
+        let _ = owner;
+        Ok(())
+    }
+
+    #[test]
+    fn process_wire_verdict_stale_epoch_on_moved_authority() -> Result<(), KernelError> {
+        let (owner, permit, binding, request, _) = wire_pair("op-wire-4")?;
+        let advanced = ProcessOwnerBoundary {
+            current_epoch: advanced_epoch(),
+            ..boundary(genesis_epoch())?
+        };
+        assert_eq!(
+            owner.check_process_permit_wire_verdict(&permit, &binding, &request, &advanced),
+            ProcessPermitWireVerdict::StaleEpoch
+        );
+        let moved_lineage = ProcessOwnerBoundary {
+            current_epoch: foreign_epoch(),
+            ..boundary(genesis_epoch())?
+        };
+        assert_eq!(
+            owner.check_process_permit_wire_verdict(&permit, &binding, &request, &moved_lineage),
+            ProcessPermitWireVerdict::StaleEpoch
+        );
+        assert_eq!(
+            ProcessPermitWireVerdict::StaleEpoch.as_verdict_str(),
+            "stale_epoch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_wire_verdict_stale_owner_on_rotated_owner() -> Result<(), KernelError> {
+        let (owner, permit, binding, request, _) = wire_pair("op-wire-5")?;
+        let rotated_generation = ProcessOwnerBoundary {
+            owner_generation: ResourceGeneration::new(2).map_err(|_| {
+                KernelError::InvalidField {
+                    field: "test.rotated_generation",
+                    reason: "test generation must construct",
+                }
+            })?,
+            ..boundary(genesis_epoch())?
+        };
+        assert_eq!(
+            owner.check_process_permit_wire_verdict(
+                &permit,
+                &binding,
+                &request,
+                &rotated_generation
+            ),
+            ProcessPermitWireVerdict::StaleOwner
+        );
+        let rotated_profile = ProcessOwnerBoundary {
+            profile_revision: "rev-10".to_owned(),
+            ..boundary(genesis_epoch())?
+        };
+        assert_eq!(
+            owner.check_process_permit_wire_verdict(&permit, &binding, &request, &rotated_profile),
+            ProcessPermitWireVerdict::StaleOwner
+        );
+        assert_eq!(
+            ProcessPermitWireVerdict::StaleOwner.as_verdict_str(),
+            "stale_owner"
+        );
+        assert_eq!(
+            ProcessPermitWireVerdict::ForeignOwner.as_verdict_str(),
+            "foreign_owner"
+        );
         Ok(())
     }
 }
