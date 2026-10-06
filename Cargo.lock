@@ -3619,6 +3619,7 @@ dependencies = [
  "eliot-learning-contracts",
  "eliot-learning-state-view",
  "eliot-maintenance",
+ "eliot-mcp",
  "eliot-memory-quality",
  "eliot-observability",
  "eliot-observability-runtime",

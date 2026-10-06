@@ -75,6 +75,19 @@ __pycache__/
 # The same applies to any other crate that declares its own `[workspace]`.
 # Those locks are build artifacts of an unadmitted crate, never release inputs.
 crates/*/*/Cargo.lock
+# Issue #1229 A1: the nine adjacent locks below are the checked-in resolver
+# join inputs the dependency-policy verifier binds offline
+# (bind_nonmember_resolver_identity); they are verification evidence, never
+# release inputs, and any substitution breaks the preparation-lock binding.
+!crates/research/eliot-dreamer-source-assurance/Cargo.lock
+!crates/smart/eliot-context-compiler-wasm/Cargo.lock
+!crates/smart/eliot-cue-activation-wasm/Cargo.lock
+!crates/smart/eliot-dreamer-curation-wasm/Cargo.lock
+!crates/smart/eliot-dreamer-cycle-wasm/Cargo.lock
+!crates/smart/eliot-dreamer-orientation-wasm/Cargo.lock
+!crates/smart/eliot-dreamer-research-wasm/Cargo.lock
+!crates/smart/eliot-memory-applicability/Cargo.lock
+!crates/smart/eliot-memory-curation-screen-wasm/Cargo.lock
 
 # Per-item build/verification evidence written by swarm managers. Never committed.
 items/
