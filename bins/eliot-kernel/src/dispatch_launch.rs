@@ -1062,6 +1062,91 @@ pub fn compose_process_capacity_reserve(
     Ok(())
 }
 
+/// Outcome of composing the process-capacity reserve from the compiled
+/// control-reserve profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessCapacityReserveComposition {
+    /// The reserve composed from the profile's claimed process rows.
+    Composed,
+    /// A process dimension is unestablished in the profile: the contour
+    /// stays deliberately uncomposed (the defined path — dispatch
+    /// carries no capacity section and the consumer refuses
+    /// fail-closed). Missing accepted inputs are never treated as
+    /// verified capacity.
+    SkippedUnestablished,
+}
+
+/// Reads the four process-capacity partition bounds from the compiled
+/// control-reserve profile, if its process rows establish them.
+///
+/// Only `Claimed` `ProcessLaunchSlots` / `ProcessCancellationTermination`
+/// rows with present positive normal/protected limits yield bounds (the
+/// owner-published partitions, never invented values). Anything else —
+/// unknown rows, missing limits, zero bounds — yields `None`.
+fn process_capacity_bounds_from_profile(
+    profile: &eliot_runtime_contracts::ControlReserveProfile,
+) -> Option<(usize, usize, usize, usize)> {
+    fn partition_limit(
+        profile: &eliot_runtime_contracts::ControlReserveProfile,
+        bottleneck: eliot_runtime_contracts::CapacityBottleneck,
+        normal: bool,
+    ) -> Option<usize> {
+        let row = profile
+            .bottleneck_rows
+            .iter()
+            .find(|row| row.bottleneck == bottleneck)?;
+        if row.coverage_state != eliot_runtime_contracts::BottleneckCoverageState::Claimed {
+            return None;
+        }
+        let limit = if normal {
+            row.normal_limit.as_ref()
+        } else {
+            row.protected_limit.as_ref()
+        }?;
+        usize::try_from(limit.quantity.get())
+            .ok()
+            .filter(|amount| *amount > 0)
+    }
+    use eliot_runtime_contracts::CapacityBottleneck::{
+        ProcessCancellationTermination, ProcessLaunchSlots,
+    };
+    Some((
+        partition_limit(profile, ProcessLaunchSlots, true)?,
+        partition_limit(profile, ProcessLaunchSlots, false)?,
+        partition_limit(profile, ProcessCancellationTermination, true)?,
+        partition_limit(profile, ProcessCancellationTermination, false)?,
+    ))
+}
+
+/// Composes the contour-owned process-capacity reserve from the
+/// composition's own compiled control-reserve profile (issue #1679,
+/// W11/W4 producer side; the production caller is the Kernel entry's
+/// dispatch-composition block).
+///
+/// Bounds come only from the profile's claimed process rows via
+/// [`process_capacity_bounds_from_profile`]: the accepted
+/// process-owner/profile/partition inputs. An unestablished profile
+/// skips fail-closed ([`ProcessCapacityReserveComposition::SkippedUnestablished`])
+/// instead of composing a guess. Set-once per process like
+/// [`compose_process_capacity_reserve`]: a second composition is
+/// refused instead of replacing live held capacity.
+pub fn compose_process_capacity_reserve_from_profile(
+    profile: &eliot_runtime_contracts::ControlReserveProfile,
+) -> Result<ProcessCapacityReserveComposition, DispatchLaunchError> {
+    let Some((launch_normal, launch_protected, cancel_normal, cancel_protected)) =
+        process_capacity_bounds_from_profile(profile)
+    else {
+        return Ok(ProcessCapacityReserveComposition::SkippedUnestablished);
+    };
+    compose_process_capacity_reserve(
+        launch_normal,
+        launch_protected,
+        cancel_normal,
+        cancel_protected,
+    )?;
+    Ok(ProcessCapacityReserveComposition::Composed)
+}
+
 /// Composes the production Doctor front-door state: the durable recovery
 /// ledger plus the immutable recipe registry.
 ///
@@ -2248,6 +2333,20 @@ pub(crate) fn read_testd_terminal_completion(
 /// (`bins/eliot-doctor/src/dispatched_material.rs::validate_nonce`:
 /// 16..=256 bytes over alphanumerics plus `-_.`); violations fail closed
 /// instead of launching.
+/// Mints the Kernel-issued dispatch/session nonce for one admission.
+///
+/// Joint #1679/#1701 nonce relation (I15.2: principal identity is issued
+/// by Kernel, never self-declared; I7.5: the child presents the nonce
+/// delivered via the protected file): the session nonce DERIVES from the
+/// claim binding (`identity_digest`, usually the receipt binding digest
+/// covering the claimant-chosen executable-join launch nonce), the
+/// admission time and the composition owner. No first presenter can set
+/// its join nonce equal to this value (it needs the admission time),
+/// so equality is never required — the join is authenticated by the
+/// canonical request digest plus the receipt echo at prepare, the file
+/// digest plus the receipt echo at prepare, the file carries this
+/// minted value, and the child re-proves exactly this value on later
+/// submissions (presented session nonce == retained record nonce).
 fn mint_dispatch_nonce(
     kind: DispatchedWorkerKind,
     identity_digest: &str,
@@ -2964,7 +3063,12 @@ pub(crate) fn answer_native_worker_capacity_verify(
     kernel: &KernelComposition,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, DispatchLaunchError> {
-    let presentation = parse_capacity_verify_presentation(payload)?;
+    // The closed `transact_json` envelope is unwrapped here too, so direct
+    // callers answer the same body the frame gateway normalizes (issue
+    // #1679 W11/W4). Idempotent: an inner body carries no `payload`
+    // object, so it passes through unchanged.
+    let body = crate::native_worker_lifecycle_route::native_worker_request_body(payload);
+    let presentation = parse_capacity_verify_presentation(body)?;
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed(
@@ -3055,9 +3159,15 @@ pub fn native_worker_material_bytes(
 /// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
 ///   vocabulary; its `receipt_digest` is the admission identity).
 /// * `epoch`/`generation` — the live authority bound at admission.
-/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
-///   executable-join launch nonce when the join is present; the caller
-///   request already binds it, and the child re-proves binding).
+/// * `nonce` — the I7.5/I15.2 session nonce, Kernel-minted per admission
+///   by `mint_dispatch_nonce` from the claim binding digest, the
+///   admission time and the composition owner. It is independent of the
+///   v2 executable-join launch nonce the caller request binds: the join
+///   nonce is claimant-chosen and digest-bound at admission, while this
+///   session nonce is issued by Kernel (I15.2), delivered to the child
+///   through this protected file (I7.5), and re-proved by the child on
+///   every later submission against the retained record (issue
+///   #1679/#1701 joint nonce relation: derivation, never equality).
 /// * `grant` — the shared `DispatchGrant` object.
 ///
 /// The concrete `ProcessRequest` plus the composed provider ports arrive
@@ -3094,15 +3204,17 @@ fn native_worker_material_bytes_with_capacity(
             "native action envelope authority epoch is not the live admitted epoch".to_owned(),
         ));
     }
-    if request
-        .executable_binding
-        .as_ref()
-        .is_some_and(|binding| binding.launch_nonce != nonce)
-    {
-        return Err(DispatchLaunchError::Inconsistent(
-            "native worker launch nonce does not match its owner executable binding".to_owned(),
-        ));
-    }
+    // Joint nonce relation (#1679/#1701): no join-vs-session equality is
+    // checked here. The claimant-chosen `executable_binding.launch_nonce`
+    // is authenticated inside the canonical request digest plus the
+    // receipt echo above, and it cannot predict this Kernel-minted
+    // session nonce (derived from the admission time at prepare). The
+    // file carries the session nonce; the child re-proves exactly this
+    // value on later submissions against the retained record.
+    debug_assert!(
+        !nonce.is_empty(),
+        "the writer only carries a minted session nonce"
+    );
     let action_envelopes = native_worker_action_envelopes(request, receipt, epoch, grant, nonce)?;
     let mut body = serde_json::json!({
         "request": request,
@@ -4346,18 +4458,21 @@ fn begin_native_worker_process_start(
             "native worker start lacks its reserved claim request".to_owned(),
         )
     })?;
-    let executable_binding = request.executable_binding.as_ref().ok_or_else(|| {
-        DispatchLaunchError::Inconsistent(
+    // The owner join must exist (required check kept); its
+    // claimant-chosen launch nonce is not compared against the
+    // Kernel-minted session nonce (joint #1679/#1701 relation:
+    // derivation, never equality — see `mint_dispatch_nonce`).
+    if request.executable_binding.is_none() {
+        return Err(DispatchLaunchError::Inconsistent(
             "native worker start lacks its owner executable binding".to_owned(),
-        )
-    })?;
+        ));
+    }
     if request.validate().is_err()
         || request.validate_canonical_digest().is_err()
         || record.request_digest != request.request_digest
         || request.claim_id != claim_id
         || request.authority_epoch != *activation_epoch
         || request.worker_artifact_digest != executable_sha256
-        || executable_binding.launch_nonce != record.nonce
         || executable_path.as_os_str().is_empty()
         || executable_file_identity.1 == 0
         || deadline_unix_ms <= super::unix_ms()
@@ -4541,11 +4656,15 @@ pub(crate) fn native_worker_process_start_binding(
         })?;
     let executable_file_identity = process_start.executable_file_identity;
     let process_receipt = process_start.receipt;
-    let Some(executable_binding) = request.executable_binding.as_ref() else {
-        return Err(DispatchLaunchError::Inconsistent(
+    // The owner join must exist (required check kept); its
+    // claimant-chosen launch nonce is not compared against the
+    // Kernel-minted session nonce (joint #1679/#1701 relation:
+    // derivation, never equality — see `mint_dispatch_nonce`).
+    let join = request.executable_binding.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Inconsistent(
             "native worker claim has no owner executable binding".to_owned(),
-        ));
-    };
+        )
+    })?;
     request
         .validate()
         .and_then(|()| request.validate_canonical_digest())
@@ -4586,9 +4705,8 @@ pub(crate) fn native_worker_process_start_binding(
         || process_fence.generation() != process_start.activation_generation
         || process.executable_sha256() != request.worker_artifact_digest.as_str()
         || process_receipt.operation_id().as_str() != retained.operation_id.as_str()
-        || executable_binding.launch_nonce != retained.nonce
-        || executable_binding.capability_cell.as_str().is_empty()
-        || executable_binding.capability_cell_registry_digest.len() != 64
+        || join.capability_cell.as_str().is_empty()
+        || join.capability_cell_registry_digest.len() != 64
     {
         return Err(DispatchLaunchError::Inconsistent(
             "retained native worker process does not bind the exact admitted cell claim".to_owned(),
@@ -5471,6 +5589,53 @@ pub fn reconcile_launched_testd_attempt(
 /// (`Unreconciled`) or pre-effect (`Reserved`) native slot refuses, so a
 /// matching digest alone can never drop a nonterminal holding (issue
 /// #1679 W11/A7/A8; I14.6).
+/// Records one genuine terminal child effect on the exact retained
+/// native-worker attempt and releases it once (issue #1679, W11/A7/A8).
+///
+/// Called from the `native_worker.result_submit` route after the route
+/// bound the submitted result to the staged claim (claim/binding/schema
+/// agreement plus a live deadline): `result_digest` is the validated
+/// terminal effect digest of that submission. First terminal evidence
+/// wins; a repeat submission resolves idempotent once the record is
+/// gone. No retained attempt resolves to `Ok(false)` without touching
+/// state (the ORS-side result still stands on its own). Unknown-outcome
+/// holdings are never resolved here — only a genuine owner submission
+/// carrying its effect digest releases, so recovery retention is
+/// untouched.
+pub(crate) fn record_native_worker_terminal_effect(
+    claim_id: &str,
+    result_digest: &str,
+) -> Result<bool, DispatchLaunchError> {
+    require_digest(
+        result_digest,
+        "terminal result digest must be a lowercase SHA-256 digest",
+    )?;
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "native-worker terminal effect needs its dispatch contour",
+        ))?;
+    let request_digest = {
+        let mut launches = launches_table(contour)?;
+        let Some(record) = launches
+            .by_identity
+            .get_mut(claim_id)
+            .filter(|record| record.kind == DispatchedWorkerKind::NativeWorker)
+        else {
+            return Ok(false);
+        };
+        if record.effect_digest.is_none() {
+            record.effect_digest = Some(result_digest.to_owned());
+        }
+        record.request_digest.clone()
+    };
+    release_launched_attempt(
+        DispatchedWorkerKind::NativeWorker,
+        claim_id,
+        &request_digest,
+    )
+}
+
 pub fn release_launched_attempt(
     kind: DispatchedWorkerKind,
     identity: &str,
@@ -5772,16 +5937,13 @@ pub fn prepare_native_worker_launch(
         admitted_at_nanos,
         contour.principal_owner.as_str(),
     )?;
-    if material
-        .request
-        .executable_binding
-        .as_ref()
-        .is_some_and(|binding| binding.launch_nonce != nonce)
-    {
-        return Err(DispatchLaunchError::Inconsistent(
-            "native worker launch nonce does not match its owner executable binding".to_owned(),
-        ));
-    }
+    // Joint nonce relation (#1679/#1701): the presented join keeps its
+    // claimant-chosen launch nonce. Equality with the just-minted
+    // session nonce is not required and not satisfiable on first
+    // presentation (the nonce derives from this admission's time). The
+    // join stays authenticated by the canonical request digest plus the
+    // receipt echo above; the session nonce derives from the claim
+    // binding and is re-proved by the child afterwards.
     let generation = Generation::new(generation)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let operation_id = OperationId::new(format!(
@@ -9373,10 +9535,11 @@ mod tests {
         release_retained_native_worker_capacity(contour, "claim-cap-A");
     }
 
-    /// Builds the consumer-shaped capacity-verify payload from one claim
-    /// and its retained pair (field-for-field with the #1701
-    /// `capacity_verify_payload`: flat claim projection plus the exact
-    /// typed pair under `permit`).
+    /// Builds the exact consumer transport frame for one capacity-verify
+    /// query: the closed `transact_json` envelope (`operation` beside a
+    /// nested `payload` object, `eliot-cli/src/lib.rs:888-891`) carrying
+    /// field-for-field the #1701 `capacity_verify_payload` (flat claim
+    /// projection plus the exact typed pair under `permit`).
     fn capacity_verify_payload_for(
         claim: &eliot_kernel_service::NativeWorkerClaimRequest,
         request: &CapacityRequest,
@@ -9384,15 +9547,17 @@ mod tests {
     ) -> serde_json::Value {
         serde_json::json!({
             "operation": super::super::native_worker_capacity_verify_route::NATIVE_WORKER_CAPACITY_VERIFY_OPERATION,
-            "claim_id": claim.claim_id,
-            "binding_digest": claim.binding_digest,
-            "worker_generation": claim.worker_generation,
-            "authority_epoch": claim.authority_epoch.sequence.get(),
-            "state_fence": serde_json::to_value(&claim.state_fence).expect("fence JSON"),
-            "registration_id": claim.registration_id,
-            "permit": {
-                "request": serde_json::to_value(request).expect("request JSON"),
-                "binding": serde_json::to_value(binding).expect("binding JSON"),
+            "payload": {
+                "claim_id": claim.claim_id,
+                "binding_digest": claim.binding_digest,
+                "worker_generation": claim.worker_generation,
+                "authority_epoch": claim.authority_epoch.sequence.get(),
+                "state_fence": serde_json::to_value(&claim.state_fence).expect("fence JSON"),
+                "registration_id": claim.registration_id,
+                "permit": {
+                    "request": serde_json::to_value(request).expect("request JSON"),
+                    "binding": serde_json::to_value(binding).expect("binding JSON"),
+                },
             },
         })
     }
@@ -9547,8 +9712,10 @@ mod tests {
         );
 
         // 4. Substitutions read their typed refusals, never a pass.
+        // Substitutions address the inner request body (the wire nests
+        // it under `payload`); top-level envelope keys are not inputs.
         let mut unknown = payload.clone();
-        unknown["claim_id"] = serde_json::Value::from("claim-verify-unknown");
+        unknown["payload"]["claim_id"] = serde_json::Value::from("claim-verify-unknown");
         assert_eq!(
             answer_native_worker_capacity_verify(&kernel, &unknown)
                 .expect("unknown answers")
@@ -9558,7 +9725,7 @@ mod tests {
             "no holding under the identity answers not_held"
         );
         let mut tampered = payload.clone();
-        tampered["permit"]["binding"]["operation_id"] =
+        tampered["payload"]["permit"]["binding"]["operation_id"] =
             serde_json::Value::from("tampered-operation");
         assert_eq!(
             answer_native_worker_capacity_verify(&kernel, &tampered)
@@ -9569,7 +9736,7 @@ mod tests {
             "a substituted pair conflicts instead of replaying"
         );
         let mut foreign = payload.clone();
-        foreign["registration_id"] = serde_json::Value::from("reg-foreign");
+        foreign["payload"]["registration_id"] = serde_json::Value::from("reg-foreign");
         assert_eq!(
             answer_native_worker_capacity_verify(&kernel, &foreign)
                 .expect("foreign answers")
@@ -9784,9 +9951,18 @@ mod tests {
             serde_json::to_value(&session.module_generation.state_fence).expect("fence JSON");
         let clock_value =
             serde_json::to_value(eliot_contracts::ClockReading::default()).expect("clock JSON");
+        // The claim identity rides the inner request body on the wire
+        // (nested under `payload`); envelope-less fixtures keep it
+        // top-level. Mirrors `native_worker_request_body`.
         let claim_id = payload
             .get("claim_id")
             .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .get("payload")
+                    .and_then(|body| body.get("claim_id"))
+                    .and_then(serde_json::Value::as_str)
+            })
             .expect("payload claim");
         let identity_value = serde_json::json!({
             "request": {
@@ -9909,6 +10085,396 @@ mod tests {
             "a foreign idempotency key fences without an answer"
         );
         release_retained_native_worker_capacity(contour, "claim-verify-2");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An envelope-less flat capacity body still verifies: the
+    /// normalization passes bodies without the transport envelope
+    /// through unchanged (unit fixtures keep working).
+    #[test]
+    fn native_worker_capacity_verify_frame_accepts_flat_body() {
+        let root = temp_root("capacity-verify-flat");
+        let kernel = ready_kernel(&root);
+        let (boundary, _) = verify_ready_boundary(&kernel);
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+        let claim = native_claim_request(
+            "claim-verify-flat",
+            "reg-verify-flat",
+            "attempt-vf",
+            "op-vf",
+        );
+        let (request, binding) = acquire_native_worker_capacity(contour, &claim, &boundary)
+            .expect("acquire")
+            .expect("composed reserve issues");
+        let mut flat = capacity_verify_payload_for(&claim, &request, &binding);
+        let inner = flat.get("payload").cloned().expect("inner body");
+        flat = inner;
+        flat["operation"] = serde_json::json!(
+            super::super::native_worker_capacity_verify_route::NATIVE_WORKER_CAPACITY_VERIFY_OPERATION
+        );
+        let session = worker_session(&kernel, DispatchedWorkerKind::NativeWorker.module_id());
+        let action = kernel
+            .dispatch_native_worker_capacity_verify(
+                &session,
+                &capacity_verify_frame(&session, "req-vf", &flat),
+            )
+            .expect("flat body verifies");
+        match action {
+            crate::KernelFrameAction::Reply(frame) => {
+                assert_eq!(
+                    reply_payload(&frame)
+                        .get("verdict")
+                        .and_then(serde_json::Value::as_str),
+                    Some("verified"),
+                    "the flat query verifies the live holding"
+                );
+            }
+            _ => panic!("capacity verify must reply"),
+        }
+        release_retained_native_worker_capacity(contour, "claim-verify-flat");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The joint #1679/#1701 nonce relation, producer side.
+    ///
+    /// A bound claim (claimant-chosen join nonce) prepares to `Ready`:
+    /// the file session nonce is independent of the join nonce, derives
+    /// from the claim binding via `mint_dispatch_nonce`, and travels in
+    /// the dispatch file beside the verbatim join.
+    #[test]
+    fn native_worker_prepare_keeps_owner_join_nonce_independent() {
+        let root = temp_root("prepare-join-nonce");
+        let kernel = ready_kernel(&root);
+        let _ = verify_ready_boundary(&kernel);
+        let request =
+            native_claim_request("claim-join-1", "reg-join-1", "attempt-join-1", "op-join-1");
+        let join_nonce = request
+            .executable_binding
+            .as_ref()
+            .expect("owner join")
+            .launch_nonce
+            .clone();
+        let child_dir = root.join("child-join-1");
+        std::fs::create_dir_all(&child_dir).expect("child dir");
+        let material = NativeWorkerLaunchMaterial {
+            request: &request,
+            executable: &child_dir.join("eliot-native-worker.exe"),
+            executable_sha256: request.worker_artifact_digest.as_str(),
+            working_directory: &child_dir,
+        };
+        let prepared = prepare_native_worker_launch(&kernel, &material, 1_750_000_000_000_000_000)
+            .expect("bound claim prepares");
+        let PreparedNativeWorkerLaunch::Ready(ready) = prepared else {
+            panic!("bound claim must be ready");
+        };
+        assert_ne!(
+            ready.nonce, join_nonce,
+            "the session nonce is Kernel-minted, never the join nonce"
+        );
+        let admitted_nanos = ready
+            .receipt
+            .admitted_at_unix_ms
+            .checked_mul(1_000_000)
+            .expect("admission nanos");
+        let derived = mint_dispatch_nonce(
+            DispatchedWorkerKind::NativeWorker,
+            &ready.receipt.binding_digest,
+            admitted_nanos,
+            PRINCIPAL,
+        )
+        .expect("derive");
+        assert_eq!(
+            ready.nonce, derived,
+            "the session nonce derives from the claim binding"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ready.material_path).expect("file"))
+                .expect("file JSON");
+        assert_eq!(body["nonce"], serde_json::json!(ready.nonce));
+        assert_eq!(
+            body["request"]["executable_binding"]["launch_nonce"],
+            serde_json::json!(join_nonce)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The start gate accepts the prepared bound claim: the pending start
+    /// carries the retained session nonce (derivation, never equality
+    /// with the join nonce).
+    #[test]
+    fn native_worker_begin_accepts_prepared_bound_claim() {
+        let root = temp_root("begin-join-nonce");
+        let kernel = ready_kernel(&root);
+        let _ = verify_ready_boundary(&kernel);
+        let request =
+            native_claim_request("claim-join-2", "reg-join-2", "attempt-join-2", "op-join-2");
+        let child_dir = root.join("child-join-2");
+        std::fs::create_dir_all(&child_dir).expect("child dir");
+        let material = NativeWorkerLaunchMaterial {
+            request: &request,
+            executable: &child_dir.join("eliot-native-worker.exe"),
+            executable_sha256: request.worker_artifact_digest.as_str(),
+            working_directory: &child_dir,
+        };
+        let prepared = prepare_native_worker_launch(&kernel, &material, 1_750_000_000_000_000_000)
+            .expect("bound claim prepares");
+        let PreparedNativeWorkerLaunch::Ready(ready) = prepared else {
+            panic!("bound claim must be ready");
+        };
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+        let terms = NativeWorkerPendingStartTerms {
+            contour,
+            claim_id: "claim-join-2",
+            operation_id: &ready.operation_id,
+            executable_path: &child_dir.join("eliot-native-worker.exe"),
+            executable_sha256: request.worker_artifact_digest.as_str(),
+            activation_epoch: &ready.authority_epoch,
+            activation_generation: ready.generation,
+            executable_file_identity: (7, 9),
+            deadline_unix_ms: super::super::unix_ms().saturating_add(60_000),
+        };
+        let pending = begin_native_worker_process_start(&terms).expect("begin accepts");
+        assert_eq!(pending, "claim-join-2");
+        let launches = launches_table(contour).expect("table");
+        let record = launches.by_identity.get("claim-join-2").expect("record");
+        let staged = launches
+            .native_worker_pending_starts
+            .get("claim-join-2")
+            .expect("pending");
+        assert_eq!(
+            staged.launch_nonce, record.nonce,
+            "the pending start carries the retained session nonce"
+        );
+        drop(launches);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A genuine terminal result resolves the exact retained attempt:
+    /// bare release refuses without evidence, the evidenced join
+    /// releases once, repeats and unknown claims resolve without state
+    /// change, and the freed launch capacity issues again.
+    #[test]
+    fn native_worker_terminal_effect_releases_prepared_attempt() {
+        let root = temp_root("terminal-effect");
+        let kernel = ready_kernel(&root);
+        let (boundary, _) = verify_ready_boundary(&kernel);
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+        let request = native_claim_request(
+            "claim-terminal-1",
+            "reg-terminal-1",
+            "attempt-t-1",
+            "op-t-1",
+        );
+        let child_dir = root.join("child-terminal-1");
+        std::fs::create_dir_all(&child_dir).expect("child dir");
+        let material = NativeWorkerLaunchMaterial {
+            request: &request,
+            executable: &child_dir.join("eliot-native-worker.exe"),
+            executable_sha256: request.worker_artifact_digest.as_str(),
+            working_directory: &child_dir,
+        };
+        let prepared = prepare_native_worker_launch(&kernel, &material, 1_750_000_000_000_000_000)
+            .expect("prepare");
+        assert!(matches!(prepared, PreparedNativeWorkerLaunch::Ready(_)));
+        let digest = launches_table(contour).expect("table").by_identity["claim-terminal-1"]
+            .request_digest
+            .clone();
+        assert!(
+            !release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-terminal-1",
+                &digest
+            )
+            .expect("gate"),
+            "no evidence: a nonterminal holding refuses release"
+        );
+        assert!(
+            record_native_worker_terminal_effect("claim-terminal-1", &"d".repeat(64))
+                .expect("terminal"),
+            "a genuine terminal effect releases the attempt"
+        );
+        assert!(
+            launches_table(contour)
+                .expect("table")
+                .by_identity
+                .get("claim-terminal-1")
+                .is_none(),
+            "the released record is gone exactly once"
+        );
+        assert!(
+            !record_native_worker_terminal_effect("claim-terminal-1", &"d".repeat(64))
+                .expect("repeat"),
+            "a repeat resolves without state change"
+        );
+        assert!(
+            !record_native_worker_terminal_effect("claim-never-1", &"d".repeat(64))
+                .expect("unknown"),
+            "an unknown claim resolves without state change"
+        );
+        assert!(
+            record_native_worker_terminal_effect("claim-terminal-1", "not-a-digest").is_err(),
+            "a malformed digest fails closed"
+        );
+        assert!(
+            acquire_native_worker_capacity(contour, &request, &boundary)
+                .expect("reacquire")
+                .is_some(),
+            "the freed slot issues again"
+        );
+        release_retained_native_worker_capacity(contour, "claim-terminal-1");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Builds one compiled control-reserve profile carrying claimed
+    /// process rows with the given partition bounds (owner-published
+    /// evidence through the real compiler, never canned rows).
+    fn process_profile_with_bounds(
+        launch_normal: u64,
+        launch_protected: u64,
+        cancel_normal: u64,
+        cancel_protected: u64,
+    ) -> eliot_runtime_contracts::ControlReserveProfile {
+        use eliot_kernel_core::{BottleneckOwnerEvidence, ControlReserveProfileIdentity};
+        use eliot_runtime_contracts::{
+            BottleneckCapacityProfile, BottleneckCoverageState, CapacityBottleneck,
+            CapacityEnforcement, CapacityLimit, frozen_bottleneck_owner_map,
+        };
+        fn owner_row(
+            bottleneck: CapacityBottleneck,
+            normal: u64,
+            protected: u64,
+        ) -> BottleneckCapacityProfile {
+            let owner = frozen_bottleneck_owner_map()
+                .into_iter()
+                .find(|bound| bound.bottleneck == bottleneck)
+                .expect("frozen process owner")
+                .owner
+                .to_owned();
+            let unit = bottleneck.unit();
+            BottleneckCapacityProfile {
+                bottleneck,
+                coverage_state: BottleneckCoverageState::Claimed,
+                owner_ref: owner,
+                owner_generation_ref: "gen-o3-1679".to_owned(),
+                unit,
+                physical_total_limit: Some(CapacityLimit {
+                    unit,
+                    quantity: std::num::NonZeroU64::new(normal + protected).expect("total"),
+                }),
+                normal_work_applicable: true,
+                normal_limit: Some(CapacityLimit {
+                    unit,
+                    quantity: std::num::NonZeroU64::new(normal).expect("normal"),
+                }),
+                protected_limit: Some(CapacityLimit {
+                    unit,
+                    quantity: std::num::NonZeroU64::new(protected).expect("protected"),
+                }),
+                emergency_limit: None,
+                enforcement: Some(CapacityEnforcement::PhysicalPartition),
+                proof_profile_ref: "proof-o3-1679".to_owned(),
+                evidence_refs: vec!["ev-o3-1679".to_owned()],
+                invalidation_set: vec!["inv-o3-1679".to_owned()],
+            }
+        }
+        let epoch = test_epoch(1);
+        let evidence = [
+            BottleneckOwnerEvidence {
+                config_snapshot_ref: "snap-o3-1679".to_owned(),
+                authority_epoch_ref: epoch.clone(),
+                row: owner_row(
+                    CapacityBottleneck::ProcessLaunchSlots,
+                    launch_normal,
+                    launch_protected,
+                ),
+            },
+            BottleneckOwnerEvidence {
+                config_snapshot_ref: "snap-o3-1679".to_owned(),
+                authority_epoch_ref: epoch.clone(),
+                row: owner_row(
+                    CapacityBottleneck::ProcessCancellationTermination,
+                    cancel_normal,
+                    cancel_protected,
+                ),
+            },
+        ];
+        eliot_kernel_core::compile_control_reserve_profile(
+            ControlReserveProfileIdentity {
+                profile_id: "o3-1679-process-profile".to_owned(),
+                profile_revision: "rev-1".to_owned(),
+                product_identity_ref: "o3-1679-test".to_owned(),
+                source_build_and_runtime_generation_refs: vec!["gen-1".to_owned()],
+                config_snapshot_ref: "snap-o3-1679".to_owned(),
+                authority_epoch_ref: epoch,
+                compiled_at_ms: 1_000,
+                profile_evidence_refs: Vec::new(),
+                invalidation_set: Vec::new(),
+            },
+            &evidence,
+        )
+        .expect("process profile compiles")
+    }
+
+    /// Unestablished process rows skip composition fail-closed: missing
+    /// accepted inputs are never treated as verified capacity.
+    #[test]
+    fn process_capacity_reserve_skips_unestablished_profile() {
+        let root = temp_root("profile-skip");
+        let kernel = ready_kernel(&root);
+        let unknown = kernel.control_reserve_profile();
+        assert_eq!(
+            process_capacity_bounds_from_profile(unknown),
+            None,
+            "assembly compiles with zero evidence: no process bounds"
+        );
+        assert_eq!(
+            compose_process_capacity_reserve_from_profile(unknown).expect("skip composes nothing"),
+            ProcessCapacityReserveComposition::SkippedUnestablished,
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Claimed process rows compose the reserve with the profile's own
+    /// bounds, and the composed producer issues for a genuine claim.
+    ///
+    /// The pure mapping is proven with distinct values (no hardcoding);
+    /// the global compose uses the suite-wide (8, 2, 2, 2) partitions so
+    /// parallel tests share one capacity shape.
+    #[test]
+    fn process_capacity_reserve_composes_from_claimed_rows() {
+        let distinct = process_profile_with_bounds(5, 3, 7, 9);
+        assert_eq!(
+            process_capacity_bounds_from_profile(&distinct),
+            Some((5, 3, 7, 9)),
+            "bounds come from the claimed rows"
+        );
+        let profile = process_profile_with_bounds(8, 2, 2, 2);
+        assert_eq!(
+            process_capacity_bounds_from_profile(&profile),
+            Some((8, 2, 2, 2)),
+            "bounds track the profile, not a constant"
+        );
+        let root = temp_root("profile-compose");
+        let kernel = ready_kernel(&root);
+        let (boundary, _) = verify_ready_boundary(&kernel);
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+        assert!(
+            matches!(
+                compose_process_capacity_reserve_from_profile(&profile),
+                Ok(ProcessCapacityReserveComposition::Composed)
+                    | Err(DispatchLaunchError::AlreadyComposed(_))
+            ),
+            "claimed rows compose (or the contour already holds them)"
+        );
+        let claim =
+            native_claim_request("claim-profile-1", "reg-profile-1", "attempt-p-1", "op-p-1");
+        assert!(
+            acquire_native_worker_capacity(contour, &claim, &boundary)
+                .expect("acquire")
+                .is_some(),
+            "the profile-composed producer issues"
+        );
+        release_retained_native_worker_capacity(contour, "claim-profile-1");
         let _ = std::fs::remove_dir_all(root);
     }
 

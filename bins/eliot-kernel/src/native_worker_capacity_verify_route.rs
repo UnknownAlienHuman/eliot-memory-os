@@ -29,7 +29,8 @@
 
 use super::{
     KernelComposition, KernelFrameAction, KernelServiceState,
-    native_worker_lifecycle_route::native_worker_json_str, status_frame,
+    native_worker_lifecycle_route::{native_worker_json_str, native_worker_request_body},
+    status_frame,
 };
 use eliot_ipc::{Session, TransportError};
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -143,8 +144,13 @@ impl KernelComposition {
         if operation != NATIVE_WORKER_CAPACITY_VERIFY_OPERATION {
             return Err(TransportError::SessionFenced);
         }
+        // The real consumer frame nests the flat claim projection under
+        // the closed `transact_json` envelope (issue #1679 W11/W4); the
+        // handler reads the inner body, exactly as the currentness proof
+        // does through `native_worker_frame_context`.
+        let body = native_worker_request_body(&payload).clone();
         let receipt = self
-            .handle_native_worker_capacity_verify(&identity_value, &payload)
+            .handle_native_worker_capacity_verify(&identity_value, &body)
             .map_err(NativeWorkerCapacityVerifyError::into_transport)?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
         frame.request_id = Some(request_id);

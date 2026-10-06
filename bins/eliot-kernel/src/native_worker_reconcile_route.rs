@@ -50,7 +50,9 @@
 //! wiring in `frame_dispatch` belong to the integrator immediately after
 //! this commit.
 
-use super::native_worker_lifecycle_route::{native_worker_json_str, native_worker_json_u64};
+use super::native_worker_lifecycle_route::{
+    native_worker_json_str, native_worker_json_u64, native_worker_request_body,
+};
 use super::{
     KernelComposition, KernelFrameAction, KernelServiceState, sha256_json, status_frame, unix_ms,
 };
@@ -299,8 +301,11 @@ impl KernelComposition {
         if operation != NATIVE_WORKER_RECONCILE_OPERATION {
             return Err(TransportError::SessionFenced);
         }
+        // Same closed `transact_json` envelope as every native-worker
+        // frame (issue #1679 W11/W4): the handler reads the inner body.
+        let body = native_worker_request_body(&payload).clone();
         let receipt = self
-            .handle_native_worker_reconcile(&identity_value, &payload)
+            .handle_native_worker_reconcile(&identity_value, &body)
             .map_err(NativeWorkerReconcileError::into_transport)?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
         frame.request_id = Some(request_id);

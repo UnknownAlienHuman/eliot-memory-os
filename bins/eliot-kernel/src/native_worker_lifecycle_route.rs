@@ -116,6 +116,28 @@ pub(crate) fn is_native_worker_operation(operation: &str) -> bool {
     )
 }
 
+/// Returns the request body of one native-worker transport frame.
+///
+/// The authenticated consumer transport (`KernelClient::transact_json`,
+/// `crates/surfaces/eliot-cli/src/lib.rs:888-891`) wraps every operation
+/// in the one closed envelope `{"operation": ..., "payload": {...}}`
+/// (I07.2). Route handlers and the currentness proof read the INNER body
+/// (claim halves, flat capacity projection), so the envelope is
+/// unwrapped here once. An envelope-less body (unit fixtures) passes
+/// through unchanged; a frame carrying the envelope keys without an
+/// object body falls through to the shape checks fail-closed.
+pub(crate) fn native_worker_request_body(payload: &serde_json::Value) -> &serde_json::Value {
+    if payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        && let Some(inner) = payload.get("payload").filter(|body| body.is_object())
+    {
+        return inner;
+    }
+    payload
+}
+
 /// Maximum length of bounded claim/registration text fields, in UTF-8 bytes.
 const MAX_CLAIM_TEXT_LEN: usize = 1_024;
 /// Maximum length of one native-worker operation identity, in UTF-8 bytes.
@@ -552,7 +574,9 @@ fn native_worker_presented_currentness(
             // Flat claim projection plus the carried pair (no nested
             // `binding` object): the claim identity, worker generation
             // and state fence ride top-level, mirroring the consumer's
-            // `capacity_verify_payload` shape.
+            // `capacity_verify_payload` shape. The `transact_json`
+            // envelope is already unwrapped by `native_worker_frame_context`,
+            // so this arm always reads the inner body.
             (payload, Some(require_op_id(payload, "claim_id")?), None)
         }
         _ => {
@@ -1201,17 +1225,23 @@ impl KernelComposition {
         if !is_native_worker_operation(&operation) {
             return Err(TransportError::SessionFenced);
         }
+        // The closed `transact_json` envelope is unwrapped once here, so
+        // the degraded gate, the readiness probe, the currentness proof
+        // and every lifecycle handler below read the inner request body
+        // (issue #1679 W11/W4: the real consumer frame nests it under
+        // `payload`; envelope-less fixtures pass through unchanged).
+        let body = native_worker_request_body(&payload).clone();
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;
         if state != KernelServiceState::Ready
             && !(state == KernelServiceState::Degraded
-                && native_worker_operation_allows_degraded(&operation, &payload))
+                && native_worker_operation_allows_degraded(&operation, &body))
         {
             return Err(TransportError::SessionFenced);
         }
         let ready_is_blocked = operation == NATIVE_WORKER_READY_OPERATION
-            && payload
+            && body
                 .get("readiness")
                 .and_then(|value| value.get("kind"))
                 .and_then(serde_json::Value::as_str)
@@ -1224,7 +1254,7 @@ impl KernelComposition {
             request_id,
             identity_value,
             presented_fence,
-            payload,
+            payload: body,
             operation,
         })
     }
@@ -3402,6 +3432,18 @@ impl KernelComposition {
         {
             return Err(NativeWorkerRouteError::ExpiredDeadline);
         }
+        // Terminal owner resolution joins the dispatch contour (issue
+        // #1679 W11/A7/A8): this genuine submitted result evidences the
+        // exact retained attempt and releases it (plus its held launch
+        // capacity) exactly once. No retained attempt resolves to no
+        // contour effect; the ORS result below still stands.
+        super::dispatch_launch::record_native_worker_terminal_effect(
+            &binding.claim_id,
+            &result_digest,
+        )
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "terminal_effect",
+        })?;
         let receipt = seal_route_receipt(serde_json::json!({
             "kind": "native_worker_result",
             "result_id": result_id,

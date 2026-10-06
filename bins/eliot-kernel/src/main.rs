@@ -50,7 +50,8 @@ use eliot_kernel::kernel_diagnostics::{
 use eliot_kernel::kernel_diagnostics::{DiagnosticSubscriberOwner, install_kernel_diagnostics};
 use eliot_kernel::{
     AuditAnchorBinding, EliotdReceiptRootBinding, KernelBuildError, KernelComposition,
-    KernelConfig, KernelDoctorRecoveryLedger, compose_dispatch_contour,
+    KernelConfig, KernelDoctorRecoveryLedger, ProcessCapacityReserveComposition,
+    compose_dispatch_contour, compose_process_capacity_reserve_from_profile,
     compose_production_doctor_front_door, compose_production_native_worker_front_door,
     compose_production_testd_front_door,
 };
@@ -467,6 +468,19 @@ async fn main() {
         };
         if let Err(error) = compose_production_native_worker_front_door(&native_worker_digest) {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+        // DISPATCH-WIRE (issue #1679 W11/W4): compose the contour-owned
+        // process-capacity reserve from the composition's own compiled
+        // control-reserve profile. Bounds come only from the profile's
+        // claimed process rows — nothing is invented here. An
+        // unestablished profile skips fail-closed (the defined
+        // Uncomposed path: dispatch carries no capacity section and the
+        // consumer refuses fail-closed); a miscomposed bound fails the
+        // launch instead of issuing under a guess.
+        match compose_process_capacity_reserve_from_profile(kernel.control_reserve_profile()) {
+            Ok(ProcessCapacityReserveComposition::Composed) => {}
+            Ok(ProcessCapacityReserveComposition::SkippedUnestablished) => {}
+            Err(error) => exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string()),
         }
     }
     #[cfg(windows)]
