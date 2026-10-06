@@ -15,7 +15,7 @@
 //! | observation `owner` / `schema` / `revision` / `content_digest` | emitting evidence owner | exact closed wire, hex digest |
 //! | observation `window` / environment / platform / toolchain | emitting evidence owner | bounds `created_at_ms` |
 //! | metric value / unit / normalization / population | emitting evidence owner | unit triple exact, no cross-unit math |
-//! | Learning delivery / use / outcome / closure observations | A-32 (#590) vocabulary; LearningClosure evidence via A-37 (#819) | narrow projection, no copied models |
+//! | Learning delivery / use / outcome / closure observations | A-32 (#590) vocabulary; `LearningClosure` evidence via A-37 (#819) | narrow projection, no copied models |
 //! | Context floor / selection / quality / economy observations | A-15 (#584) vocabulary | narrow projection |
 //! | Dreamer grounding / candidate / controller observations | A-03 (#578) vocabulary | narrow projection |
 //! | diagnosis dimensions / severity / priority / recurrence | this contract (#971) | independent axes, no pass scalar |

@@ -292,6 +292,7 @@ fn delta_fixture(
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     delta.seal()?;
@@ -586,6 +587,7 @@ fn self_learning_working_path_links_delta_to_closure() -> Result<(), Box<dyn std
         rollback_refs: vec![aid("rollback-path")?],
         external_promotion_refs: vec![promotion.promotion_id.clone()],
         requested_decision: ExternalDecisionClass::PromotionReview,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     handoff.seal()?;

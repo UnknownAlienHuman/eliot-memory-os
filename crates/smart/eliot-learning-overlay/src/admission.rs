@@ -77,6 +77,11 @@ pub struct AdmissionReceipt {
     /// Digest binding the frozen pre-evaluation fields to the overlay
     /// identity and canonical digest at admission time.
     pub frozen_digest: String,
+    /// Lifecycle disposition reached and validated by the issuing call:
+    /// `ShapeValidated` from [`admit_local`] (shape predicates re-verified,
+    /// no advance), `LocalAdmitted` from [`admit_local_with_refs`], and
+    /// `ActiveForNextAttempt` from [`revalidate_for_campaign`].
+    pub lifecycle: lifecycle::OverlayLifecycle,
 }
 
 /// Enforce the locally checkable admission predicates without owner records.
@@ -191,6 +196,7 @@ pub fn admit_local(
         overlay_id: candidate.overlay_id.as_str().to_owned(),
         admitted_at_ms: observed_at_ms,
         frozen_digest: frozen_digest_of(candidate),
+        lifecycle: lifecycle::OverlayLifecycle::ShapeValidated,
     })
 }
 
@@ -215,7 +221,7 @@ pub fn admit_local_with_refs(
     refs: &AuthoritativeRefs<'_>,
     observed_at_ms: u64,
 ) -> Result<AdmissionReceipt, OverlayError> {
-    let receipt = admit_local(candidate, view, deltas, observed_at_ms)?;
+    let mut receipt = admit_local(candidate, view, deltas, observed_at_ms)?;
     if refs.objective_revision.trim().is_empty() {
         return Err(OverlayError::Contract(LearningContractError::Missing {
             field: "admission.objective_revision",
@@ -282,6 +288,7 @@ pub fn admit_local_with_refs(
         lifecycle::OverlayLifecycle::ShapeValidated,
         lifecycle::LifecycleEvent::AdmitLocal,
     )?;
+    receipt.lifecycle = lifecycle::OverlayLifecycle::LocalAdmitted;
     Ok(receipt)
 }
 
@@ -351,13 +358,15 @@ pub fn revalidate_for_campaign(
         lifecycle::OverlayLifecycle::LocalAdmitted,
         lifecycle::LifecycleEvent::ActivateForNextAttempt,
     )?;
-    admit_local_with_refs(
+    let mut receipt = admit_local_with_refs(
         candidate,
         request.view,
         request.deltas,
         request.refs,
         request.now_ms,
-    )
+    )?;
+    receipt.lifecycle = lifecycle::OverlayLifecycle::ActiveForNextAttempt;
+    Ok(receipt)
 }
 
 /// Build the frozen pre-evaluation bundle carried on one candidate.

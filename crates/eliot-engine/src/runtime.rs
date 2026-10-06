@@ -402,6 +402,16 @@ pub fn recover_stale_single_instance_lock(
         Some(lock_snapshot.as_slice()),
         observations.publication_pid,
     )?;
+    // Cross-phase PID object binding (Windows): open the validated PID file
+    // object once BEFORE the dead-owner decision and retain its FileIdentity.
+    // Retirement re-opens the path and must resolve to this same object: a
+    // replacement carrying identical bytes is a different object and is
+    // refused. Bytes alone cannot prove this (norm A02-03:73: one owner, one
+    // proof) — without this anchor a same-bytes swap between validation and
+    // retirement would be retired under stale authority.
+    #[cfg(windows)]
+    let stale_pid_identity =
+        capture_stale_pid_identity(&lock_path, &pid_path, pid_snapshot.as_deref())?;
     probe_owner_dead(&lock_path, owner_pid)?;
     // Exclusive-ownership guard spanning validation to mutation (Windows):
     // pin the validated lock object with delete/write sharing denied, so no
@@ -443,8 +453,16 @@ pub fn recover_stale_single_instance_lock(
     // that same handle retired) before the old lock becomes available.
     // A successor created after old-lock removal is therefore never touched
     // by this operation. The lock pin above stays live across the PID work.
+    #[cfg(windows)]
+    let pid_retired = retire_stale_pid_while_lock_held(
+        &lock_path,
+        &pid_path,
+        pid_snapshot.as_deref(),
+        stale_pid_identity,
+    )?;
+    #[cfg(not(windows))]
     let pid_retired =
-        retire_stale_pid_while_lock_held(&lock_path, &pid_path, pid_snapshot.as_deref())?;
+        retire_stale_pid_while_lock_held(&lock_path, &pid_path, pid_snapshot.as_deref(), ())?;
     // The explicit drop is load-bearing: without it the pin above would deny
     // our own removal. The drop-to-remove window is closed by the owner's
     // deny-delete creation handle (a live successor's lock resists unlink)
@@ -521,47 +539,32 @@ fn establish_single_instance_ownership(
             "the lock path no longer names the created owner bytes; refusing to proceed on a replacement lock",
         ));
     }
-    if let Err(error) = std::fs::write(&pid_path, &owner_text) {
-        // The shared cleanup consumes the creation handle (closing it first)
-        // so the partial-claim removal below can remove our own lock; the
-        // handle denies delete sharing on Windows while it is open.
-        let cleanup = abandon_partial_claim(
-            file,
-            lock_path,
-            &pid_path,
-            &startup_marker_path,
-            &clean_marker_path,
-            owner_pid,
-            pid_identity,
-            MarkerBackup::Unknown,
-            MarkerBackup::Unknown,
-        );
-        return Err(EngineError::SingleInstanceAcquisitionFailed {
-            stage: "record-pid".to_owned(),
-            detail: format!("cannot record {error}; {cleanup}"),
-        });
-    }
-    let pid_identity = capture_pid_identity(runtime_dir, &owner_text);
-    #[cfg(windows)]
-    if pid_identity.is_none() {
-        let cleanup = abandon_partial_claim(
-            file,
-            lock_path,
-            &pid_path,
-            &startup_marker_path,
-            &clean_marker_path,
-            owner_pid,
-            pid_identity,
-            MarkerBackup::Unknown,
-            MarkerBackup::Unknown,
-        );
-        return Err(EngineError::SingleInstanceAcquisitionFailed {
-            stage: "capture-pid-identity".to_owned(),
-            detail: format!(
-                "cannot bind the published daemon.pid file object to this owner; {cleanup}"
-            ),
-        });
-    }
+    // Publish through one retained handle and capture the identity from that
+    // same handle: a separate write-then-reopen could adopt a replacement
+    // object published between the two operations as this attempt's identity.
+    let pid_identity = match publish_pid_through_retained_handle(&pid_path, &owner_text) {
+        Ok(identity) => identity,
+        Err(error) => {
+            // The shared cleanup consumes the creation handle (closing it first)
+            // so the partial-claim removal below can remove our own lock; the
+            // handle denies delete sharing on Windows while it is open.
+            let cleanup = abandon_partial_claim(
+                file,
+                lock_path,
+                &pid_path,
+                &startup_marker_path,
+                &clean_marker_path,
+                owner_pid,
+                pid_identity,
+                MarkerBackup::Unknown,
+                MarkerBackup::Unknown,
+            );
+            return Err(EngineError::SingleInstanceAcquisitionFailed {
+                stage: "record-pid".to_owned(),
+                detail: format!("cannot record {error}; {cleanup}"),
+            });
+        }
+    };
     finish_single_instance_ownership(
         lock_path,
         pid_path,
@@ -831,6 +834,70 @@ fn abandon_partial_claim(
     format!("cleanup: {}", notes.join("; "))
 }
 
+/// Outcome of retiring a marker this attempt published over a previously
+/// absent state.
+enum MarkerRetirement {
+    /// The exact owned object was retired.
+    Retired,
+    /// The path no longer names an object this attempt owns.
+    NotOwned,
+    /// The object was owned but the disposition failed; residue remains.
+    Failed(String),
+}
+
+/// Retires a marker this attempt owns, binding the unlink to the exact file
+/// object instead of a pathname resolved twice.
+///
+/// The caller runs this while its owned lock still names the attempt, so no
+/// successor can publish a marker concurrently; that lock is the serialization
+/// this function relies on. The object binding closes the remaining
+/// check-then-unlink window: on Windows the pinned handle denies write and
+/// delete sharing from the moment the content is read until the disposition is
+/// applied, so the bytes proved to be ours and the object unlinked are the same
+/// object. A non-reparse, non-regular path is never retired.
+fn retire_owned_marker(path: &Path, owner_pid: u32) -> MarkerRetirement {
+    #[cfg(windows)]
+    {
+        let mut pinned = match eliot_windows_ipc::RetirablePinnedFile::open(path) {
+            Ok(pinned) => pinned,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return MarkerRetirement::NotOwned;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                return MarkerRetirement::NotOwned;
+            }
+            Err(error) => return MarkerRetirement::Failed(error.to_string()),
+        };
+        let owned = match pinned.read_all() {
+            Ok(bytes) => parse_owner_marker(&bytes) == Some(owner_pid),
+            Err(error) => return MarkerRetirement::Failed(error.to_string()),
+        };
+        if !owned {
+            return MarkerRetirement::NotOwned;
+        }
+        match pinned.retire() {
+            Ok(()) => MarkerRetirement::Retired,
+            Err(error) => MarkerRetirement::Failed(error.to_string()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let owned = std::fs::read(path)
+            .ok()
+            .is_some_and(|current| parse_owner_marker(&current) == Some(owner_pid));
+        if !owned {
+            return MarkerRetirement::NotOwned;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => MarkerRetirement::Retired,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                MarkerRetirement::NotOwned
+            }
+            Err(error) => MarkerRetirement::Failed(error.to_string()),
+        }
+    }
+}
+
 fn restore_marker_or_remove(
     path: &Path,
     backup: MarkerBackup,
@@ -843,16 +910,21 @@ fn restore_marker_or_remove(
             notes.push(format!("{role} left in place: previous state unknown"));
         }
         MarkerBackup::WasMissing => {
-            let own = std::fs::read(path)
-                .ok()
-                .is_some_and(|current| parse_owner_marker(&current) == Some(owner_pid));
-            if own {
-                match std::fs::remove_file(path) {
-                    Ok(()) => notes.push(format!("removed own {role}")),
-                    Err(_) => notes.push(format!("own {role} removal failed; residue remains")),
+            // The previous state was absent, so the only correct disposition is
+            // to unlink the marker this attempt published. The content check
+            // classifies the object; the retirement itself is bound to that
+            // exact file object, so a replacement object can never be unlinked
+            // through a path the check happened to resolve.
+            match retire_owned_marker(path, owner_pid) {
+                MarkerRetirement::Retired => notes.push(format!("removed own {role}")),
+                MarkerRetirement::NotOwned => {
+                    notes.push(format!("{role} left in place: not provably this attempt"));
                 }
-            } else {
-                notes.push(format!("{role} left in place: not provably this attempt"));
+                MarkerRetirement::Failed(detail) => {
+                    notes.push(format!(
+                        "own {role} removal failed; residue remains ({detail})"
+                    ));
+                }
             }
         }
         MarkerBackup::Previous(previous) => {
@@ -1143,6 +1215,7 @@ fn retire_stale_pid_while_lock_held(
     lock_path: &Path,
     pid_path: &Path,
     pid_snapshot: Option<&[u8]>,
+    expected_identity: PidIdentity,
 ) -> Result<bool, EngineError> {
     match pid_snapshot {
         None => {
@@ -1158,11 +1231,12 @@ fn retire_stale_pid_while_lock_held(
         Some(snapshot) => {
             #[cfg(windows)]
             {
-                retire_exact_pid_object(pid_path, snapshot, lock_path)?;
+                retire_exact_pid_object(pid_path, snapshot, lock_path, expected_identity)?;
                 Ok(true)
             }
             #[cfg(not(windows))]
             {
+                let _ = expected_identity;
                 confirm_pid_snapshot_unchanged(lock_path, pid_path, Some(snapshot))?;
                 match std::fs::remove_file(pid_path) {
                     Ok(()) => Ok(true),
@@ -1203,24 +1277,82 @@ fn open_retirable_single_instance_pid(
     }
 }
 
-/// Retires the exact PID object through one retained handle: opens the PID
-/// path once with delete access, reads the bytes from that same handle, and
-/// retires that same object only when its bytes still equal the validated
-/// snapshot.
+/// Captures the file-object identity of the validated stale PID evidence
+/// BEFORE the dead-owner probe decides anything. The identity is read from
+/// the same handle the bytes are proved on, so the captured pair always names
+/// one object. Returns `None` only when there was no PID evidence to bind.
+#[cfg(windows)]
+fn capture_stale_pid_identity(
+    lock_path: &Path,
+    pid_path: &Path,
+    pid_snapshot: Option<&[u8]>,
+) -> Result<PidIdentity, EngineError> {
+    match pid_snapshot {
+        None => {
+            if pid_path.exists() {
+                return Err(single_instance_contention(
+                    lock_path,
+                    SingleInstanceRefusal::ReplacementDetected,
+                    "daemon.pid appeared during stale-owner validation; refusing removal",
+                ));
+            }
+            Ok(None)
+        }
+        Some(snapshot) => {
+            let mut pinned = open_retirable_single_instance_pid(pid_path, lock_path)?;
+            let bytes = pinned.read_all().map_err(|error| {
+                single_instance_contention(
+                    lock_path,
+                    SingleInstanceRefusal::InaccessibleEvidence,
+                    format!("cannot read pinned daemon.pid before validation: {error}"),
+                )
+            })?;
+            if bytes != snapshot {
+                return Err(single_instance_contention(
+                    lock_path,
+                    SingleInstanceRefusal::ReplacementDetected,
+                    "daemon.pid was replaced during stale-owner validation; refusing removal",
+                ));
+            }
+            Ok(Some(pinned.identity()))
+        }
+    }
+}
+
+/// Retires the exact PID object bound at validation: opens the PID path once
+/// with delete access and retires that handle only when its file-object
+/// identity still equals the identity captured before the dead-owner decision
+/// AND its bytes still equal the validated snapshot.
 ///
 /// The retained handle denies write and delete sharing from open to
 /// retirement, so no successor or stale observer can replace the object or
 /// interleave a pathname swap in between: there is no pin-drop-reopen window
 /// and no path reread authorizes the removal. A vanished path, a non-regular
-/// file, unreadable bytes, or changed bytes all refuse instead of unlinking
-/// by pathname.
+/// file, unreadable bytes, changed bytes, a missing capture, or a different
+/// object carrying identical bytes all refuse instead of unlinking by
+/// pathname.
 #[cfg(windows)]
 fn retire_exact_pid_object(
     pid_path: &Path,
     pid_snapshot: &[u8],
     lock_path: &Path,
+    expected_identity: PidIdentity,
 ) -> Result<(), EngineError> {
+    let Some(expected_identity) = expected_identity else {
+        return Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "stale daemon.pid file-object identity was not captured before validation; refusing removal",
+        ));
+    };
     let mut retirable = open_retirable_single_instance_pid(pid_path, lock_path)?;
+    if retirable.identity() != expected_identity {
+        return Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "daemon.pid was replaced during stale-owner validation; refusing removal",
+        ));
+    }
     let bytes = retirable.read_all().map_err(|error| {
         single_instance_contention(
             lock_path,
@@ -1378,23 +1510,64 @@ fn path_names_owned_lock(lock_path: &Path, owner_bytes: &[u8]) -> bool {
     std::fs::read(lock_path).ok().as_deref() == Some(owner_bytes)
 }
 
-/// Captures the PID file object identity bound at establishment, so `Drop`
-/// can refuse to retire a replacement object carrying identical bytes. A
-/// missing identity fails acquisition on Windows, where PID retirement must
-/// be bound to the established file object.
+/// Publishes the owner PID through one retained handle and captures the file
+/// object identity FROM THAT SAME HANDLE before it is closed, so `Drop` can
+/// refuse to retire a replacement object carrying identical bytes.
+///
+/// A `std::fs::write` followed by a separate identity capture re-opens the
+/// path and can adopt a replacement object published between the two
+/// operations as this attempt's identity. Here the publication handle denies
+/// write and delete sharing while open (Windows), so no actor can replace the
+/// object between the write and the capture: the returned identity always
+/// names the object this attempt published. Bytes are re-read from the same
+/// handle to prove the write landed.
+///
+/// An already-present PID file is overwritten, not refused: after exclusive
+/// lock creation no live rival exists, and residue from a halfway cleanup must
+/// self-heal into this attempt's object rather than brick the next startup. A
+/// replacement published after this handle closes is a new object and is
+/// refused later by the identity-bound retirement (`retire_claim_pid`).
 #[cfg(windows)]
-fn capture_pid_identity(runtime_dir: &Path, owner_text: &str) -> PidIdentity {
-    let pid_path = runtime_dir.join("daemon.pid");
-    let mut pinned = eliot_windows_ipc::PinnedFile::open(&pid_path).ok()?;
-    let bytes = pinned.read_all().ok()?;
-    if bytes != owner_text.as_bytes() {
-        return None;
+fn publish_pid_through_retained_handle(
+    pid_path: &Path,
+    owner_text: &str,
+) -> Result<PidIdentity, String> {
+    use std::io::{Read as _, Seek as _};
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(SINGLE_INSTANCE_LOCK_SHARE_MODE)
+        .open(pid_path)
+        .map_err(|error| format!("cannot open daemon.pid for owner publication: {error}"))?;
+    file.write_all(owner_text.as_bytes())
+        .map_err(|error| format!("cannot write owner PID to daemon.pid: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot sync daemon.pid: {error}"))?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| format!("cannot re-read published daemon.pid: {error}"))?;
+    let mut written = Vec::new();
+    file.read_to_end(&mut written)
+        .map_err(|error| format!("cannot re-read published daemon.pid: {error}"))?;
+    if written != owner_text.as_bytes() {
+        return Err("daemon.pid changed during publication; refusing unbound identity".to_owned());
     }
-    Some(pinned.identity())
+    eliot_windows_ipc::file_identity_of(&file)
+        .map(Some)
+        .map_err(|error| format!("cannot capture published daemon.pid identity: {error}"))
 }
 
 #[cfg(not(windows))]
-fn capture_pid_identity(_runtime_dir: &Path, _owner_text: &str) -> PidIdentity {}
+fn publish_pid_through_retained_handle(
+    pid_path: &Path,
+    owner_text: &str,
+) -> Result<PidIdentity, String> {
+    std::fs::write(pid_path, owner_text)
+        .map_err(|error| format!("cannot write owner PID to daemon.pid: {error}"))?;
+    Ok(())
+}
 
 #[cfg(windows)]
 type PidIdentity = Option<eliot_windows_ipc::FileIdentity>;
@@ -2088,4 +2261,179 @@ fn module_rejected(reason: &str) -> EngineError {
 
 pub fn shutdown_deadline_after(duration: Duration) -> Instant {
     Instant::now() + duration
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod single_instance_object_proofs {
+    // Proof fixtures fail fast with `expect`: a fixture failure is itself the
+    // test signal, never production control flow.
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PROOF_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn proof_dir(name: &str) -> PathBuf {
+        let id = PROOF_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("eliot-2876-{name}-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("proof dir");
+        dir
+    }
+
+    fn write_bytes(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).expect("write proof file");
+    }
+
+    /// Replaces the file at `path` with a NEW file object carrying identical
+    /// bytes: same content, different `FileIdentity`. Commits the swap through
+    /// the filesystem (remove + create) so the old object is truly gone.
+    #[cfg(windows)]
+    fn swap_same_bytes(path: &Path, bytes: &[u8]) {
+        std::fs::remove_file(path).expect("remove proof file");
+        write_bytes(path, bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_retirement_refuses_same_bytes_replacement() {
+        let dir = proof_dir("stale-refuse");
+        let lock_path = dir.join("daemon.lock");
+        let pid_path = dir.join("daemon.pid");
+        let snapshot = b"4242";
+        write_bytes(&pid_path, snapshot);
+
+        // Validation pins object A and retains its identity.
+        let pinned =
+            eliot_windows_ipc::RetirablePinnedFile::open(&pid_path).expect("open proof pid");
+        let identity_a = pinned.identity();
+        drop(pinned);
+
+        // Fixture swaps A for B with identical bytes.
+        swap_same_bytes(&pid_path, snapshot);
+
+        let error = retire_exact_pid_object(&pid_path, snapshot, &lock_path, Some(identity_a))
+            .expect_err("replacement with identical bytes must be refused");
+        assert!(
+            matches!(
+                error,
+                EngineError::SingleInstanceContention {
+                    refusal: SingleInstanceRefusal::ReplacementDetected,
+                    ..
+                }
+            ),
+            "expected ReplacementDetected, got {error:?}"
+        );
+        // B survives: nothing was retired under stale authority.
+        assert_eq!(std::fs::read(&pid_path).expect("B survives"), snapshot);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_retirement_accepts_unchanged_object() {
+        let dir = proof_dir("stale-accept");
+        let lock_path = dir.join("daemon.lock");
+        let pid_path = dir.join("daemon.pid");
+        let snapshot = b"4242";
+        write_bytes(&pid_path, snapshot);
+
+        let pinned =
+            eliot_windows_ipc::RetirablePinnedFile::open(&pid_path).expect("open proof pid");
+        let identity_a = pinned.identity();
+        drop(pinned);
+
+        retire_exact_pid_object(&pid_path, snapshot, &lock_path, Some(identity_a))
+            .expect("unchanged object retires");
+        assert!(!pid_path.exists(), "retired PID object must be gone");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn published_identity_refuses_later_replacement() {
+        let dir = proof_dir("publish-refuse");
+        let pid_path = dir.join("daemon.pid");
+        let owner_text = "4243";
+
+        // Acquisition publishes through the retained handle: the captured
+        // identity always names the object just written, never a reopen.
+        let identity =
+            publish_pid_through_retained_handle(&pid_path, owner_text).expect("publish proof pid");
+        assert_eq!(
+            std::fs::read(&pid_path).expect("published pid"),
+            owner_text.as_bytes()
+        );
+
+        // Replacement before any retirement: same bytes, new object.
+        swap_same_bytes(&pid_path, owner_text.as_bytes());
+        let error = retire_claim_pid(&pid_path, owner_text, identity)
+            .expect_err("replacement must not retire as this attempt");
+        assert!(
+            error.contains("identity"),
+            "refusal must name the identity mismatch, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&pid_path).expect("replacement survives"),
+            owner_text.as_bytes()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn published_identity_retires_own_object() {
+        let dir = proof_dir("publish-accept");
+        let pid_path = dir.join("daemon.pid");
+        let owner_text = "4244";
+
+        let identity =
+            publish_pid_through_retained_handle(&pid_path, owner_text).expect("publish proof pid");
+        retire_claim_pid(&pid_path, owner_text, identity).expect("own object retires");
+        assert!(!pid_path.exists(), "own PID object must be gone");
+    }
+
+    #[test]
+    fn missing_marker_retires_only_own_object() {
+        let dir = proof_dir("marker-missing");
+        let owner_pid = std::process::id();
+        let own_path = dir.join("startup.marker");
+        let foreign_path = dir.join("clean-shutdown.marker");
+
+        write_bytes(&own_path, format_owner_marker(owner_pid).as_bytes());
+        let foreign_pid = owner_pid.wrapping_add(1).max(1);
+        write_bytes(&foreign_path, format_owner_marker(foreign_pid).as_bytes());
+
+        let mut notes = Vec::new();
+        restore_marker_or_remove(
+            &own_path,
+            MarkerBackup::WasMissing,
+            owner_pid,
+            "startup marker",
+            &mut notes,
+        );
+        assert!(!own_path.exists(), "own marker must be retired");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("removed own startup marker")),
+            "notes must record the retirement: {notes:?}"
+        );
+
+        let mut notes = Vec::new();
+        restore_marker_or_remove(
+            &foreign_path,
+            MarkerBackup::WasMissing,
+            owner_pid,
+            "clean marker",
+            &mut notes,
+        );
+        assert!(
+            foreign_path.exists(),
+            "a successor-owned marker must survive"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("not provably this attempt")),
+            "notes must record the refusal: {notes:?}"
+        );
+    }
 }

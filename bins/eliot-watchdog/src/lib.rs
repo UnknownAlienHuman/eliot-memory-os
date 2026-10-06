@@ -68,6 +68,8 @@ mod host_identity_observation;
 /// reconciliation, and the correlated dual audit record. Private cell: it
 /// performs no SCM effect and opens no Host journal.
 pub mod host_recovery;
+#[cfg(test)]
+mod import_positive_tests;
 mod independent_sensor;
 mod observation_attribution;
 mod observation_coverage;
