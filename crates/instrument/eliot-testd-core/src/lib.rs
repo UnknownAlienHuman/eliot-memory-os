@@ -65,7 +65,7 @@ pub use typed_evidence::{
     TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
     TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
     TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
-    TestdStreamResolution, TestdStreamSlot, TypedEvidenceRestartRecord,
+    TestdStreamResolution, TestdStreamSlot, TestdStreamSourceSidecar, TypedEvidenceRestartRecord,
 };
 
 // ---- Closed testd profile to executable binding registry (issue #20) ----
@@ -958,6 +958,14 @@ const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
 /// id. Additive owner table: existing stores migrate idempotently without
 /// rewriting job payloads.
 const TYPED_RESTART: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_typed_restart_v1");
+/// Raw bytes of testd-retained immutable stream sources (issue #456, WD1),
+/// keyed by source locator. Additive owner table: existing stores migrate
+/// idempotently without rewriting job payloads.
+const STREAM_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_stream_bytes_v1");
+/// Sidecar records for testd-retained stream sources, keyed by source
+/// locator. Additive owner table: existing stores migrate idempotently
+/// without rewriting job payloads.
+const STREAM_META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_stream_meta_v1");
 
 /// Persistent daemon failures.
 #[derive(Debug, Error)]
@@ -3424,6 +3432,8 @@ impl TestdStore {
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
         drop(write.open_table(TYPED_RESTART).map_err(database)?);
+        drop(write.open_table(STREAM_BYTES).map_err(database)?);
+        drop(write.open_table(STREAM_META).map_err(database)?);
         write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
@@ -5015,6 +5025,156 @@ impl TestdStore {
                 .map(Some)
                 .map_err(|error| TestdError::Corrupt(error.to_string()))
             })
+    }
+
+    /// Persists one testd-retained stream source beside its sidecar.
+    ///
+    /// Issue #456 (WD1): the sidecar revalidates fully before the write
+    /// commits, and bytes whose digest or length disagree with the sidecar
+    /// are refused, never stored.
+    pub fn store_stream_source(
+        &self,
+        sidecar: &TestdStreamSourceSidecar,
+        bytes: &[u8],
+    ) -> Result<(), TestdError> {
+        sidecar
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if sha256_hex(bytes) != sidecar.sha256
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != sidecar.byte_length
+        {
+            return Err(TestdError::Contract(
+                "stream source bytes disagree with the sidecar identity".to_owned(),
+            ));
+        }
+        let encoded =
+            serde_json::to_vec(sidecar).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let write = self.database.begin_write().map_err(database)?;
+        {
+            let mut meta = write.open_table(STREAM_META).map_err(database)?;
+            meta.insert(sidecar.locator.as_str(), encoded.as_slice())
+                .map_err(database)?;
+        }
+        {
+            let mut blobs = write.open_table(STREAM_BYTES).map_err(database)?;
+            blobs
+                .insert(sidecar.locator.as_str(), bytes)
+                .map_err(database)?;
+        }
+        write.commit().map_err(database)?;
+        Ok(())
+    }
+
+    /// Loads one retained source with its sidecar, re-verifying identity.
+    ///
+    /// Issue #456 (WD1/WD2): `None` means no source was ever retained under
+    /// this locator. Stored bytes that disagree with the sidecar fail closed
+    /// as corrupt instead of serving.
+    pub fn load_stream_source(
+        &self,
+        locator: &str,
+    ) -> Result<Option<(TestdStreamSourceSidecar, Vec<u8>)>, TestdError> {
+        if locator.trim().is_empty() || locator.chars().any(char::is_control) {
+            return Err(TestdError::Invalid {
+                field: "locator",
+                reason: "source locator must be non-blank and control-free",
+            });
+        }
+        let read = self.database.begin_read().map_err(database)?;
+        let meta = read.open_table(STREAM_META).map_err(database)?;
+        let Some(stored) = meta.get(locator).map_err(database)? else {
+            return Ok(None);
+        };
+        let sidecar: TestdStreamSourceSidecar = serde_json::from_slice(stored.value())
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        sidecar
+            .validate()
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        if sidecar.locator != locator {
+            return Err(TestdError::Corrupt(
+                "stream sidecar locator disagrees with its row key".to_owned(),
+            ));
+        }
+        let blobs = read.open_table(STREAM_BYTES).map_err(database)?;
+        let Some(bytes) = blobs.get(locator).map_err(database)? else {
+            return Err(TestdError::Corrupt(
+                "stream source sidecar has no retained bytes".to_owned(),
+            ));
+        };
+        let bytes = bytes.value().to_vec();
+        if sha256_hex(&bytes) != sidecar.sha256
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != sidecar.byte_length
+        {
+            return Err(TestdError::Corrupt(
+                "retained stream bytes disagree with the sidecar identity".to_owned(),
+            ));
+        }
+        Ok(Some((sidecar, bytes)))
+    }
+
+    /// Drops one job's stream rows except the cited locators.
+    ///
+    /// Issue #456 (WD1 growth bound): called at finish with the locators the
+    /// finished receipt's typed bundles cite. Returns the dropped row count.
+    /// Rows of other jobs are never touched.
+    pub fn release_job_stream_sources_except(
+        &self,
+        job_id: &str,
+        keep: &[String],
+    ) -> Result<usize, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let write = self.database.begin_write().map_err(database)?;
+        let doomed: Vec<String> = {
+            let meta = write.open_table(STREAM_META).map_err(database)?;
+            let mut doomed = Vec::new();
+            for item in meta.iter().map_err(database)? {
+                let (key, value) = item.map_err(database)?;
+                let locator = key.value().to_owned();
+                let sidecar: TestdStreamSourceSidecar = serde_json::from_slice(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                if sidecar.job_id == job_id && !keep.contains(&locator) {
+                    doomed.push(locator);
+                }
+            }
+            doomed
+        };
+        {
+            let mut meta = write.open_table(STREAM_META).map_err(database)?;
+            let mut blobs = write.open_table(STREAM_BYTES).map_err(database)?;
+            for locator in &doomed {
+                meta.remove(locator.as_str()).map_err(database)?;
+                blobs.remove(locator.as_str()).map_err(database)?;
+            }
+        }
+        write.commit().map_err(database)?;
+        Ok(doomed.len())
+    }
+
+    /// Reopens persisted typed evidence after a restart and reconciles it.
+    ///
+    /// Issue #456 (WD2): a job with no persisted record reopens to empty
+    /// outcomes. Every bundle identity is revalidated from the durable row
+    /// before any port call, so reconstruction needs no operation memory.
+    pub fn reopen_typed_evidence(
+        &self,
+        job_id: &str,
+        port: &dyn ProcessStreamSourceReadbackPort,
+        max_bytes: u64,
+        deadline_ms: u64,
+    ) -> Result<
+        (
+            Vec<TestdProcessEvidenceBundle>,
+            Vec<Vec<TestdStreamResolution>>,
+        ),
+        TestdError,
+    > {
+        let Some(mut record) = self.load_typed_evidence_restart(job_id)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let outcomes = record
+            .reconcile(port, max_bytes, deadline_ms)
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        Ok((record.bundles.clone(), outcomes))
     }
 
     /// Completes an attempt, or durably schedules a bounded retry.

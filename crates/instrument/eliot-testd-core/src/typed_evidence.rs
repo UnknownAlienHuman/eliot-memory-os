@@ -27,8 +27,8 @@ use eliot_contracts::{ClockReading, StateFence};
 use eliot_process::{
     DurableStreamLocatorKind, DurableStreamRepresentation, ProcessEvidence,
     ProcessExecutionBinding, ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
-    ProcessStreamTransformationBinding, StreamEvidenceGap, StreamPersistenceStatus,
-    StreamTransportStatus,
+    ProcessStreamSinkState, ProcessStreamTransformationBinding, StreamEvidenceGap,
+    StreamPersistenceStatus, StreamTransportStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -2199,6 +2199,99 @@ impl TypedEvidenceRestartRecord {
             .iter_mut()
             .map(|bundle| bundle.resolve_pending(port, &context))
             .collect())
+    }
+}
+
+/// Durable sidecar for one testd-retained immutable stream source (issue
+/// #456, WD1/WD2).
+///
+/// The store persists this record beside the raw bytes under the source
+/// locator. The readback port re-verifies every binding (locator, ready
+/// receipt, digest, length, fence) against the admitted request before
+/// serving a byte; the bytes table alone never authorizes a readback.
+/// Blob-kind sources are refused here: Blob ownership stays with #297, and
+/// this table only ever holds testd-retained `ImmutableArtifact` rows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdStreamSourceSidecar {
+    /// Immutable source locator value
+    /// (`testd-retained:<job>:<operation>:<stream>`).
+    pub locator: String,
+    /// Immutable locator class (always `ImmutableArtifact` here).
+    pub locator_kind: DurableStreamLocatorKind,
+    /// Ready-receipt identity minted at finalize.
+    pub ready_receipt_ref: String,
+    /// Readback-receipt identity minted at finalize.
+    pub readback_receipt_id: String,
+    /// SHA-256 over the exact durable source bytes.
+    pub sha256: String,
+    /// Exact durable source length. Zero is valid.
+    pub byte_length: u64,
+    /// Durable job identity the source was retained for.
+    pub job_id: String,
+    /// Stdout or stderr.
+    pub stream: ProcessStreamKind,
+    /// Terminal sink state that produced this source.
+    pub terminal_state: ProcessStreamSinkState,
+    /// SHA-256 over the terminal material.
+    pub terminal_sha256: String,
+    /// State Fence the post-restart readback must satisfy.
+    pub fence: StateFence,
+    /// Unix-millisecond clock when the terminal landed.
+    pub observed_at_ms: u64,
+}
+
+impl TestdStreamSourceSidecar {
+    /// Validates the sidecar before any byte is stored or served.
+    pub fn validate(&self) -> Result<(), TestdEvidenceError> {
+        validate_reference("locator", Some(self.locator.as_str())).map_err(|_| {
+            TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar locator is blank or malformed",
+            }
+        })?;
+        if self.locator_kind != DurableStreamLocatorKind::ImmutableArtifact {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar locator class is not testd-retained",
+            });
+        }
+        if !self.locator.starts_with("testd-retained:") {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar locator is not testd-retained",
+            });
+        }
+        validate_reference("ready_receipt_ref", Some(self.ready_receipt_ref.as_str())).map_err(
+            |_| TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar ready receipt is blank or malformed",
+            },
+        )?;
+        validate_reference(
+            "readback_receipt_id",
+            Some(self.readback_receipt_id.as_str()),
+        )
+        .map_err(|_| TestdEvidenceError::BindingMismatch {
+            reason: "the stream sidecar readback receipt is blank or malformed",
+        })?;
+        validate_digest("sidecar.sha256", self.sha256.as_str()).map_err(|_| {
+            TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar digest is not a lowercase SHA-256",
+            }
+        })?;
+        validate_digest("sidecar.terminal_sha256", self.terminal_sha256.as_str()).map_err(
+            |_| TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar terminal digest is not a lowercase SHA-256",
+            },
+        )?;
+        validate_reference("job_id", Some(self.job_id.as_str())).map_err(|_| {
+            TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar job identity is blank or malformed",
+            }
+        })?;
+        self.fence
+            .validate()
+            .map_err(|_| TestdEvidenceError::BindingMismatch {
+                reason: "the stream sidecar fence carries no resource generation",
+            })?;
+        Ok(())
     }
 }
 
