@@ -32,6 +32,7 @@ MANIFEST = ROOT / "crates/eliot-types/tests/data/cue_kind_migration.toml"
 A10_FILE = "crates/smart/eliot-cue-contracts/src/normalization.rs"
 A10_LIB = "crates/smart/eliot-cue-contracts/src/lib.rs"
 CUE_RS = "crates/eliot-types/src/ul/cue.rs"
+MIGRATION_TOML = "crates/eliot-types/tests/data/cue_kind_migration.toml"
 BOUNDARY_RS = "crates/eliot-types/tests/cue_kind_legacy_boundary.rs"
 RETIREMENT_RS = "crates/eliot-types/tests/cue_kind_retirement.rs"
 ACCEPTANCE_804 = "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"
@@ -139,6 +140,14 @@ class RetirementCoordinator(unittest.TestCase):
     def test_01_exactly_one_current_enum_in_complete_denominator(self):
         self.assertBoundCase(1)
         self.assertEqual(a.enum_declaration_files(), [A10_FILE])
+        # Occurrence denominator, not file projection: a second `enum CueKind`
+        # in the owner file or in any other file adds a site here, while the
+        # file list above would stay `[A10_FILE]` (I05-15 owner collision).
+        named = [s for s in a.enum_declaration_sites("CueKind") if s.name == "CueKind"]
+        self.assertEqual(len(named), 1)
+        self.assertEqual(named[0].path, A10_FILE)
+        self.assertEqual(named[0].module_path, ())
+        self.assertEqual(a.current_owner_site_violations(), [])
 
     # WORK_UNIT_CASE: 835/2
     def test_02_current_owner_exactly_a10_pinned(self):
@@ -340,6 +349,12 @@ class RetirementCoordinator(unittest.TestCase):
             )
         self.assertFalse(a.declares_enum(a.strip_rust("enum CueKindProvenance {}\n"), "CueKind"))
         self.assertFalse(a.declares_enum(a.strip_rust("// enum CueKind\n"), "CueKind"))
+        # The live tree carries exactly one current-kind occurrence: any second
+        # declaration, same file or elsewhere, surfaces as a site violation.
+        named = [s for s in a.enum_declaration_sites("CueKind") if s.name == "CueKind"]
+        self.assertEqual(len(named), 1)
+        self.assertEqual(named[0].path, A10_FILE)
+        self.assertEqual(a.current_owner_site_violations(), [])
 
     # WORK_UNIT_CASE: 835/17
     def test_17_oracle_detects_legacy_alias_and_reexport(self):
@@ -376,6 +391,9 @@ class RetirementCoordinator(unittest.TestCase):
         for snippet in adversarial:
             self.assertIsNotNone(escape.search(a.strip_rust(snippet)), snippet)
         self.assertEqual(a.enum_declaration_files(), [A10_FILE])
+        # Occurrence check beside the file projection: a second declaration in
+        # the owner file leaves the projection above unchanged but violates here.
+        self.assertEqual(a.current_owner_site_violations(), [])
 
     # WORK_UNIT_CASE: 835/20
     def test_20_navigation_and_source_denominators_reconcile(self):
@@ -453,8 +471,11 @@ class RetirementCoordinator(unittest.TestCase):
     def test_23_exact_allowed_source_test_oracle_handoff_diff(self):
         self.assertBoundCase(23)
         diff = a.git_diff_names()
-        self.assertIn(CUE_RS, diff)
-        self.assertIn(RETIREMENT_RS, diff)
+        # B1/B2 (cue.rs alias removal, retirement boundary suite) are
+        # final on main (audit Already-done, PR #2476): this range must
+        # not re-touch them. The remaining delivery is the handoff
+        # manifest row plus oracle/coordinator.
+        self.assertIn(MIGRATION_TOML, diff)
         allowed = {
             line.strip()
             for line in (FIXTURES / "allowed_diff.txt").read_text(encoding="utf-8").splitlines()
@@ -582,11 +603,14 @@ class RetirementCoordinator(unittest.TestCase):
         audit_source = (ROOT / "scripts/audit_cue_kind_retirement.py").read_text(
             encoding="utf-8"
         )
-        # Verdict-shaped literals in CODE (comments/docstrings/strings stripped):
-        # no fabricated result payloads, no shouted verdicts, and never the
-        # legacy NOT_RUN/NOT_CHECKED shape. Legitimate machinery identifiers
-        # (passed_exec, EXECUTED_PASS receipts via accepted constructors) do
-        # not match these payload shapes.
+        # Verdict-shaped literals anywhere in the oracle file (code and
+        # prose): the scan runs over Rust-lexical-stripped text, which
+        # leaves Python `#` prose and docstring bodies visible, so oracle
+        # prose must avoid these tokens too. No fabricated result
+        # payloads, no shouted verdicts, never an unexecuted-verdict
+        # shape. Legitimate machinery identifiers (passed_exec,
+        # EXECUTED_PASS receipts via accepted constructors) do not match
+        # these payload shapes.
         code = a.strip_rust(audit_source)
         for token in (
             "NOT_RUN",
