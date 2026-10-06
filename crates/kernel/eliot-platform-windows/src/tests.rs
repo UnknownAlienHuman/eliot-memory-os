@@ -9,7 +9,6 @@
 //! sharded fragments named per anchor above.
 //! Policy: No wildcard imports, no new lint allows; existing test-module import/lint policy moves unchanged.
 use super::*;
-use crate::usn_journal::{parse_usn_record_page, volume_device_path};
 #[cfg(windows)]
 use crate::secret_store::{
     HOST_CREDENTIAL_INTERLOCK_TIMEOUT_MS, classify_host_credential_interlock_wait,
@@ -19,6 +18,7 @@ use crate::secret_store::{
     credential_write, installer_credential_target, require_exact_credential_readback,
     valid_credential_key, valid_installer_credential_target,
 };
+use crate::usn_journal::{parse_usn_record_page, volume_device_path};
 
 #[cfg(windows)]
 #[test]
@@ -5067,17 +5067,23 @@ fn usn_record_parser_reads_v2_and_v3_records_in_order() {
 fn usn_record_parser_refuses_truncation_and_unknown_versions() {
     let record = usn_v2_record(1, 1, "t.txt");
     assert_eq!(
-        parse_usn_record_page(&record[..record.len() - 1]).unwrap_err(),
+        parse_usn_record_page(&record[..record.len() - 1])
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
         UsnJournalError::TruncatedRecord
     );
     assert_eq!(
-        parse_usn_record_page(&record[..4]).unwrap_err(),
+        parse_usn_record_page(&record[..4])
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
         UsnJournalError::TruncatedRecord
     );
     let mut bad_version = record.clone();
     bad_version[4..6].copy_from_slice(&9_u16.to_le_bytes());
     assert_eq!(
-        parse_usn_record_page(&bad_version).unwrap_err(),
+        parse_usn_record_page(&bad_version)
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
         UsnJournalError::UnsupportedRecordVersion { version: 9 }
     );
 }
@@ -5096,11 +5102,15 @@ fn usn_volume_device_path_accepts_drive_paths_only() {
         expected_d
     );
     assert_eq!(
-        volume_device_path(std::path::Path::new("relative/path")).unwrap_err(),
+        volume_device_path(std::path::Path::new("relative/path"))
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
         UsnJournalError::InvalidVolume
     );
     assert_eq!(
-        volume_device_path(std::path::Path::new("\\\\server\\share")).unwrap_err(),
+        volume_device_path(std::path::Path::new("\\\\server\\share"))
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
         UsnJournalError::InvalidVolume
     );
 }
@@ -5128,7 +5138,9 @@ fn usn_journal_state_query_on_system_volume() {
     let root = usn_system_volume_root();
     if !usn_journal_tests_elevated() {
         assert_eq!(
-            query_usn_journal_state(&root).unwrap_err(),
+            query_usn_journal_state(&root)
+                .err()
+                .unwrap_or_else(|| panic!("USN negative must refuse")),
             UsnJournalError::AccessDenied
         );
         return;
@@ -5148,7 +5160,9 @@ fn usn_journal_page_read_advances_through_a_live_cursor() {
             next_usn: 0,
         };
         assert_eq!(
-            read_usn_journal_page(&root, &denied, 65_536).unwrap_err(),
+            read_usn_journal_page(&root, &denied, 65_536)
+                .err()
+                .unwrap_or_else(|| panic!("USN negative must refuse")),
             UsnJournalError::AccessDenied
         );
         return;
@@ -5179,7 +5193,9 @@ fn usn_journal_page_read_with_a_dead_journal_id_is_stale() {
             next_usn: 0,
         };
         assert_eq!(
-            read_usn_journal_page(&root, &denied, 65_536).unwrap_err(),
+            read_usn_journal_page(&root, &denied, 65_536)
+                .err()
+                .unwrap_or_else(|| panic!("USN negative must refuse")),
             UsnJournalError::AccessDenied
         );
         return;
@@ -5190,7 +5206,9 @@ fn usn_journal_page_read_with_a_dead_journal_id_is_stale() {
         next_usn: 0,
     };
     assert_eq!(
-        read_usn_journal_page(&root, &dead, 65_536).unwrap_err(),
+        read_usn_journal_page(&root, &dead, 65_536)
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
         UsnJournalError::StaleCursor {
             expected_journal_id: 0,
             observed_journal_id: state.journal_id,

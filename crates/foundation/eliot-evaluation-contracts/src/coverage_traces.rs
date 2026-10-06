@@ -784,10 +784,10 @@ impl JournalReplayEvidence {
     /// # Errors
     ///
     /// Returns [`EvaluationContractError`] when the journal identity is blank
-    /// or the window end precedes its start.
+    /// or the window is inverted or its inclusive length cannot fit in `u64`.
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         text(&self.journal_id, "replay_evidence.journal_id")?;
-        if self.last_cursor < self.first_cursor {
+        if self.window_len() == 0 {
             return Err(EvaluationContractError::InvalidInterval {
                 field: "replay_evidence.first/last_cursor",
             });
@@ -796,9 +796,13 @@ impl JournalReplayEvidence {
     }
 
     /// Returns the exact replayed-window length the channel record must carry.
+    /// Returns zero for invalid bounds, which [`Self::validate`] rejects.
     #[must_use]
     pub fn window_len(&self) -> u64 {
-        self.last_cursor - self.first_cursor + 1
+        self.last_cursor
+            .checked_sub(self.first_cursor)
+            .and_then(|length| length.checked_add(1))
+            .unwrap_or(0)
     }
 }
 
@@ -2012,5 +2016,20 @@ mod coverage_replay_evidence_tests_1755 {
         assert!(inverted.validate().is_err());
         assert!(exact_evidence().validate().is_ok());
         assert_eq!(exact_evidence().window_len(), 10);
+    }
+
+    #[test]
+    fn unrepresentable_replay_window_is_refused_without_overflow() {
+        let evidence = JournalReplayEvidence {
+            journal_id: "filesystem-usn-journal".to_owned(),
+            first_cursor: 0,
+            last_cursor: u64::MAX,
+        };
+        assert_eq!(evidence.window_len(), 0);
+        assert!(matches!(
+            evidence.validate(),
+            Err(EvaluationContractError::InvalidInterval { .. })
+        ));
+        assert!(replayed_channel(0, Some(evidence)).validate().is_err());
     }
 }

@@ -401,7 +401,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let retained = eliot_platform_windows::UsnCursor {
-            journal_id: 0x0A11_CE5C_09,
+            journal_id: 0x000A_11CE_5C09,
             next_usn: 4242,
         };
         let scope = disposable_scope("restart")?;
@@ -434,7 +434,7 @@ mod tests {
     /// coverage claim — and the next interval starts clean, never duplicating
     /// the un-acked window.
     #[test]
-    fn crash_between_save_and_ack_is_a_named_omission() -> TestResult {
+    fn crash_between_save_and_ack_is_a_named_omission() {
         let cell = IntervalCoverageCell::new(1000);
         assert_eq!(cell.begin_interval(1000), None);
         assert_eq!(
@@ -471,7 +471,6 @@ mod tests {
         assert_eq!(record.disposition(), CoverageDisposition::Unknown);
         assert_eq!(record.observed_replayed_observations(), 0);
         assert!(record.replayed_evidence().is_none());
-        Ok(())
     }
 
     /// A5 daemon-down: the replay step runs with no daemon, lease, or Kernel
@@ -504,7 +503,7 @@ mod tests {
     /// owns accounts every channel — live samples, the replayed window, the
     /// measured partials, and exactly the four measured-missing adapters.
     #[test]
-    fn full_interval_accounts_every_producer() -> TestResult {
+    fn full_interval_accounts_every_producer() {
         let cell = IntervalCoverageCell::new(1000);
         assert_eq!(cell.begin_interval(1000), None);
         for (channel, class) in [
@@ -574,7 +573,6 @@ mod tests {
                 .expect("live record present");
             assert_eq!(record.disposition(), CoverageDisposition::Continuous);
         }
-        Ok(())
     }
 
     /// Disposable-scope acceptance, live or refused: on the system volume the

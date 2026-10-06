@@ -2260,10 +2260,9 @@ mod shared_manifest_tick_tests {
     /// Without a bound owner spool nothing is retained and nothing fails:
     /// the miss is for the tick to trace, not a refusal.
     #[test]
-    fn missing_port_retains_nothing() -> TestResult {
+    fn missing_port_retains_nothing() {
         let outcome = published_outcome();
         assert!(matches!(outcome, CoverageManifestOutcome::Published { .. }));
         assert!(!retain_published_shared_manifest(None, &outcome));
-        Ok(())
     }
 }
