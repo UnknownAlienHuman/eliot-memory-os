@@ -2143,6 +2143,61 @@ fn prune_delivery_slots(
     }
 }
 
+/// Reconciles retained Ready slots against their staged bytes (issue
+/// #2786 A4): a Ready slot whose immutable set no longer re-hashes to
+/// its recorded identity digests is transitioned to an explicit Failed
+/// publication (`delivery-material-missing`) instead of reporting a
+/// complete set. Skips the slot being published and any slot backing
+/// the live fixed set; those have their own replay/reclaim paths. The
+/// sweep is bounded local I/O under the publish serial guard — no guest
+/// execution, no RPC — and a concurrent publisher's fresh slot either
+/// has no Ready marker yet (skipped) or fails the byte check only when
+/// its bytes are genuinely absent (then Failed is honest: a replay
+/// re-stages the identical slot bytes and rewrites Ready).
+fn reconcile_ready_slots(
+    slots: &std::path::Path,
+    live_envelope_digest: Option<&str>,
+    current_slot_name: &str,
+) {
+    let Ok(entries) = std::fs::read_dir(slots) else {
+        return;
+    };
+    for entry in entries.flatten().take(MAX_SLOT_SCAN_ENTRIES) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == current_slot_name {
+            continue;
+        }
+        let slot = entry.path();
+        let Some(WasmPublicationState::Ready { identity }) = read_slot_state(&slot) else {
+            continue;
+        };
+        if live_envelope_digest.is_some_and(|live| identity.envelope_digest == live) {
+            continue;
+        }
+        if slot_payloads_match(&slot, &identity) {
+            continue;
+        }
+        mark_slot_failed(&slot, &identity, "delivery-material-missing");
+    }
+}
+
+/// Whether a slot's staged immutable set still re-hashes to the
+/// identity digests: artifact, input, and envelope copy must all exist
+/// with byte-exact bodies. Missing or replaced bytes mean the Ready
+/// marker no longer names a complete set.
+fn slot_payloads_match(slot: &std::path::Path, identity: &WasmDeliveryIdentity) -> bool {
+    let artifact_ok = std::fs::read(slot.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))
+        .ok()
+        .is_some_and(|bytes| sha256_hex(&bytes) == identity.artifact_digest);
+    let input_ok = std::fs::read(slot.join(WASM_HOST_GUEST_INPUT_FILE_NAME))
+        .ok()
+        .is_some_and(|bytes| sha256_hex(&bytes) == identity.input_digest);
+    let envelope_ok = std::fs::read(slot.join(WASM_HOST_MATERIAL_FILE_NAME))
+        .ok()
+        .is_some_and(|bytes| sha256_hex(&bytes) == identity.envelope_digest);
+    artifact_ok && input_ok && envelope_ok
+}
+
 /// Stages the immutable generation slot: Pending marker, bounded
 /// payloads, envelope copy, then the Ready marker last. A Ready slot
 /// for the same delivery is an idempotent replay (Ready covers the slot
@@ -2321,6 +2376,35 @@ fn mark_slot_failed(slot: &std::path::Path, identity: &WasmDeliveryIdentity, rea
 /// byte bindings, or the file staging fails closed, or
 /// [`WasmDispatchError::Backpressure`] when another live delivery owns
 /// the fixed names.
+/// Claim-shape validation for [`publish_wasm_dispatch_bundle`]: non-blank
+/// host path and digest, non-empty size-bounded guest bytes bound to the
+/// claim digests. Pure check, no staging side effect.
+fn validate_publish_claim(
+    host_executable_path: &str,
+    host_artifact_digest: &str,
+    claim: &WasmOwnerClaim,
+) -> Result<(), WasmDispatchError> {
+    if host_executable_path.trim().is_empty() {
+        return Err(invalid("registry-host-path"));
+    }
+    require_digest(host_artifact_digest, "registry-host-digest")?;
+    if claim.artifact_bytes.is_empty() || claim.input_bytes.is_empty() {
+        return Err(invalid("guest-bytes"));
+    }
+    if claim.artifact_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
+        || claim.input_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
+    {
+        return Err(invalid("guest-bytes-bound"));
+    }
+    if sha256_hex(&claim.artifact_bytes) != claim.guest.artifact_digest
+        || sha256_hex(&claim.input_bytes) != claim.guest.input_digest
+    {
+        return Err(invalid("guest-bytes-binding"));
+    }
+    Ok(())
+}
+
+/// Publish a validated owner claim as the live wasm dispatch bundle.
 pub fn publish_wasm_dispatch_bundle(
     host_executable_path: &str,
     host_artifact_digest: &str,
@@ -2341,23 +2425,7 @@ pub fn publish_wasm_dispatch_bundle(
     let _serial = PUBLISH_SERIAL_GUARD
         .lock()
         .map_err(|_| invalid("delivery-guard"))?;
-    if host_executable_path.trim().is_empty() {
-        return Err(invalid("registry-host-path"));
-    }
-    require_digest(host_artifact_digest, "registry-host-digest")?;
-    if claim.artifact_bytes.is_empty() || claim.input_bytes.is_empty() {
-        return Err(invalid("guest-bytes"));
-    }
-    if claim.artifact_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
-        || claim.input_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
-    {
-        return Err(invalid("guest-bytes-bound"));
-    }
-    if sha256_hex(&claim.artifact_bytes) != claim.guest.artifact_digest
-        || sha256_hex(&claim.input_bytes) != claim.guest.input_digest
-    {
-        return Err(invalid("guest-bytes-binding"));
-    }
+    validate_publish_claim(host_executable_path, host_artifact_digest, claim)?;
     let material = publish_wasm_dispatch_material(
         &claim.claim_id,
         &claim.operation_id,
@@ -2436,6 +2504,18 @@ pub fn publish_wasm_dispatch_bundle(
             install_dir,
         )?;
     }
+    // Owner-side reconciliation (issue #2786 A4): a Ready publication
+    // whose material disappeared is transitioned to an explicit
+    // recoverable Failed publication before the new set stages, so Join
+    // Ready can never outlive missing material. At this point the old
+    // live set is either absent or owner-reclaimed above; the live skip
+    // is re-read defensively.
+    let swept_live_digest = read_live_material(install_dir)
+        .ok()
+        .flatten()
+        .and_then(|live| material_bytes(&live).ok())
+        .map(|envelope| sha256_hex(&envelope));
+    reconcile_ready_slots(&slots, swept_live_digest.as_deref(), &slot_name);
     // Immutable generation staging first: a publication error here never
     // touches the fixed names, so it cannot delete another generation.
     // Fixed-name exposure follows, payloads first and envelope last, each
@@ -2804,6 +2884,54 @@ mod tests {
         assert!(!dir.join("00000000000000000007-0000000000000001").exists());
         assert!(dir.join("00000000000000000007-0000000000000009").exists());
         assert!(dir.join("00000000000000000007-residue").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Ready slot whose staged bytes are gone is transitioned to an
+    /// explicit Failed publication instead of reporting a complete set
+    /// (issue #2786 A4).
+    #[test]
+    fn reconcile_transitions_ready_with_missing_bytes_to_failed() {
+        let dir = stage_dir("eliot-2786-reconcile-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slots dir writable");
+        marked_slot(&dir, "00000000000000000007-aaaaaaaaaaaaaaaa", 1);
+        reconcile_ready_slots(&dir, None, "00000000000000000007-bbbbbbbbbbbbbbbb");
+        let slot = dir.join("00000000000000000007-aaaaaaaaaaaaaaaa");
+        assert!(!slot.join(WASM_DELIVERY_READY_FILE_NAME).exists());
+        let state = read_slot_state(&slot);
+        assert!(matches!(state, Some(WasmPublicationState::Failed { .. })));
+        if let Some(WasmPublicationState::Failed { reason, .. }) = state {
+            assert_eq!(reason, "delivery-material-missing");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reconciliation skips the slot being published and any slot backing
+    /// the live fixed set; those have their own replay/reclaim paths.
+    #[test]
+    fn reconcile_keeps_current_and_live_backed_ready() {
+        let dir = stage_dir("eliot-2786-reconcile-skips");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slots dir writable");
+        marked_slot(&dir, "00000000000000000007-aaaaaaaaaaaaaaaa", 1);
+        marked_slot(&dir, "00000000000000000007-bbbbbbbbbbbbbbbb", 2);
+        let live = "e".repeat(64);
+        reconcile_ready_slots(
+            &dir,
+            Some(live.as_str()),
+            "00000000000000000007-aaaaaaaaaaaaaaaa",
+        );
+        for name in [
+            "00000000000000000007-aaaaaaaaaaaaaaaa",
+            "00000000000000000007-bbbbbbbbbbbbbbbb",
+        ] {
+            let state = read_slot_state(&dir.join(name));
+            assert!(
+                matches!(state, Some(WasmPublicationState::Ready { .. })),
+                "{name} stays Ready, got {state:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
