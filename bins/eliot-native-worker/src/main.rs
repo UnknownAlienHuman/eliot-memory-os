@@ -840,6 +840,10 @@ mod tests {
         ResourceLimits, SuspendedProcessIdentity, ValidatedDispatch,
     };
     use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
+    use eliot_runtime_contracts::{
+        CapacityBottleneck, CapacityLimit, CapacityPermitBinding, CapacityRequest, CapacityUnit,
+        NormalWorkClass, RequestedOperationClass,
+    };
 
     use super::{
         ADMITTED_DRIVE_FAILED_EXIT, FinishState, KERNEL_ADMISSION_EXIT, PROVIDER_RUNTIME_DEFERRED,
@@ -1682,6 +1686,11 @@ mod tests {
             Some(sink),
         );
         let mut worker: SliceDWorker = NativeWorker::new(core);
+        admit_drive_capacity(
+            &mut worker,
+            claim_value.operation_id.as_str(),
+            &claim_value.authority_epoch,
+        );
         let mut lifecycle = FakeLifecycle::new();
         let ready = block_on(drive_admitted_claimed(
             &mut lifecycle,
@@ -1847,6 +1856,52 @@ mod tests {
         }
     }
 
+    /// Presents the owner-issued process-launch capacity evidence the
+    /// claimed start/recovery gates require (issue #1701, R2-owners/W5).
+    /// Test-only presentation: the dispatch contour will carry the
+    /// owner-issued binding; until then the drive fixtures present the
+    /// matching pair explicitly so the production gate stays enforced.
+    fn admit_drive_capacity(worker: &mut SliceDWorker, operation: &str, epoch_value: &EpochId) {
+        let operation_tag = RequestedOperationClass::Normal(NormalWorkClass::Swarm);
+        let slot = || CapacityLimit {
+            unit: CapacityUnit::ProcessSlots,
+            quantity: load(std::num::NonZeroU64::new(1).ok_or("non-zero")),
+        };
+        let request = CapacityRequest {
+            operation: operation_tag,
+            operation_id: operation.to_owned(),
+            requested_bottleneck: CapacityBottleneck::ProcessLaunchSlots,
+            requested_limit: slot(),
+            requesting_owner_ref: "test-worker-owner".to_owned(),
+            requesting_generation_ref: load(ResourceGeneration::new(1)),
+            authority_epoch_ref: epoch_value.clone(),
+            profile_id: "profile-test-1".to_owned(),
+            profile_revision: "rev-7".to_owned(),
+            deadline_ms: 9_000,
+        };
+        let permit = CapacityPermitBinding {
+            permit_id: format!("TEST-{}-{operation}", operation_tag.as_contract_str()),
+            operation_id: request.operation_id.clone(),
+            capacity_class: operation_tag.capacity_class(),
+            operation: operation_tag,
+            bottleneck: request.requested_bottleneck,
+            granted_limit: slot(),
+            capacity_owner_ref: "test-capacity-owner".to_owned(),
+            capacity_owner_generation_ref: load(ResourceGeneration::new(9)),
+            requesting_owner_ref: request.requesting_owner_ref.clone(),
+            requesting_generation_ref: load(ResourceGeneration::new(1)),
+            authority_epoch_ref: request.authority_epoch_ref.clone(),
+            profile_id: request.profile_id.clone(),
+            profile_revision: request.profile_revision.clone(),
+            issued_at_ms: 1_000,
+            expires_at_ms: 4_000_000_000_000,
+            owner_evidence_refs: vec!["test-evidence-1".to_owned()],
+        };
+        worker
+            .admit_capacity_permit(&permit, &request, fake_now_ms())
+            .unwrap_or_else(|error| panic!("drive capacity admits: {error:?}"));
+    }
+
     fn drive_carriers(
         fence_json: &serde_json::Value,
         epoch_json: &serde_json::Value,
@@ -1884,6 +1939,8 @@ mod tests {
         let hello_value = hello();
         let registration = registration();
         let claim_value = claim_for(&registration, &hello_value, &process);
+        let capacity_operation = claim_value.operation_id.as_str().to_owned();
+        let capacity_epoch = claim_value.authority_epoch.clone();
         let envelope = AdmittedClaimEnvelope {
             admission: claim_request(&registration, &claim_value),
             hello: hello_value,
@@ -1920,14 +1977,9 @@ mod tests {
             Some(TestCheckpoint),
             Some(sink),
         );
-        (
-            NativeWorker::new(core),
-            FakeLifecycle::new(),
-            material,
-            process,
-            bat,
-            staged,
-        )
+        let mut worker: SliceDWorker = NativeWorker::new(core);
+        admit_drive_capacity(&mut worker, &capacity_operation, &capacity_epoch);
+        (worker, FakeLifecycle::new(), material, process, bat, staged)
     }
 
     fn refusal_detail<T>(result: Result<T, NativeWorkerError>, what: &str) -> String {

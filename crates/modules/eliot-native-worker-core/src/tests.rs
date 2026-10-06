@@ -30,6 +30,11 @@ use eliot_process::{
 };
 use std::num::NonZeroU64;
 
+use eliot_runtime_contracts::{
+    CapacityBottleneck, CapacityLimit, CapacityPermitBinding, CapacityRequest, CapacityUnit,
+    NormalWorkClass, RequestedOperationClass,
+};
+
 use super::*;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -2063,6 +2068,72 @@ fn claim_request_for(
     .expect("claim request")
 }
 
+const TEST_CAPACITY_PROFILE: &str = "profile-test-1";
+const TEST_CAPACITY_REVISION: &str = "rev-7";
+const TEST_CAPACITY_NOW_MS: u64 = 5_000;
+
+fn capacity_limit() -> CapacityLimit {
+    CapacityLimit {
+        unit: CapacityUnit::ProcessSlots,
+        quantity: NonZeroU64::new(1).expect("nonzero capacity"),
+    }
+}
+
+fn capacity_request_for(
+    operation: &str,
+    epoch: EpochId,
+    profile_revision: &str,
+) -> CapacityRequest {
+    CapacityRequest {
+        operation: RequestedOperationClass::Normal(NormalWorkClass::Swarm),
+        operation_id: operation.to_owned(),
+        requested_bottleneck: CapacityBottleneck::ProcessLaunchSlots,
+        requested_limit: capacity_limit(),
+        requesting_owner_ref: "test-worker-owner".to_owned(),
+        requesting_generation_ref: ResourceGeneration::new(1).expect("generation"),
+        authority_epoch_ref: epoch,
+        profile_id: TEST_CAPACITY_PROFILE.to_owned(),
+        profile_revision: profile_revision.to_owned(),
+        deadline_ms: 9_000,
+    }
+}
+
+fn capacity_permit_for(
+    request: &CapacityRequest,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+) -> CapacityPermitBinding {
+    CapacityPermitBinding {
+        permit_id: format!(
+            "TEST-{}-{}",
+            request.operation.as_contract_str(),
+            request.operation_id
+        ),
+        operation_id: request.operation_id.clone(),
+        capacity_class: request.operation.capacity_class(),
+        operation: request.operation,
+        bottleneck: request.requested_bottleneck,
+        granted_limit: capacity_limit(),
+        capacity_owner_ref: "test-capacity-owner".to_owned(),
+        capacity_owner_generation_ref: ResourceGeneration::new(9).expect("generation"),
+        requesting_owner_ref: request.requesting_owner_ref.clone(),
+        requesting_generation_ref: ResourceGeneration::new(1).expect("generation"),
+        authority_epoch_ref: request.authority_epoch_ref.clone(),
+        profile_id: request.profile_id.clone(),
+        profile_revision: request.profile_revision.clone(),
+        issued_at_ms,
+        expires_at_ms,
+        owner_evidence_refs: vec!["test-evidence-1".to_owned()],
+    }
+}
+
+fn admit_test_permit(core: &mut TestCore, operation: &str) {
+    let request = capacity_request_for(operation, test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    core.admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+        .expect("capacity permit");
+}
+
 fn claimed_frame(connection: &str, request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
     let mut created = frame(request_id, body);
     created.connection_id = connection.to_owned();
@@ -2083,13 +2154,14 @@ fn claimed_setup() -> (
     ClaimAdmissionRequest,
     String,
 ) {
-    let (core, executor, admission, replay, _) = fixture();
+    let (mut core, executor, admission, replay, _) = fixture();
     let registration = claim_registration();
     let process = process_request();
     let hello_value = claim_hello("connection-claim-1", "start-claim-1");
     let claim_value = claim_for(&registration, &hello_value, &process);
     let digest = claim_value.binding_digest.clone();
     let request = claim_request_for(&registration, &claim_value);
+    admit_test_permit(&mut core, "operation-1");
     (core, executor, admission, replay, request, digest)
 }
 
@@ -2108,13 +2180,15 @@ fn restarted_core(
     admission: &FakeAdmission,
     replay: &FakeReplay,
 ) -> TestCore {
-    WorkerCore::new(
+    let mut restarted = WorkerCore::new(
         Some(executor.clone()),
         Some(admission.clone()),
         Some(replay.clone()),
         Some(replay.clone()),
         Some(Arc::new(RecordingSink::default())),
-    )
+    );
+    admit_test_permit(&mut restarted, "operation-1");
+    restarted
 }
 
 #[test]
@@ -2454,5 +2528,182 @@ fn claim_bound_reconnect_refuses_stale_generation_and_epoch() {
             WorkerFrameBody::Health
         )))
         .is_ok()
+    );
+}
+
+fn unpermitted_claimed_parts() -> (TestCore, FakeExecutor, ClaimAdmissionRequest) {
+    let (core, executor, _, _, _) = fixture();
+    let registration = claim_registration();
+    let process = process_request();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let claim_value = claim_for(&registration, &hello_value, &process);
+    let request = claim_request_for(&registration, &claim_value);
+    (core, executor, request)
+}
+
+fn drive_claim(
+    core: &mut TestCore,
+    claim: &ClaimAdmissionRequest,
+) -> Result<WorkerReady, WorkerError> {
+    block_on(core.demand_start_claimed(
+        claim.clone(),
+        claim_hello("connection-claim-1", "start-claim-1"),
+        process_request(),
+    ))
+}
+
+fn executor_starts(executor: &FakeExecutor) -> usize {
+    executor.state.lock().expect("executor lock").starts
+}
+
+#[test]
+fn capacity_permit_missing_refuses_claimed_start_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let error = drive_claim(&mut core, &claim).expect_err("missing capacity permit must refuse");
+    assert!(
+        matches!(error, WorkerError::AdmissionRejected(ref detail) if detail.contains("capacity_permit_missing")),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+#[test]
+fn capacity_permit_foreign_operation_refuses_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    admit_test_permit(&mut core, "operation-9");
+    let error = drive_claim(&mut core, &claim).expect_err("foreign capacity permit must refuse");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_operation")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+#[test]
+fn capacity_permit_stale_epoch_refuses_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(2), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    core.admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+        .expect("self-consistent pair admits");
+    let error = drive_claim(&mut core, &claim).expect_err("stale epoch permit must refuse");
+    assert!(
+        matches!(error, WorkerError::StaleEpoch),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+#[test]
+fn capacity_permit_expired_refuses_at_presentation() {
+    let (mut core, _, _, _, _) = fixture();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 4_000);
+    let error = core
+        .admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+        .expect_err("expired permit must refuse");
+    assert!(
+        matches!(error, WorkerError::DeadlineExpired),
+        "unexpected refusal: {error:?}"
+    );
+}
+
+#[test]
+fn capacity_permit_conflict_while_unknown_retains_exclusion() {
+    let (mut core, executor, _, _, _) =
+        fixture_with_executor(FakeExecutor::with_start_mode(StartMode::Unknown));
+    let registration = claim_registration();
+    let process = process_request();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let claim_value = claim_for(&registration, &hello_value, &process);
+    let claim = claim_request_for(&registration, &claim_value);
+    admit_test_permit(&mut core, "operation-1");
+    let error = drive_claim(&mut core, &claim).expect_err("unknown start outcome");
+    assert!(
+        matches!(error, WorkerError::UnknownOutcome),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(core.lifecycle(), WorkerLifecycle::UnknownOutcome);
+    assert_eq!(executor_starts(&executor), 1);
+    let request2 = capacity_request_for("operation-1", test_epoch(1), "rev-8");
+    let permit2 = capacity_permit_for(&request2, 1_000, 10_000);
+    let error = core
+        .admit_capacity_permit(&permit2, &request2, TEST_CAPACITY_NOW_MS)
+        .expect_err("changed content must conflict");
+    assert!(
+        matches!(error, WorkerError::IdempotencyConflict),
+        "unexpected refusal: {error:?}"
+    );
+    let request9 = capacity_request_for("operation-9", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit9 = capacity_permit_for(&request9, 1_000, 10_000);
+    let error = core
+        .admit_capacity_permit(&permit9, &request9, TEST_CAPACITY_NOW_MS)
+        .expect_err("other operation must stay excluded");
+    assert!(
+        matches!(
+            error,
+            WorkerError::InvalidRequest("capacity_permit_excluded")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    let error = drive_claim(&mut core, &claim).expect_err("overlapping work stays fenced");
+    assert!(
+        matches!(error, WorkerError::InvalidLifecycle),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(core.lifecycle(), WorkerLifecycle::UnknownOutcome);
+}
+
+#[test]
+fn capacity_permit_links_new_revision_after_clean_terminal() {
+    let (mut core, executor, _, _, _) =
+        fixture_with_executor(FakeExecutor::with_start_mode(StartMode::FailUnavailable));
+    let registration = claim_registration();
+    let process = process_request();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let claim_value = claim_for(&registration, &hello_value, &process);
+    let claim = claim_request_for(&registration, &claim_value);
+    admit_test_permit(&mut core, "operation-1");
+    let error = drive_claim(&mut core, &claim).expect_err("failed start without effect");
+    assert!(
+        matches!(error, WorkerError::PlanGap { .. }),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    let request2 = capacity_request_for("operation-1", test_epoch(1), "rev-8");
+    let permit2 = capacity_permit_for(&request2, 1_000, 10_000);
+    core.admit_capacity_permit(&permit2, &request2, TEST_CAPACITY_NOW_MS)
+        .expect("linked new revision replaces after clean terminal");
+    let error = drive_claim(&mut core, &claim).expect_err("executor still unavailable");
+    assert!(
+        matches!(error, WorkerError::PlanGap { .. }),
+        "capacity gate must pass with the linked revision, got: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 2);
+}
+
+#[test]
+fn capacity_permit_recovery_revalidates_epoch_after_restart() {
+    let (mut first, executor, admission, replay, claim, _) = claimed_setup();
+    claimed_start(&mut first, &claim);
+    let mut restarted = restarted_core(&executor, &admission, &replay);
+    let stale_request = capacity_request_for("operation-1", test_epoch(2), TEST_CAPACITY_REVISION);
+    let stale_permit = capacity_permit_for(&stale_request, 1_000, 10_000);
+    restarted
+        .admit_capacity_permit(&stale_permit, &stale_request, TEST_CAPACITY_NOW_MS)
+        .expect("self-consistent stale pair admits");
+    let error = block_on(restarted.recover_after_restart_claimed(
+        claim,
+        claim_hello("connection-claim-2", "recover-claim-1"),
+        process_request(),
+        0,
+    ))
+    .expect_err("stale epoch permit must refuse recovery");
+    assert!(
+        matches!(error, WorkerError::StaleEpoch),
+        "unexpected refusal: {error:?}"
     );
 }

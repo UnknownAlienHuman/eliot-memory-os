@@ -35,6 +35,7 @@ use eliot_process::{
     ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
 use eliot_receipts::{ProofCeiling, ReceiptDisposition};
+use eliot_runtime_contracts::{CapacityPermitBinding, CapacityRequest};
 pub use generated::{
     NativeWorkerExecuteEbpCallV1, NativeWorkerFacetStubError, compile_native_worker_execute_call_v1,
 };
@@ -234,6 +235,7 @@ pub struct WorkerCore<E, A, R, C> {
     evidence_sink: Option<Arc<dyn ProcessEvidenceSink>>,
     lifecycle: WorkerLifecycle,
     grant: Option<CapabilityGrant>,
+    capacity_permit: Option<CapacityPermitBinding>,
     process_binding: Option<ProcessBindingSnapshot>,
     process_start_receipt: Option<ProcessStartReceipt>,
     connection_id: Option<String>,
@@ -264,6 +266,7 @@ where
             evidence_sink,
             lifecycle: WorkerLifecycle::Created,
             grant: None,
+            capacity_permit: None,
             process_binding: None,
             process_start_receipt: None,
             connection_id: None,
@@ -299,6 +302,111 @@ where
             .await
     }
 
+    /// Consumes one owner-issued process-launch capacity permit and retains
+    /// it under the admitted operation identity (issue #1701, R2-owners/W5).
+    ///
+    /// The issuing owner is the control-reserve capacity owner on the
+    /// `ControlReserveFrontDoor::issue_permit` boundary
+    /// (`eliot-kernel-core`); this core never mints a permit, it only
+    /// validates a presented binding against the request it was issued for
+    /// and retains the exact bytes. A malformed request or binding, a binding
+    /// that does not match its request (foreign operation, owner, epoch, or
+    /// profile revision), or an expired binding is refused here, before any
+    /// effect. Retention is keyed by operation identity: re-presenting the
+    /// identical binding is idempotent (post-restart evidence replay), while
+    /// changed content for the same operation conflicts instead of replaying
+    /// unless the lifecycle is quiescent (`Created`, `Stopped`, `Cancelled`,
+    /// or `Reconciled` — the previous attempt reached a proven terminal
+    /// state, so a linked new revision after a clean failure replaces the
+    /// retention). While a possible effect is outstanding, a different
+    /// operation's permit is refused: unknown outcomes retain exclusion.
+    /// Norm: `docs/architecture/I14-03-control-reserve.md` (independent
+    /// process-launch capacity) and the frozen `CapacityPermitBinding`
+    /// match/replay rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidRequest`] for a malformed request or
+    /// binding, or a binding that does not match its request;
+    /// [`WorkerError::DeadlineExpired`] for an expired binding;
+    /// [`WorkerError::IdempotencyConflict`] for changed content while a
+    /// possible effect is outstanding; [`WorkerError::InvalidRequest`] with
+    /// `capacity_permit_excluded` for a different operation while fenced.
+    pub fn admit_capacity_permit(
+        &mut self,
+        permit: &CapacityPermitBinding,
+        request: &CapacityRequest,
+        now_ms: u64,
+    ) -> Result<(), WorkerError> {
+        request
+            .validate()
+            .map_err(|_| WorkerError::InvalidRequest("capacity_permit_request"))?;
+        permit
+            .validate()
+            .map_err(|_| WorkerError::InvalidRequest("capacity_permit_binding"))?;
+        if !permit.matches_request(request) {
+            return Err(WorkerError::InvalidRequest("capacity_permit_foreign"));
+        }
+        if permit.expires_at_ms <= now_ms {
+            return Err(WorkerError::DeadlineExpired);
+        }
+        if let Some(retained) = self.capacity_permit.as_ref() {
+            if retained == permit {
+                return Ok(());
+            }
+            if matches!(
+                self.lifecycle,
+                WorkerLifecycle::Created
+                    | WorkerLifecycle::Stopped
+                    | WorkerLifecycle::Cancelled
+                    | WorkerLifecycle::Reconciled
+            ) {
+                self.capacity_permit = Some(permit.clone());
+                return Ok(());
+            }
+            if retained.operation_id == permit.operation_id {
+                return Err(WorkerError::IdempotencyConflict);
+            }
+            return Err(WorkerError::InvalidRequest("capacity_permit_excluded"));
+        }
+        self.capacity_permit = Some(permit.clone());
+        Ok(())
+    }
+
+    /// Requires the retained capacity permit to cover the claimed start.
+    ///
+    /// The retained binding must name the claim's exact operation identity
+    /// and agree with the claim's authority epoch; otherwise the start is
+    /// refused before P-03 starts anything. A missing retention refuses as
+    /// an admission prerequisite (fail-closed: no owner-issued process-launch
+    /// evidence, no effect).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::AdmissionRejected`] when no permit is retained
+    /// for the operation, [`WorkerError::AdmissionMismatch`] when the
+    /// retained permit names another operation, or [`WorkerError::StaleEpoch`]
+    /// when the retained permit's epoch disagrees with the claim epoch.
+    fn require_capacity_for_claim(&self, claim: &NativeWorkerClaim) -> Result<(), WorkerError> {
+        let retained =
+            self.capacity_permit.as_ref().ok_or_else(|| {
+                WorkerError::AdmissionRejected(format!(
+                    "capacity_permit_missing: no owner-issued process-launch permit retained for operation {}",
+                    claim.operation_id.as_str()
+                ))
+            })?;
+        if retained.operation_id != claim.operation_id.as_str() {
+            return Err(WorkerError::AdmissionMismatch("capacity_permit_operation"));
+        }
+        if !retained
+            .authority_epoch_ref
+            .is_same_authority(&claim.authority_epoch)
+        {
+            return Err(WorkerError::StaleEpoch);
+        }
+        Ok(())
+    }
+
     /// Binds the existing start path to one exact claim presentation,
     /// validation only; mints nothing.
     ///
@@ -326,7 +434,10 @@ where
     ///
     /// Returns the `from_claim` join failure (`InvalidRequest`,
     /// `UnsupportedVersion`, `StaleEpoch`, `StaleFence`, or
-    /// `DeadlineExpired`), the downstream admission/start/proof failure, or
+    /// `DeadlineExpired`), the capacity-permit refusal (`AdmissionRejected`
+    /// when no owner-issued process-launch permit is retained,
+    /// `AdmissionMismatch` for another operation, `StaleEpoch` for a moved
+    /// epoch), the downstream admission/start/proof failure, or
     /// the typed executable-join refusal (`InvalidRequest`, `StaleEpoch`,
     /// `StaleFence`, `DeadlineExpired`, `Revoked`, or `UnsupportedVersion`).
     pub async fn demand_start_claimed(
@@ -337,6 +448,7 @@ where
     ) -> Result<WorkerReady, WorkerError> {
         claim.validate_binding()?;
         let admission_request = CapabilityAdmissionRequest::from_claim(&claim, &hello, &process)?;
+        self.require_capacity_for_claim(claim.claim())?;
         self.demand_start_inner(hello, process, admission_request)
             .await
     }
@@ -663,6 +775,7 @@ where
     ) -> Result<WorkerRecovery, WorkerError> {
         claim.validate_binding()?;
         let admission_request = CapabilityAdmissionRequest::from_claim(&claim, &hello, &process)?;
+        self.require_capacity_for_claim(claim.claim())?;
         self.recover_after_restart_inner(hello, process, admission_request, replay_after_sequence)
             .await
     }

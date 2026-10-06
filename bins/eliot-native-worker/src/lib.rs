@@ -20,6 +20,7 @@ use eliot_process::{ProcessExecutor, ProcessRequest};
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
 };
+use eliot_runtime_contracts::{CapacityPermitBinding, CapacityRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -137,6 +138,21 @@ where
         self.core
             .demand_start(hello, process)
             .await
+            .map_err(NativeWorkerError::from)
+    }
+
+    /// Consumes one owner-issued process-launch capacity permit into the
+    /// core retention (issue #1701, R2-owners/W5). The claimed start and
+    /// claimed recovery gates require the retained permit; see
+    /// [`eliot_native_worker_core::WorkerCore::admit_capacity_permit`].
+    pub fn admit_capacity_permit(
+        &mut self,
+        permit: &CapacityPermitBinding,
+        request: &CapacityRequest,
+        now_ms: u64,
+    ) -> Result<(), NativeWorkerError> {
+        self.core
+            .admit_capacity_permit(permit, request, now_ms)
             .map_err(NativeWorkerError::from)
     }
 
