@@ -1,0 +1,84 @@
+# Retired authority and campaign surface record (issue #1225 N_step6/AC6).
+#
+# Accepted source for the repository-policy retirement gate: every path below
+# is a retired authority or campaign surface that must stay absent from the
+# tree. The gate (scripts/verify-retired-authority-surfaces.py, called from
+# .github/workflows/repository-policy.yml) reads this record, never an inline
+# workflow list, so retiring or restoring a surface means changing this file
+# and the verdict follows the record. Norm: I00-08 (retirement authority
+# lives in an accepted record, never in inline prose as active authority).
+#
+# Count reconciliation: 36 surfaces, moved verbatim from the inline
+# `forbidden=(...)` list in .github/workflows/repository-policy.yml.
+[[surface]]
+path = ".eliot"
+[[surface]]
+path = ".codebase-memory"
+[[surface]]
+path = "research"
+[[surface]]
+path = "reports"
+[[surface]]
+path = "swarm"
+[[surface]]
+path = "docs/tasks"
+[[surface]]
+path = "docs/normative"
+[[surface]]
+path = "docs/conformance.toml"
+[[surface]]
+path = "docs/UNIMPLEMENTED.md"
+[[surface]]
+path = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+[[surface]]
+path = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+[[surface]]
+path = "docs/operations/BRANCH_INTEGRATION_CLEANUP_HANDOFF_2026-08-28.md"
+[[surface]]
+path = "docs/operations/M5_OPERATIONS_RUNBOOK.md"
+[[surface]]
+path = "docs/operations/PRODUCTION_CUTOVER_RUNBOOK.md"
+[[surface]]
+path = "docs/operations/RUNTIME_LIVE_V3_HANDOFF_2026-08-22.md"
+[[surface]]
+path = "COGNITIVE_COMPLETION_RECOVERY_PROGRESS.md"
+[[surface]]
+path = "UL_PROGRESS.md"
+[[surface]]
+path = "crates/smart/.audit-probe"
+[[surface]]
+path = ".github/workflows/runtime017-primary.yml"
+[[surface]]
+path = ".github/workflows/candidate-release.yml"
+[[surface]]
+path = "scripts/gen-composition-roots.ps1"
+[[surface]]
+path = "scripts/verify-composition-roots.ps1"
+[[surface]]
+path = "scripts/gen-conformance.ps1"
+[[surface]]
+path = "scripts/verify-conformance.ps1"
+[[surface]]
+path = "scripts/gen-contour-cut.ps1"
+[[surface]]
+path = "scripts/verify-contour-cut.ps1"
+[[surface]]
+path = "scripts/gen-module-manifests.ps1"
+[[surface]]
+path = "scripts/verify-module-manifests.ps1"
+[[surface]]
+path = "scripts/gen-unimplemented.ps1"
+[[surface]]
+path = "scripts/verify-unimplemented.ps1"
+[[surface]]
+path = "scripts/measure-stu.ps1"
+[[surface]]
+path = "scripts/run-cognitive-field-certification.ps1"
+[[surface]]
+path = "scripts/run-runtime017-primary.ps1"
+[[surface]]
+path = "scripts/run-ul-cross-agent-certification.ps1"
+[[surface]]
+path = "scripts/test-m5-isolated-operations.ps1"
+[[surface]]
+path = "scripts/plan-eliot-production-cutover.ps1"

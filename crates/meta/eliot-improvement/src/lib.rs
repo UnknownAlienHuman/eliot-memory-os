@@ -258,8 +258,8 @@
 //!   `grep` for `std::fs`, `std::net`, `std::process`, `std::thread`,
 //!   `std::env`, `Command::new`, `tokio`, `async `, `await` and `unsafe`
 //!   over `src/*.rs` returns ZERO source hits. The textual matches for those
-//!   strings live in `tests/promotion_input.rs:1199-1221` and
-//!   `tests/learning_closure.rs:1928-1941`, where they are the FORBIDDEN list
+//!   strings live in the `case_28_no_runtime_assessment_promotion_effect_calls` FORBIDDEN list and
+//!   the `case_57_no_algorithm_dependency_on_a33_a34_a35_a36` FORBIDDEN list, where they are the FORBIDDEN lists
 //!   of a source-bound test that asserts the module's own source contains none
 //!   of them. `unsafe_code = "forbid"` is inherited from the workspace
 //!   `[workspace.lints.rust]`, and `overlay_policy_routing.rs:19` repeats it
@@ -278,7 +278,7 @@
 //!   `now` is always a parameter (`candidate_bounds.rs:1370,1877,1897,2237,2355`
 //!   and `governed_screen.rs:83,152,190`). The two modules that own the inner
 //!   learning loop are clock-free outright: `Select-String` for
-//!   `OffsetDateTime` over `learning_closure.rs` and `promotion_input.rs`
+//!   `OffsetDateTime` over the `learning_closure` and `promotion_input` modules
 //!   returns nothing, so neither module can read a clock even by accident.
 //! - **One owner-held read.** `brief::SafeBoundary::from_observed_closure`
 //!   calls `CanonicalLearningDeltaStore::load()` (`brief.rs:232`), a read of
@@ -352,7 +352,7 @@
 //!   `ImprovementCandidate::transition_lifecycle` refuses `Supported`/`Narrowed`
 //!   outright (`lib.rs:948`) and only `promote_lifecycle` admits them, and only
 //!   with a budget proof.
-//! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
+//! - `promotion_input::prepare_promotion_input` is a
 //!   pure gate over already-supplied evidence, and it has no production caller.
 //!
 //! ## Tests
@@ -364,7 +364,7 @@
 //! | File | `#[test]` |
 //! |---|---|
 //! | `tests/learning_closure.rs` | 58 |
-//! | `tests/promotion_input.rs` | 28 |
+//! | promotion-input integration test (`tests/promotion_input`) | 28 |
 //! | `tests/candidate_bounds_1869.rs` | 10 |
 //! | `tests/candidate_admission_edge.rs` | 5 |
 //! | `tests/producer_1869.rs` | 5 |
@@ -372,7 +372,7 @@
 //! Counted by matching the `#[test]` attribute in each file's source, not by a
 //! test run. Two of them are source-bound negatives rather than behavioural
 //! proofs and are the direct evidence for the effect claims above:
-//! `tests/promotion_input.rs:1197` and `tests/learning_closure.rs:1926` read
+//! the `case_28_no_runtime_assessment_promotion_effect_calls` and `case_57_no_algorithm_dependency_on_a33_a34_a35_a36` source-bound negatives read
 //! their own module's source with `include_str!` and assert the forbidden
 //! effect vocabulary is absent.
 
