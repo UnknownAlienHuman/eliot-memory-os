@@ -142,11 +142,10 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         live_reference: "eliot-governor --config",
         body: CREDENTIAL_RUNBOOK,
     },
-    ConsumerSurface {
-        path: "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
-        live_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-        body: CLAUDE_CODE_PLUGIN_GUIDE,
-    },
+    // #1858 W6: docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md and
+    // docs/integrations/claude/CLAUDE_CODE_PLUGIN.md name only the bridge
+    // since 1858-O4-001, so they are no longer CONSUMER_SURFACES. Their
+    // migration is recorded in MIGRATED_CONSUMER_EDGES below.
     ConsumerSurface {
         path: "integrations/claude/eliot/README.md",
         live_reference: "eliot-governor host install --host claude",
@@ -1117,13 +1116,8 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when the runbook targets bins/eliot under #11",
         },
-        ConsumerEntry {
-            consumer: "Claude Code operator guide",
-            proof: "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
-            live_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the guide documents the agent-bridge front door under #13",
-        },
+        // #1858 W6: both operator-guide rows migrated to MIGRATED_CONSUMER_EDGES
+        // (guides name only the bridge since 1858-O4-001).
         ConsumerEntry {
             consumer: "Claude plugin operator README",
             proof: "integrations/claude/eliot/README.md",
@@ -1328,6 +1322,14 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         evidence: "tracked MCPB manifest server.mcp_config declares exactly the bridge argv the guide now documents",
     },
     MigratedConsumerEdge {
+        consumer: "Claude Desktop operator guide launch block",
+        proof: "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
+        legacy_reference: "server/eliot-governor.exe mcp stdio",
+        current_owner_reference: "server/eliot-agent-bridge.exe mcp --profile SPINE_FUNCTIONAL",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "issue #1858 W6 (1858-O4-001): the guide launch block now commands server/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration server/agent-bridge/client-declaration-v2.json), matching the tracked MCPB manifest integrations/claude/claude-desktop/mcpb/manifest.json:19-30; lifecycle install/activate/doctor lines stay governor-owned because the bridge exposes no host subcommand",
+    },
+    MigratedConsumerEdge {
         consumer: "Claude Desktop package build instructions",
         proof: "integrations/claude/claude-desktop/README.md",
         legacy_reference: "cargo build --release -p eliot-app",
@@ -1359,6 +1361,14 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge (Desktop MCPB server)",
         evidence: "021 packager swap stages server/eliot-agent-bridge.exe and renders the manifest from bridge mcp catalog --host claude --surface desktop (bins/eliot-agent-bridge/src/packager_catalog.rs::render_mcp_catalog over eliot_mcp::tools_list_result); the tracked manifest entry server/eliot-agent-bridge.exe matches the staged path",
     },
+    MigratedConsumerEdge {
+        consumer: "Claude Code operator guide server bullet",
+        proof: "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
+        legacy_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+        current_owner_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "issue #1858 W6 (1858-O4-001): the tracked-config bullet now commands ${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration), matching the tracked host config integrations/claude/eliot/.mcp.json:5-13; lifecycle $governor host lines stay governor-owned because the bridge exposes no host subcommand",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -1375,6 +1385,7 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "integrations/codex/marketplace.json" => Some(CODEX_MARKETPLACE),
         "plugin/eliot-governor/.codex-plugin/plugin.json" => Some(CODEX_PLUGIN_METADATA),
         "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md" => Some(CLAUDE_DESKTOP_GUIDE),
+        "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md" => Some(CLAUDE_CODE_PLUGIN_GUIDE),
         "integrations/claude/claude-desktop/README.md" => Some(CLAUDE_DESKTOP_README),
         "integrations/claude/claude-desktop/mcpb/README.md" => Some(CLAUDE_DESKTOP_MCPB_README),
         _ => None,

@@ -82,8 +82,10 @@ impl InstallationActivationApproval {
 
     /// Constructs the private registry approval after an independent signed
     /// authority verifier has authenticated every field.  The constructor is
-    /// crate-visible so the signed-activation bridge remains the sole
-    /// production path; external callers cannot manufacture this value.
+    /// crate-visible so the signed-activation bridge and the
+    /// preparation-allocated destination path
+    /// ([`Self::from_preparation_parts`]) remain the only production issuers;
+    /// external callers cannot manufacture this value.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_verified_parts(
         approval_ref: PlatformHandle,
@@ -113,6 +115,65 @@ impl InstallationActivationApproval {
             authority_generation,
             authority_state_fence,
         }
+    }
+
+    /// Constructs the registry approval for a preparation-allocated isolated
+    /// destination (issue #958, A2).
+    ///
+    /// This is the SECOND legitimate in-crate issuer besides the signed
+    /// activation bridge, and it is explicit rather than silent: the caller is
+    /// the installation authority's own prepared-destination admission, gated by
+    /// the live exclusive [`HostOwnerEpochCapability`] every registry mutation
+    /// requires, and every field binds preparation-observed owner evidence
+    /// rather than installer-transaction evidence:
+    ///
+    /// - `approval_ref` and `transaction_id` are the preparation operation
+    ///   identity (the admitted canonical request hash), so a repeated request
+    ///   for the same operation reproduces the same approval;
+    /// - `plan_digest` is the digest of the admitted preparation record (the
+    ///   effect plan preparation executes), not an installer plan digest;
+    /// - `generation`, `candidate_manifest_digest`, `runtime_descriptor_digest`,
+    ///   `signature_ref`, the authority descriptor path and the allocation
+    ///   fence/generation are read off the destination manifest this same
+    ///   admission built, so the approval binds that exact manifest through the
+    ///   crate's existing binding validator;
+    /// - the authority descriptor digest is the Phase-B pending marker: no
+    ///   authority descriptor bytes are published for the destination yet, and
+    ///   the cutover child publishes them before activation.
+    ///
+    /// The row this approval lands in is never active and never
+    /// last-known-good: allocation is not activation, and the source row stays
+    /// the active one until a separately admitted cutover moves it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_preparation_parts(
+        operation_id: PlatformHandle,
+        plan_digest: PlatformHandle,
+        manifest: &crate::CandidateManifest,
+        required_owner: PlatformHandle,
+        authority_generation: ResourceGeneration,
+        authority_state_fence: StateFence,
+    ) -> Result<Self, InstallationError> {
+        let manifest_digest =
+            manifest
+                .compute_digest()
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "preparation_approval.candidate_manifest_digest".to_owned(),
+                    reason: error.to_string(),
+                })?;
+        Ok(Self::from_verified_parts(
+            operation_id.clone(),
+            operation_id,
+            plan_digest,
+            manifest.generation.clone(),
+            manifest_digest,
+            manifest.runtime_launch.descriptor_digest.clone(),
+            required_owner,
+            manifest.signature_ref.clone(),
+            manifest.runtime_launch.authority_descriptor_path.clone(),
+            manifest.runtime_launch.authority_descriptor_digest.clone(),
+            authority_generation,
+            authority_state_fence,
+        ))
     }
 
     /// Validates the approval's self-contained typed binding.

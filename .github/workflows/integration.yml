@@ -331,6 +331,7 @@ jobs:
           # Runner loss, forced cancellation, or job timeout can prevent this
           # finalizer from completing: a missing or partial receipt stays
           # unknown/reconciliation-required and never reads as clean.
+          $workflowDigest = ((Get-FileHash -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.github/workflows/integration.yml') -Algorithm SHA256).Hash).ToLowerInvariant()
           $manifest = @(
             'workflow=Manual Windows Integration Workflow',
             ('admitted_source_sha={0}' -f '${{ inputs.admitted_source_sha }}'),
@@ -340,7 +341,10 @@ jobs:
             ('inventory={0}' -f $env:INVENTORY_RESULT),
             ('validate={0}' -f $env:VALIDATE_RESULT),
             ('run={0}' -f $env:RUN_RESULT),
-            ('runner_os={0}' -f $env:RUNNER_OS)
+            ('runner_os={0}' -f $env:RUNNER_OS),
+            ('workflow_digest={0}' -f $workflowDigest),
+            'mandatory_denominator=inventory,validate,run',
+            'proof_ceiling=manual structural integration run only'
           ) -join "`n"
           $redacted = Get-IntegrationHarnessRedactedText -Text $manifest -MaxBytes 65536
           $receiptPath = Join-Path $env:GITHUB_WORKSPACE '.eliot/evidence-receipt.txt'

@@ -148,7 +148,12 @@ function Get-EntrypointCommandResolution([string]$Command) {
     }
 }
 
-function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceCommit, [string]$BundleRoot, [object]$FrontDoorBridge) {
+function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceCommit, [string]$BundleRoot, [object]$FrontDoorBridge, [string]$InstallRoot = '') {
+    # $InstallRoot (issue #1858 W0, optional, backward compatible): when it
+    # names a directory carrying installed host configs, the host surfaces
+    # below resolve command+argv+declaration from those INSTALLED bytes
+    # (basis INSTALLED_BYTES) instead of the source template (basis
+    # SOURCE_DECLARED). Callers passing four arguments see no behavior change.
     if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
         throw 'entrypoint inventory requires the repository root'
     }
@@ -200,14 +205,40 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     # time. This function reads the source template, not the installed plugin
     # root, so the command is recorded as an unresolved template input rather than
     # an observed installed command.
-    $claudeResolution = Get-EntrypointCommandResolution ([string]$claudeServer.command)
+    # Issue #1858 W0: prefer the INSTALLED plugin config when an install
+    # root is supplied. An installed config carries the marker expanded to a
+    # literal bridge path plus an installation-owned absolute declaration
+    # path; only then is the command an observed installed command.
+    $claudeInstalled = Get-InstalledConsumerBytes $InstallRoot 'integrations/claude/eliot/.mcp.json'
+    $claudeEffectiveCommand = [string]$claudeServer.command
+    $claudeEffectiveArgs = @($claudeArgs)
+    $claudeDeclarationPresent = $false
+    if ($null -ne $claudeInstalled) {
+        $claudeInstalledJson = Convert-ConsumerJson $claudeInstalled.text 'installed integrations/claude/eliot/.mcp.json'
+        $claudeInstalledServer = $claudeInstalledJson.mcpServers.eliot
+        $claudeEffectiveCommand = [string]$claudeInstalledServer.command
+        $claudeEffectiveArgs = @($claudeInstalledServer.args)
+        if ([System.IO.Path]::GetFileName($claudeEffectiveCommand) -cne 'eliot-agent-bridge.exe') {
+            throw 'installed Claude Code MCP server command does not name the canonical Bridge binary: integrations/claude/eliot/.mcp.json'
+        }
+        if (($claudeEffectiveArgs[0..5] -join [char]0) -cne ($claudeExpectedArgs[0..5] -join [char]0)) {
+            throw 'installed Claude Code MCP server argv drifted from the canonical Bridge argv: integrations/claude/eliot/.mcp.json'
+        }
+        if ($claudeEffectiveArgs.Count -lt 7 -or -not [System.IO.Path]::IsPathRooted([string]$claudeEffectiveArgs[6])) {
+            throw 'installed Claude Code MCP server names no absolute installation-owned client declaration: integrations/claude/eliot/.mcp.json'
+        }
+        $claudeDeclarationPresent = Test-Path -LiteralPath ([string]$claudeEffectiveArgs[6]) -PathType Leaf
+    }
+    $claudeResolution = Get-EntrypointCommandResolution $claudeEffectiveCommand
     $claudeBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches ${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned declaration>); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
         entrypoint = 'Claude Code MCP stdio profile SPINE_FUNCTIONAL'
         cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/claude/eliot/.mcp.json'
         packaged_config = $null
-        inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the Claude plugin install, not the Windows bundle. This is a SOURCE TEMPLATE, not the installed plugin root.'
+        inventory_basis = if ($null -ne $claudeInstalled) { 'INSTALLED_BYTES: command, argv and declaration resolved from the installed plugin config verified against the install receipt; sha256/bytes are the installed bytes.' } else { 'SOURCE_DECLARED: working-tree bytes verified identical to the pinned source blob; this launch config ships with the Claude plugin install, not the Windows bundle. This is a SOURCE TEMPLATE, not the installed plugin root.' }
+        installed_config_sha256 = if ($null -ne $claudeInstalled) { [string]$claudeInstalled.sha256 } else { $null }
+        installed_declaration_present = [bool]$claudeDeclarationPresent
         source_sha256 = [string]$claudeMcp.sha256
         source_bytes = [int64]$claudeMcp.bytes
         staged_sha256 = $null
@@ -215,8 +246,8 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         command_resolution_state = [string]$claudeResolution.state
         command_resolution_detail = [string]$claudeResolution.detail
         installed_command_observed = ([string]$claudeResolution.state -eq 'LITERAL')
-        command = [string]$claudeServer.command
-        args = @($claudeArgs)
+        command = $claudeEffectiveCommand
+        args = @($claudeEffectiveArgs)
         configured_environment = Get-EnvMember $claudeServer
         effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process; never gates behavior)'
         behavior = $claudeBehavior
@@ -276,19 +307,47 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     if (($desktopArgs -join "`0") -cne ($desktopExpectedArgs -join "`0")) {
         throw 'Claude Desktop MCP server argv drifted from the inventoried bytes: integrations/claude/claude-desktop/mcpb/manifest.json'
     }
+    # Issue #1858 W0: prefer the INSTALLED MCPB server config (same contract
+    # as the Claude Code surface above).
+    $desktopInstalled = Get-InstalledConsumerBytes $InstallRoot 'integrations/claude/claude-desktop/mcpb/manifest.json'
+    $desktopEffectiveCommand = [string]$desktopConfig.command
+    $desktopEffectiveArgs = @($desktopArgs)
+    $desktopDeclarationPresent = $false
+    if ($null -ne $desktopInstalled) {
+        $desktopInstalledJson = Convert-ConsumerJson $desktopInstalled.text 'installed integrations/claude/claude-desktop/mcpb/manifest.json'
+        $desktopInstalledConfig = $desktopInstalledJson.server.mcp_config
+        $desktopEffectiveCommand = [string]$desktopInstalledConfig.command
+        $desktopEffectiveArgs = @($desktopInstalledConfig.args)
+        if ([System.IO.Path]::GetFileName($desktopEffectiveCommand) -cne 'eliot-agent-bridge.exe') {
+            throw 'installed Claude Desktop MCP server command does not name the canonical Bridge binary: integrations/claude/claude-desktop/mcpb/manifest.json'
+        }
+        if (($desktopEffectiveArgs[0..5] -join [char]0) -cne ($desktopExpectedArgs[0..5] -join [char]0)) {
+            throw 'installed Claude Desktop MCP server argv drifted from the canonical Bridge argv: integrations/claude/claude-desktop/mcpb/manifest.json'
+        }
+        if ($desktopEffectiveArgs.Count -lt 7 -or -not [System.IO.Path]::IsPathRooted([string]$desktopEffectiveArgs[6])) {
+            throw 'installed Claude Desktop MCP server names no absolute installation-owned client declaration: integrations/claude/claude-desktop/mcpb/manifest.json'
+        }
+        $desktopDeclarationPresent = Test-Path -LiteralPath ([string]$desktopEffectiveArgs[6]) -PathType Leaf
+    }
+    $desktopResolution = Get-EntrypointCommandResolution $desktopEffectiveCommand
     $desktopBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches ${__dirname}/server/eliot-agent-bridge.exe with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned declaration>); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
         entrypoint = 'Claude Desktop MCP stdio profile SPINE_FUNCTIONAL'
         cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/claude/claude-desktop/mcpb/manifest.json'
         packaged_config = $null
-        inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; the MCPB server entry ships through MCPB packaging, not the Windows bundle.'
+        inventory_basis = if ($null -ne $desktopInstalled) { 'INSTALLED_BYTES: command, argv and declaration resolved from the installed MCPB server config; sha256/bytes are the installed bytes.' } else { 'SOURCE_DECLARED: working-tree bytes verified identical to the pinned source blob; the MCPB server entry ships through MCPB packaging, not the Windows bundle.' }
+        command_resolution_state = [string]$desktopResolution.state
+        command_resolution_detail = [string]$desktopResolution.detail
+        installed_command_observed = ([string]$desktopResolution.state -eq 'LITERAL')
+        installed_config_sha256 = if ($null -ne $desktopInstalled) { [string]$desktopInstalled.sha256 } else { $null }
+        installed_declaration_present = [bool]$desktopDeclarationPresent
         source_sha256 = [string]$desktop.sha256
         source_bytes = [int64]$desktop.bytes
         staged_sha256 = $null
         staged_bytes = $null
-        command = [string]$desktopConfig.command
-        args = @($desktopArgs)
+        command = $desktopEffectiveCommand
+        args = @($desktopEffectiveArgs)
         configured_environment = Get-EnvMember $desktopConfig
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
         behavior = $desktopBehavior
@@ -306,9 +365,40 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     # environment marker. Nothing here reads the merged user config or the
     # environment, so the marker is recorded as an unresolved template input and
     # the surface is NOT reported as an observed installed disposition.
-    $opencodeResolution = Get-EntrypointCommandResolution ([string]$opencodeCommand[0])
-    $declarationArg = @($opencodeCommand | Where-Object { [string]$_ -match 'client-declaration' })
-    $declarationValue = if ($declarationArg.Count -gt 0) { [string]$opencodeCommand[$opencodeCommand.Count - 1] } else { $null }
+    # Issue #1858 W0: prefer the INSTALLED (merged user) OpenCode config and
+    # resolve its {env:NAME} markers against the host lifecycle environment.
+    $opencodeInstalled = Get-InstalledConsumerBytes $InstallRoot 'integrations/opencode/opencode.json'
+    $opencodeEffectiveCommand = @($opencodeCommand)
+    $opencodeDeclarationPresent = $false
+    if ($null -ne $opencodeInstalled) {
+        $opencodeInstalledJson = Convert-ConsumerJson $opencodeInstalled.text 'installed integrations/opencode/opencode.json'
+        $opencodeEffectiveCommand = @($opencodeInstalledJson.mcp.eliot.command)
+        for ($opencodeTokenIndex = 0; $opencodeTokenIndex -lt $opencodeEffectiveCommand.Count; $opencodeTokenIndex++) {
+            $opencodeToken = [string]$opencodeEffectiveCommand[$opencodeTokenIndex]
+            if ($opencodeToken -cmatch '^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$') {
+                $opencodeEnvValue = [System.Environment]::GetEnvironmentVariable($Matches[1])
+                if (-not [string]::IsNullOrWhiteSpace($opencodeEnvValue)) {
+                    $opencodeEffectiveCommand[$opencodeTokenIndex] = $opencodeEnvValue
+                }
+            }
+        }
+        $opencodeEffectiveFirst = [string]$opencodeEffectiveCommand[0]
+        if ($opencodeEffectiveFirst -cnotmatch '[\$%\{]') {
+            if ([System.IO.Path]::GetFileName($opencodeEffectiveFirst) -cne 'eliot-agent-bridge.exe') {
+                throw 'installed OpenCode MCP server command does not name the canonical Bridge binary: integrations/opencode/opencode.json'
+            }
+            if (($opencodeEffectiveCommand[1..5] -join [char]0) -cne ($opencodeExpected[1..5] -join [char]0)) {
+                throw 'installed OpenCode MCP server argv drifted from the canonical Bridge argv: integrations/opencode/opencode.json'
+            }
+        }
+        $opencodeEffectiveLast = [string]$opencodeEffectiveCommand[$opencodeEffectiveCommand.Count - 1]
+        if ([System.IO.Path]::IsPathRooted($opencodeEffectiveLast)) {
+            $opencodeDeclarationPresent = Test-Path -LiteralPath $opencodeEffectiveLast -PathType Leaf
+        }
+    }
+    $opencodeResolution = Get-EntrypointCommandResolution ([string]$opencodeEffectiveCommand[0])
+    $declarationArg = @($opencodeEffectiveCommand | Where-Object { [string]$_ -match 'client-declaration' })
+    $declarationValue = if ($declarationArg.Count -gt 0) { [string]$opencodeEffectiveCommand[$opencodeEffectiveCommand.Count - 1] } else { $null }
     $declarationResolution = Get-EntrypointCommandResolution $declarationValue
     $opencodeBehavior = 'Stages the canonical Bridge command directly (AUD2 limb 1): launches the installation-owned Bridge executable resolved through {env:ELIOT_AGENT_BRIDGE_EXE} with the canonical MCP argv (mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration {env:ELIOT_AGENT_BRIDGE_DECLARATION}); the Bridge re-validates the installation-owned client declaration before serving the admitted SPINE_FUNCTIONAL contour through the Kernel front door. No Governor, Store, WAL, or writer object is constructed on this path; no ambient operator flag is consulted. ' + $bridgeEvidence
     $consumers += [ordered]@{
@@ -316,19 +406,21 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
         cutover_limb = 'limb-1-bridge-command'
         source_config = 'integrations/opencode/opencode.json'
         packaged_config = $null
-        inventory_basis = 'PINNED_SOURCE_BYTES: working-tree bytes verified identical to the pinned source blob; this launch config ships with the OpenCode host install, not the Windows bundle. This is a SOURCE TEMPLATE, not the merged installed user configuration.'
+        inventory_basis = if ($null -ne $opencodeInstalled) { 'INSTALLED_BYTES: command, argv, environment resolution and declaration resolved from the installed merged user config; sha256/bytes are the installed bytes.' } else { 'SOURCE_DECLARED: working-tree bytes verified identical to the pinned source blob; this launch config ships with the OpenCode host install, not the Windows bundle. This is a SOURCE TEMPLATE, not the merged installed user configuration.' }
         source_sha256 = [string]$opencode.sha256
         source_bytes = [int64]$opencode.bytes
         staged_sha256 = $null
         staged_bytes = $null
-        command = [string]$opencodeCommand[0]
+        command = [string]$opencodeEffectiveCommand[0]
         command_resolution_state = [string]$opencodeResolution.state
         command_resolution_detail = [string]$opencodeResolution.detail
         client_declaration = $declarationValue
         client_declaration_resolution_state = [string]$declarationResolution.state
         client_declaration_resolution_detail = [string]$declarationResolution.detail
         installed_command_observed = ($opencodeResolution.state -eq 'LITERAL' -and $declarationResolution.state -eq 'LITERAL')
-        args = @($opencodeCommand | Select-Object -Skip 1)
+        args = @($opencodeEffectiveCommand | Select-Object -Skip 1)
+        installed_config_sha256 = if ($null -ne $opencodeInstalled) { [string]$opencodeInstalled.sha256 } else { $null }
+        installed_declaration_present = [bool]$opencodeDeclarationPresent
         configured_environment = 'No MCP env member in the tracked template; the template resolves the Bridge executable through ELIOT_AGENT_BRIDGE_EXE and the client declaration through ELIOT_AGENT_BRIDGE_DECLARATION. Neither variable is read, resolved or digest-checked here.'
         effective_cutover_value = 'NOT_OBSERVED (never gates behavior)'
         behavior = $opencodeBehavior
@@ -564,6 +656,70 @@ function Get-LegacyEntrypointDispositions([string]$RepoRoot, [string]$SourceComm
     return $dispositions
 }
 
+function Get-InstalledConsumerBytes([string]$InstallRoot, [string]$RelativePath) {
+    # Issue #1858 W0/AUD2/AUD5: read the INSTALLED host configuration instead
+    # of the source template. Returns $null when no install root is supplied
+    # or the installed file is absent (the caller keeps the pinned source
+    # row, re-based as SOURCE_DECLARED). An installed file that cannot be
+    # read is reported as absent, never thrown: the inventory reports install
+    # truth, it does not fail on a broken install.
+    if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+        return $null
+    }
+    $full = Join-Path $InstallRoot ([string]$RelativePath)
+    $file = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+    if ($null -eq $file -or -not ($file -is [System.IO.FileInfo])) {
+        return $null
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+    }
+    catch {
+        return $null
+    }
+    $sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    return [ordered]@{
+        relative_path = [string]$RelativePath
+        installed_full_path = [string]$file.FullName
+        installed = $true
+        sha256 = [string]$sha256
+        bytes = [int64]$bytes.Length
+        text = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
+    }
+}
+
+function Get-EntrypointReadbackClass([string]$EntryCommand, [object]$HookCommands, [string]$Stdout, [string]$Stderr, [int]$ExitCode, [bool]$CanonicalRouteObserved, [bool]$IsBridgeEntry) {
+    # Issue #1858 A1/AUD6: typed readback classes replacing the single
+    # $cutoverCode oracle. Pure decision: no process, no install, no manifest.
+    $hooks = @($HookCommands | Where-Object { $null -ne $_ })
+    if ($hooks.Count -ne 0) {
+        return 'hook'
+    }
+    if ([string]::IsNullOrWhiteSpace($EntryCommand)) {
+        return 'evidence_only'
+    }
+    if ($EntryCommand -match '[\$%\{]') {
+        return 'hook'
+    }
+    $streams = [string]$Stdout + "`n" + [string]$Stderr
+    if ($streams -cnotmatch 'LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER') {
+        # Bridge-served evidence, kernel-free: the catalog contour names the
+        # canonical tools (eliot.state), the hook intake emits the exact
+        # per-event decision schema ("continue").
+        if ($IsBridgeEntry -and $ExitCode -eq 0 -and ($streams -cmatch 'eliot\.state' -or $streams -cmatch '"continue"')) {
+            return 'direct_canonical_bridge'
+        }
+        return 'unmatched'
+    }
+    if ($ExitCode -eq 1 -and [string]$Stderr -cmatch '(?m)^status=REDIRECT' -and [string]$Stdout -cmatch '(?m)^status=ERROR') {
+        return 'legacy_redirect'
+    }
+    if ($ExitCode -eq 1 -and [bool]$CanonicalRouteObserved) {
+        return 'legacy_reject'
+    }
+    return 'unmatched'
+}
+
 function Invoke-InstalledEntrypointReadback {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -605,13 +761,16 @@ function Invoke-InstalledEntrypointReadback {
             canonical_route_observed = $false
         }
         $hookCommands = @($launch.hook_commands | Where-Object { $null -ne $_ })
+        $record.readback_class = $null
         if ($hookCommands.Count -ne 0) {
             $record.detail = 'hook commands resolve host-install variables at host install time; bundle readback cannot invoke them without the host install. Invoke each staged hook command on the host and match the cutover code plus canonical-route receipt.'
+            $record.readback_class = 'hook'
             $results += $record
             continue
         }
         if ($null -eq $launch.command) {
             $record.detail = 'this disposition carries no invocable command (evidence or registration record); nothing to invoke.'
+            $record.readback_class = 'evidence_only'
             $results += $record
             continue
         }
@@ -625,6 +784,7 @@ function Invoke-InstalledEntrypointReadback {
                 $exePath = Join-Path (Join-Path $resolved $packagedDir) $command
             }
         }
+        $record.readback_class = Get-EntrypointReadbackClass $command $null '' '' 0 $false (($command -match 'eliot-agent-bridge\.exe'))
         if ($null -eq $exePath -or -not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
             if ([string]::IsNullOrWhiteSpace($command) -or ($command -match '[\$%\{]')) {
                 $record.detail = "installed command is anchored at a host-install variable ($command); bundle readback cannot resolve it without the host install. Invoke it on the host and match the cutover code plus canonical-route receipt."
@@ -663,13 +823,14 @@ function Invoke-InstalledEntrypointReadback {
                 $record.stderr_sha256 = [string](Get-StringSha256 $stderr)
                 $record.cutover_code_observed = ($stdout + "`n" + $stderr) -cmatch $cutoverCode
                 $record.canonical_route_observed = ($stdout + "`n" + $stderr) -cmatch 'canonical_route'
-                if ($record.cutover_code_observed -and $record.canonical_route_observed) {
+                $record.readback_class = Get-EntrypointReadbackClass $command $null $stdout $stderr $process.ExitCode $record.canonical_route_observed (($command -match 'eliot-agent-bridge\.exe'))
+                if ($record.readback_class -in @('legacy_reject', 'legacy_redirect', 'direct_canonical_bridge')) {
                     $record.status = 'PASS'
-                    $record.detail = 'installed invocation returned the stable cutover code plus the canonical-route receipt.'
+                    $record.detail = "installed invocation typed as $($record.readback_class): legacy_reject/legacy_redirect carry the stable cutover code plus the canonical-route receipt; direct_canonical_bridge serves the admitted canonical surface."
                 }
                 else {
                     $record.status = 'FAIL'
-                    $record.detail = 'installed invocation completed without the stable cutover code plus canonical-route receipt.'
+                    $record.detail = "installed invocation completed without an admitted typed outcome (class $($record.readback_class)): no stable cutover code plus canonical-route receipt, and no served canonical surface."
                 }
             }
             catch {
@@ -689,7 +850,7 @@ function Invoke-InstalledEntrypointReadback {
         schema = 'eliot-installed-entrypoint-readback-v1'
         install_root = [string]$resolved
         cutover_code = [string]$cutoverCode
-        proof_ceiling = 'installed-Windows invocation with stdout/stderr capture and receipt match; hook and host-variable-anchored commands require the host install and stay NOT_PERFORMED here'
+        proof_ceiling = 'installed-Windows invocation with stdout/stderr capture and typed readback_class per record (legacy_reject/legacy_redirect/direct_canonical_bridge PASS on their admitted evidence; hook/evidence_only stay NOT_PERFORMED by design and are classes, not placeholders; unmatched FAILs). A full live-install handshake stays TEST-PHASE work.'
         results = @($results)
     }
     if (-not [string]::IsNullOrWhiteSpace($SnapshotPath)) {

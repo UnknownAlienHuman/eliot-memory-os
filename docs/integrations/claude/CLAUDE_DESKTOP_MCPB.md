@@ -8,8 +8,7 @@ server/eliot-agent-bridge.exe mcp --profile SPINE_FUNCTIONAL --transport stdio -
 ```
 
 The package contains no database, password, provider credential, runtime token,
-project data, or Claude Code hooks. It connects to the same Governor authority as
-the Code plugin.
+project data, or Claude Code hooks. It serves the admitted SPINE_FUNCTIONAL contour through the Kernel front door with no Governor, Store, WAL, or writer objects; the client declaration is installation-owned.
 
 ## Build and validate
 

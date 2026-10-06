@@ -552,6 +552,127 @@ function Test-HarnessCase6 {
     $missing = Join-Path $script:RepoRoot 'SELFTEST-harness-missing-inventory-907-6.json'
     Test-HarnessSeamRejects $Failures '6-missing-inventory-rejected' { & $seam.Name -InventoryPath $missing }
     Test-HarnessSeamRejects $Failures '6-empty-inventory-path-rejected' { & $seam.Name -InventoryPath '' }
+    # PROVIDER ARGUMENTS THREADED FROM THE GROUP ROW, observed rather than
+    # asserted from field names (norm:
+    # docs/architecture/I18-32-stateful-test-environments.md:30 - "stateful
+    # isolation is observed, not asserted by a synthetic report").
+    # Invoke-IntegrationHarnessProviderOperation
+    # (scripts/integration/IntegrationHarness.Core.psm1:253-257) invokes each
+    # provider op with a context carrying `.binding` and `.arguments`, and the
+    # Run path threads the group row into those arguments
+    # (scripts/integration/IntegrationHarness.Core.psm1:3940: groupKey,
+    # testCount, providerClass, targetClass, isolationClass, resetClass,
+    # serializationClass). The Plan op below CAPTURES those arguments instead of
+    # returning a shape: a route that never threaded the row would leave the
+    # capture table empty and the threaded asserts below would fail.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case6-arguments-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the receipt gate instead of the missing-provider branch.
+        $seen = @{}
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = {
+                param($c)
+                $seen['planArgs'] = $c.arguments
+                return @{}
+            }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # The same admitted prebuilt receipt as the Case19 block, so the run
+        # reaches the execution contour instead of the missing-receipt branch.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only. No process is
+        # launched here - the observation is typed, never a live pid. The fixed
+        # pid is honest because the validator judges shape and run binding,
+        # never liveness.
+        $runner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424260; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+        # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+        # binding against the AMBIENT wall clock, outside Core's injected owner,
+        # so a fixed past instant would already be expired; deterministic time
+        # behavior is proven by Case24 at the Core seam, not here, and no assert
+        # below depends on a time value.
+        # WHY no entrypoint child is spawned: the temp inventory plus
+        # -CandidateRoot under the temp dir are the only inputs and no
+        # scriptblock below launches any process.
+        $threaded = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('f0' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures ([string]$seen['planArgs']['targetClass'] -ceq 't1') '6-target-threaded'
+        Assert-HarnessTrue $Failures ([string]$seen['planArgs']['providerClass'] -ceq 'STORE') '6-provider-threaded'
+        Assert-HarnessTrue $Failures `
+            (-not [string]::IsNullOrWhiteSpace([string]$seen['planArgs']['groupKey'])) '6-group-key-threaded'
+        Assert-HarnessTrue $Failures `
+            ([string]$threaded.evidence['perTestTerminal'][0].disposition -ceq 'Passed') '6-threaded-run-passes'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '6-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -588,6 +709,70 @@ function Test-HarnessCase7 {
     }
     $shellish = @($allParams | Where-Object { $_ -match '^(Shell|Executable|Argv|Command|ScriptBlock|Url|Credential|Environment|ConnectionString)' })
     Assert-HarnessTrue $Failures ($shellish.Count -eq 0) '7-no-shellish-params-on-seams'
+
+    # CLOSED OPERATIONS SET, ASSERTED AS SET MEMBERSHIP (norm:
+    # docs/architecture/I18-32-stateful-test-environments.md:27 - "test success
+    # requires both property evidence and cleanup/residue disposition", so only
+    # the closed receipt validator mints a disposition and a provider operation
+    # never does). The provider interface is EXACTLY the nine closed operations
+    # (scripts/integration/IntegrationHarness.Core.psm1:53-63). Execution is NOT
+    # one of them: it cannot be invoked through the provider table, only through
+    # the Core-owned contour Invoke-HarnessExactTestExecution
+    # (scripts/integration/IntegrationHarness.Core.psm1:3157) whose closed runner
+    # receipt the validator judges. A tenth provider-side execution op would let a
+    # provider mint verdicts, so membership is asked of the real
+    # Test-IntegrationHarnessClosedOperation
+    # (scripts/integration/IntegrationHarness.Core.psm1:129) rather than
+    # re-derived from the seam scan above.
+    $nineClosed = @(
+        'ValidateRequirement', 'Plan', 'Allocate', 'Start', 'ObserveReadiness',
+        'ResetForTest', 'CollectEvidence', 'Stop', 'VerifyCleanup'
+    )
+    $allNineTrue = $true
+    foreach ($op in $nineClosed) {
+        if (-not (Test-IntegrationHarnessClosedOperation -Operation $op)) {
+            $allNineTrue = $false
+        }
+    }
+    # ONE assert for all nine: the claim is the exact set membership, which the
+    # rejections below pin again from the other side.
+    Assert-HarnessTrue $Failures $allNineTrue '7-closed-nine'
+
+    # EXECUTION IS NOT A PROVIDER OPERATION. 'Execute' must THROW
+    # HARNESS-UNKNOWN-OPERATION, never return $true: if it were admitted as a
+    # provider op, the call would return without throwing, $thrown would stay
+    # false and the case goes red under this assert instead of being caught and
+    # passed over.
+    $executeThrown = $false
+    $executeMessage = ''
+    try { [void](Test-IntegrationHarnessClosedOperation -Operation 'Execute') }
+    catch {
+        if (Test-HarnessContractMismatch $_) { throw }
+        $executeMessage = [string]$_.Exception.Message
+        $executeThrown = $true
+    }
+    Assert-HarnessTrue $Failures `
+        ($executeThrown -and ($executeMessage -match 'HARNESS-UNKNOWN-OPERATION')) `
+        '7-execute-not-provider-op'
+
+    # Unknown words never mint a provider verdict either - the same closed
+    # membership judged by a near-miss name and by an invented one. Both must
+    # throw HARNESS-UNKNOWN-OPERATION.
+    $unknownAllThrown = $true
+    foreach ($op in @('ExecutedTest', 'EvilOp')) {
+        $thrown = $false
+        $message = ''
+        try { [void](Test-IntegrationHarnessClosedOperation -Operation $op) }
+        catch {
+            if (Test-HarnessContractMismatch $_) { throw }
+            $message = [string]$_.Exception.Message
+            $thrown = $true
+        }
+        if (-not ($thrown -and ($message -match 'HARNESS-UNKNOWN-OPERATION'))) {
+            $unknownAllThrown = $false
+        }
+    }
+    Assert-HarnessTrue $Failures $unknownAllThrown '7-unknown-op-rejected'
 }
 
 # ---------------------------------------------------------------------------
@@ -686,6 +871,181 @@ function Test-HarnessCase11 {
     if (-not $script:ModulesAvailable) { return }
     $seam = Get-HarnessSeamCommand 'WhatIf'
     Test-HarnessSeamRejects $Failures '11-empty-selection-rejected' { & $seam.Name -SelectedTestId @() }
+
+    # BEHAVIORAL PROOF of per-group provider binding, the mirror of the Case19
+    # block in this SAME file. Norm
+    # docs/architecture/I18-32-stateful-test-environments.md:29 - "parallel
+    # tests sharing a declared resource use one serial/conflict group rather
+    # than racing" - so each group is the unit of dispatch and gets its OWN
+    # binding; and norm
+    # docs/architecture/I18-32-stateful-test-environments.md:27 - "test
+    # success requires both property evidence and cleanup/residue disposition"
+    # - which is why this block asserts observed binding names, observed
+    # dispositions AND residue disposition.
+    #
+    # WHY two rows that differ in providerClass: the group key is exactly the
+    # five class fields (scripts/integration/IntegrationHarness.Core.psm1:1850-1855),
+    # so these rows form TWO groups, and the run must bind and dispatch each
+    # group under its own provider name instead of collapsing the whole run to
+    # one 'unbound-provider'. A run collapsed to one unbound provider would show
+    # a single binding name and fail the first assert below.
+    # WHY distinct row digests: Test-IntegrationHarnessSelectedSet
+    # (scripts/integration/IntegrationHarness.Model.psm1:713-717) rejects a
+    # repeated rowDigest in the selected set, so two rows need two digests.
+    # WHY a shared capture table and not $script: state: a $script: assignment
+    # does not propagate into module-invoked closures (probe-measured on #907),
+    # so the table must travel as a hashtable the closures capture and mutate.
+    # WHY $c.binding['providerName']: the run mints one immutable binding per
+    # group from the accepted row's provider class
+    # (scripts/integration/IntegrationHarness.Core.psm1:3814-3834), so the
+    # names observed by the provider op prove each group dispatched under its
+    # own binding.
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant plus 600s would already be expired and the run would
+    # die before reaching the gate. Deterministic time behavior is proven by
+    # Case24 at the Core seam, not here; here the clock only needs to admit the
+    # binding, and no assert below depends on a time value.
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under the temp dir are the only inputs and no scriptblock
+    # below launches any process.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case11-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                }, @{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test2'
+                    providerClass    = 'RUNTIME'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('e' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # Two groups = two concrete provider classes (never
+        # 'unbound-provider'), so the binding names are STORE and RUNTIME and
+        # the run reaches the receipt gate instead of the missing-provider
+        # branch.
+        $seen = @{ names = @() }
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = {
+                param($c)
+                $seen.names += [string]$c.binding['providerName']
+                return @{}
+            }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = {
+                param($c)
+                # The provider contributes nothing to the verdict: the
+                # Core-owned contour mints the closed receipt from the runner
+                # observation below.
+                return @{}
+            }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipts (#907 W7): bound BEFORE any dispatch, so
+        # both groups reach the execution contour instead of the
+        # missing-receipt branch. Each rowDigest equals its selected row's
+        # digest, and the two digests are distinct.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+            'pkg::kind::name::test2' = @{
+                testIdentity      = 'pkg::kind::name::test2'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('e' * 64)
+            }
+        }
+        # Injected execution runner: process mechanics only. No process is
+        # launched here - the observation is typed, never a live pid. The
+        # Core-owned contour mints the closed receipt from this observation;
+        # the fixed pid is honest because the validator judges shape and run
+        # binding, never liveness.
+        $runner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424261; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $multi = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('f1' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        # Order-independent: each group bound and dispatched under its OWN
+        # provider name, exactly once. Serving both groups under one binding
+        # fails this assert.
+        Assert-HarnessTrue $Failures (
+            @($seen.names | Where-Object { $_ -ceq 'STORE' }).Count -eq 1 -and
+            @($seen.names | Where-Object { $_ -ceq 'RUNTIME' }).Count -eq 1) '11-per-group-bindings'
+        $passCount = @($multi.evidence['perTestTerminal'] |
+            Where-Object { [string]$_.disposition -ceq 'Passed' }).Count
+        Assert-HarnessTrue $Failures ($passCount -eq 2) '11-two-groups-pass'
+        Assert-HarnessTrue $Failures ([string]$multi.outcome -ceq 'Complete') '11-multi-complete'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '11-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -706,6 +1066,142 @@ function Test-HarnessCase12 {
     Assert-HarnessTrue $Failures ($grouped.Count -gt 0) '12-grouping-seam-exported'
     $seam = Get-HarnessSeamCommand 'WhatIf'
     Test-HarnessSeamRejects $Failures '12-duplicate-ids-rejected' { & $seam.Name -SelectedTestId @('dup-907-12', 'dup-907-12') }
+
+    # WHAT this proves that the duplicate-SELECTION-ID assert above cannot: the
+    # assert above rejects a repeated SELECTION ID at the entrypoint/WhatIf
+    # surface. Two DISTINCT rows can still carry the SAME row digest into the
+    # Run seam, so the assert above says nothing about digest duplication.
+    # Test-IntegrationHarnessSelectedSet
+    # (scripts/integration/IntegrationHarness.Model.psm1:713-717) rejects a
+    # repeated rowDigest in the selected set, and the Run seam throws
+    # HARNESS-DUPLICATE-SELECTION before any disposition exists (probe-measured
+    # on #907: exit 1, no record minted).
+    #
+    # WHY the residue pair is part of this block (norm:
+    # docs/architecture/I18-32-stateful-test-environments.md:27 - test success
+    # requires both property evidence and cleanup/residue disposition; a
+    # duplicated selection never reaches a disposition at all, so the residue
+    # disposition of this rejection is what the pair observes).
+    #
+    # WHY the provider table and runner are supplied even though the throw
+    # precedes every provider call: -Provider and -Runner are mandatory seam
+    # parameters for the Run seam, and -PrebuiltReceipts is passed empty for the
+    # same reason - so the rejection under test is the digest one, not a
+    # missing-parameter or missing-receipt branch.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired; no assert below depends on
+    # a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs and no scriptblock
+    # below launches any process.
+    $dupRunSeam = Get-HarnessSeamCommand 'Run'
+    $dupTag = 'harness-core-case12-dup-' + [guid]::NewGuid().ToString('N')
+    $dupTmp = Join-Path ([IO.Path]::GetTempPath()) $dupTag
+    $dupResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($dupTmp)
+        $dupInv = Join-Path $dupTmp 'inventory.json'
+        # Two rows identical except testName ('test' and 'test2'), so both the
+        # identities and the selections are distinct - and the SAME rowDigest
+        # appears twice on purpose.
+        $dupInventoryDocument = @{
+            rows = @(
+                @{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                }
+                @{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test2'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                }
+            )
+        }
+        [IO.File]::WriteAllText($dupInv, ($dupInventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # The mirror provider table, exactly the Case19 shape: every op is a
+        # plain empty result except Allocate (a handle), the accepted
+        # ObserveReadiness receipt shape and a verified cleanup. No op here is
+        # expected to run - the digest rejection precedes dispatch.
+        $dupFake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Injected execution runner: process mechanics only, no process is
+        # launched. The fixed pid is honest because the validator judges shape
+        # and run binding, never liveness.
+        $dupRunner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424263; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $dupThrew = $false
+        try {
+            & $dupRunSeam.Name -SelectAllRows -InventoryPath $dupInv `
+                -Provider $dupFake -RunId ('f4' * 16) -CandidateRoot $dupTmp -TimeoutSeconds 600 `
+                -Clock ({ [DateTimeOffset]::UtcNow }.GetNewClosure()) -PrebuiltReceipts @{} -Runner $dupRunner
+            $dupThrew = $false
+        }
+        catch {
+            # An unexpected error still fails the case (the Case5 contract
+            # mismatch pattern): only DUPLICATE-SELECTION counts as the
+            # rejection under test.
+            if (Test-HarnessContractMismatch $_) { throw }
+            if ([string]$_.Exception.Message -match 'DUPLICATE-SELECTION') { $dupThrew = $true }
+        }
+        Assert-HarnessTrue $Failures $dupThrew '12-duplicate-row-digest-rejected'
+    }
+    finally {
+        if (Test-Path -LiteralPath $dupTmp) {
+            Remove-Item -LiteralPath $dupTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $dupResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '12-dup-digest-no-residue' $dupResidueBefore $dupResidueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -751,6 +1247,145 @@ function Test-HarnessCase14 {
     foreach ($raw in $script:RemovedRawParams) {
         Assert-HarnessTrue $Failures (-not $allParams.Contains($raw)) ("14-no-raw-param-{0}" -f $raw)
     }
+
+    # BEHAVIORAL PROOF THAT THE BOUND RECIPE IS WHAT GETS LAUNCHED, not another
+    # parameter-surface scan. The asserts above only prove the former raw knobs
+    # (-TestBinary / -TestName / -BinTarget / -LibTarget /
+    # -TestFilterExpression) are ABSENT from the exported surface; absence says
+    # nothing about what the contour actually hands the executor. So one
+    # in-process run of the Run seam over a single-row temp inventory captures,
+    # inside the runner Execute scriptblock, the exact contour it received:
+    # the recipe (with its contour-minted digest), the test identity and the
+    # run id. A contour that launched a raw command instead of the bound recipe
+    # would leave recipeDigest empty and fail the first assert.
+    #
+    # NORMS: docs/architecture/I18-32-stateful-test-environments.md:27 - test
+    # success requires both property evidence and cleanup/residue disposition,
+    # which is why the residue pair below is part of this block;
+    # docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md:8 - the
+    # executor receives an explicit executable/argv/env/cwd, here the exact
+    # bound recipe rather than a raw command, which is what the capture proves.
+    #
+    # WHY cross-scriptblock state is a CAPTURED HASHTABLE: the runner Execute
+    # scriptblock is invoked from inside the module, so a $script: assignment
+    # there does not propagate back into this file's scope (probe-measured on
+    # #907). A hashtable the closure captures and mutates travels with the
+    # scriptblock, so the captured values are observable here.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired. Deterministic time behavior
+    # is proven by Case24 at the Core seam, not here, and no assert below depends
+    # on a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs, the owned root is
+    # created and removed by the run itself, and no scriptblock below launches
+    # any process.
+    $exactSeamCommand = Get-HarnessSeamCommand 'Run'
+    $exactTag = 'harness-core-case14-' + [guid]::NewGuid().ToString('N')
+    $exactTmp = Join-Path ([IO.Path]::GetTempPath()) $exactTag
+    $exactResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($exactTmp)
+        $inv = Join-Path $exactTmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the execution contour instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt: bound before dispatch so the run reaches
+        # the execution contour; rowDigest equals the selected row's digest.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only. The capture happens
+        # on ENTRY, so a recipe/testIdentity/runId that was never captured stays
+        # empty and the asserts below fail. No process is launched: the
+        # observation is typed, never a live pid.
+        $seen = @{}
+        $runner = @{
+            Execute = {
+                param($c)
+                $seen['recipe'] = $c.recipe
+                $seen['testIdentity'] = $c.testIdentity
+                $seen['runId'] = [string]$c.binding['runId']
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424252; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $exactRun = & $exactSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('e9' * 16) -CandidateRoot $exactTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$seen['recipe']['recipeDigest'] -cmatch '^[0-9a-f]{64}$') '14-exact-recipe-bound'
+        Assert-HarnessTrue $Failures ($seen['testIdentity'] -ceq 'pkg::kind::name::test') '14-exact-identity-bound'
+        Assert-HarnessTrue $Failures ($seen['runId'] -ceq ('e9' * 16)) '14-exact-run-bound'
+        Assert-HarnessTrue $Failures `
+            ([string]$exactRun.evidence['perTestTerminal'][0].disposition -ceq 'Passed') '14-exact-launch-passes'
+    }
+    finally {
+        if (Test-Path -LiteralPath $exactTmp) {
+            Remove-Item -LiteralPath $exactTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $exactResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '14-no-residue' $exactResidueBefore $exactResidueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -770,6 +1405,168 @@ function Test-HarnessCase15 {
     $found = @(Get-Command -Module 'IntegrationHarness.Core', 'IntegrationHarness.Model' -CommandType Function -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match 'Receipt|Prebuilt|Toolchain' })
     Assert-HarnessTrue $Failures ($found.Count -gt 0) '15-receipt-seam-exported'
+
+    # BEHAVIORAL PROOF OF PREBUILT ADMISSION, not another source scan. The
+    # asserts above only prove the receipt CONCEPT exists on the exported
+    # surface; nothing there proves that a member without an admitted receipt
+    # is refused BEFORE anything is started or executed. Two in-process runs of
+    # the Run seam over the SAME single-row temp inventory, the SAME fake
+    # provider table and the SAME injected runner differ in exactly one thing:
+    # whether the prebuilt receipt table has the member's admitted receipt. The
+    # negative run offers an EMPTY table, so the member has no admitted receipt
+    # and the admission path
+    # (scripts/integration/IntegrationHarness.Core.psm1:4148-4156) records
+    # HARNESS-MISSING-PREBUILT-RECEIPT as InfrastructureBlocked and continues
+    # before the execution contour; the positive control offers the identical
+    # run with the admitted receipt and reaches the contour exactly once.
+    # Since the two runs differ only in admission, the execution counter is
+    # what separates "the scaffolding started something" from "the admission
+    # decided whether the execution happens".
+    #
+    # NORMS: docs/architecture/I18-32-stateful-test-environments.md:27 - test
+    # success requires both property evidence and cleanup/residue disposition,
+    # which is why the residue pair below is part of this block and not a
+    # separate concern; :28 - unknown external effect or failed cleanup
+    # quarantines the environment and opens Problem State, which is why the
+    # blocked leg must not leave an environment behind that a later run could
+    # mistake for a clean one.
+    #
+    # WHY cross-scriptblock state is a CAPTURED HASHTABLE: the runner Execute
+    # scriptblock is invoked from inside the module, so a $script: assignment
+    # there does not propagate back into this file's scope (probe-measured on
+    # #907). A hashtable the closure captures and mutates travels with the
+    # scriptblock, so the increments are observable here.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired and the run would die
+    # before reaching the admission gate. Deterministic time behavior is proven
+    # by Case24 at the Core seam, not here; here the clock only needs to admit
+    # the binding, and no assert below depends on a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs, the owned root is
+    # created and removed by the run itself, and no scriptblock below launches
+    # any process. The fixed pid is honest because the receipt validator judges
+    # shape and run binding, never liveness.
+    $admitSeamCommand = Get-HarnessSeamCommand 'Run'
+    $admitTag = 'harness-core-case15-' + [guid]::NewGuid().ToString('N')
+    $admitTmp = Join-Path ([IO.Path]::GetTempPath()) $admitTag
+    $admitResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($admitTmp)
+        $inv = Join-Path $admitTmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the admission gate instead of the missing-provider branch.
+        $startCalls = @{ n = 0 }
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) $startCalls.n++; return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Injected execution runner: process mechanics only, and the execution
+        # counter this case exists to read. The increment happens on ENTRY, so
+        # a zero count means the runner was never called at all - not that it
+        # was called and declined. No process is launched: the observation is
+        # typed, never a live pid.
+        $execCalls = @{ n = 0 }
+        $runner = @{
+            Execute = {
+                param($c)
+                $execCalls.n++
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424251; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        # NEGATIVE: identical args, empty receipt table, so the member has no
+        # admitted receipt. The admission path records
+        # HARNESS-MISSING-PREBUILT-RECEIPT and continues before the contour.
+        $blocked = & $admitSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('e7' * 16) -CandidateRoot $admitTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts @{} -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$blocked.evidence['perTestTerminal'][0].disposition -ceq 'InfrastructureBlocked') `
+            '15-no-receipt-blocked'
+        # Nothing starts or executes without the admitted receipt.
+        Assert-HarnessTrue $Failures ($execCalls.n -eq 0) '15-no-receipt-no-execution'
+        Assert-HarnessTrue $Failures ($startCalls.n -eq 0) '15-no-start-without-receipt'
+        Assert-HarnessTrue $Failures ([string]$blocked.outcome -ceq 'Failed') '15-no-receipt-fails-run'
+
+        # POSITIVE CONTROL: the identical run with the admitted receipt table -
+        # one entry keyed by the member identity, digests bound to the selected
+        # row. Only the admission differs from the blocked leg above, so a
+        # passing disposition here is the admission's doing, not the
+        # scaffolding's.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+        $admitted = & $admitSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('e8' * 16) -CandidateRoot $admitTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$admitted.evidence['perTestTerminal'][0].disposition -ceq 'Passed') `
+            '15-receipt-admits-execution'
+        Assert-HarnessTrue $Failures ($execCalls.n -eq 1) '15-receipt-executes-once'
+    }
+    finally {
+        if (Test-Path -LiteralPath $admitTmp) {
+            Remove-Item -LiteralPath $admitTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $admitResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '15-no-residue' $admitResidueBefore $admitResidueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -796,6 +1593,174 @@ function Test-HarnessCase16 {
     $sources = (Read-HarnessModuleSource $script:CoreModulePath) + "`n" + (Read-HarnessModuleSource $script:ModelModulePath)
     Assert-HarnessTrue $Failures ($sources -match '(?i)readiness') '16-readiness-literal'
     Assert-HarnessTrue $Failures ($sources -match '(?i)unknown') '16-unknown-state-literal'
+
+    # BEHAVIORAL PROOF THAT AN OBSERVED PROCESS IS NOT READINESS, not another
+    # surface scan. The asserts above only prove the former probe knob is gone
+    # and that a readiness seam is exported; nothing there shows what the run
+    # loop DOES with an observation that carries no semantic receipt. So two
+    # in-process runs of the Run seam over the SAME single-row temp inventory,
+    # the SAME admitted receipts and the SAME injected runner differ in exactly
+    # one thing: what ObserveReadiness returns. The alias run returns
+    # readyBecausePidAlive with NO semanticReceipt, which
+    # Test-IntegrationHarnessReadiness
+    # (scripts/integration/IntegrationHarness.Core.psm1:1915-1917) reads NOT
+    # READY; the observed loop (:4080-4085) then records the group as
+    # InfrastructureBlocked BEFORE any execution contour is entered. The typed
+    # control returns the accepted shape - binding-bound runId/providerRevision
+    # plus a semantic receipt - and reaches execution and passes. Only the
+    # readiness payload differs, so the execution counter and the terminal
+    # disposition are what separate "a process was observed" from "readiness was
+    # proven".
+    #
+    # NORMS: docs/architecture/I18-32-stateful-test-environments.md:27 - test
+    # success requires both property evidence and cleanup/residue disposition,
+    # which is why the residue pair below is part of this block;
+    # :30 - stateful isolation is observed, not asserted by a synthetic report,
+    # which is why the readiness verdict is read back out of the run loop rather
+    # than restated here as a report this file would then take on trust.
+    #
+    # WHY cross-scriptblock state is a CAPTURED HASHTABLE: the runner Execute
+    # scriptblock is invoked from inside the module, so a $script: assignment
+    # there does not propagate back into this file's scope (probe-measured on
+    # #907). A hashtable the closure captures and mutates travels with the
+    # scriptblock, so the execution count is observable here.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired. Deterministic time behavior
+    # is proven by Case24 at the Core seam, not here, and no assert below depends
+    # on a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs, the owned root is
+    # created and removed by the run itself, and no scriptblock below launches
+    # any process. The fixed pid is honest because the receipt validator judges
+    # shape and run binding, never liveness.
+    $readySeamCommand = Get-HarnessSeamCommand 'Run'
+    $readyTag = 'harness-core-case16-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $readyTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the readiness observation instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt: bound before dispatch so both runs below
+        # reach the execution contour instead of the missing-receipt branch.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only, and the execution
+        # counter this case exists to read. The increment happens on ENTRY, so
+        # a zero count means the runner was never called at all - not that it
+        # was called and declined. No process is launched.
+        $execCalls = @{ n = 0 }
+        $runner = @{
+            Execute = {
+                param($c)
+                $execCalls.n++
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424253; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        # NEGATIVE: identical inventory, receipts and runner - only
+        # ObserveReadiness differs. A live pid is an ALIAS, not readiness: the
+        # alias branch of Test-IntegrationHarnessReadiness reads $false before
+        # the semantic receipt is ever consulted, and the group is blocked.
+        $fakeAlias = @{}
+        foreach ($key in @($fake.Keys)) { $fakeAlias[$key] = $fake[$key] }
+        $fakeAlias['ObserveReadiness'] = {
+            param($c)
+            return @{
+                runId                = [string]$c.binding['runId']
+                providerRevision     = [string]$c.binding['providerRevision']
+                readyBecausePidAlive = $true
+            }
+        }.GetNewClosure()
+
+        $aliasRun = & $readySeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fakeAlias -RunId ('ea' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$aliasRun.evidence['perTestTerminal'][0].disposition -ceq 'InfrastructureBlocked') `
+            '16-alias-blocked'
+        Assert-HarnessTrue $Failures ($execCalls.n -eq 0) '16-alias-no-execution'
+
+        # TYPED CONTROL: the identical run whose ObserveReadiness returns the
+        # accepted shape. Only the readiness payload changed from the leg above,
+        # so a Passed disposition here is the readiness gate's doing.
+        $typedRun = & $readySeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('eb' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$typedRun.evidence['perTestTerminal'][0].disposition -ceq 'Passed') `
+            '16-typed-passes'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '16-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -817,6 +1782,178 @@ function Test-HarnessCase17 {
     $found = @(Get-Command -Module 'IntegrationHarness.Core', 'IntegrationHarness.Model' -CommandType Function -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match 'Timeout|Deadline|Readiness|Cleanup' })
     Assert-HarnessTrue $Failures ($found.Count -gt 0) '17-timeout-cleanup-seam-exported'
+
+    # BEHAVIORAL PROOF that a readiness probe which fails never runs the test,
+    # and that the same scaffolding with a passing probe does run it. Two
+    # in-process runs of the Run seam over the SAME single-row inventory, the
+    # SAME fake provider table, the SAME admitted prebuilt receipts and the
+    # SAME injected runner differ in exactly one thing: the readiness
+    # receipt's readinessProbePassed. The negative leg returns the exact shape
+    # Test-IntegrationHarnessReadiness accepts (binding-bound runId /
+    # providerRevision plus a semantic receipt carrying owner and generation
+    # from the binding) EXCEPT readinessProbePassed = $false, which that
+    # function reads NOT READY (scripts/integration/IntegrationHarness.Core.psm1:1930-1932);
+    # the observed loop (:4080-4085) then records the group as
+    # InfrastructureBlocked BEFORE any execution contour is entered. The ready
+    # control returns the identical payload with readinessProbePassed = $true
+    # and reaches execution. Only the probe verdict differs, so the terminal
+    # disposition and the execution counter are what separate "a provider was
+    # allocated and started" from "readiness was proven".
+    #
+    # NORMS: docs/architecture/I18-32-stateful-test-environments.md:27 - test
+    # success requires both property evidence and cleanup/residue disposition,
+    # which is why the residue pair below is part of this block;
+    # docs/architecture/I14-24-local-failure-containment-matrix.md:35 - the
+    # blocked group keeps the stop recipe (bounded stage, then cleanup) and the
+    # attempt evidence, so the blocked leg is asserted as a terminal
+    # disposition read back out of the run rather than as an exception or an
+    # absence of output.
+    #
+    # WHY cross-scriptblock state is a CAPTURED HASHTABLE: the runner Execute
+    # scriptblock is invoked from inside the module, so a $script: assignment
+    # there does not propagate back into this file's scope (probe-measured on
+    # #907). A hashtable the closure captures and mutates travels with the
+    # scriptblock, so the execution count is observable here. The increment
+    # happens on ENTRY, so a zero count means the runner was never called at
+    # all - not that it was called and declined.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired. Deterministic time
+    # behavior is proven by Case24 at the Core seam, not here, and no assert
+    # below depends on a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs, the owned root is
+    # created and removed by the run itself, and no scriptblock below launches
+    # any process. The fixed pid is honest because the receipt validator judges
+    # shape and run binding, never liveness.
+    $readinessSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case17-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the readiness observation instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness. The ONLY difference from the ready control
+                # below is the probe verdict itself.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $false
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt: bound before dispatch so both legs below
+        # reach the execution contour instead of the missing-receipt branch.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only, and the execution
+        # counter this block exists to read. No process is launched here - the
+        # observation is typed, never a live pid.
+        $execCalls = @{ n = 0 }
+        $runner = @{
+            Execute = {
+                param($c)
+                $execCalls.n++
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424254; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        # NOT-READY LEG: the group never becomes ready, so it never runs.
+        $notReadyRun = & $readinessSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('ec' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$notReadyRun.evidence['perTestTerminal'][0].disposition -ceq 'InfrastructureBlocked') `
+            '17-not-ready-blocked'
+        Assert-HarnessTrue $Failures ($execCalls.n -eq 0) '17-not-ready-no-execution'
+
+        # READY CONTROL: identical run, identical inventory, identical fake
+        # table, identical receipts and runner - only readinessProbePassed is
+        # $true now, so a Passed disposition here is the probe's doing.
+        $fakeReady = @{}
+        foreach ($key in @($fake.Keys)) { $fakeReady[$key] = $fake[$key] }
+        $fakeReady['ObserveReadiness'] = {
+            param($c)
+            return @{
+                runId            = [string]$c.binding['runId']
+                providerRevision = [string]$c.binding['providerRevision']
+                semanticReceipt  = @{
+                    readinessProbePassed = $true
+                    owner                = [string]$c.binding['owner']
+                    generation           = [int]$c.binding['generation']
+                }
+            }
+        }.GetNewClosure()
+
+        $readyRun = & $readinessSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fakeReady -RunId ('ed' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$readyRun.evidence['perTestTerminal'][0].disposition -ceq 'Passed') `
+            '17-ready-passes'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '17-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -835,6 +1972,184 @@ function Test-HarnessCase18 {
     foreach ($outcome in $script:TerminalOutcomes) {
         Assert-HarnessTrue $Failures ($sources -match [regex]::Escape($outcome)) ("18-outcome-literal-{0}" -f $outcome)
     }
+
+    # BEHAVIORAL PROOF of the one-disposition-per-test mapping. Two selected
+    # tests share EVERY class field, so both land in ONE group and run through
+    # ONE member loop - the shape where a verdict can be minted per group, per
+    # attempt or per execution instead of per selected test. The run must still
+    # produce exactly one terminal record per selected test: no merged record
+    # for the group, no split records for one test, no dropped member, and each
+    # record carries exactly one disposition from the closed vocabulary, here
+    # Passed for both (docs/architecture/I18-32-stateful-test-environments.md:27
+    # - success requires both property evidence and its cleanup/residue
+    # disposition).
+    #
+    # WHY the two rows keep the SAME five class fields: the group key is
+    # providerClass + isolationClass + targetClass + resetClass +
+    # serializationClass (scripts/integration/IntegrationHarness.Core.psm1
+    # :1850-1855), so identical classes with a different testName is exactly
+    # the "several tests of one group" shape whose per-test mapping is at risk.
+    #
+    # WHY the two row digests differ: Test-IntegrationHarnessSelectedSet
+    # (scripts/integration/IntegrationHarness.Model.psm1:713-717) refuses a
+    # repeated rowDigest in the selected set, so identical digests would die as
+    # HARNESS-DUPLICATE-SELECTION long before any disposition existed and the
+    # mapping below would be vacuously true.
+    #
+    # WHY in-process is safe here: no entrypoint child is spawned, the temp
+    # inventory plus a -CandidateRoot under that temp dir are the only inputs,
+    # and no scriptblock below launches any process - the statefulness is
+    # observed in the recorded per-test dispositions, never asserted from a
+    # synthetic report (docs/architecture/I18-32-stateful-test-environments.md
+    # :30).
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant plus 600s would already be expired and the run would
+    # die before the gate. Deterministic time behavior is proven by Case24 at
+    # the Core seam, not here; no assert below depends on a time value.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case18-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                }, @{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test2'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('e' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One group = one concrete provider class (never 'unbound-provider'),
+        # so the binding names STORE and the run reaches the receipt gate
+        # instead of the missing-provider branch. The provider contributes
+        # nothing to the verdict: the Core-owned contour receipt alone is judged.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # An admitted prebuilt receipt for EVERY member, each rowDigest equal to
+        # its own row's digest, so neither member reaches the missing-receipt
+        # branch and the dispositions below are produced by the validator, not
+        # by absent evidence.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+            'pkg::kind::name::test2' = @{
+                testIdentity      = 'pkg::kind::name::test2'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('e' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only. No process is
+        # launched here - the observation is typed, never a live pid. The fixed
+        # pid is honest because the validator judges shape and run binding,
+        # never liveness.
+        $runner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424255; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $result = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('ee' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() `
+            -PrebuiltReceipts $receipts -Runner $runner
+
+        # ONE record per selected test. A loop that merged the group into one
+        # record, split one test into several, or dropped a member fails here.
+        $terminal = @($result.evidence['perTestTerminal'])
+        Assert-HarnessTrue $Failures ($terminal.Count -eq 2) '18-two-terminal-records'
+
+        # Order-independent: member order inside a group is an implementation
+        # detail, so both records are checked on their own terms - exactly one
+        # disposition each, drawn from the closed vocabulary, both Passed, and
+        # two distinct identities so no two records claim the same test.
+        $oneEach = $true
+        $passedCount = 0
+        $identities = @()
+        foreach ($record in $terminal) {
+            $dispositionKeys = @(@($record.Keys) | Where-Object { [string]$_ -ceq 'disposition' })
+            if ($dispositionKeys.Count -ne 1) { $oneEach = $false; continue }
+            $disposition = [string]$record['disposition']
+            if ($script:TerminalOutcomes -cnotcontains $disposition) { $oneEach = $false; continue }
+            if ($disposition -ceq 'Passed') { $passedCount++ }
+            $identities += [string]$record['testIdentity']
+        }
+        if ($passedCount -ne 2) { $oneEach = $false }
+        if (@($identities | Sort-Object -Unique).Count -ne 2) { $oneEach = $false }
+        Assert-HarnessTrue $Failures $oneEach '18-one-disposition-each'
+
+        # Two per-test passes, one complete run: the outcome is derived from the
+        # dispositions, so it can only be Complete when neither record failed.
+        Assert-HarnessTrue $Failures ([string]$result.outcome -ceq 'Complete') '18-two-pass-complete'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '18-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -976,6 +2291,456 @@ function Test-HarnessCase19 {
     Assert-HarnessTrue $Failures ($outside -eq 0) '19-no-disposition-literal-outside-validator'
     Assert-HarnessTrue $Failures ($passedSites -eq 1) '19-exactly-one-passed-assignment-site'
 
+    # BEHAVIORAL PROOF of the admission/execution/validator chain, not another
+    # parse-tree claim. Two in-process runs of the Run seam over the SAME
+    # single-row inventory, the SAME fake provider table, the SAME admitted
+    # prebuilt receipts and the SAME injected runner differ in exactly one
+    # thing: what CollectEvidence returns. The negative run offers the legacy
+    # two-digest provider payload whose digests CONTRADICT the admitted
+    # receipt; the cross-check turns it into HarnessError. The positive control
+    # offers no provider receipt at all, and the Core-owned contour's closed
+    # runner receipt passes. Reverting the contour/validator to two-digest
+    # acceptance, or breaking the cross-check, fails the first pair of asserts.    # in-process runs of the Run seam over the SAME single-row inventory and
+    # the SAME fake provider table differ in exactly one thing: what
+    # CollectEvidence returns. The negative run hands the validator the legacy
+    # two-digest provider payload (testIdentity + binaryDigest +
+    # discoveryDigest) and nothing else; the positive control hands it a
+    # complete runner receipt bound to this run, this group, this attempt and
+    # this identity. Only the second one may pass, so reverting the validator
+    # to two-digest acceptance fails the first pair of asserts.
+    #
+    # WHY an in-process Invoke-HarnessRun with this fake table is safe here: no
+    # entrypoint child is spawned, the temp inventory plus a -CandidateRoot
+    # under that temp dir are the only inputs, the owned root is created and
+    # removed by the run itself, and no scriptblock below launches any process.
+    # The suite header's never-satisfiable-selection rule targets entrypoint
+    # children that would really execute; this block executes only fake
+    # hashtables.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # any fixed past instant plus 600s would already be expired and the run would
+    # die before reaching the gate. Deterministic time behavior is proven by
+    # Case24 at the Core seam, not here; here the clock only needs to admit the
+    # binding, and no assert below depends on a time value.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case19-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the receipt gate instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = {
+                param($c)
+                # NEGATIVE: the legacy two-digest provider payload with digests
+                # that CONTRADICT the admitted receipt below (same identity, so
+                # the HarnessError proves the digests are cross-checked, not
+                # just the identity). The contour receipt itself is well-formed,
+                # so only this contradiction can fail the run.
+                return @{
+                    executedReceipt = @{
+                        testIdentity   = 'pkg::kind::name::test'
+                        binaryDigest   = ('f' * 64)
+                        discoveryDigest = ('e' * 64)
+                    }
+                }
+            }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt (#907 W7): bound BEFORE any dispatch, so
+        # both runs below reach the execution contour instead of the
+        # missing-receipt branch. rowDigest equals the selected row's digest.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+        # Injected execution runner: process mechanics only. No process is
+        # launched here - the observation is typed, never a live pid. The
+        # Core-owned contour mints the closed receipt from this observation;
+        # the fixed pid is honest because the validator judges shape and run
+        # binding, never liveness.
+        $runner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424242; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $negative = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('e' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow } -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$negative.evidence['perTestTerminal'][0].disposition -ceq 'HarnessError') '19-legacy-receipt-no-pass'
+        Assert-HarnessTrue $Failures ([string]$negative.outcome -cne 'Complete') '19-legacy-receipt-no-complete'
+
+        # POSITIVE CONTROL: identical run, identical inventory, identical fake
+        # table, identical receipts and runner - only CollectEvidence differs,
+        # now returning no provider receipt at all. The Core-owned contour
+        # mints the closed runner receipt from the runner observation above,
+        # and the validator passes it: the provider contributes nothing to the
+        # verdict.
+        $fakePass = @{}
+        foreach ($key in @($fake.Keys)) { $fakePass[$key] = $fake[$key] }
+        $fakePass['CollectEvidence'] = { param($c) return @{} }.GetNewClosure()
+
+        $positive = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fakePass -RunId ('e' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow } -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$positive.evidence['perTestTerminal'][0].disposition -ceq 'Passed') '19-bound-receipt-passes'
+        Assert-HarnessTrue $Failures ([string]$positive.outcome -ceq 'Complete') '19-bound-receipt-completes'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '19-fake-run-no-residue' $residueBefore $residueAfter
+
+    # STAGE ORDER, observed rather than asserted from stage NAMES (norm:
+    # docs/architecture/I18-32-stateful-test-environments.md:30 - "stateful
+    # isolation is observed, not asserted by a synthetic report"). The block
+    # above proves WHAT the receipt validator accepts; this block proves WHEN
+    # the execution contour ran, by having reset, the runner and evidence
+    # collection record themselves as they are entered. Nothing here scans
+    # stage names or counts source sites: the order is an observation of a real
+    # pass through the Run seam, so a path that skipped the contour records
+    # 'reset,collect' and a path that retried it records a longer sequence.
+    #
+    # WHY a shared order table and not $script: state: a $script: assignment
+    # does not propagate into module-invoked closures (probe-measured on #907),
+    # so the table must travel as a hashtable the closures capture and mutate.
+    # WHY `+=` on the key rather than a List: the array assigned back to the
+    # shared key stays observable through the shared table reference.
+    $stages = @{ seq = @() }
+    $stageTag = 'harness-core-case19-stages-' + [guid]::NewGuid().ToString('N')
+    $stageTmp = Join-Path ([IO.Path]::GetTempPath()) $stageTag
+    $stageResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($stageTmp)
+        $stageInv = Join-Path $stageTmp 'inventory.json'
+        $stageInventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($stageInv, ($stageInventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        $stageFake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = {
+                param($c)
+                $stages.seq += 'reset'
+                return @{}
+            }.GetNewClosure()
+            CollectEvidence   = {
+                param($c)
+                $stages.seq += 'collect'
+                return @{}
+            }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # The same admitted prebuilt receipt as the block above, so the run
+        # reaches the execution contour instead of the missing-receipt branch.
+        $stageReceipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # The execution stage records itself on entry, before returning the
+        # typed observation the contour mints its closed receipt from. No
+        # process is launched: the fixed pid is honest because the validator
+        # judges shape and run binding, never liveness.
+        $stageRunner = @{
+            Execute = {
+                param($c)
+                $stages.seq += 'execute'
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424259; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+        # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+        # binding against the AMBIENT wall clock, outside Core's injected
+        # owner, so a fixed past instant would already be expired; deterministic
+        # time behavior is proven by Case24 at the Core seam, not here, and no
+        # assert below depends on a time value.
+        # WHY no entrypoint child is spawned: the temp inventory plus
+        # -CandidateRoot under the temp dir are the only inputs and no
+        # scriptblock below launches any process.
+        $staged = & $runSeamCommand.Name -SelectAllRows -InventoryPath $stageInv `
+            -Provider $stageFake -RunId ('ef' * 16) -CandidateRoot $stageTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow } -PrebuiltReceipts $stageReceipts -Runner $stageRunner
+        Assert-HarnessTrue $Failures (($stages.seq -join ',') -ceq 'reset,execute,collect') '19-stage-order'
+        Assert-HarnessTrue $Failures `
+            ([string]$staged.evidence['perTestTerminal'][0].disposition -ceq 'Passed') '19-stage-order-passes'
+    }
+    finally {
+        if (Test-Path -LiteralPath $stageTmp) {
+            Remove-Item -LiteralPath $stageTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $stageResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '19-stage-no-residue' $stageResidueBefore $stageResidueAfter
+
+    # FORGERY IMMUNITY, observed (norms:
+    # docs/architecture/I18-32-stateful-test-environments.md:27 - "test success
+    # requires both property evidence and cleanup/residue disposition" - which is
+    # why the residue pair below is part of this block and not an afterthought -
+    # and :30 - "stateful isolation is observed, not asserted by a synthetic
+    # report": the stage block above proved the ORDER of a real pass; this block
+    # proves which DIGESTS that pass may be built from, by letting a dishonest
+    # producer try to smuggle its own digests into the receipt.
+    #
+    # Leg 1 hands the contour a runner observation that already carries
+    # foreign binary/discovery digests. The receipt must still be stamped from
+    # the admitted prebuilt digests (IntegrationHarness.Core.psm1:3342-3343), so
+    # the run passes AND the terminal receipt shows the prebuilt digests. Leg 2
+    # keeps that receipt honest but has the provider contradict it; the
+    # cross-check at IntegrationHarness.Core.psm1:3463-3472 must turn that into
+    # HarnessError and fail the run. Letting observation digests reach the
+    # receipt fails 19-prebuilt-digests-win; dropping the cross-check fails
+    # 19-provider-contradiction-blocked.
+    #
+    # WHY $seen is created BEFORE the tables that capture it: closures capture
+    # only the variables that already exist when .GetNewClosure() runs, and a
+    # table built afterwards is invisible inside module-invoked closures
+    # (probe-measured on #907) - the same reason the stage block above uses a
+    # shared order table instead of $script: state.
+    $seen = @{}
+    $forgeTag = 'harness-core-case19-forge-' + [guid]::NewGuid().ToString('N')
+    $forgeTmp = Join-Path ([IO.Path]::GetTempPath()) $forgeTag
+    $forgeResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($forgeTmp)
+        $forgeInv = Join-Path $forgeTmp 'inventory.json'
+        $forgeInventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($forgeInv, ($forgeInventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # The same one-row STORE inventory shape as the blocks above, so the
+        # binding names STORE and the run reaches the receipt gate.
+        $forgeFake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # The same admitted prebuilt receipt as the blocks above.
+        $forgeReceipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # LEG 1 - FORGED OBSERVATION. The runner observation smuggles foreign
+        # digests alongside a well-formed outcome and an owned process tree. No
+        # process is launched; the fixed pid is honest because the validator
+        # judges shape and run binding, never liveness.
+        $forgeRunner = @{
+            Execute = {
+                param($c)
+                $seen['executeRunId'] = [string]$c.binding['runId']
+                return @{
+                    outcome         = 'passed'
+                    binaryDigest    = ('f' * 64)
+                    discoveryDigest = ('e' * 64)
+                    processTree     = @{ rootPid = 424262; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+        # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+        # binding against the AMBIENT wall clock, outside Core's injected owner,
+        # so a fixed past instant would already be expired; deterministic time
+        # behavior is proven by Case24 at the Core seam, not here, and no assert
+        # below depends on a time value.
+        # WHY no entrypoint child is spawned: the temp inventory plus
+        # -CandidateRoot under the temp dir are the only inputs and no
+        # scriptblock below launches any process.
+        $forged = & $runSeamCommand.Name -SelectAllRows -InventoryPath $forgeInv `
+            -Provider $forgeFake -RunId ('f2' * 16) -CandidateRoot $forgeTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() `
+            -PrebuiltReceipts $forgeReceipts -Runner $forgeRunner
+        Assert-HarnessTrue $Failures `
+            ([string]$forged.evidence['perTestTerminal'][0].disposition -ceq 'Passed') '19-forged-digests-pass'
+        # The verdict is not merely green: the terminal receipt itself carries the
+        # prebuilt digests, so the foreign ones never became evidence.
+        Assert-HarnessTrue $Failures `
+            ([string]$forged.evidence['perTestTerminal'][0].executedReceipt['binaryDigest'] -ceq ('c' * 64)) '19-prebuilt-digests-win'
+
+        # LEG 2 - CONTRADICTING PROVIDER. The identical run, whose runner
+        # observation is honest again, but whose CollectEvidence stores its input
+        # and then returns a provider copy that disagrees with the runner receipt.
+        # A provider is evidence, never the verdict: the cross-check refuses it.
+        $contraFake = @{}
+        foreach ($key in @($forgeFake.Keys)) { $contraFake[$key] = $forgeFake[$key] }
+        $contraFake['CollectEvidence'] = {
+            param($c)
+            $seen['collectRunId'] = [string]$c.binding['runId']
+            return @{
+                executedReceipt = @{
+                    testIdentity    = 'pkg::kind::name::test'
+                    binaryDigest    = ('f' * 64)
+                    discoveryDigest = ('e' * 64)
+                }
+            }
+        }.GetNewClosure()
+
+        $honestRunner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424262; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $contradiction = & $runSeamCommand.Name -SelectAllRows -InventoryPath $forgeInv `
+            -Provider $contraFake -RunId ('f3' * 16) -CandidateRoot $forgeTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() `
+            -PrebuiltReceipts $forgeReceipts -Runner $honestRunner
+        Assert-HarnessTrue $Failures `
+            ([string]$contradiction.evidence['perTestTerminal'][0].disposition -ceq 'HarnessError') '19-provider-contradiction-blocked'
+        Assert-HarnessTrue $Failures ([string]$contradiction.outcome -ceq 'Failed') '19-provider-contradiction-fails-run'
+    }
+    finally {
+        if (Test-Path -LiteralPath $forgeTmp) {
+            Remove-Item -LiteralPath $forgeTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $forgeResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '19-forge-no-residue' $forgeResidueBefore $forgeResidueAfter
+
     $seam = Get-HarnessSeamCommand 'WhatIf'
     Test-HarnessSeamRejects $Failures '19-vacuous-selection-rejected' { & $seam.Name -SelectedTestId @() }
 }
@@ -1002,6 +2767,249 @@ function Test-HarnessCase20 {
         }
     }
     Assert-HarnessTrue $Failures ($seen.Count -eq $script:TerminalOutcomes.Count) '20-all-nine-outcomes-distinct'
+
+    # DIRECT MAPPER BLOCK: the closed runner-outcome vocabulary is exercised at
+    # the mapper itself. The source scan above only proves the nine disposition
+    # NAMES occur in the module; it cannot prove that each runner token maps to
+    # the RIGHT one, nor that an unknown token is refused instead of being read
+    # as a verdict. WHY this level is the right one here: Case19 already proves
+    # the production loop routes every disposition through the validator and
+    # this same mapper, and that exactly one literal 'Passed' assignment site
+    # exists; what remained unproven is the mapping itself, so the mapping is
+    # asserted directly and exhaustively instead of re-deriving it indirectly.
+    $closedTokens = @(
+        @{ token = 'passed'; disposition = 'Passed' },
+        @{ token = 'assertion-failed'; disposition = 'AssertionFailed' },
+        @{ token = 'timed-out'; disposition = 'TimedOut' },
+        @{ token = 'process-crashed'; disposition = 'ProcessCrashed' },
+        @{ token = 'infrastructure-blocked'; disposition = 'InfrastructureBlocked' },
+        @{ token = 'unsupported-credential'; disposition = 'UnsupportedExternalCredential' },
+        @{ token = 'cancelled'; disposition = 'Cancelled' },
+        @{ token = 'harness-error'; disposition = 'HarnessError' }
+    )
+    $closedNames = @(
+        '20-map-passed', '20-map-assertion-failed', '20-map-timed-out',
+        '20-map-process-crashed', '20-map-infrastructure-blocked',
+        '20-map-unsupported-credential', '20-map-cancelled', '20-map-harness-error'
+    )
+    for ($i = 0; $i -lt $closedTokens.Count; $i++) {
+        $entry = $closedTokens[$i]
+        Assert-HarnessTrue $Failures `
+            ([string](ConvertTo-HarnessTerminalDisposition -Outcome $entry.token) -ceq $entry.disposition) `
+            $closedNames[$i]
+    }
+
+    # UNKNOWN TOKENS NEVER MINT A VERDICT. A provider (or a runner) that
+    # invents, empties or garbles an outcome word must not be able to produce
+    # Passed: every unrecognised token reads HarnessError, so an unknown word
+    # fails the run loudly instead of silently passing it. Case and whitespace
+    # tolerance is deliberate and is the ONLY laxity here: ' PASSED ' is the
+    # same closed token as 'passed'.
+    Assert-HarnessTrue $Failures `
+        ([string](ConvertTo-HarnessTerminalDisposition -Outcome '') -ceq 'HarnessError') '20-map-unknown-empty'
+    Assert-HarnessTrue $Failures `
+        ([string](ConvertTo-HarnessTerminalDisposition -Outcome '  ') -ceq 'HarnessError') '20-map-unknown-blank'
+    Assert-HarnessTrue $Failures `
+        ([string](ConvertTo-HarnessTerminalDisposition -Outcome 'bogus-outcome') -ceq 'HarnessError') '20-map-unknown-bogus'
+    Assert-HarnessTrue $Failures `
+        ([string](ConvertTo-HarnessTerminalDisposition -Outcome 'passed!') -ceq 'HarnessError') '20-map-unknown-suffix'
+    Assert-HarnessTrue $Failures `
+        ([string](ConvertTo-HarnessTerminalDisposition -Outcome ' PASSED ') -ceq 'Passed') '20-map-tolerant-case'
+
+    # END-TO-END CRASH LEG. The mapper block above proves the table; this leg
+    # proves the property the whole case exists for - a crashed child is
+    # reported as exactly ProcessCrashed, fails the run, and keeps its receipt
+    # on the record, through the REAL Run seam over the SAME single-row
+    # inventory, fake provider table, admitted prebuilt receipts and injected
+    # runner shape as the Case19 behavioral block. It differs from that block in
+    # exactly two places: the runner reports 'process-crashed' instead of
+    # 'passed', and CollectEvidence returns no provider receipt, so the
+    # Core-owned contour receipt alone is judged. CollectEvidence returning
+    # nothing is not a shortcut here - it is the isolation of the claim: the
+    # provider contributes nothing to the verdict.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired and the run would die
+    # before reaching the gate. Deterministic time behavior is proven by Case24
+    # at the Core seam, not here; here the clock only needs to admit the
+    # binding, and no assert below depends on a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs, the owned root is
+    # created and removed by the run itself, and no scriptblock below launches
+    # any process. The fixed pid is honest because the validator judges receipt
+    # shape and run binding, never liveness.
+    $crashSeamCommand = Get-HarnessSeamCommand 'Run'
+    $crashTag = 'harness-core-case20-' + [guid]::NewGuid().ToString('N')
+    $crashTmp = Join-Path ([IO.Path]::GetTempPath()) $crashTag
+    $crashResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($crashTmp)
+        $inv = Join-Path $crashTmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        $runner = @{
+            Execute = {
+                param($c)
+                # The crash leg's only difference from the Case19 positive
+                # control: the typed outcome is 'process-crashed', not 'passed'.
+                return @{
+                    outcome     = 'process-crashed'
+                    processTree = @{ rootPid = 424243; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $result = & $crashSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('e' * 32) -CandidateRoot $crashTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow } -PrebuiltReceipts $receipts -Runner $runner
+
+        Assert-HarnessTrue $Failures `
+            ([string]$result.evidence['perTestTerminal'][0].disposition -ceq 'ProcessCrashed') '20-e2e-crash-maps'
+        Assert-HarnessTrue $Failures ([string]$result.outcome -ceq 'Failed') '20-e2e-crash-fails-run'
+        # The receipt survives on the record: a crash is still property
+        # evidence (disposition) plus a disposition-carrying receipt, so the
+        # failure can be diagnosed rather than merely reported.
+        Assert-HarnessTrue $Failures `
+            ([string]$result.evidence['perTestTerminal'][0].executedReceipt['outcome'] -ceq 'process-crashed') `
+            '20-e2e-receipt-preserved'
+    $cancelInfraTag = 'harness-core-case20-cancel-infra-' + [guid]::NewGuid().ToString('N')
+    $cancelInfraTmp = Join-Path ([IO.Path]::GetTempPath()) $cancelInfraTag
+    $cancelInfraResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($cancelInfraTmp)
+        $cancelInfraInv = Join-Path $cancelInfraTmp 'inventory.json'
+        [IO.File]::WriteAllText($cancelInfraInv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # CANCELLED leg. The outcome ladder
+        # (scripts/integration/IntegrationHarness.Core.psm1:2588-2589) reports a cancelled run as
+        # 'Cancelled' - never 'Failed', never 'Complete' - so this leg asserts exactly that.
+        $cancelRunner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'cancelled'
+                    processTree = @{ rootPid = 424256; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+        $cancelled = & $crashSeamCommand.Name -SelectAllRows -InventoryPath $cancelInfraInv `
+            -Provider $fake -RunId ('ec' * 16) -CandidateRoot $cancelInfraTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow } -PrebuiltReceipts $receipts -Runner $cancelRunner
+        Assert-HarnessTrue $Failures `
+            ([string]$cancelled.evidence['perTestTerminal'][0].disposition -ceq 'Cancelled') '20-e2e-cancelled-maps'
+        Assert-HarnessTrue $Failures ([string]$cancelled.outcome -ceq 'Cancelled') '20-e2e-cancelled-cancels-run'
+        Assert-HarnessTrue $Failures `
+            ([string]$cancelled.evidence['perTestTerminal'][0].executedReceipt['outcome'] -ceq 'cancelled') `
+            '20-e2e-cancelled-receipt-preserved'
+
+        # INFRASTRUCTURE-BLOCKED leg. Same scaffolding, only the typed observation differs.
+        $infraRunner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'infrastructure-blocked'
+                    processTree = @{ rootPid = 424257; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+        $infra = & $crashSeamCommand.Name -SelectAllRows -InventoryPath $cancelInfraInv `
+            -Provider $fake -RunId ('ed' * 16) -CandidateRoot $cancelInfraTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow } -PrebuiltReceipts $receipts -Runner $infraRunner
+        Assert-HarnessTrue $Failures `
+            ([string]$infra.evidence['perTestTerminal'][0].disposition -ceq 'InfrastructureBlocked') '20-e2e-infra-maps'
+        Assert-HarnessTrue $Failures ([string]$infra.outcome -ceq 'Failed') '20-e2e-infra-fails-run'
+        Assert-HarnessTrue $Failures `
+            ([string]$infra.evidence['perTestTerminal'][0].executedReceipt['outcome'] -ceq 'infrastructure-blocked') `
+            '20-e2e-infra-receipt-preserved'
+
+        # UNSUPPORTED-CREDENTIAL leg. Same scaffolding, only the typed observation differs.
+        $credRunner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'unsupported-credential'
+                    processTree = @{ rootPid = 424258; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+        $cred = & $crashSeamCommand.Name -SelectAllRows -InventoryPath $cancelInfraInv `
+            -Provider $fake -RunId ('ee' * 16) -CandidateRoot $cancelInfraTmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow } -PrebuiltReceipts $receipts -Runner $credRunner
+        Assert-HarnessTrue $Failures `
+            ([string]$cred.evidence['perTestTerminal'][0].disposition -ceq 'UnsupportedExternalCredential') '20-e2e-cred-maps'
+        Assert-HarnessTrue $Failures ([string]$cred.outcome -ceq 'Failed') '20-e2e-cred-fails-run'
+        Assert-HarnessTrue $Failures `
+            ([string]$cred.evidence['perTestTerminal'][0].executedReceipt['outcome'] -ceq 'unsupported-credential') `
+            '20-e2e-cred-receipt-preserved'
+    }
+    finally {
+        if (Test-Path -LiteralPath $cancelInfraTmp) {
+            Remove-Item -LiteralPath $cancelInfraTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $cancelInfraResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '20-e2e-cancel-infra-no-residue' $cancelInfraResidueBefore $cancelInfraResidueAfter
+    }
+    finally {
+        if (Test-Path -LiteralPath $crashTmp) {
+            Remove-Item -LiteralPath $crashTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $crashResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '20-e2e-no-residue' $crashResidueBefore $crashResidueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +3035,145 @@ function Test-HarnessCase21 {
         }
     }
     Assert-HarnessTrue $Failures $allowed '21-no-auto-retry-token'
+
+    # BEHAVIORAL PROOF of the single-attempt rule, not another token scan. The
+    # scan above can only show that the word 'retry' is absent from the module
+    # sources; it cannot show that the production loop makes exactly ONE attempt
+    # when a test fails, which is the property this case exists for. So the Run
+    # seam is invoked once over the SAME single-row temp inventory, the SAME
+    # fake provider table, the SAME admitted prebuilt receipts and the SAME
+    # injected runner shape as the Test-HarnessCase19 behavioral block, with one
+    # difference in the runner: the typed observation is 'assertion-failed'
+    # instead of 'passed'. A loop that retried the failure would preserve a
+    # second attempt on the terminal record and fail '21-single-attempt-no-retry'
+    # below; a loop that mistook the failure for success would fail
+    # '21-failure-maps' or '21-failure-fails-run'.
+    #
+    # Norms:
+    #   docs/architecture/I18-32-stateful-test-environments.md:27 - test success
+    #     requires both property evidence AND cleanup/residue disposition, which
+    #     is why the residue snapshot brackets this block and names its verdict.
+    #   docs/architecture/I14-24-local-failure-containment-matrix.md:35 - the
+    #     stop recipe preserves attempt evidence, which is what the
+    #     exactly-one-attempt assert below reads.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired and the run would die before
+    # reaching the gate. Deterministic time behavior is proven by Case24 at the
+    # Core seam, not here; here the clock only needs to admit the binding, and
+    # no assert below depends on a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs and no scriptblock
+    # below launches any process. The fixed pid is honest because the validator
+    # judges receipt shape and run binding, never liveness.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case21-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the execution contour instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            # The Core-owned contour receipt alone is judged here: the provider
+            # contributes nothing to the verdict.
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt: bound BEFORE any dispatch, so the run
+        # reaches the execution contour instead of the missing-receipt branch.
+        # rowDigest equals the selected row's digest.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only. No process is
+        # launched here - the observation is typed, never a live pid. The one
+        # difference from the Case19 positive control is the typed outcome:
+        # 'assertion-failed' instead of 'passed'.
+        $runner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'assertion-failed'
+                    processTree = @{ rootPid = 424246; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $result = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('d' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() `
+            -PrebuiltReceipts $receipts -Runner $runner
+
+        Assert-HarnessTrue $Failures `
+            ([string]$result.evidence['perTestTerminal'][0].disposition -ceq 'AssertionFailed') '21-failure-maps'
+        Assert-HarnessTrue $Failures ([string]$result.outcome -ceq 'Failed') '21-failure-fails-run'
+        # Exactly one attempt survives on the terminal record: a second one
+        # would prove the automatic retry this case forbids.
+        Assert-HarnessTrue $Failures `
+            ($result.evidence['perTestTerminal'][0].attempts.Count -eq 1) '21-single-attempt-no-retry'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '21-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +3191,167 @@ function Test-HarnessCase22 {
     if (-not $script:ModulesAvailable) { return }
     $sources = (Read-HarnessModuleSource $script:CoreModulePath) + "`n" + (Read-HarnessModuleSource $script:ModelModulePath)
     Assert-HarnessTrue $Failures ($sources -match '(?i)attempt') '22-attempt-literal'
+
+    # BEHAVIORAL PROOF of recurrence at the Core seam, not another source-level
+    # claim. The scan above can only show that the word 'attempt' occurs in the
+    # module sources; it cannot show that a REPEATED run over the same
+    # environment observes the same explicit attempts instead of averaging them,
+    # dropping them or quietly retrying. So the Run seam is invoked TWICE over
+    # the SAME single-row temp inventory, the SAME fake provider table, the SAME
+    # admitted prebuilt receipts and the SAME injected runner shape as the
+    # Test-HarnessCase19 behavioral block, with exactly three differences: the
+    # typed runner observation is 'assertion-failed', CollectEvidence returns
+    # nothing, and the two runs carry DIFFERENT run ids ('b'*32 then 'c'*32) so
+    # no shared state can leak between them and hide a dropped attempt. A loop
+    # that averaged or discarded attempts on the repeat run fails the pair of
+    # asserts below; a loop that retried would preserve a second attempt and
+    # fail '22-recurrence-single-attempt-each'.
+    #
+    # Norms:
+    #   docs/architecture/I18-32-stateful-test-environments.md:27 - test success
+    #     requires both property evidence AND cleanup/residue disposition, which
+    #     is why the residue snapshot brackets this block and names its verdict.
+    #   docs/architecture/I18-32-stateful-test-environments.md:30 - stateful
+    #     isolation is OBSERVED, not asserted by a synthetic report: attempts are
+    #     the observed evidence, so a repeated run must observe the same attempts.
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired and the run would die before
+    # reaching the gate. Deterministic time behavior is proven by Case24 at the
+    # Core seam, not here; here the clock only needs to admit the binding, and no
+    # assert below depends on a time value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs and no scriptblock
+    # below launches any process. The fixed pid is honest because the validator
+    # judges receipt shape and run binding, never liveness.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case22-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the receipt gate instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            # The Core-owned contour receipt alone is judged here: the provider
+            # contributes nothing to the verdict.
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt (#907 W7): bound BEFORE any dispatch, so
+        # both runs below reach the execution contour instead of the
+        # missing-receipt branch. rowDigest equals the selected row's digest.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only. No process is
+        # launched here - the observation is typed, never a live pid. The typed
+        # outcome is 'assertion-failed', so both runs carry an explicit failed
+        # attempt whose preservation is the property under test.
+        $runner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'assertion-failed'
+                    processTree = @{ rootPid = 424247; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        # Otherwise identical args; only the run id differs, so nothing about
+        # the environment can be shared between the two observations.
+        $first = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('b' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() `
+            -PrebuiltReceipts $receipts -Runner $runner
+        $second = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('c' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() `
+            -PrebuiltReceipts $receipts -Runner $runner
+
+        # Same disposition on both legs of the recurrence.
+        Assert-HarnessTrue $Failures `
+            ([string]$first.evidence['perTestTerminal'][0].disposition -ceq 'AssertionFailed') `
+            '22-recurrence-same-disposition'
+        Assert-HarnessTrue $Failures `
+            ([string]$second.evidence['perTestTerminal'][0].disposition -ceq 'AssertionFailed') `
+            '22-recurrence-same-disposition'
+
+        # Exactly one preserved attempt per run: the repeat neither retries
+        # (a second attempt) nor drops what the first run observed.
+        Assert-HarnessTrue $Failures `
+            ($first.evidence['perTestTerminal'][0].attempts.Count -eq 1 -and
+            $second.evidence['perTestTerminal'][0].attempts.Count -eq 1) `
+            '22-recurrence-single-attempt-each'
+
+        # The preserved attempts agree: recurrence preserves every explicit
+        # attempt instead of averaging or discarding them.
+        Assert-HarnessTrue $Failures `
+            ([string]$first.evidence['perTestTerminal'][0].attempts[0].outcome -ceq
+            [string]$second.evidence['perTestTerminal'][0].attempts[0].outcome) `
+            '22-recurrence-same-attempt-outcome'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '22-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +3370,220 @@ function Test-HarnessCase23 {
     $sources = (Read-HarnessModuleSource $script:CoreModulePath) + "`n" + (Read-HarnessModuleSource $script:ModelModulePath)
     Assert-HarnessTrue $Failures ($sources -match 'NotExecutedDueToPriorContamination') '23-contamination-literal'
     Assert-HarnessTrue $Failures ($sources -match '(?i)reset') '23-reset-literal'
+
+    # BEHAVIORAL PROOF of the contamination fence, not another literal scan.
+    # The two source asserts above can only show the NAMES
+    # 'NotExecutedDueToPriorContamination' and reset survive in the modules;
+    # they cannot show that a failed cleanup actually quarantines the
+    # environment and opens Problem State
+    # (docs/architecture/I18-32-stateful-test-environments.md:28) with the
+    # property evidence and cleanup/residue disposition the same norm requires
+    # (docs/architecture/I18-32-stateful-test-environments.md:27). So this block
+    # runs the Run seam in process over a THREE-row inventory whose rows share
+    # the SAME five class fields, and fails the second member's reset.
+    #
+    # WHY three rows in ONE group: the group key is exactly those five class
+    # fields (scripts/integration/IntegrationHarness.Core.psm1:1850-1855), so
+    # all three rows land in one group and run through the one member loop where
+    # a contamination can fence the remainder. A one-row inventory, or three
+    # rows in three groups, has no remainder to fence and would make every
+    # assert below vacuous.
+    #
+    # WHY distinct row digests: Test-IntegrationHarnessSelectedSet
+    # (scripts/integration/IntegrationHarness.Model.psm1:713-717) rejects a
+    # repeated rowDigest in the selected set, so three identical digests would
+    # die as HARNESS-DUPLICATE-SELECTION before any disposition exists and the
+    # fence would never be observed. Distinct testName AND distinct rowDigest
+    # per row are both load-bearing.
+    #
+    # WHY a reset CALL COUNTER instead of an identity check: member order is an
+    # implementation detail, so which row is 'test2' must not decide the
+    # property. A counter makes exactly one reset succeed and the second fail
+    # whichever member it belongs to, so the remainder property holds
+    # order-independently.
+    #
+    # WHY a captured hashtable for both counters: cross-scriptblock state MUST
+    # travel as a hashtable the closures capture and mutate, never as a `$script:`
+    # variable assignment, which does not propagate into module-invoked
+    # closures (probe-measured on #907).
+    #
+    # WHY the clock is ambient here: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, outside Core's injected owner, so
+    # a fixed past instant would already be expired and the run would die before
+    # reaching the reset contour. Deterministic time behavior is proven by
+    # Case24 at the Core seam, not here, and no assert below depends on a time
+    # value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs and no scriptblock
+    # below launches any process; the fixed pid in the runner observation is
+    # honest because the validator judges shape and run binding, never liveness.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case23-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                }, @{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test2'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('e' * 64)
+                }, @{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test3'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('f' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # Reset-call counter: the first member's reset succeeds, the second
+        # fails, so exactly one member executes and the fenced remainder never
+        # reaches the runner.
+        $resetCalls = @{ n = 0 }
+
+        # Execution counter: the runner that would be dispatched per member. A
+        # loop that executed the fenced remainder would push this past 1.
+        $execCalls = @{ n = 0 }
+
+        # One group = one concrete provider class (never 'unbound-provider'),
+        # so the binding names STORE and the run reaches the reset contour
+        # instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = {
+                param($c)
+                $resetCalls.n++
+                if ($resetCalls.n -ge 2) { throw 'HARNESS-SIMULATED-RESET-FAILURE' }
+                return @{}
+            }.GetNewClosure()
+            # The provider contributes nothing to the verdict; the Core-owned
+            # contour receipt alone is judged.
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt for EVERY member, each rowDigest equal to
+        # its own row's digest, so no member reaches the missing-receipt branch
+        # and the dispositions below are produced by the fence, not by absent
+        # evidence.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+            'pkg::kind::name::test2' = @{
+                testIdentity      = 'pkg::kind::name::test2'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('e' * 64)
+            }
+            'pkg::kind::name::test3' = @{
+                testIdentity      = 'pkg::kind::name::test3'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('f' * 64)
+            }
+        }
+
+        # Injected execution runner: process mechanics only, counting entries so
+        # the "fenced remainder never executes" claim is measured rather than
+        # inferred from the disposition list alone.
+        $runner = @{
+            Execute = {
+                param($c)
+                $execCalls.n++
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424248; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $r2 = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('a' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() `
+            -PrebuiltReceipts $receipts -Runner $runner
+
+        # Exactly one member passes, exactly one is blocked by the failed reset,
+        # and exactly one is fenced as never executed - in any order, because
+        # member order is an implementation detail.
+        $terminal = @($r2.evidence['perTestTerminal'])
+        $passedCount = @($terminal | Where-Object { [string]$_.disposition -ceq 'Passed' }).Count
+        $blockedCount = @($terminal | Where-Object { [string]$_.disposition -ceq 'InfrastructureBlocked' }).Count
+        $fencedCount = @($terminal | Where-Object { [string]$_.disposition -ceq 'NotExecutedDueToPriorContamination' }).Count
+        Assert-HarnessTrue $Failures `
+            ($passedCount -eq 1 -and $blockedCount -eq 1 -and $fencedCount -eq 1) '23-contamination-exact-remainder'
+
+        # The failed cleanup opens Problem State: the run itself fails even
+        # though one member passed.
+        Assert-HarnessTrue $Failures ([string]$r2.outcome -ceq 'Failed') '23-contamination-fails-run'
+
+        # The remainder never reaches the runner. A loop that executed it fails
+        # here, independently of what the disposition list says.
+        Assert-HarnessTrue $Failures ($execCalls.n -eq 1) '23-remainder-never-executed'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '23-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -1130,6 +3652,292 @@ function Test-HarnessCase24 {
     # The bounded runtime already refuses an absent clock; assert the run path
     # passes an admitted one rather than constructing its own.
     Assert-HarnessTrue $Failures ($coreSource -match 'Get-HarnessAdmittedClock') '24-run-uses-admitted-clock'
+
+    # BEHAVIORAL PROOF of the wall breach at the Core seam, not another
+    # source-level claim. Two in-process runs of the Run seam over the SAME
+    # single-row inventory, the SAME fake provider table, the SAME admitted
+    # prebuilt receipts and the SAME injected runner differ in exactly one
+    # thing: whether the Execute scriptblock arms the captured time state. The
+    # breached run arms it on entry, so the contour's execStart read sees the
+    # base instant and its execEnd read sees base + 601s - the Execute window
+    # measures exactly 601s and breaches the 600s test-wall bound. The control
+    # never arms it, so the window measures 0s and the same run completes.
+    # Reverting the contour breach branch, or the wall/idle measurement that
+    # feeds it, fails the first pair of asserts.
+    #
+    # WHY a captured hashtable for the time state: cross-scriptblock time
+    # state MUST travel as a hashtable the closures capture and mutate
+    # ($timeState.armed), never as a `$script:` variable assignment - that does
+    # not propagate into module-invoked closures (probe-measured on #907).
+    #
+    # WHY the base is near-ambient: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the
+    # binding against the AMBIENT wall clock, so a fixed past base would already
+    # be expired and the run would die before reaching the contour. The default
+    # bounds are testWallSeconds = 600 / testIdleSeconds = 120
+    # (scripts/integration/IntegrationHarness.Model.psm1:156-157), so the 601s
+    # window breaches the wall bound.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus a
+    # -CandidateRoot under that temp dir are the only inputs and no scriptblock
+    # below launches any process.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case24-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # One row = one group = one concrete provider class (never
+        # 'unbound-provider'), so the binding names STORE and the run reaches
+        # the execution contour instead of the missing-provider branch.
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            # The timeout path continues before evidence collection, so this
+            # returning nothing is honest: it is never reached on the breach
+            # run, and the control's provider contributes nothing to the verdict.
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Admitted prebuilt receipt: bound BEFORE any dispatch, so the run
+        # reaches the execution contour instead of the missing-receipt branch.
+        # rowDigest equals the selected row's digest.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Time state for the breached run: near-ambient base, armed by the
+        # runner's Execute on entry.
+        $timeState = @{ base = [DateTimeOffset]::UtcNow; armed = $false }
+
+        # Injected execution runner: process mechanics only. No process is
+        # launched here - the observation is typed, never a live pid. The fixed
+        # pid is honest because the validator judges shape and run binding,
+        # never liveness.
+        $runner = @{
+            Execute = {
+                param($c)
+                $timeState.armed = $true
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424244; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $breached = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('f' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { if ($timeState.armed) { $timeState.base.AddSeconds(601) } else { $timeState.base } }.GetNewClosure() `
+            -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$breached.evidence['perTestTerminal'][0].disposition -ceq 'TimedOut') '24-wall-breach-maps'
+        Assert-HarnessTrue $Failures ([string]$breached.outcome -ceq 'Failed') '24-wall-breach-fails-run'
+        Assert-HarnessTrue $Failures `
+            ([int]$breached.evidence['perTestTerminal'][0].attempts.Count -eq 1) '24-wall-single-attempt'
+        Assert-HarnessTrue $Failures `
+            ([double]$breached.evidence['perTestTerminal'][0].attempts[0].wallSeconds -ge 601) '24-wall-seconds-prove-breach'
+
+        # CONTROL: identical inventory, candidate root, fake table, receipts
+        # and runner, with a second state table that is never armed, so the
+        # clock always returns its base and the Execute window measures 0s.
+        # Nothing else differs, so the breach - not the scaffolding - is what
+        # causes the timeout above.
+        $controlTimeState = @{ base = [DateTimeOffset]::UtcNow; armed = $false }
+        $controlRunner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424245; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+        $control = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('f' * 32) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { $controlTimeState.base }.GetNewClosure() `
+            -PrebuiltReceipts $receipts -Runner $controlRunner
+        Assert-HarnessTrue $Failures `
+            ([string]$control.evidence['perTestTerminal'][0].disposition -ceq 'Passed') '24-wall-control-passes'
+        Assert-HarnessTrue $Failures ([string]$control.outcome -ceq 'Complete') '24-wall-control-completes'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '24-wall-no-residue' $residueBefore $residueAfter
+
+    # BEHAVIORAL PROOF of the IDLE breach, which the wall leg above structurally
+    # cannot reach: with a broken idle computation that leg still times out at
+    # the WALL bound, so it cannot prove the idle path is wired at all. This leg
+    # runs the same Run seam over the same scaffolding with exactly one
+    # difference: the Execute scriptblock arms the state but reports NO
+    # 'progressSeconds', and the injected clock then reads base + 200s. The
+    # Execute window therefore measures 200s - UNDER the 600s test-wall bound
+    # but OVER the 120s test-idle bound
+    # (scripts/integration/IntegrationHarness.Model.psm1:156-157), so only the
+    # idle computation can produce this timeout.
+    # WHY no 'progressSeconds' key: the contour's default idle is the window
+    # minus numeric observed progress, i.e. the WHOLE window when the key is
+    # absent (scripts/integration/IntegrationHarness.Core.psm1:3252-3280). That
+    # is what makes the entire 200s window idle.
+    # WHY 200 and not 120: 120 is the bound itself and the comparison is
+    # strictly greater-than, so the window must exceed it; 200 keeps the leg
+    # far below the 600s wall bound, which is what separates the idle path from
+    # the wall path. Setting the jump to 60s puts the window under BOTH bounds,
+    # the run completes, and this block fails - the assertion is load-bearing.
+    # WHY a fresh state table and temp dir: cross-scriptblock time state must
+    # travel as a hashtable the closures capture and mutate (see the wall leg),
+    # and a separate tag keeps this leg's inventory and residue independent of
+    # the wall leg's.
+    # Norms: docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md:13
+    # (wall, idle, memory, CPU and process-count limits) and
+    # docs/architecture/I18-32-stateful-test-environments.md:27 (test success
+    # requires both property evidence and cleanup/residue disposition).
+    $idleTag = 'harness-core-case24-idle-' + [guid]::NewGuid().ToString('N')
+    $idleTmp = Join-Path ([IO.Path]::GetTempPath()) $idleTag
+    $idleResidueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($idleTmp)
+        $idleInv = Join-Path $idleTmp 'inventory.json'
+        $idleInventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($idleInv, ($idleInventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        # Same single-row shape, same one concrete provider class (STORE), so
+        # the run reaches the execution contour.
+        $idleFake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # Same admitted prebuilt receipt, so the run reaches the execution
+        # contour instead of the missing-receipt branch.
+        $idleReceipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+
+        # Fresh time state for the idle leg, armed by the runner on entry.
+        $idleState = @{ base = [DateTimeOffset]::UtcNow; armed = $false }
+
+        # The one difference from the wall leg: no 'progressSeconds' key, so the
+        # contour measures the whole window as idle. The fixed pid is honest
+        # because the validator judges shape and run binding, never liveness.
+        $idleRunner = @{
+            Execute = {
+                param($c)
+                $idleState.armed = $true
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424245; ownerRunId = [string]$c.binding['runId'] }
+                }
+            }.GetNewClosure()
+        }
+
+        $idleBreached = & $runSeamCommand.Name -SelectAllRows -InventoryPath $idleInv `
+            -Provider $idleFake -RunId ('9' * 32) -CandidateRoot $idleTmp -TimeoutSeconds 600 `
+            -Clock { if ($idleState.armed) { $idleState.base.AddSeconds(200) } else { $idleState.base } }.GetNewClosure() `
+            -PrebuiltReceipts $idleReceipts -Runner $idleRunner
+        Assert-HarnessTrue $Failures `
+            ([string]$idleBreached.evidence['perTestTerminal'][0].disposition -ceq 'TimedOut') '24-idle-breach-maps'
+        Assert-HarnessTrue $Failures ([string]$idleBreached.outcome -ceq 'Failed') '24-idle-breach-fails-run'
+        Assert-HarnessTrue $Failures `
+            ([int]$idleBreached.evidence['perTestTerminal'][0].attempts.Count -eq 1) '24-idle-single-attempt'
+        Assert-HarnessTrue $Failures `
+            ([double]$idleBreached.evidence['perTestTerminal'][0].attempts[0].wallSeconds -lt 600) '24-idle-wall-under-bound'
+        Assert-HarnessTrue $Failures `
+            ([double]$idleBreached.evidence['perTestTerminal'][0].attempts[0].idleSeconds -ge 200) '24-idle-seconds-prove-idle-path'
+    }
+    finally {
+        if (Test-Path -LiteralPath $idleTmp) {
+            Remove-Item -LiteralPath $idleTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $idleResidueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '24-idle-no-residue' $idleResidueBefore $idleResidueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +3961,130 @@ function Test-HarnessCase25 {
     Assert-HarnessTrue $Failures ($sources -notmatch 'Stop-Process[^`r`n]*-Name') '25-no-name-based-stop'
     Assert-HarnessTrue $Failures ($sources -notmatch 'Get-Process\s+-Name') '25-no-name-based-query'
     Assert-HarnessTrue $Failures ($sources -match '(?i)(taskkill|/T\b|descendant|owned)') '25-owned-tree-stop-literal'
+
+    # BEHAVIORAL PROOF that a foreign owner's tree claim fails the run. Mirrors
+    # the Test-HarnessCase19 behavioral block exactly - the same temp-dir
+    # inventory with one STORE row, the same $fake provider ops table with the
+    # accepted ObserveReadiness shape, the same admitted $receipts table keyed by
+    # 'pkg::kind::name::test' and the same $runner shape - and differs in exactly
+    # one thing: the runner claims a process tree owned by a FOREIGN run.
+    #
+    # Norms: I10.08.02:36 (descendants stay inside the admitted envelope and are
+    # observed as lineage; an unexpected escape or effect is a failure) and
+    # I18.32:27 (test success needs both property evidence and a cleanup/residue
+    # disposition).
+    #
+    # WHY this exact ownerRunId: the contour
+    # (scripts/integration/IntegrationHarness.Core.psm1:3331-3334) rejects a
+    # runner tree whose ownerRunId contradicts the binding runId with
+    # HARNESS-CONTRADICTORY-EVIDENCE. An all-zeros id can never equal the
+    # -RunId below, so this leg proves a foreign tree claim fails the run instead
+    # of being adopted as ours. The rootPid is a fixed typed observation, never a
+    # live pid: the validator judges shape and run binding, never liveness, and
+    # the owner check is reached before any liveness question.
+    #
+    # WHY the clock is ambient: Test-IntegrationHarnessRunBinding
+    # (scripts/integration/IntegrationHarness.Model.psm1:562) admits the binding
+    # against the AMBIENT wall clock, outside Core's injected owner, so a fixed
+    # past instant would already be expired. Deterministic time behavior is proven
+    # by Case24 at the Core seam, not here, and no assert below depends on a time
+    # value.
+    #
+    # WHY no entrypoint child is spawned: the temp inventory plus -CandidateRoot
+    # under that temp dir are the only inputs and no scriptblock launches a
+    # process.
+    $runSeamCommand = Get-HarnessSeamCommand 'Run'
+    $caseTag = 'harness-core-case25-foreign-' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) $caseTag
+    $residueBefore = Get-OwnedResidueSnapshot
+    try {
+        [void][IO.Directory]::CreateDirectory($tmp)
+        $inv = Join-Path $tmp 'inventory.json'
+        $inventoryDocument = @{
+            rows = @(@{
+                    packageId        = 'pkg'
+                    targetKind       = 'kind'
+                    targetName       = 'name'
+                    testName         = 'test'
+                    providerClass    = 'STORE'
+                    isolationClass   = 'serial'
+                    targetClass      = 't1'
+                    resetClass       = 'reset'
+                    serializationClass = 'serial'
+                    rowDigest        = ('c' * 64)
+                })
+        }
+        [IO.File]::WriteAllText($inv, ($inventoryDocument | ConvertTo-Json -Depth 8),
+            [Text.UTF8Encoding]::new($false))
+
+        $fake = @{
+            ValidateRequirement = { param($c) return @{} }.GetNewClosure()
+            Plan                = { param($c) return @{} }.GetNewClosure()
+            Allocate            = { param($c) return @{ handle = 'fake' } }.GetNewClosure()
+            Start               = { param($c) return @{} }.GetNewClosure()
+            ObserveReadiness    = {
+                param($c)
+                # The exact shape Test-IntegrationHarnessReadiness accepts:
+                # binding-bound ids plus a passed semantic receipt. No
+                # readyBecauseExitZero / readyBecausePortOpen /
+                # readyBecausePidAlive alias is returned, because none of those
+                # prove readiness.
+                return @{
+                    runId            = [string]$c.binding['runId']
+                    providerRevision = [string]$c.binding['providerRevision']
+                    semanticReceipt  = @{
+                        readinessProbePassed = $true
+                        owner                = [string]$c.binding['owner']
+                        generation           = [int]$c.binding['generation']
+                    }
+                }
+            }.GetNewClosure()
+            ResetForTest      = { param($c) return @{} }.GetNewClosure()
+            # Never reached on this path: the loop maps the harness-error and
+            # continues first. The provider contributes nothing to this leg.
+            CollectEvidence   = { param($c) return @{} }.GetNewClosure()
+            Stop              = { param($c) return @{} }.GetNewClosure()
+            VerifyCleanup     = { param($c) return @{ verified = $true } }.GetNewClosure()
+        }
+
+        # The admitted receipt bound BEFORE dispatch, so this run reaches the
+        # execution contour instead of the missing-receipt branch. rowDigest
+        # equals the selected row's digest.
+        $receipts = @{
+            'pkg::kind::name::test' = @{
+                testIdentity      = 'pkg::kind::name::test'
+                binaryDigest      = ('c' * 64)
+                discoveryDigest   = ('d' * 64)
+                sourceDigest      = ('9' * 64)
+                toolchainIdentity = 'fake-toolchain-1'
+                rowDigest         = ('c' * 64)
+            }
+        }
+        # The single injected difference: the tree is claimed by a FOREIGN run.
+        $runner = @{
+            Execute = {
+                param($c)
+                return @{
+                    outcome     = 'passed'
+                    processTree = @{ rootPid = 424250; ownerRunId = ('0' * 32) }
+                }
+            }.GetNewClosure()
+        }
+
+        $foreign = & $runSeamCommand.Name -SelectAllRows -InventoryPath $inv `
+            -Provider $fake -RunId ('b5' * 16) -CandidateRoot $tmp -TimeoutSeconds 600 `
+            -Clock { [DateTimeOffset]::UtcNow }.GetNewClosure() -PrebuiltReceipts $receipts -Runner $runner
+        Assert-HarnessTrue $Failures `
+            ([string]$foreign.evidence['perTestTerminal'][0].disposition -ceq 'HarnessError') '25-foreign-owner-rejected'
+        Assert-HarnessTrue $Failures ([string]$foreign.outcome -ceq 'Failed') '25-foreign-owner-fails-run'
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $residueAfter = Get-OwnedResidueSnapshot
+    Assert-HarnessNoNewResidue $Failures '25-foreign-no-residue' $residueBefore $residueAfter
 }
 
 # ---------------------------------------------------------------------------
@@ -1519,6 +4451,8 @@ function Write-HarnessCaseResult {
         identity        = ("907/{0}" -f $Id)
         content_digest  = $script:SuiteDigest
         truncated_bytes = 0
+        executing_pid   = [Diagnostics.Process]::GetCurrentProcess().Id
+        start_instant   = [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().ToString('o')
     }
     [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))
 }

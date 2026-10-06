@@ -585,6 +585,7 @@ fn build_activation_candidate(
             .receipt_completeness_and_missing_fields
             .to_vec(),
         invalidation_expiry_and_missingness: input.invalidation_expiry_and_missingness.to_vec(),
+        frozen_pre_evaluation_digest: Some(input.overlay.frozen_digest()),
         canonical_digest: String::new(),
     };
     activation

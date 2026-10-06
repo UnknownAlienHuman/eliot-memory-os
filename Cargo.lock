@@ -2067,6 +2067,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-store-api",
  "eliot-windows-ipc",
  "serde",
@@ -3029,6 +3030,7 @@ dependencies = [
  "eliot-research-exchange",
  "eliot-research-exchange-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3620,6 +3622,7 @@ dependencies = [
  "eliot-learning-contracts",
  "eliot-learning-state-view",
  "eliot-maintenance",
+ "eliot-mcp",
  "eliot-memory-quality",
  "eliot-observability",
  "eliot-observability-runtime",

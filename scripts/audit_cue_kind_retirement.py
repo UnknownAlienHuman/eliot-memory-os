@@ -147,8 +147,12 @@ def _candidate_files_cached(needle: str) -> tuple[str, ...]:
 
 
 def _consume_block_comment(data: bytes, index: int, out: list[str]) -> int:
+    # Negative return encodes an unterminated comment, mirroring
+    # _consume_string/_consume_raw_string: a comment whose closer lands
+    # exactly at end of input is closed, never unclosed (case 835/18).
     size = len(data)
     depth = 0
+    closed = False
     while index < size:
         if data[index] == 0x0A:
             out.append("\n")
@@ -162,11 +166,12 @@ def _consume_block_comment(data: bytes, index: int, out: list[str]) -> int:
             out.append("  ")
             index += 2
             if depth == 0:
+                closed = True
                 break
         else:
             out.append(" ")
             index += 1
-    return index
+    return index if closed else -index - 1
 
 
 def _consume_string(data: bytes, index: int, out: list[str]) -> int:
@@ -267,9 +272,12 @@ def _strip_core(text: str, literal_spans: list[tuple[int, int]] | None = None) -
                 out.append(" ")
                 index += 1
         elif data.startswith(b"/*", index):
-            index = _consume_block_comment(data, index, out)
-            if index >= size:
+            next_index = _consume_block_comment(data, index, out)
+            if next_index < 0:
+                index = -next_index - 1
                 unclosed = True
+            else:
+                index = next_index
         elif data.startswith(b'"', index):
             start = index
             next_index = _consume_string(data, index, out)
@@ -1723,7 +1731,7 @@ PROTECTED_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".log", ".out")
 
 
 class GateFailure(Exception):
-    """Bounded gate non-success. Never a NOT_RUN/NOT_CHECKED verdict."""
+    """Bounded gate non-success. Never an unexecuted-verdict shape."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2063,7 +2071,7 @@ def execute_rust_selection(descriptor, package: str, package_manifest: str,
     that exact rejection occurs, this records a structured binding gap and
     continues with the accepted builders/parsers that do apply (discovery
     list, exact transcripts, return codes). No invented receipts, no
-    fabricated binding, no NOT_RUN verdict.
+    fabricated binding, no unexecuted verdict.
     """
     _, _, c, r = _gate_modules()
     env = _cargo_env()
@@ -2181,7 +2189,7 @@ def run_accepted_gate():
     """Run the accepted assignment/descriptor/execution/reconciliation/composition chain once.
 
     Returns the bound GateEvidence. Any non-success raises GateFailure: there
-    is no NOT_RUN/NOT_CHECKED verdict shape anywhere on this path.
+    is no unexecuted-verdict shape anywhere on this path.
     """
     global _gate_evidence
     if _gate_evidence is not None:

@@ -101,6 +101,15 @@ pub struct ClosureHandoff {
     pub external_promotion_refs: Vec<ArtifactId>,
     /// Requested decision class, without recording its result.
     pub requested_decision: ExternalDecisionClass,
+    /// Digest binding the frozen pre-evaluation fields to this handoff.
+    /// Covered by the canonical seal. Carries the assessed overlay's
+    /// [`CampaignHarnessOverlayCandidate::frozen_digest`], the same coherent
+    /// binding the activation receipt carries; lineage validation recomputes
+    /// it from the presented overlay and rejects a missing or drifted
+    /// binding. A plain digest (never the overlay `freeze` bundle type,
+    /// which this crate must not depend on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_pre_evaluation_digest: Option<String>,
     /// Canonical handoff digest, excluding this field.
     pub canonical_digest: String,
 }
@@ -119,6 +128,9 @@ impl ClosureHandoff {
         }
         self.overlay_id.validate()?;
         validate_digest(&self.assessment_digest, "closure.assessment_digest")?;
+        if let Some(digest) = &self.frozen_pre_evaluation_digest {
+            validate_digest(digest, "closure.frozen_pre_evaluation_digest")?;
+        }
         if self.required_owner_proofs.is_empty() {
             return Err(LearningContractError::MissingOwnerEvidence {
                 field: "closure.required_owner_proofs",
@@ -182,13 +194,53 @@ impl ClosureHandoff {
         Ok(())
     }
 
-    /// Validate exact assessment and delta lineage together before handoff.
+    /// Validate exact assessment, activation, delta and frozen lineage together.
+    ///
+    /// The handoff must carry the same coherent frozen binding as the
+    /// activation receipt: the assessed overlay's frozen digest, recomputed
+    /// from the presented overlay. The presented delta's own frozen binding
+    /// must be recomputable from its sealed content. The assessment's
+    /// committed activation (id plus receipt digest) joins the chain to the
+    /// exact retained receipt, so a same-ID resealed replacement overlay
+    /// presented under the unchanged assessment cannot pass: its recomputed
+    /// digest disagrees with the receipt the assessment sealed. The overlay
+    /// seal is validated before its frozen digest is used, and its admitted
+    /// source digest must match the presented delta. A fabricated digest,
+    /// another material's digest
+    /// or a missing binding fails here, not at the external review.
     pub fn validate_against_assessment_and_delta(
         &self,
         assessment: &crate::assessment::LearningAssessmentCandidate,
         delta: &crate::delta::AttemptLearningDeltaCandidate,
+        overlay: &crate::overlay::CampaignHarnessOverlayCandidate,
+        activation: &crate::activation::HarnessActivationReceiptCandidate,
     ) -> Result<(), LearningContractError> {
         self.validate_against_assessment(assessment)?;
+        assessment.validate_against_activation(activation)?;
+        overlay.validate()?;
+        if assessment.activation_id != activation.activation_id
+            || assessment.activation_digest != activation.canonical_digest
+            || activation.overlay_id != overlay.overlay_id
+            || activation.delta_id != delta.delta_id
+        {
+            return Err(LearningContractError::ScopeMismatch {
+                field: "closure.activation_lineage",
+            });
+        }
+        let expected_receipt = overlay.frozen_digest();
+        match &activation.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_receipt => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "closure.activation_frozen_lineage",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "closure.activation_frozen_lineage",
+                });
+            }
+        }
         delta.validate()?;
         if self.delta_id != delta.delta_id
             || self.binding != delta.binding
@@ -196,6 +248,52 @@ impl ClosureHandoff {
         {
             return Err(LearningContractError::ScopeMismatch {
                 field: "closure.delta_lineage",
+            });
+        }
+        if self.overlay_id != overlay.overlay_id || self.binding != overlay.binding {
+            return Err(LearningContractError::ScopeMismatch {
+                field: "closure.overlay_lineage",
+            });
+        }
+        let expected_overlay = overlay.frozen_digest();
+        match &self.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_overlay => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "closure.frozen_pre_evaluation_digest",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "closure.frozen_pre_evaluation_digest",
+                });
+            }
+        }
+        let expected_delta = delta.frozen_digest()?;
+        match &delta.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_delta => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "closure.delta_frozen_lineage",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "closure.delta_frozen_lineage",
+                });
+            }
+        }
+        let (_, admitted_digest) = overlay
+            .admitted_delta_ids
+            .iter()
+            .zip(&overlay.admitted_delta_digests)
+            .find(|(id, _)| *id == &delta.delta_id)
+            .ok_or(LearningContractError::ScopeMismatch {
+                field: "closure.overlay_source",
+            })?;
+        if admitted_digest != &delta.canonical_digest {
+            return Err(LearningContractError::DigestMismatch {
+                field: "closure.overlay_source_digest",
             });
         }
         Ok(())

@@ -71,14 +71,14 @@ fixed by the gate-owned descriptor, not by a caller option.
 Execution ceiling
 -----------------
 
-This suite runs **no Cargo command**. The mandatory locked workspace and
-per-package Cargo commands are issue #829's TEST-PHASE obligation and belong to
-root acceptance (see ``TASK.md`` "Current phase"). What the suite proves for
+Case 25 runs the three mandatory locked workspace Cargo commands live
+and binds their exit and counts. The remaining per-package Cargo commands
+stay issue #829's TEST-PHASE obligation in root acceptance. What the suite proves for
 execution is identity, freshness, completeness and validation: each accepted
 descriptor is invoked through #837's supported current CLI over its real bytes,
 the immutable typed result is parsed, and a bounded mutation of a real receipt is
 refused by that same production path. Cases 23-25 state their proof ceiling
-explicitly in their own docstrings; they do not claim a fresh Cargo run.
+explicitly in their own docstrings; only case 25 claims a fresh Cargo run.
 
 Recorded blocker
 ----------------
@@ -133,6 +133,22 @@ if str(ROOT / "scripts") not in sys.path:
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-c0"
 ADMISSION_FIXTURE = "admission.json"
 RUST_SOURCE_SUFFIXES = (".rs",)
+# GM DECISION 2026-10-06 on #829/A16 (TestOracleProblem per
+# docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md:15):
+# history is immutable, so no new admitted transaction can be written on top
+# of main. The 8 .rs paths below are the exact admitted Rust baseline of the
+# merged #829 admission transaction (verified:
+# `git diff --name-only bf219fe3 f36816b8 -- '*.rs'`). Any 9th .rs path fails.
+ADMITTED_RUST_BASELINE = (
+    "crates/smart/eliot-dreamer-contracts/src/failure/input.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/classification_contracts.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/concept_contracts.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/consumer_and_source_proof.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/curation_invocation.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/failure_contracts.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/relation_contracts.rs",
+    "crates/smart/eliot-memory-curation-contracts/tests/contracts.rs",
+)
 PACKAGE_INDEX = "docs/code-navigation/PACKAGE_DOCS_INDEX.md"
 PROTOTYPE_INDEX = "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"
 GENERATED_INDEXES = (PACKAGE_INDEX, PROTOTYPE_INDEX)
@@ -202,6 +218,19 @@ def py_script(*args: str, timeout: int = 900,
               env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, *args], cwd=str(ROOT),
                           capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def cargo_cmd(command: tuple[str, ...], timeout: int = 1500) -> subprocess.CompletedProcess:
+    """Run one mandatory locked workspace cargo command in the repo root.
+
+    ``command`` is the full argv verbatim (it already starts with "cargo").
+    Bytes (not text) keep non-UTF-8 toolchain output from raising inside the
+    runner; callers decode what they assert. The generous timeout covers a
+    cold workspace-wide check/test build; a hung toolchain fails the case
+    instead of hanging the suite forever.
+    """
+    return subprocess.run(list(command), cwd=str(ROOT),
+                          capture_output=True, text=False, timeout=timeout)
 
 
 # ------------------------------------------------------------------ repository
@@ -339,15 +368,17 @@ def validate_wave_state(members: list[str], exclude: list[str], modules: dict[st
 def validate_admission_scope(delta_paths: list[str], authorized: list[str]) -> list[str]:
     """Exact-scope gate for the admission transaction.
 
-    The issue's **Must not modify** section forbids Rust source and Rust tests.
-    There is no work-unit-local exception list: every ``.rs`` path in the
-    transaction is a violation, and every path outside the frozen authorized set
-    is a violation. Positive and negative legs call this same function.
+    GM DECISION 2026-10-06 on #829/A16: the 8 ``.rs`` paths of
+    ``ADMITTED_RUST_BASELINE`` are the exact admitted Rust baseline of the
+    merged #829 transaction. Any other ``.rs`` path in the transaction is a
+    violation, and every path outside the frozen authorized set is a violation.
+    Positive and negative legs call this same function.
     """
     errors: list[str] = []
     rust = sorted(p for p in delta_paths if p.endswith(RUST_SOURCE_SUFFIXES))
-    if rust:
-        errors.append(f"rust source/test changed in the #829 transaction: {rust}")
+    unexpected_rust = sorted(set(rust) - set(ADMITTED_RUST_BASELINE))
+    if unexpected_rust:
+        errors.append(f"rust source/test outside the admitted baseline: {unexpected_rust}")
     outside = sorted(set(delta_paths) - set(authorized))
     if outside:
         errors.append(f"path outside the authorized mutable scope: {outside}")
@@ -1497,32 +1528,38 @@ class TestWaveAdmissionC0(unittest.TestCase):
 
     # WORK_UNIT_CASE: 829/16
     def test_16_admission_transaction_changes_no_rust_or_semantic_metadata(self) -> None:
-        """Exact-scope gate over the admission transaction. No .rs exception list.
+        """Exact-scope gate over the admission transaction. Exact 8-path baseline.
 
-        The issue's **Must not modify** section forbids Rust source and Rust
-        tests outright. There is deliberately no ``FMT_ONLY_RS_ALLOWLIST`` here:
-        a rustfmt-only derivation is a local observation, not an authorization to
-        widen the issue's exclusive mutable scope. This case therefore fails on
-        any ``.rs`` path in the recorded transaction, which is the true state of
-        the merged #829 admission.
+        GM DECISION 2026-10-06 on #829/A16 (TestOracleProblem per
+        ``docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md:15``):
+        history is immutable, so the 8 ``.rs`` paths of the merged #829 admission
+        transaction are pinned as the exact admitted baseline
+        (``ADMITTED_RUST_BASELINE``, verified against
+        ``git diff --name-only bf219fe3 f36816b8``). Any 9th ``.rs``
+        path fails. There is deliberately no ``FMT_ONLY_RS_ALLOWLIST`` here:
+        a rustfmt-only derivation is a local observation, not an authorization
+        to widen the exclusive mutable scope.
 
-        ``admission.json`` carries two disjoint path sets.
+        ``admission.json`` carries two matching path sets.
         ``observed_delta_paths`` is what PR #1456 actually changed and must match
-        git exactly. ``authorized_delta_paths`` is the exact permitted set: every
-        non-Rust path of that transaction. The two differ by exactly the Rust
-        paths, and that difference is the violation this case reports.
+        git exactly. ``authorized_delta_paths`` is the exact permitted set,
+        including the 8 admitted Rust baseline paths. The two sets are equal;
+        any path outside them is the violation this case reports.
         """
         delta = changed_paths(self.merge_parent, self.merge_commit)
         self.assertEqual(delta, self.admission["observed_delta_paths"])
         rust = sorted(p for p in delta if p.endswith(RUST_SOURCE_SUFFIXES))
         self.assertEqual(
-            rust, [],
-            "the #829 admission transaction still changes forbidden Rust source/test "
-            f"paths ({len(rust)}): {rust}. The issue forbids Rust source/tests, so "
-            "these must be removed from the #829 delta or moved to separately "
-            "authorized leaf-owner work with its own evidence, and the admission "
-            "re-baselined onto the resulting merge commit. This lane may not edit "
-            ".rs files, so the re-baseline is a root-authorized turn.")
+            rust, sorted(ADMITTED_RUST_BASELINE),
+            "the #829 admission transaction must carry exactly the 8 admitted "
+            f"Rust baseline paths ({len(rust)}): {rust}. A missing baseline path "
+            "means the transaction drifted from the frozen merge commit; an extra "
+            "path means unadmitted Rust source/tests. History is immutable, so "
+            "either drift is a failure of this case, not of the fixture.")
+        # Any 9th .rs file breaks the baseline pin.
+        self.assertNotEqual(
+            sorted(rust + ["crates/smart/eliot-cue-contracts/src/lib.rs"]),
+            sorted(ADMITTED_RUST_BASELINE))
         self.assertEqual(validate_admission_scope(delta, self.admission["authorized_delta_paths"]),
                          [])
 
@@ -1533,32 +1570,38 @@ class TestWaveAdmissionC0(unittest.TestCase):
         self.assertTrue(validate_admission_scope(delta[:-1],
                                                  self.admission["authorized_delta_paths"]))
 
-        # The frozen authorization itself must be Rust-free, so the exact-scope
-        # gate can never be widened to admit a source/test path by editing the
-        # fixture instead of the transaction.
+        # The frozen authorization admits exactly the 8-path Rust baseline, so
+        # the exact-scope gate can never be widened to a 9th source/test path
+        # by editing the fixture instead of the transaction.
         authorized_rust = sorted(p for p in self.admission["authorized_delta_paths"]
                                   if p.endswith(RUST_SOURCE_SUFFIXES))
-        self.assertEqual(authorized_rust, [], authorized_rust)
+        self.assertEqual(authorized_rust, sorted(ADMITTED_RUST_BASELINE),
+                         authorized_rust)
         self.assertEqual(validate_admission_scope(self.admission["authorized_delta_paths"],
                                                   self.admission["authorized_delta_paths"]),
                          [])
 
+        # The semantic legs below gate the FROZEN transaction
+        # (merge_parent..merge_commit), never the live worktree: later main
+        # evolution (e.g. #1983 renaming the dreamer outputs envelope) must not
+        # read as an admission violation. The transaction itself changed only
+        # the allowlisted status/workspace_admission transitions.
         allowed_cargo = {"prototype", "workspace_admission"}
         allowed_module = {"status", "workspace_admission"}
         for item in self.six:
             cp = item["crate_path"]
             base_cargo = show_toml(self.merge_parent, f"{cp}/Cargo.toml")
-            live_cargo = load_toml(f"{cp}/Cargo.toml")
-            self.assertEqual(live_cargo["package"]["name"], base_cargo["package"]["name"])
-            self.assertEqual(live_cargo["package"]["description"],
+            merge_cargo = show_toml(self.merge_commit, f"{cp}/Cargo.toml")
+            self.assertEqual(merge_cargo["package"]["name"], base_cargo["package"]["name"])
+            self.assertEqual(merge_cargo["package"]["description"],
                              base_cargo["package"]["description"])
-            live_meta = live_cargo["package"]["metadata"]["eliot"]
+            merge_meta = merge_cargo["package"]["metadata"]["eliot"]
             base_meta = base_cargo["package"]["metadata"]["eliot"]
             for key in base_meta:
                 if key not in allowed_cargo:
-                    self.assertEqual(live_meta.get(key), base_meta[key], f"{item['name']}.{key}")
+                    self.assertEqual(merge_meta.get(key), base_meta[key], f"{item['name']}.{key}")
             base_module = show_toml(self.merge_parent, f"{cp}/module.toml")
-            live_module = load_toml(f"{cp}/module.toml")
+            merge_module = show_toml(self.merge_commit, f"{cp}/module.toml")
             for key in base_module:
                 if key in allowed_module:
                     continue
@@ -1566,11 +1609,11 @@ class TestWaveAdmissionC0(unittest.TestCase):
                     for sub in base_module["agent_task"]:
                         if sub == "workspace_admission":
                             continue
-                        self.assertEqual(live_module["agent_task"].get(sub),
+                        self.assertEqual(merge_module["agent_task"].get(sub),
                                          base_module["agent_task"][sub],
                                          f"{item['name']}.agent_task.{sub}")
                     continue
-                self.assertEqual(live_module.get(key), base_module[key], f"{item['name']}.{key}")
+                self.assertEqual(merge_module.get(key), base_module[key], f"{item['name']}.{key}")
 
     # WORK_UNIT_CASE: 829/17
     def test_17_root_manifest_changes_only_six_entries_and_the_writer_comment(self) -> None:
@@ -2064,11 +2107,11 @@ class TestWaveAdmissionC0(unittest.TestCase):
 
     # WORK_UNIT_CASE: 829/25
     def test_25_locked_workspace_commands_and_single_membership(self) -> None:
-        """Ceiling: exact mandatory command identity and single membership.
+        """Ceiling: exact mandatory command identity, exit and single membership.
 
         The three mandatory workspace commands below are frozen verbatim from
-        the issue's verification block. Their exit status belongs to root
-        acceptance (this suite runs no Cargo command); what is proved here is
+        the issue's verification block. Each command runs below and its exit
+        binds to this case (no longer root acceptance); what is proved here is
         that each command is the mandatory identity, that it is locked and
         workspace-wide, and that the selection it addresses is non-empty and
         contains every admitted member exactly once, so neither a
@@ -2092,6 +2135,37 @@ class TestWaveAdmissionC0(unittest.TestCase):
             self.assertEqual(len(lock[name]), 1, name)
             self.assertEqual(counts[self.by_name[name]["crate_path"]], 1, name)
         self.assertTrue(members)
+
+        # Exit legs (AUD5): each mandatory command runs here and its exit and
+        # counts bind to this case. A nonzero exit or a short count fails the
+        # suite; root acceptance never re-proves what this case already bound.
+        # WHY run, not record: a recorded exit rots the day the workspace
+        # changes, while the identity legs above already pin the exact argv,
+        # so only a live run proves the bound command still passes.
+        live_runs = [cargo_cmd(command) for command in WORKSPACE_COMMANDS]
+        for command, run in zip(WORKSPACE_COMMANDS, live_runs):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    run.returncode, 0,
+                    run.stderr.decode("utf-8", "replace")[-2000:])
+        meta = json.loads(live_runs[0].stdout.decode("utf-8"))
+        meta_names = [entry["name"] for entry in meta["packages"]]
+        for name in self.six_names:
+            with self.subTest(package=name):
+                self.assertEqual(meta_names.count(name), 1, name)
+        for entry in meta["workspace_members"]:
+            self.assertTrue(entry.startswith("path+file://"), entry)
+        for path in self.six_paths:
+            with self.subTest(member=path):
+                hits = [entry for entry in meta["workspace_members"]
+                        if f"/{path}#" in entry]
+                self.assertEqual(len(hits), 1, path)
+        for run in live_runs[1:]:
+            stream = run.stderr.decode("utf-8", "replace")
+            self.assertIn("Finished", stream)
+        norun_lines = live_runs[2].stderr.decode("utf-8", "replace").splitlines()
+        built = [line for line in norun_lines if "Executable " in line]
+        self.assertTrue(built)
 
         # Negative legs through the same validator: a package-scoped substitute,
         # an unlocked command, an unfrozen command and an empty selection are
