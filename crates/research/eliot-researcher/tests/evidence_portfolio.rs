@@ -1200,3 +1200,86 @@ fn open_verified_empty_retains_examined() {
     assert!(account.open_members().is_empty());
     assert_eq!(account.observed_outside_scope().len(), 2);
 }
+
+// Issue #1767 A5: the science grade binds evaluator linkage through the real
+// requirement selector. Three records with distinct lineage roots, providers,
+// ancestors and assumptions satisfy every axis only when their evaluators are
+// distinct; one shared evaluator holds the EvaluatorFamily axis (and the whole
+// profile) unmet. Grade scoping itself stays with `select_independence_requirement`
+// (I21.2/I21.3): lower grades do not request the axis, so no linkage is
+// demanded of them here.
+fn evaluator_case_records(shared_evaluator: bool) -> BTreeMap<String, SourceRecord> {
+    let mut records = BTreeMap::new();
+    for handle in ["eval-a", "eval-b", "eval-c"] {
+        let mut params = source_params(handle);
+        params.transformed_from = Some(format!("parent-{handle}"));
+        params.evaluator_family = Some(if shared_evaluator {
+            "evaluator-shared".to_owned()
+        } else {
+            format!("evaluator-{handle}")
+        });
+        records.insert(
+            handle.to_owned(),
+            SourceRecord::new(params).expect("evaluator case record"),
+        );
+    }
+    records
+}
+
+fn science_evaluator_profile(
+    records: &BTreeMap<String, SourceRecord>,
+) -> eliot_researcher::inquiry_governance::IndependenceProfile {
+    use eliot_researcher::inquiry_governance::{EvidenceGrade, select_independence_requirement};
+
+    let grade = EvidenceGrade::from_name("SCIENCE_GRADE").expect("science grade");
+    let (dimensions, minimum) = select_independence_requirement(grade);
+    assert!(
+        dimensions.contains(
+            &eliot_researcher::inquiry_governance::IndependenceDimension::EvaluatorFamily
+        ),
+        "the science grade must request the evaluator axis"
+    );
+    let eligible: Vec<String> = records.keys().cloned().collect();
+    eliot_researcher::inquiry_governance::IndependenceProfile::derive(
+        &eligible,
+        records,
+        &dimensions,
+        minimum,
+    )
+}
+
+#[test]
+fn shared_evaluator_does_not_satisfy_science_requirement() {
+    use eliot_researcher::inquiry_governance::IndependenceDimension;
+
+    let records = evaluator_case_records(true);
+    let profile = science_evaluator_profile(&records);
+    assert!(
+        !profile.meets_requirement,
+        "one evaluator behind three records must not satisfy the science requirement"
+    );
+    let evaluator = profile
+        .dimensions
+        .iter()
+        .find(|measurement| measurement.dimension == IndependenceDimension::EvaluatorFamily)
+        .expect("evaluator axis is measured");
+    assert!(
+        !evaluator.meets_requirement,
+        "the shared evaluator axis must stay unmet"
+    );
+    assert_eq!(
+        evaluator.groups,
+        vec!["evaluator-shared".to_owned()],
+        "the shared evaluator collapses to exactly one family"
+    );
+}
+
+#[test]
+fn distinct_evaluators_satisfy_science_requirement() {
+    let records = evaluator_case_records(false);
+    let profile = science_evaluator_profile(&records);
+    assert!(
+        profile.meets_requirement,
+        "distinct evaluators over distinct roots/providers/ancestors/assumptions satisfy science"
+    );
+}
