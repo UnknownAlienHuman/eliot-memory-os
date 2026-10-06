@@ -153,7 +153,7 @@ use crate::dispatch_material::{
     WASM_HOST_CONTROL_FILE_NAME, WasmControlAck, WasmControlDelivery, WasmControlKind,
     admitted_material_path, control_ack_name, control_delivery_name, join_control_delivery,
     parse_control_delivery, parse_control_name, read_control_bytes, retire_legacy_control,
-    stage_control_bytes,
+    stage_ack_bytes,
 };
 use crate::parent_authority::edge_now_ms;
 use crate::parent_runtime::{
@@ -2012,6 +2012,27 @@ fn refused_ack(
     }
 }
 
+/// Reports whether a staged ack digest matches the owner's digest shape
+/// (64 lowercase hex): the same rule `validate_control_ack`
+/// (eliot-kernel-service) applies through `require_digest`.
+fn ack_digest_ok(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Reports whether a staged ack detail matches the owner's detail shape
+/// (within bound, no control chars, never blank when present): the same
+/// rule `validate_control_ack` applies through `require_detail`.
+fn ack_detail_ok(detail: Option<&str>) -> bool {
+    detail.is_none_or(|value| {
+        value.len() <= WASM_CONTROL_MAX_DETAIL_BYTES
+            && !value.chars().any(char::is_control)
+            && !value.trim().is_empty()
+    })
+}
+
 /// One polled-but-unconfirmed control delivery: validated and yielded to the
 /// loop, but not yet admitted and enqueued, so still unacknowledged and
 /// fully replayable. Every identity field it carries is the delivery's own,
@@ -2151,15 +2172,31 @@ enum PreviousDisposition {
 
 /// Resolution of one delivery's ack slot.
 #[derive(Clone, Debug)]
+/// Closed outcome set of one ack-slot resolution (issue #2896 W11/A8):
+/// every staged-ack shape earns its own variant, so the poll loop can
+/// never confuse terminal evidence, garbage, or our own open acceptance.
+/// Only [`AckSlot::Free`] and [`AckSlot::Reoffer`] admit or refuse; every
+/// other variant leaves the delivery staged and unacknowledged.
 enum AckSlot {
-    /// Skip the delivery: terminal evidence, garbage, or our own still-open
-    /// acceptance already occupies the slot.
-    Skip,
     /// The slot is free: the delivery may validate and refuse into it.
     Free,
-    /// A prior incarnation left the slot openly accepted: the delivery may
-    /// be re-offered for UNKNOWN recovery when its bytes still match.
+    /// A prior incarnation left the slot openly accepted and its bytes
+    /// still join this exact delivery: re-offer for UNKNOWN recovery.
     Reoffer(WasmControlAck),
+    /// A decisive ack (Completed/Refused) bound to this exact delivery:
+    /// terminal evidence, never re-admitted.
+    Decided,
+    /// Our own still-open acceptance occupies the slot.
+    OwnOpen,
+    /// An ack is staged but its bytes are unreadable: someone's evidence,
+    /// never ours to delete or overwrite.
+    Unreadable,
+    /// An ack is staged but fails the exact owner join
+    /// (`validate_control_ack` in eliot-kernel-service): foreign or
+    /// corrupt, left in place.
+    Unjoined,
+    /// The bounded read budget ran out: deferred work, not a finding.
+    Deferred,
 }
 
 /// Installed Kernel control reader: the external control intake of the
@@ -2383,11 +2420,10 @@ impl KernelControlReader {
     ) -> Option<WasmHostRequestFrame> {
         let mut reads = 0usize;
         for &(generation, sequence) in deliveries {
-            let slot = self.open_ack(generation, sequence, acks, &mut reads);
-            if matches!(slot, AckSlot::Skip) {
-                continue;
-            }
-            let slot_taken = matches!(slot, AckSlot::Reoffer(_));
+            // The exact delivery is read and parsed BEFORE the ack slot is
+            // resolved (issue #2896 W11/A8): the slot joins the staged ack
+            // against this delivery's identity, never against bare
+            // wire/version/generation/sequence.
             if reads >= CONTROL_POLL_READ_BUDGET {
                 return None;
             }
@@ -2404,14 +2440,24 @@ impl KernelControlReader {
                 // on — a poisoned file cannot wedge intake.
                 continue;
             };
-            // A re-offered open delivery must still carry its accepted
-            // bytes: changed same-sequence content is an identity conflict,
-            // left as the two mismatching files for the owner, never
-            // re-acknowledged over the taken slot.
-            if let AckSlot::Reoffer(ack) = &slot
-                && ack.delivery_digest != delivery.delivery_digest
-            {
-                continue;
+            let slot = self.open_ack(generation, sequence, &delivery, acks, &mut reads);
+            // Only a free slot or a byte-matching re-offer admits or
+            // refuses; every other outcome leaves the delivery staged and
+            // unacknowledged. A re-offered slot is taken, so refusals never
+            // overwrite the retained open acceptance.
+            let slot_taken = matches!(slot, AckSlot::Reoffer(_));
+            match &slot {
+                AckSlot::Free | AckSlot::Reoffer(_) => {}
+                AckSlot::Deferred => return None,
+                AckSlot::Decided | AckSlot::OwnOpen | AckSlot::Unreadable | AckSlot::Unjoined => {
+                    continue;
+                }
+            }
+            // The re-offered ack already joined this exact delivery inside
+            // `open_ack`: same digest, never re-acknowledged over the taken
+            // slot when the content changed under the sequence.
+            if let AckSlot::Reoffer(ack) = &slot {
+                debug_assert_eq!(ack.delivery_digest, delivery.delivery_digest);
             }
             let identity = &delivery.identity;
             if identity.generation != generation || identity.owner_sequence != sequence {
@@ -2478,11 +2524,18 @@ impl KernelControlReader {
         None
     }
 
-    /// Resolves the ack slot for one delivery.
+    /// Resolves the ack slot for one already-parsed delivery (issue #2896
+    /// W11/A8). The staged ack joins against this exact delivery with the
+    /// same checks the owner applies in `validate_control_ack`
+    /// (eliot-kernel-service): wire id/version, replay key, operation id,
+    /// generation, owner sequence, and delivery digest, plus the detail
+    /// bound and the phase/detail/outcome shape. Anything less is
+    /// [`AckSlot::Unjoined`], never a silent skip over unchecked fields.
     fn open_ack(
         &self,
         generation: u64,
         sequence: u64,
+        delivery: &WasmControlDelivery,
         acks: &[(u64, u64)],
         reads: &mut usize,
     ) -> AckSlot {
@@ -2490,39 +2543,54 @@ impl KernelControlReader {
             return AckSlot::Free;
         }
         if *reads >= CONTROL_POLL_READ_BUDGET {
-            return AckSlot::Skip;
+            return AckSlot::Deferred;
         }
         *reads += 1;
         let path = self.directory.join(control_ack_name(generation, sequence));
         let Ok(bytes) = read_control_bytes(&path) else {
-            return AckSlot::Skip;
+            return AckSlot::Unreadable;
         };
         let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
-            return AckSlot::Skip;
+            return AckSlot::Unjoined;
         };
+        let identity = &delivery.identity;
         if ack.wire_id != WASM_CONTROL_ACK_WIRE_ID
             || ack.wire_version != WASM_CONTROL_ACK_WIRE_VERSION
+            || ack.replay_key != identity.replay_key
+            || ack.operation_id != identity.operation_id
             || ack.generation != generation
             || ack.owner_sequence != sequence
+            || ack.delivery_digest != delivery.delivery_digest
             || ack
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.len() > WASM_CONTROL_MAX_DETAIL_BYTES)
         {
-            return AckSlot::Skip;
+            return AckSlot::Unjoined;
         }
-        match ack.phase {
-            ControlAckPhase::Completed | ControlAckPhase::Refused => AckSlot::Skip,
-            ControlAckPhase::Enqueued => {
+        // Same shape rules the owner applies in `validate_control_ack`; see
+        // `ack_digest_ok` / `ack_detail_ok` beside `refused_ack`.
+        match (&ack.phase, &ack.detail, &ack.outcome_digest) {
+            (ControlAckPhase::Enqueued, _, None) if ack_detail_ok(ack.detail.as_deref()) => {
                 let mine = self.accepted.as_ref().is_some_and(|accepted| {
                     accepted.generation == generation && accepted.sequence == sequence
                 });
                 if mine {
-                    AckSlot::Skip
+                    AckSlot::OwnOpen
                 } else {
                     AckSlot::Reoffer(ack)
                 }
             }
+            (ControlAckPhase::Completed, _, outcome)
+                if ack_detail_ok(ack.detail.as_deref())
+                    && outcome.as_deref().is_none_or(ack_digest_ok) =>
+            {
+                AckSlot::Decided
+            }
+            (ControlAckPhase::Refused, Some(_), None) if ack_detail_ok(ack.detail.as_deref()) => {
+                AckSlot::Decided
+            }
+            _ => AckSlot::Unjoined,
         }
     }
 
@@ -3013,11 +3081,20 @@ impl KernelControlReader {
         ack: &WasmControlAck,
     ) -> Result<(), LoopError> {
         let bytes = serde_json::to_vec(ack).map_err(|_| LoopError::ChannelUnavailable)?;
-        stage_control_bytes(
+        // Compare-before-write (issue #2896 W10): a slot that already holds
+        // other bytes belongs to whoever staged them. Every caller either
+        // ignores this result or retries through `ack_staged`, so absorbing
+        // the conflict is the only non-impersonating choice — failing the
+        // loop on foreign-owned evidence would wedge intake, and overwriting
+        // would impersonate it.
+        if let Err(error) = stage_ack_bytes(
             &self.directory.join(control_ack_name(generation, sequence)),
             &bytes,
-        )
-        .map_err(|_| LoopError::ChannelUnavailable)
+        ) && !matches!(error, MaterialError::DigestMismatch)
+        {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        Ok(())
     }
 
     /// Pins a legacy Shutdown frame to this operation. The parse carries its
@@ -6514,4 +6591,308 @@ fn read_admitted_material() -> Result<
         MaterialError::Missing => DriveError::NoMaterial,
         other => DriveError::Material(other),
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod spool_tests {
+    use super::*;
+    use crate::dispatch_material::{
+        ControlDeliveryIdentity, WASM_CONTROL_DELIVERY_WIRE_ID, WASM_CONTROL_DELIVERY_WIRE_VERSION,
+    };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(3).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_fence() -> StateFence {
+        StateFence::new(
+            test_epoch(),
+            ResourceGeneration::new(7).expect("nonzero test generation"),
+        )
+    }
+
+    fn test_binding(generation: u64) -> AdmittedBinding {
+        AdmittedBinding {
+            claim_id: "claim-2896".to_owned(),
+            operation_id: "operation-2896".to_owned(),
+            invocation_id: "operation-2896".to_owned(),
+            request_digest: "d".repeat(64),
+            grant_digest: "9".repeat(64),
+            generation,
+            work_scope: "scope-2896".to_owned(),
+            authority_epoch_json: "{}".to_owned(),
+            component_id: "component-2896".to_owned(),
+            artifact_digest: "a".repeat(64),
+            input_digest: "i".repeat(64),
+            input_bytes: Vec::new(),
+            fence_nonce: "fence-2896".to_owned(),
+            deterministic_seed: 7,
+            max_output_bytes: 1024,
+        }
+    }
+
+    fn test_delivery(generation: u64, sequence: u64) -> WasmControlDelivery {
+        WasmControlDelivery {
+            wire_id: WASM_CONTROL_DELIVERY_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_DELIVERY_WIRE_VERSION,
+            identity: ControlDeliveryIdentity {
+                operation_id: "operation-2896".to_owned(),
+                invocation_id: "operation-2896".to_owned(),
+                claim_id: "claim-2896".to_owned(),
+                generation,
+                control_kind: WasmControlKind::Reconcile,
+                owner_sequence: sequence,
+                authority_epoch: test_epoch(),
+                state_fence: test_fence(),
+                work_scope: "scope-2896".to_owned(),
+                principal_digest: "b".repeat(64),
+                session_connection: "conn-2896".to_owned(),
+                session_epoch: 1,
+                dispatch_grant_digest: "c".repeat(64),
+                publisher_challenge_id: "challenge-2896".to_owned(),
+                publisher_operation: "operation-class-2896".to_owned(),
+                publisher_decided_at_unix_ms: 4_000_000_000_000,
+                deadline_unix_ms: 4_000_000_060_000,
+                replay_key: "e".repeat(64),
+                previous_delivery_digest: None,
+            },
+            delivery_digest: "f".repeat(64),
+        }
+    }
+
+    fn test_ack(
+        delivery: &WasmControlDelivery,
+        phase: ControlAckPhase,
+        detail: Option<&str>,
+        outcome_digest: Option<&str>,
+    ) -> WasmControlAck {
+        let identity = &delivery.identity;
+        WasmControlAck {
+            wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+            replay_key: identity.replay_key.clone(),
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            owner_sequence: identity.owner_sequence,
+            delivery_digest: delivery.delivery_digest.clone(),
+            phase,
+            detail: detail.map(str::to_owned),
+            outcome_digest: outcome_digest.map(str::to_owned),
+        }
+    }
+
+    fn spool_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("spool dir writable");
+        dir
+    }
+
+    fn test_reader(dir: &std::path::Path, generation: u64) -> KernelControlReader {
+        KernelControlReader::new(&test_binding(generation), dir.to_path_buf())
+    }
+
+    fn stage_ack(dir: &std::path::Path, generation: u64, sequence: u64, ack: &WasmControlAck) {
+        let bytes = serde_json::to_vec(ack).expect("ack serializes");
+        std::fs::write(dir.join(control_ack_name(generation, sequence)), &bytes)
+            .expect("ack writable");
+    }
+
+    /// Positive control for the spool builders: no staged ack resolves Free.
+    #[test]
+    fn ack_slot_free_without_staged_ack() {
+        let dir = spool_dir("eliot-2896-ack-slot-free");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[], &mut reads),
+            AckSlot::Free
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A decisive Completed ack bound to the exact delivery resolves Decided.
+    #[test]
+    fn ack_slot_decided_on_completed() {
+        let dir = spool_dir("eliot-2896-ack-slot-decided");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Completed, None, None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Decided
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A foreign open acceptance re-offers for UNKNOWN recovery.
+    #[test]
+    fn ack_slot_reoffer_on_foreign_enqueued() {
+        let dir = spool_dir("eliot-2896-ack-slot-reoffer");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Enqueued, None, None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Reoffer(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Our own still-open acceptance occupies the slot.
+    #[test]
+    fn ack_slot_own_open_for_accepted() {
+        let dir = spool_dir("eliot-2896-ack-slot-own");
+        let mut reader = test_reader(&dir, 7);
+        reader.accepted = Some(AcceptedControl {
+            kind: WasmControlKind::Reconcile,
+            operation_id: "operation-2896".to_owned(),
+            generation: 7,
+            sequence: 0,
+            replay_key: "e".repeat(64),
+            delivery_digest: "f".repeat(64),
+            ack_staged: true,
+        });
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Enqueued, None, None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::OwnOpen
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listed slot with no readable file is someone's evidence, not a free slot.
+    #[test]
+    fn ack_slot_unreadable_without_ack_file() {
+        let dir = spool_dir("eliot-2896-ack-slot-unreadable");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unreadable
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A digest the delivery never carried fails the exact join.
+    #[test]
+    fn ack_slot_unjoined_on_foreign_digest() {
+        let dir = spool_dir("eliot-2896-ack-slot-digest");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let mut ack = test_ack(&delivery, ControlAckPhase::Enqueued, None, None);
+        ack.delivery_digest = "0".repeat(64);
+        stage_ack(&dir, 7, 0, &ack);
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unjoined
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blank refusal detail fails the owner's shape rule.
+    #[test]
+    fn ack_slot_unjoined_on_blank_refused_detail() {
+        let dir = spool_dir("eliot-2896-ack-slot-detail");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(&delivery, ControlAckPhase::Refused, Some("   "), None),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unjoined
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An outcome digest on Enqueued is a shape violation.
+    #[test]
+    fn ack_slot_unjoined_on_enqueued_outcome() {
+        let dir = spool_dir("eliot-2896-ack-slot-outcome");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        stage_ack(
+            &dir,
+            7,
+            0,
+            &test_ack(
+                &delivery,
+                ControlAckPhase::Enqueued,
+                None,
+                Some(&"f".repeat(64)),
+            ),
+        );
+        let mut reads = 0_usize;
+        assert!(matches!(
+            reader.open_ack(7, 0, &delivery, &[(7, 0)], &mut reads),
+            AckSlot::Unjoined
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal never overwrites an occupied slot: the staged acceptance stands.
+    #[test]
+    fn refuse_never_overwrites_occupied_slot() {
+        let dir = spool_dir("eliot-2896-ack-slot-occupied");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        let ack = test_ack(&delivery, ControlAckPhase::Enqueued, None, None);
+        stage_ack(&dir, 7, 0, &ack);
+        let snapshot = std::fs::read(dir.join(control_ack_name(7, 0))).expect("ack readable");
+        reader.refuse_slot(7, 0, &delivery, "control-test", false);
+        assert_eq!(
+            std::fs::read(dir.join(control_ack_name(7, 0))).expect("ack readable"),
+            snapshot
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal stages into a genuinely free slot as Refused.
+    #[test]
+    fn refuse_stages_into_free_slot() {
+        let dir = spool_dir("eliot-2896-ack-slot-refuse-free");
+        let reader = test_reader(&dir, 7);
+        let delivery = test_delivery(7, 0);
+        reader.refuse_slot(7, 0, &delivery, "control-test", false);
+        let bytes = std::fs::read(dir.join(control_ack_name(7, 0))).expect("refused ack readable");
+        let staged: WasmControlAck = serde_json::from_slice(&bytes).expect("refused ack parses");
+        assert_eq!(staged.phase, ControlAckPhase::Refused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
