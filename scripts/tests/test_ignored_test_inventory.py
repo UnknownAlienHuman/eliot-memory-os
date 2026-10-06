@@ -157,14 +157,19 @@ class TestIgnoredTestInventory(unittest.TestCase):
             digest = hashlib.sha256(_canonical_bytes(header[denominator_field])).hexdigest()
             self.assertEqual(header[digest_field], digest)
 
+        # Closed denominator schema (issue #905 W10): production emits exactly
+        # these key sets (`_target_denominator`, `discover_source` resolved
+        # shape, artifact records) - no extra fields admitted.
         target_fields = {
             "package_id", "package_name", "target_name", "target_kind", "src_path",
             "test_enabled", "doctest_enabled", "bench_enabled", "required_features",
-            "required_features_satisfied", "test_disposition",
+            "required_features_satisfied", "features", "available_features", "edition",
+            "test_disposition",
         }
         source_fields = {
             "package_id", "package_name", "target_name", "target_kind", "path",
-            "module_path", "sha256", "cfg_evidence", "resolution", "declaration",
+            "module_path", "sha256", "file_identity", "cfg_evidence", "resolution",
+            "declaration",
         }
         artifact_fields = {
             "package_id", "package_name", "target_name", "target_kind", "profile",
@@ -172,18 +177,31 @@ class TestIgnoredTestInventory(unittest.TestCase):
             "ignored_test_count",
         }
         for record in header["target_denominator"]:
-            self.assertTrue(target_fields.issubset(record))
+            self.assertEqual(set(record), target_fields)
             self.assertIn(record["test_disposition"], {"test_enabled", "test_disabled", "exempt"})
             self.assertIsNone(record["bench_enabled"])
+            self.assertIsInstance(record["edition"], str)
+            self.assertTrue(record["edition"])
+            self.assertIsInstance(record["features"], list)
+            self.assertIsInstance(record["available_features"], list)
+            if record["required_features_satisfied"] is True:
+                self.assertTrue(
+                    set(record["required_features"]).issubset(set(record["features"])),
+                    "satisfied target must enable its required features",
+                )
         for record in header["source_denominator"]:
-            self.assertTrue(source_fields.issubset(record))
+            self.assertEqual(set(record), source_fields)
             self.assertIn(record["resolution"], {"resolved", "unresolved"})
             if record["resolution"] == "resolved":
                 self.assertRegex(record["sha256"], r"\A[0-9a-f]{64}\Z")
+                self.assertEqual(
+                    set(record["file_identity"]), {"device", "inode", "size", "mtime_ns"}
+                )
             else:
                 self.assertIsNone(record["sha256"])
+                self.assertIsNone(record["file_identity"])
         for record in header["artifact_denominator"]:
-            self.assertTrue(artifact_fields.issubset(record))
+            self.assertEqual(set(record), artifact_fields)
             self.assertIsInstance(record["ignored_test_count"], int)
             self.assertGreaterEqual(record["ignored_test_count"], 0)
             self.assertEqual(set(record["file_identity"]), {"device", "inode", "size", "mtime_ns"})
@@ -1597,8 +1615,21 @@ class TestIgnoredTestInventory(unittest.TestCase):
                 }],
             }
             build_targets = _targets(troot, build_metadata)
+            # Closed target schema (issue #905 W10): production emits exactly
+            # these keys for every target record - no extra fields admitted.
+            denominator_records = iti._target_denominator(troot, build_targets)
+            for denominator_record in denominator_records:
+                self.assertEqual(
+                    set(denominator_record),
+                    {
+                        "package_id", "package_name", "target_name", "target_kind",
+                        "src_path", "test_enabled", "doctest_enabled", "bench_enabled",
+                        "required_features", "required_features_satisfied", "features",
+                        "available_features", "edition", "test_disposition",
+                    },
+                )
             build_target_record = next(
-                record for record in iti._target_denominator(troot, build_targets)
+                record for record in denominator_records
                 if record["target_kind"] == "custom-build"
             )
             self.assertEqual(
@@ -2591,6 +2622,21 @@ class TestIgnoredTestInventory(unittest.TestCase):
 
                 with patch.object(iti, "_observe_source_file", side_effect=observe_with_shared_synthetic_identity):
                     tests = discover_source(root, [target], source_denominator_records=records)
+                # Closed source schema (issue #905 W10): every denominator record
+                # production emits is exactly the resolved shape or the dangling
+                # (unresolved/inactive/recheck) shape - no other keys admitted.
+                resolved_shape = frozenset({
+                    "package_id", "package_name", "target_name", "target_kind",
+                    "path", "module_path", "sha256", "file_identity", "cfg_evidence",
+                    "resolution", "declaration",
+                })
+                dangling_shape = resolved_shape | frozenset({
+                    "reason", "declaration_source_path", "declaration_source_sha256",
+                    "declaration_source_file_identity",
+                })
+                for source_record in records:
+                    self.assertIn(frozenset(source_record), {resolved_shape, dangling_shape})
+                    self.assertEqual("reason" in source_record, frozenset(source_record) == dangling_shape)
                 return tests, records
 
         tests_created_forward, sources_created_forward = discover_in_creation_order(("alpha.rs", "omega.rs"))

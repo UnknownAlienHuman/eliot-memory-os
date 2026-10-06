@@ -1,6 +1,6 @@
 {
   "header": {
-    "aggregate_sha256": "5fa01c93f8555c2a4af4eec4feefc0e8e5388728f76b85fe24b71472bcbd1cf6",
+    "aggregate_sha256": "2df38be88f79a7b4f8e2c2b50a7e09286e1157ee2fbfb93c8c18b4bedb1668ad",
     "artifact_denominator": [
       {
         "executable": "debug/deps/sample_package-1111111111111111",
@@ -111,8 +111,11 @@
     },
     "target_denominator": [
       {
+        "available_features": [],
         "bench_enabled": null,
         "doctest_enabled": true,
+        "edition": "2024",
+        "features": [],
         "package_id": "sample-package 0.1.0 (path+file:///crates/sample-package)",
         "package_name": "sample-package",
         "required_features": [],
@@ -124,7 +127,7 @@
         "test_enabled": true
       }
     ],
-    "target_denominator_sha256": "401a8e29c8412318c82f687a7fdda5e9a47aaaa84fb9508b8bb2016d0b67eaa3",
+    "target_denominator_sha256": "5467214bd0687a55dfe1435a32494b593f756361b1c4025222dff0b85611d4ad",
     "tool_version": "0.5.0",
     "toolchain": {
       "channel": "1.97.1",
