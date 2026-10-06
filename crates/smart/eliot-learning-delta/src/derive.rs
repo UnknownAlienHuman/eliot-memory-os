@@ -1357,6 +1357,7 @@ fn phase_build_delta(
         frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    candidate.frozen_pre_evaluation_digest = Some(candidate.frozen_digest()?);
     candidate.seal()?;
     candidate.validate_against_view(state_view)?;
     check_output_size(&AttemptLearningOutcome::Delta(candidate.clone()), policy)?;

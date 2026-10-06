@@ -1859,6 +1859,10 @@ fn valid_consequential_attempt_yields_delta() {
     assert_eq!(delta.evidence, vec![aid("evaluator"), aid("observation")]);
     assert_eq!(delta.evaluator_receipts, vec![aid("evaluator")]);
     assert_eq!(delta.proof_ceiling, ProofCeiling::CandidateArtifact);
+    assert_eq!(
+        delta.frozen_pre_evaluation_digest,
+        Some(delta.frozen_digest().expect("frozen source commitment"))
+    );
     assert_eq!(delta.canonical_digest.len(), 64);
     assert!(delta.validate_against_view(&view).is_ok());
 }
