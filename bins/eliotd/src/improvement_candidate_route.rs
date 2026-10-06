@@ -548,10 +548,11 @@ mod tests {
     use eliot_maintenance::{
         IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_LEGACY_DIGEST_ALGORITHM,
         IMPROVEMENT_PIPELINE_WIRE_REVISION, IMPROVEMENT_PROOF_CEILING,
-        IMPROVEMENT_REQUESTED_EFFECT, IMPROVEMENT_RISK_CEILING_BOUNDED,
+        IMPROVEMENT_REQUESTED_EFFECT, IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementBlockCause,
         ImprovementEvidenceExecution, ImprovementMaterialEquality, ImprovementPulseOutcome,
-        KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT, OP_PROPOSE, PipelineError,
-        ProposalCommitment, TESTD_OWNER, VERIFIER_OWNER_FAMILY, improvement_admission_policy,
+        ImprovementRejectCause, KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT, OP_PROPOSE,
+        PipelineError, ProposalCommitment, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+        improvement_admission_policy,
     };
 
     /// The rollback-contract owner a caller supplies, exactly as
@@ -1297,5 +1298,79 @@ mod tests {
             check_improvement_handoff_identity(&legacy_algorithm, &group.experiment),
             Err(PipelineError::UncheckedRecordIdentity(_))
         ));
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions, not its own restatement of them (AUD7/A1).
+    #[test]
+    fn routed_stale_closure_blocks_with_typed_cause_and_remedy() {
+        let mut group = joined_group("stale");
+        group.admission_evidence.closure_stale = true;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::Blocked {
+                cause,
+                remedy,
+                owner_id,
+                ..
+            }) => {
+                assert_eq!(cause, ImprovementBlockCause::StaleClosure);
+                assert_eq!(remedy, cause.remedy());
+                assert_eq!(owner_id, group.policy.external_owner_id);
+            }
+            Ok(other) => panic!("a stale closure binding must block, got {other:?}"),
+            Err(error) => panic!("a stale closure binding must block, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions (AUD7/A2).
+    #[test]
+    fn routed_harm_rejects_with_typed_cause() {
+        let mut group = joined_group("harm");
+        group.admission_evidence.harm_observed = true;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::Rejected {
+                cause, owner_id, ..
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::HarmObserved);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+            }
+            Ok(other) => panic!("observed harm must reject, got {other:?}"),
+            Err(error) => panic!("observed harm must reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions (AUD7/A3).
+    #[test]
+    fn routed_pulse_regression_regress_rejects_with_typed_cause() {
+        let mut group = joined_group("regression");
+        group.admission_evidence.pulse = ImprovementPulseOutcome::Regression;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::RegressionRejected {
+                cause, owner_id, ..
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::PulseRegression);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+            }
+            Ok(other) => panic!("a pulse regression must regress-reject, got {other:?}"),
+            Err(error) => panic!("a pulse regression must regress-reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions (AUD7/A4/A6).
+    #[test]
+    fn routed_unknown_outcome_requires_reconciliation_bound_to_candidate() {
+        let mut group = joined_group("unknown");
+        group.admission_evidence.outcome_unknown = true;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation }) => {
+                assert_eq!(obligation.candidate_id, group.candidate.candidate_id);
+                assert_eq!(obligation.experiment_id, group.experiment.experiment_id);
+            }
+            Ok(other) => panic!("an unknown outcome must require reconciliation, got {other:?}"),
+            Err(error) => panic!("an unknown outcome must require reconciliation, got {error:?}"),
+        }
     }
 }

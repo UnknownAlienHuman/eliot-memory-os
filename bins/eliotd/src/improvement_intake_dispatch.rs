@@ -3171,3 +3171,147 @@ fn archive_record_key(archived: &ArchivedCandidate) -> String {
         archived.candidate_id, archived.archived_revision
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_maintenance::{PipelineError, improvement_admission_policy};
+
+    use crate::improvement_candidate_dispatch::{
+        ImprovementRouteDispatch, dispatch_improvement_candidate_route,
+    };
+
+    /// One production-shaped dispatch input: a candidate built the way the
+    /// existing dispatch tests build one, with every detail the route reads
+    /// populated, plus the observed closure record this same pass read.
+    fn dispatch_input() -> (ImprovementArtifact, ImprovementAdmissionPolicy, StateFence) {
+        let replay_plan = ReplayPlan {
+            fixed_replay_refs: vec!["replay-2703-a".to_string()],
+            holdout_refs: vec!["holdout-2703-a".to_string()],
+            transfer_refs: vec!["transfer-2703-a".to_string()],
+            counter_metric_names: vec!["metric-2703-a".to_string()],
+            verifier_refs: vec!["verifier-2703-a".to_string()],
+        };
+        let mut candidate = ImprovementCandidate::new(
+            "maintenance-2703-a",
+            ImprovementSurface::Memory,
+            "change-2703-a",
+            vec!["applies-2703-a".to_string()],
+            vec!["not-applies-2703-a".to_string()],
+            vec!["trace-2703-a".to_string()],
+            vec!["evidence-2703-a".to_string()],
+            replay_plan,
+            BTreeMap::new(),
+        )
+        .expect("candidate builds");
+        candidate.set_details(
+            "trigger-2703-a",
+            vec!["hypothesis-2703-a".to_string()],
+            BTreeMap::new(),
+            "scope-2703-a",
+            "owner-2703-a",
+            "delivery-2703-a",
+            "canary-2703-a",
+            "rollback-2703-a",
+            "stop-2703-a",
+        );
+        // The brief and decision travel on the artifact but the route under
+        // test reads only the candidate and the closure: they are populated
+        // honestly rather than defaulted so the input stays production-shaped.
+        let brief = ImprovementBrief {
+            brief_id: "brief-2703-a".to_string(),
+            candidate_id: candidate.candidate_id.clone(),
+            candidate_revision: candidate.revision,
+            problem: "trigger-2703-a".to_string(),
+            evidence_refs: vec!["evidence-2703-a".to_string()],
+            likely_benefit: "benefit-2703-a".to_string(),
+            risk: "risk-2703-a".to_string(),
+            proposed_owner: "owner-2703-a".to_string(),
+            cost: "cost-2703-a".to_string(),
+            next_reversible_step: "step-2703-a".to_string(),
+            unknowns: vec!["unknown-2703-a".to_string()],
+            created_at: candidate.created_at,
+        };
+        let decision = OwnerDecision {
+            brief_id: "brief-2703-a".to_string(),
+            candidate_id: candidate.candidate_id.clone(),
+            owner: "owner-2703-a".to_string(),
+            kind: OwnerDecisionKind::Reject,
+            note: "note-2703-a".to_string(),
+            decided_at: candidate.created_at,
+        };
+        let observed = ObservedClosure {
+            lineage_artifact: "closure-artifact-2703-a".to_string(),
+            lineage_digest: "closure-digest-2703-a".to_string(),
+            attempt_id: "attempt-2703-a".to_string(),
+            campaign_id: "campaign-2703-a".to_string(),
+            route_id: "route-2703-a".to_string(),
+            evidence_ref_count: 1,
+            carries_behavioural_proposal: false,
+            has_retry_lineage: false,
+        };
+        let artifact = ImprovementArtifact {
+            candidate,
+            brief,
+            decision,
+            observed_closure: observed,
+        };
+        let policy = improvement_admission_policy("op-2703-a", "idem-2703-a", "rollback-2703-a");
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("valid lineage"),
+            NonZeroU64::new(1).expect("nonzero sequence"),
+        )
+        .expect("valid epoch");
+        let fence = StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"));
+        (artifact, policy, fence)
+    }
+
+    /// Norm: `I05-16:23` - absence is refused, never guessed (AUD1/AUD2/AUD5).
+    #[test]
+    fn absent_privacy_class_refuses_as_missing_field_without_fallback() {
+        let (artifact, policy, fence) = dispatch_input();
+        let result = dispatch_improvement_candidate_route(ImprovementRouteDispatch {
+            artifact: &artifact,
+            policy: &policy,
+            state_fence: &fence,
+            retained: None,
+            observed_closure: &artifact.observed_closure,
+            privacy_class: None,
+        });
+        // The honest typed refusal crosses as itself: no fallback disposition
+        // is invented for it, so the result is `Err` rather than any `Ok`.
+        match result {
+            Err(PipelineError::MissingField(field)) => assert_eq!(field, "privacy_class"),
+            other => panic!("an absent privacy class must refuse as itself, got {other:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the narrowed fallback reinterprets nothing (AUD3).
+    #[test]
+    fn supplied_privacy_class_reaches_next_honest_refusal_without_fallback() {
+        let (artifact, policy, fence) = dispatch_input();
+        let result = dispatch_improvement_candidate_route(ImprovementRouteDispatch {
+            artifact: &artifact,
+            policy: &policy,
+            state_fence: &fence,
+            retained: None,
+            observed_closure: &artifact.observed_closure,
+            privacy_class: Some("internal"),
+        });
+        // The supplied class clears the profile, so the admitting path reports
+        // its OWN next refusal - the honestly absent evaluation run - rather
+        // than the privacy absence. Had the narrowed fallback fired, this
+        // would be an `Ok(Rejected)` from the gate; the `Err` proves the gate
+        // was never asked to reinterpret a refusal it does not own.
+        match result {
+            Err(PipelineError::MissingField(field)) => assert_eq!(field, "evidence.run_ref"),
+            other => {
+                panic!("a supplied privacy class must surface the next refusal, got {other:?}")
+            }
+        }
+    }
+}
