@@ -1,2 +1,4 @@
 Cargo.lock
+# Issue #1229 A1: the adjacent lock is checked-in resolver-join evidence, not a build artifact.
+!Cargo.lock
 /target/
