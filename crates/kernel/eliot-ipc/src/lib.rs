@@ -3832,6 +3832,49 @@ mod tests {
     }
 
     #[test]
+    fn every_bridge_dimension_keeps_its_own_signal() {
+        // Issue #2731 item A6 (disposition precision): each bridge
+        // saturation dimension the route arms can shed carries its own
+        // signal from the arm to the driver reply - no two dimensions share
+        // one, and the unattributed dispatch fallback never stands in for
+        // a dimension. The driver retains the admitted session on every one
+        // of these (front_door_driver backpressure arm revokes nothing, so
+        // gap/reconcile/retirement recovery stays usable on the transport).
+        let dimensions = [
+            (BACKPRESSURE_BRIDGE_STREAM_OWNERS, "bridge-stream-owners"),
+            (
+                BACKPRESSURE_BRIDGE_HANDOFF_ROWS,
+                "bridge-event-handoff-rows",
+            ),
+            (BACKPRESSURE_BRIDGE_EVENT_RECORDS, "bridge-event-records"),
+            (BACKPRESSURE_BRIDGE_ENVELOPE_BYTES, "bridge-envelope-bytes"),
+            (
+                BACKPRESSURE_BRIDGE_RECOVERY_WINDOWS,
+                "bridge-recovery-windows",
+            ),
+            (BACKPRESSURE_BRIDGE_RECOVERY_CUTS, "bridge-recovery-cuts"),
+        ];
+        for (signal, dimension) in dimensions {
+            assert_eq!(signal.dimension, dimension);
+            assert_ne!(
+                signal, BACKPRESSURE_BRIDGE_DISPATCH,
+                "{dimension} must not collapse into the dispatch fallback"
+            );
+            let attributed = TransportError::AttributedBackpressure(signal);
+            assert_eq!(
+                attributed.backpressure_signal(),
+                Some(signal),
+                "{dimension} must round-trip its own signal to the driver"
+            );
+        }
+        for (index, (first, _)) in dimensions.iter().enumerate() {
+            for (other, _) in &dimensions[index + 1..] {
+                assert_ne!(first, other, "two bridge dimensions share one signal");
+            }
+        }
+    }
+
+    #[test]
     fn stream_owner_saturation_names_its_dimension() {
         // Issue #2731 item 6: the owner-table bind refused at the 2048-owner
         // bound reports its own dimension — never the generic dispatch one.
