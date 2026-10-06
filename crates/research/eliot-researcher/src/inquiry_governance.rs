@@ -3041,7 +3041,7 @@ pub struct AbsenceEvidence {
 /// * the receipt already retains the record's identity
 ///   ([`CoverageReceipt::absence_evidence_digest`]) and its ceiling
 ///   ([`CoverageReceipt::absence_proof_ceiling_grade`]) inside
-///   `coverage-receipt/v3`, and it re-proves the record itself inside
+///   `coverage-receipt/v4`, and it re-proves the record itself inside
 ///   [`AbsencePreconditions::derive`] before the verdict is derived. A third copy
 ///   of the same fact on the receipt would be a second owner of it;
 /// * a closure decision needs the *record*, not its digest. "The digest of a
@@ -3218,6 +3218,14 @@ pub struct CoverageReceipt {
     pub enumeration_state: EnumerationState,
     /// Eligible handles the receipt represents.
     pub eligible_handles: Vec<String>,
+    /// Eligible handles carrying a visible account disposition (I21.6
+    /// `represented` population: eligible intersected with observed members).
+    pub represented_handles: Vec<String>,
+    /// Eligible handles another eligible record cites (I21.6 `cited`
+    /// population: cites edges resolving inside the eligible set).
+    pub cited_handles: Vec<String>,
+    /// Eligible handles no observation reached (I21.6 `omitted` population).
+    pub omitted_handles: Vec<String>,
     /// Explicit coverage unknowns, preserved rather than smoothed.
     pub unknown_coverage: Vec<String>,
     /// Routes the run used.
@@ -3342,6 +3350,29 @@ impl CoverageReceipt {
             .collect();
         eligible_handles.sort();
         eligible_handles.dedup();
+        // W2 (#1767, I21.6): the norm-required source populations, derived
+        // from the same account + records the rest of the receipt binds,
+        // never restated. Route staleness/skips and page cursors have no
+        // admitted input on this path, so they are not synthesized here.
+        let observed = account.observed_members();
+        let represented_handles: Vec<String> = eligible_handles
+            .iter()
+            .filter(|handle| observed.contains(*handle))
+            .cloned()
+            .collect();
+        let omitted_handles: Vec<String> = eligible_handles
+            .iter()
+            .filter(|handle| !observed.contains(*handle))
+            .cloned()
+            .collect();
+        let mut cited_handles: Vec<String> = records
+            .iter()
+            .filter(|record| record.eligibility == SourceEligibility::Eligible)
+            .flat_map(|record| record.record.cites.iter().cloned())
+            .collect();
+        cited_handles.retain(|handle| eligible_handles.contains(handle));
+        cited_handles.sort();
+        cited_handles.dedup();
         let observed_outside_scope = account.observed_outside_scope();
         let enumeration_state = enumeration_state(account, &observed_outside_scope);
         // The evaluation and the manifest it was issued under arrive together or
@@ -3398,6 +3429,9 @@ impl CoverageReceipt {
             observed_outside_scope,
             enumeration_state,
             eligible_handles,
+            represented_handles,
+            cited_handles,
+            omitted_handles,
             unknown_coverage,
             routes_used,
             provider_degradation,
@@ -3438,7 +3472,12 @@ impl CoverageReceipt {
         // freeze, the claim audit and the unsupported-precision residue became
         // carried fields. `research-debt/v1` is unaffected because its preimage
         // never named the receipt digest.
-        let mut preimage = String::from("coverage-receipt/v3;");
+        // `coverage-receipt/v3` -> `v4` by #1767 for the same field-set reason:
+        // the I21.6 represented/cited/omitted source populations are now
+        // carried fields, so one name must not cover both field sets.
+        // Transitively, `evidence-freeze/*` and `inquiry-terminal-record/*`
+        // bind this digest and produce different values for the same run.
+        let mut preimage = String::from("coverage-receipt/v4;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
         push_field(&mut preimage, "requested_scope", &self.requested_scope);
@@ -3543,7 +3582,7 @@ impl CoverageReceipt {
     }
 }
 
-/// Pushes the receipt's three free-valued retained lists onto a digest preimage.
+/// Pushes the receipt's six free-valued retained lists onto a digest preimage.
 ///
 /// Each list is bound as a count followed by that many values under the same
 /// tag, so a reader of the preimage can tell an empty list from a list whose
@@ -3551,6 +3590,9 @@ impl CoverageReceipt {
 /// of the values within each list is the order the receipt itself carries.
 fn push_repeated_fields(preimage: &mut String, receipt: &CoverageReceipt) {
     for (tag, values) in [
+        ("represented_handle", &receipt.represented_handles),
+        ("cited_handle", &receipt.cited_handles),
+        ("omitted_handle", &receipt.omitted_handles),
         ("unknown_coverage", &receipt.unknown_coverage),
         ("route_used", &receipt.routes_used),
         ("degradation", &receipt.provider_degradation),

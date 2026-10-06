@@ -383,3 +383,76 @@ fn coverage_account_digest_observes_substitution() {
         "a substituted disposition must move the digest"
     );
 }
+
+// Issue #1767 W2: the norm-required source populations ride the receipt.
+// represented = eligible with a visible disposition, omitted = eligible with
+// none, cited = eligible handles another eligible record cites. Route
+// staleness/skips and page cursors have no admitted input on this path, so no
+// test synthesizes them.
+fn w2_receipt() -> CoverageReceipt {
+    use std::collections::BTreeSet;
+
+    let profile = receipt_profile();
+    let admissibility = vec![
+        w4_admissible(&profile, w4_record("rep-a", vec!["rep-b".to_owned()])),
+        w4_admissible(&profile, w4_record("rep-b", Vec::new())),
+        w4_admissible(&profile, w4_record("om-c", Vec::new())),
+    ];
+    let mut account = CoverageAccount::open(
+        ["rep-a", "rep-b", "om-c"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<String>>(),
+    )
+    .expect("w2 account");
+    for record in &admissibility[..2] {
+        account
+            .observe(
+                &record.record.handle,
+                record.record.acquisition,
+                &record.record.content_digest,
+                &record.record.operation_id,
+                DIGEST_VE,
+            )
+            .expect("w2 observe");
+    }
+    CoverageReceipt::compute(CoverageReceiptParams {
+        profile: &profile,
+        requested_scope: "which valve alloy survives the thermal envelope",
+        frozen_scope_digest: DIGEST_VE,
+        account: &account,
+        records: &admissibility,
+        absence_evidence: None,
+        routes_used: Vec::new(),
+        provider_degradation: Vec::new(),
+        unknown_coverage: Vec::new(),
+        budget_limitation: None,
+        assessment_time_ms: 1_800_000_000_000,
+    })
+    .expect("w2 receipt")
+}
+
+#[test]
+fn receipt_separates_represented_cited_and_omitted() {
+    let receipt = w2_receipt();
+    assert_eq!(
+        receipt.eligible_handles,
+        vec!["om-c".to_owned(), "rep-a".to_owned(), "rep-b".to_owned()],
+        "all three admitted records are eligible"
+    );
+    assert_eq!(
+        receipt.represented_handles,
+        vec!["rep-a".to_owned(), "rep-b".to_owned()],
+        "only observed eligible handles are represented"
+    );
+    assert_eq!(
+        receipt.cited_handles,
+        vec!["rep-b".to_owned()],
+        "only the cited eligible handle is cited"
+    );
+    assert_eq!(
+        receipt.omitted_handles,
+        vec!["om-c".to_owned()],
+        "the never-observed eligible handle is omitted"
+    );
+}

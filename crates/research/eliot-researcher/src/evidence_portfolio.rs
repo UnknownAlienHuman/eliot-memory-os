@@ -2024,6 +2024,13 @@ impl CoverageAccount {
             .collect()
     }
 
+    /// Declared members carrying a recorded attempt, in canonical member
+    /// order. Every outcome holds a non-empty attempt chain, so membership
+    /// here is exactly "carries a visible disposition" (issue #1767 W2).
+    pub fn observed_members(&self) -> Vec<String> {
+        self.outcomes.keys().cloned().collect()
+    }
+
     /// Whether every accounted member closed intact. Complete accounting with
     /// failures still reports `false` here: accounting completeness and
     /// evidence success stay distinct.
@@ -2140,7 +2147,7 @@ impl CoverageAccount {
     /// prevent.
     ///
     /// Transitively `absence-preconditions/v2` binds this digest through
-    /// `account_digest` and `coverage-receipt/v3` through `account_digest` and
+    /// `account_digest` and `coverage-receipt/v4` through `account_digest` and
     /// `AbsencePreconditions`'s own set, so all three change value for the same
     /// run. Their own field sets and domains are unchanged, and the value
     /// changing in a field a digest already declared is the dependency behaving
@@ -4134,7 +4141,7 @@ fn member_join_reason(
 /// the limitation note on
 /// [`NoMatchEvaluation`] for why no in-crate check can close it. The live
 /// composition owner does re-check the retained record, and it now does so by
-/// name rather than by verdict class alone: `coverage-receipt/v3` binds this
+/// name rather than by verdict class alone: `coverage-receipt/v4` binds this
 /// verdict's class, the reason it carries, the digest of the exact
 /// owner-issued evaluation it was derived from and that record's proof ceiling,
 /// and `InquiryGovernance::validate_integrity` re-checks that receipt digest
@@ -4381,7 +4388,7 @@ fn unclosed_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdi
 /// to reach the *absent-evaluation* arm instead, because it never entered
 /// `incompatible` at all. No test in this crate asserts this string, so treat it
 /// as unblessed by the suite: changing it is a visible change to every receipt
-/// that carries the reason, and it moves `coverage-receipt/v3`.
+/// that carries the reason, and it moves `coverage-receipt/v4`.
 fn incompatible_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
     if preconditions.incompatible.is_empty() {
         return None;
@@ -4501,7 +4508,7 @@ fn unestablished_dimensions(evaluation: &NoMatchEvaluation) -> Option<AbsenceVer
 /// that covered exactly the pre-#2893 `closed` set is now a mismatch. Every such
 /// input was already `Unproven` — the incompatibility arm runs first — so no
 /// input changes from `Proven` to `Unproven` or back. What changes is which
-/// reason a caller reads, and it moves `coverage-receipt/v3`. No test in this
+/// reason a caller reads, and it moves `coverage-receipt/v4`. No test in this
 /// crate asserts this string.
 fn mismatched_evaluated_members(
     evaluation: &NoMatchEvaluation,
