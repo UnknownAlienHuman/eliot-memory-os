@@ -2376,6 +2376,35 @@ fn mark_slot_failed(slot: &std::path::Path, identity: &WasmDeliveryIdentity, rea
 /// byte bindings, or the file staging fails closed, or
 /// [`WasmDispatchError::Backpressure`] when another live delivery owns
 /// the fixed names.
+/// Claim-shape validation for [`publish_wasm_dispatch_bundle`]: non-blank
+/// host path and digest, non-empty size-bounded guest bytes bound to the
+/// claim digests. Pure check, no staging side effect.
+fn validate_publish_claim(
+    host_executable_path: &str,
+    host_artifact_digest: &str,
+    claim: &WasmOwnerClaim,
+) -> Result<(), WasmDispatchError> {
+    if host_executable_path.trim().is_empty() {
+        return Err(invalid("registry-host-path"));
+    }
+    require_digest(host_artifact_digest, "registry-host-digest")?;
+    if claim.artifact_bytes.is_empty() || claim.input_bytes.is_empty() {
+        return Err(invalid("guest-bytes"));
+    }
+    if claim.artifact_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
+        || claim.input_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
+    {
+        return Err(invalid("guest-bytes-bound"));
+    }
+    if sha256_hex(&claim.artifact_bytes) != claim.guest.artifact_digest
+        || sha256_hex(&claim.input_bytes) != claim.guest.input_digest
+    {
+        return Err(invalid("guest-bytes-binding"));
+    }
+    Ok(())
+}
+
+/// Publish a validated owner claim as the live wasm dispatch bundle.
 pub fn publish_wasm_dispatch_bundle(
     host_executable_path: &str,
     host_artifact_digest: &str,
@@ -2396,23 +2425,7 @@ pub fn publish_wasm_dispatch_bundle(
     let _serial = PUBLISH_SERIAL_GUARD
         .lock()
         .map_err(|_| invalid("delivery-guard"))?;
-    if host_executable_path.trim().is_empty() {
-        return Err(invalid("registry-host-path"));
-    }
-    require_digest(host_artifact_digest, "registry-host-digest")?;
-    if claim.artifact_bytes.is_empty() || claim.input_bytes.is_empty() {
-        return Err(invalid("guest-bytes"));
-    }
-    if claim.artifact_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
-        || claim.input_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
-    {
-        return Err(invalid("guest-bytes-bound"));
-    }
-    if sha256_hex(&claim.artifact_bytes) != claim.guest.artifact_digest
-        || sha256_hex(&claim.input_bytes) != claim.guest.input_digest
-    {
-        return Err(invalid("guest-bytes-binding"));
-    }
+    validate_publish_claim(host_executable_path, host_artifact_digest, claim)?;
     let material = publish_wasm_dispatch_material(
         &claim.claim_id,
         &claim.operation_id,
