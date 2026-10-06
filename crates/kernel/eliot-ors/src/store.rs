@@ -41105,3 +41105,89 @@ mod effect_delivery_current_state_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod bridge_handoff_retirement_2731 {
+    use super::*;
+    use serde_json::json;
+
+    const RETIRE_LINEAGE_2731: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn unscoped_gap_payload(nonce: &str, gap_tag: &str) -> serde_json::Value {
+        json!({
+            "gap_id": gap_tag,
+            "stream_id": "",
+            "start_sequence": 1,
+            "end_sequence": 1,
+            "owner_authority_lineage": RETIRE_LINEAGE_2731,
+            "owner_principal": "principal-2731",
+            "reason_ref": "reason-2731",
+            "staging_connection": "conn-2731",
+            "owner_connection": "conn-2731",
+            "owner_launch_nonce": nonce,
+            "owner_session_epoch": 1,
+        })
+    }
+
+    fn temp_retire_store() -> (RedbRecoveryStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-2731-retire-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = RedbRecoveryStore::open(&path).expect("temp retire store opens");
+        (store, path)
+    }
+
+    #[test]
+    fn owner_table_saturation_breaks_through_with_typed_limit() -> Result<(), OrsError> {
+        // Issue #2731 item 6: the 2048-owner table bound is a measured,
+        // reachable saturation — not an assumed constant. Each unscoped gap
+        // binds its reporter's own occurrence namespace through the real
+        // public gap entry (the same call the :8016 route arm serves).
+        let (store, path) = temp_retire_store();
+        for index in 0..2048 {
+            let tag = format!("2731-{index:05}");
+            let outcome = store.record_bridge_event_gap_checked(&unscoped_gap_payload(
+                &format!("nonce-{tag}"),
+                &format!("gap-{tag}"),
+            ))?;
+            assert_eq!(
+                outcome.get("accepted").and_then(serde_json::Value::as_bool),
+                Some(true),
+                "owner bind {index} of 2048 must stage its gap"
+            );
+        }
+        // The 2049th fresh namespace fails with the typed projection limit
+        // (store.rs `bind_bridge_stream_owner_in`), never with silent loss
+        // and never by evicting a retained owner.
+        let overflow = store.record_bridge_event_gap_checked(&unscoped_gap_payload(
+            "nonce-2731-overflow",
+            "gap-2731-overflow",
+        ));
+        assert!(
+            matches!(overflow, Err(OrsError::ProjectionLimitExceeded)),
+            "the 2049th fresh owner bind must fail with ProjectionLimitExceeded, got {overflow:?}"
+        );
+        // A retained namespace still binds: replaying its gap answers the
+        // stored duplicate instead of a second row.
+        let replay = store.record_bridge_event_gap_checked(&unscoped_gap_payload(
+            "nonce-2731-00000",
+            "gap-2731-00000",
+        ))?;
+        assert_eq!(
+            replay.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a retained owner namespace must replay its gap, not bind twice"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
