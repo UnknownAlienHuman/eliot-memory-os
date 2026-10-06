@@ -81,7 +81,7 @@ use crate::SpoolError;
 /// fence, or later reader ever loads an older revision. It is not a guard over a
 /// persisted one, and it is deliberately not a digest — there is nothing here to
 /// hash and no original recorded value to compare a hash against.
-pub const SENSOR_MAP_REVISION: u16 = 3;
+pub const SENSOR_MAP_REVISION: u16 = 4;
 
 /// One of the eleven Windows sensors I8.2 enumerates.
 ///
@@ -351,7 +351,7 @@ impl ChannelCapability {
 /// `Wired`/`MissingAdapter` is the measured state of this crate at
 /// `SENSOR_MAP_REVISION`, from `git grep` over `bins/eliot-watchdog/src` for a
 /// production runtime caller of each channel's source — not a design intent.
-/// Six channels are wired; the other five are measured missing adapters and
+/// Seven channels are wired; the other four are measured missing adapters and
 /// are the named gaps that keep a full-coverage claim unavailable.
 pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
     ChannelCapability {
@@ -437,15 +437,15 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::PathChange],
         mechanism: SensorMechanism::JournalReplay,
         privilege_profile: PlatformPrivilegeProfile::HostAdministrator,
-        coverage_limitation: "The journal surface (`eliot-platform-windows::usn_journal`), the \
-             spool-retained cursor and the replay adapter exist, but the tick passes no \
-             registered-scope volume, so no window is ever recorded and file-change coverage \
-             stays blind.",
-        wiring: ChannelWiring::MissingAdapter {
-            reason: "`journal_replay_observation::observe_journal_replay` has no production caller: \
-                 the tick holds no registered-scope roots to pass (see `RegisteredScope`), so the \
-                 adapter, the platform page read and the spool cursor it stands on are proved by \
-                 unit tests only",
+        coverage_limitation: "The tick replays one bounded page per admitted scope through \
+             the spool-retained cursor and records the window through `record_replayed`. No \
+             production registrar issues scopes, so the admitted set is empty in production and \
+             the channel stays without an establishable sample until one does; the \
+             disposable-scope proof lives test-side in `registered_scope_replay`.",
+        wiring: ChannelWiring::Wired {
+            runtime_caller: "watchdog_composition::WatchdogComposition::start_with_shutdown_and_host_and_heartbeat \
+                 -> registered_scope_replay::replay_registered_scopes -> \
+                 journal_replay_observation::observe_journal_replay",
         },
     },
     ChannelCapability {
@@ -1451,6 +1451,29 @@ impl IntervalCoverageCell {
             })
     }
 
+    /// Records one journal-replay window the replay adapter reported for one
+    /// channel (#1755 W3).
+    ///
+    /// The same closed-interval rule as [`record`](Self::record): an offer
+    /// made while no interval is open, or against a poisoned cell, returns
+    /// [`RecordOutcome::NotRecorded`]. The one-window-per-channel-per-interval
+    /// bound lives in the publisher, so a second window for one channel in
+    /// one interval is refused without touching the first.
+    pub fn record_replayed(
+        &self,
+        channel: ObservationChannel,
+        evidence: JournalReplayEvidence,
+    ) -> RecordOutcome {
+        self.state
+            .lock()
+            .map_or(RecordOutcome::NotRecorded, |mut state| {
+                if !state.interval_open {
+                    return RecordOutcome::NotRecorded;
+                }
+                state.publisher.record_replayed(channel, evidence)
+            })
+    }
+
     /// Closes the open interval at `end_ms`.
     ///
     /// Returns `None` when the cell's lock is poisoned or no interval is open,
@@ -1508,11 +1531,11 @@ mod replay_disposition_tests {
     }
 
     /// An exact replayed window substitutes the missing live source on the
-    /// unwired journal channel: `JOURNAL_REPLAYED` with the count equal to
+    /// journal channel: `JOURNAL_REPLAYED` with the count equal to
     /// the evidence window length, no gaps, not blocking, internally valid.
     /// I8.2 (`docs/architecture/I08-02-independent-observation-routes.md:26`).
     #[test]
-    fn exact_window_on_unwired_channel_closes_as_journal_replayed() {
+    fn exact_window_on_journal_channel_closes_as_journal_replayed() {
         let mut publisher = IntervalCoveragePublisher::new(1_000);
         assert_eq!(
             publisher.record_replayed(ObservationChannel::FilesystemJournal, window(100, 109)),
@@ -1563,9 +1586,11 @@ mod replay_disposition_tests {
     }
 
     /// Malformed evidence (blank journal, inverted window) is refused like a
-    /// duplicate: the channel stays blind with its named gap, never replayed.
+    /// duplicate: the wired channel stays without an establishable sample
+    /// with its named gap, never replayed (map revision 4: the journal
+    /// channel has a production caller, so refusal is `UNKNOWN`, not `BLIND`).
     #[test]
-    fn malformed_window_is_refused_and_channel_stays_blind() {
+    fn malformed_window_is_refused_and_channel_stays_unknown() {
         let mut publisher = IntervalCoveragePublisher::new(1_000);
         assert_eq!(
             publisher.record_replayed(
@@ -1584,12 +1609,12 @@ mod replay_disposition_tests {
         );
         let report = publisher.close(2_000);
         let record = journal_record(&report);
-        assert_eq!(record.disposition(), CoverageDisposition::Blind);
+        assert_eq!(record.disposition(), CoverageDisposition::Unknown);
         assert!(
             record
                 .gaps()
                 .iter()
-                .any(|gap| gap.reason == "NO_COMPETENT_SOURCE")
+                .any(|gap| gap.reason == "NO_ESTABLISHABLE_SAMPLE")
         );
         assert!(
             report

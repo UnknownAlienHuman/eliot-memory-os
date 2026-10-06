@@ -74,6 +74,7 @@ mod independent_sensor;
 mod journal_replay_observation;
 mod observation_attribution;
 mod observation_coverage;
+mod registered_scope_replay;
 mod runtime_manifest_selection;
 mod scm_launch;
 mod self_admission;

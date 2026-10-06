@@ -96,9 +96,8 @@ pub(crate) fn observe_journal_replay(
     watched_root: &Path,
     max_bytes: u32,
 ) -> JournalReplayOutcome {
-    let retained = match spool.read_journal_cursor(volume) {
-        Ok(cursor) => cursor,
-        Err(_) => return JournalReplayOutcome::Unavailable(SPOOL_UNAVAILABLE),
+    let Ok(retained) = spool.read_journal_cursor(volume) else {
+        return JournalReplayOutcome::Unavailable(SPOOL_UNAVAILABLE);
     };
     match retained {
         None => seed_position(spool, volume, watched_root),

@@ -746,6 +746,23 @@ impl WatchdogComposition {
                                 ObservationClass::ListenerBinding,
                             );
                         }
+                        // I8.2 (#1755 W3/C6): one registered-scope journal-replay
+                        // step over the admitted scopes. No production registrar
+                        // issues scopes, so the admitted set is empty here and
+                        // the step is a measured no-op; the disposable scopes
+                        // that prove it are owner-issued test-side. The step
+                        // takes no daemon handle: with `eliotd` down this still
+                        // runs on the owner spool and platform reads alone.
+                        if let Some(port) = kernel.spool_backup_port() {
+                            let _ = crate::registered_scope_replay::replay_registered_scopes(
+                                port.spool.as_ref(),
+                                &coverage,
+                                &[],
+                                &[],
+                                &[],
+                                crate::registered_scope_replay::JOURNAL_REPLAY_PAGE_BYTES,
+                            );
+                        }
                         let admission = match admission.reload() {
                             Ok(admission) => admission,
                             Err(error) => {

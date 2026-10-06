@@ -1239,6 +1239,10 @@ impl WatchdogSpool {
 
     /// Reads the latest retained shared I8.2 coverage manifest (#1755 W6).
     ///
+    /// Test-only readback for the retain proof: no production path consumes
+    /// the retained row yet, so the reader serves the verification suite
+    /// rather than shipping a caller-less production API.
+    ///
     /// `Ok(None)` when no interval has retained one yet. A stored row that no
     /// longer parses or validates is refused as corrupt rather than served as
     /// evidence: fail closed, never a best-effort manifest.
@@ -1247,6 +1251,7 @@ impl WatchdogSpool {
     ///
     /// Returns [`SpoolError`] when the database cannot be read or the stored
     /// row is corrupt.
+    #[cfg(test)]
     pub(crate) fn read_shared_coverage_manifest(
         &self,
     ) -> Result<Option<eliot_evaluation_contracts::ObservationCoverageManifest>, SpoolError> {
