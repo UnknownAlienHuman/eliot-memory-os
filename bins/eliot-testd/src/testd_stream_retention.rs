@@ -789,17 +789,19 @@ mod tests {
         }
     }
 
-    /// Issue #456 (WA11/WB1/I3): chunked stdout plus small stderr stream
-    /// through a real pump into retained rows, then admit and resolve to
-    /// byte-identical evidence with stable readback identities.
-    #[test]
-    fn retained_streams_round_trip_through_real_pump() {
-        let (dir, store) = test_store("round-trip");
-        let retention = TestdStreamRetention::new(Arc::new(store), test_fence());
-        let binding = test_binding();
-
-        let payload: Vec<u8> = (0..20_000_u32).map(|i| (i % 251) as u8).collect();
-        let mut stdout_pump = pump(&retention, binding.clone(), ProcessStreamKind::Stdout);
+    /// Pumps one chunked stdout plus one small stderr stream through real
+    /// pumps into retained rows, returning both terminal evidences with the
+    /// exact pumped payloads.
+    fn pump_two_terminal_streams(
+        retention: &TestdStreamRetention,
+        binding: &eliot_process::ProcessExecutionBinding,
+        payload: &[u8],
+        stderr_bytes: &[u8],
+    ) -> (
+        eliot_process::ProcessStreamEvidence,
+        eliot_process::ProcessStreamEvidence,
+    ) {
+        let mut stdout_pump = pump(retention, binding.clone(), ProcessStreamKind::Stdout);
         stdout_pump.open().expect("stdout session must open");
         for chunk in [
             &payload[..7_000],
@@ -826,17 +828,31 @@ mod tests {
                 .starts_with("testd-retained:job-1:operation-1:stdout")
         );
 
-        let stderr_bytes = b"stderr-line".to_vec();
-        let mut stderr_pump = pump(&retention, binding.clone(), ProcessStreamKind::Stderr);
+        let mut stderr_pump = pump(retention, binding.clone(), ProcessStreamKind::Stderr);
         stderr_pump.open().expect("stderr session must open");
         assert_eq!(
             stderr_pump
-                .append(&stderr_bytes)
+                .append(stderr_bytes)
                 .expect("stderr chunk must admit"),
             SinkAppendOutcome::Admitted
         );
         let stderr_terminal = stderr_pump.finalize_eof().expect("stderr must finalize");
-        let stderr_evidence = stderr_terminal.evidence().clone();
+        (stdout_evidence, stderr_terminal.evidence().clone())
+    }
+
+    /// Issue #456 (WA11/WB1/I3): chunked stdout plus small stderr stream
+    /// through a real pump into retained rows, then admit and resolve to
+    /// byte-identical evidence with stable readback identities.
+    #[test]
+    fn retained_streams_round_trip_through_real_pump() {
+        let (dir, store) = test_store("round-trip");
+        let retention = TestdStreamRetention::new(Arc::new(store), test_fence());
+        let binding = test_binding();
+
+        let payload: Vec<u8> = (0..20_000_u32).map(|i| (i % 251) as u8).collect();
+        let stderr_bytes = b"stderr-line".to_vec();
+        let (stdout_evidence, stderr_evidence) =
+            pump_two_terminal_streams(&retention, &binding, &payload, &stderr_bytes);
 
         let record = ProcessEvidence::new_typed(
             test_view(&binding),
