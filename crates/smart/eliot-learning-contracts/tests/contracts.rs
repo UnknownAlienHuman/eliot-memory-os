@@ -935,7 +935,7 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
     };
     handoff.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
     handoff.seal()?;
-    handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay)?;
+    handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay, &receipt)?;
     Ok(())
 }
 
@@ -1167,7 +1167,7 @@ fn frozen_chain() -> Result<FrozenChain, Box<dyn std::error::Error>> {
     };
     handoff.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
     handoff.seal()?;
-    handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay)?;
+    handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay, &receipt)?;
     Ok((view, delta, overlay, receipt, assessment, handoff))
 }
 
@@ -1253,7 +1253,7 @@ fn activation_lineage_rejects_missing_and_drifted_frozen_bindings()
 #[test]
 fn closure_lineage_rejects_missing_and_drifted_frozen_bindings()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (_, delta, overlay, _, assessment, handoff) = frozen_chain()?;
+    let (_, delta, overlay, receipt, assessment, handoff) = frozen_chain()?;
     // Sealed delta carrying 64 `a`s with a resealed handoff carrying 64
     // `b`s: otherwise valid matching lineage must still fail.
     let mut forged_delta = delta.clone();
@@ -1263,12 +1263,22 @@ fn closure_lineage_rejects_missing_and_drifted_frozen_bindings()
     drifted_handoff.frozen_pre_evaluation_digest = Some("b".repeat(64));
     drifted_handoff.seal()?;
     assert!(matches!(
-        drifted_handoff.validate_against_assessment_and_delta(&assessment, &forged_delta, &overlay),
+        drifted_handoff.validate_against_assessment_and_delta(
+            &assessment,
+            &forged_delta,
+            &overlay,
+            &receipt
+        ),
         Err(LearningContractError::DigestMismatch { .. })
     ));
     // Forged delta binding fails even with a bound handoff.
     assert!(matches!(
-        handoff.validate_against_assessment_and_delta(&assessment, &forged_delta, &overlay),
+        handoff.validate_against_assessment_and_delta(
+            &assessment,
+            &forged_delta,
+            &overlay,
+            &receipt
+        ),
         Err(LearningContractError::DigestMismatch { .. })
     ));
     // Missing handoff binding fails closed even with a bound delta.
@@ -1276,7 +1286,12 @@ fn closure_lineage_rejects_missing_and_drifted_frozen_bindings()
     unbound_handoff.frozen_pre_evaluation_digest = None;
     unbound_handoff.seal()?;
     assert!(matches!(
-        unbound_handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay),
+        unbound_handoff.validate_against_assessment_and_delta(
+            &assessment,
+            &delta,
+            &overlay,
+            &receipt
+        ),
         Err(LearningContractError::Missing { .. })
     ));
     // Missing delta binding fails closed even with a bound handoff.
@@ -1284,8 +1299,45 @@ fn closure_lineage_rejects_missing_and_drifted_frozen_bindings()
     unbound_delta.frozen_pre_evaluation_digest = None;
     unbound_delta.seal()?;
     assert!(matches!(
-        handoff.validate_against_assessment_and_delta(&assessment, &unbound_delta, &overlay),
+        handoff.validate_against_assessment_and_delta(
+            &assessment,
+            &unbound_delta,
+            &overlay,
+            &receipt
+        ),
         Err(LearningContractError::Missing { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn closure_lineage_rejects_resealed_overlay_under_unchanged_assessment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, delta, overlay, receipt, assessment, handoff) = frozen_chain()?;
+    // Same-ID replacement overlay: only the prediction changes, the overlay
+    // is resealed, and the handoff digest follows the replacement while the
+    // assessment, the delta and the receipt stay untouched. The receipt the
+    // assessment sealed still binds the original frozen content, so closure
+    // must refuse to present the replacement as the assessed revision.
+    let mut replaced_overlay = overlay.clone();
+    replaced_overlay.prediction = "replaced-prediction".to_owned();
+    replaced_overlay.seal()?;
+    assert_ne!(
+        replaced_overlay.frozen_digest(),
+        overlay.frozen_digest(),
+        "the substitution must change the frozen content it claims"
+    );
+    let mut rebound_handoff = handoff.clone();
+    rebound_handoff.frozen_pre_evaluation_digest = Some(replaced_overlay.frozen_digest());
+    rebound_handoff.seal()?;
+    assert!(matches!(
+        rebound_handoff.validate_against_assessment_and_delta(
+            &assessment,
+            &delta,
+            &replaced_overlay,
+            &receipt
+        ),
+        Err(LearningContractError::DigestMismatch { .. })
     ));
     Ok(())
 }

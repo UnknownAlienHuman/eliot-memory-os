@@ -194,21 +194,52 @@ impl ClosureHandoff {
         Ok(())
     }
 
-    /// Validate exact assessment, delta and frozen lineage together before handoff.
+    /// Validate exact assessment, activation, delta and frozen lineage together.
     ///
     /// The handoff must carry the same coherent frozen binding as the
     /// activation receipt: the assessed overlay's frozen digest, recomputed
     /// from the presented overlay. The presented delta's own frozen binding
-    /// must be recomputable from its sealed content. A fabricated digest,
-    /// another material's digest or a missing binding fails here, not at the
-    /// external review.
+    /// must be recomputable from its sealed content. The assessment's
+    /// committed activation (id plus receipt digest) joins the chain to the
+    /// exact retained receipt, so a same-ID resealed replacement overlay
+    /// presented under the unchanged assessment cannot pass: its recomputed
+    /// digest disagrees with the receipt the assessment sealed. Overlay seal
+    /// integrity needs no separate check here: the digest is recomputed
+    /// from content, so seal-consistent tampering still mismatches both
+    /// sealed commitments. A fabricated digest, another material's digest
+    /// or a missing binding fails here, not at the external review.
     pub fn validate_against_assessment_and_delta(
         &self,
         assessment: &crate::assessment::LearningAssessmentCandidate,
         delta: &crate::delta::AttemptLearningDeltaCandidate,
         overlay: &crate::overlay::CampaignHarnessOverlayCandidate,
+        activation: &crate::activation::HarnessActivationReceiptCandidate,
     ) -> Result<(), LearningContractError> {
         self.validate_against_assessment(assessment)?;
+        activation.validate()?;
+        if assessment.activation_id != activation.activation_id
+            || assessment.activation_digest != activation.canonical_digest
+            || activation.overlay_id != overlay.overlay_id
+            || activation.delta_id != delta.delta_id
+        {
+            return Err(LearningContractError::ScopeMismatch {
+                field: "closure.activation_lineage",
+            });
+        }
+        let expected_receipt = overlay.frozen_digest();
+        match &activation.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_receipt => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "closure.activation_frozen_lineage",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "closure.activation_frozen_lineage",
+                });
+            }
+        }
         delta.validate()?;
         if self.delta_id != delta.delta_id
             || self.binding != delta.binding
