@@ -5950,6 +5950,32 @@ pub enum BackupDispatchTarget {
     Reconcile,
 }
 
+/// How an isolated-destination preparation failed: refused before any effect,
+/// or uncertain after the effect boundary was crossed.
+///
+/// The boundary is the durable admission record: everything that fails while
+/// only READS ran is a refusal, and everything that fails once the admission
+/// (and therefore the destination row) is retained — the materialisation, the
+/// creation record, or a lost CAS response — is uncertain, because the root
+/// may exist and only reconciliation can say. The dispatch arm answers the
+/// first with a pre-effect refusal and the second with a retained
+/// possible-effect, never with a no-effect refusal after the boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IsolatedPreparationFailure {
+    Refused(&'static str),
+    EffectUncertain(&'static str),
+}
+
+/// What one replay lookup found for an admitted operation identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedReplay {
+    /// Nothing is retained for this operation: the caller allocates fresh.
+    Allocate,
+    /// The retained pair matches: the caller resolves the same verified
+    /// destination instead of allocating or refusing.
+    Replay,
+}
+
 /// The exact closed prepare/cutover dispatch table this Host composition
 /// registers on the canonical Host runtime-control endpoint (#962).
 ///
@@ -6561,13 +6587,31 @@ impl HostComposition {
             ));
         };
         let outcome = match target {
-            // The status/reconciliation read. The operation identity is the
-            // admitted request's own authenticated `request_id`, and it is a
+            // The status/reconciliation read. The operation selector is the
+            // ADMITTED canonical request hash carried on the operation body's
+            // own request identity — the same hash prepare, replay, status and
+            // cleanup all key by — never the transport `request_id`, which
+            // names the delivery and cannot select a retained record. It is a
             // READ selector only: the owner re-derives the record from its own
-            // durable journal, and no destination, epoch or digest is taken from
+            // durable stores, and no destination, epoch or digest is taken from
             // it. It never calls prepare or cutover again.
             BackupDispatchTarget::Reconcile => {
-                match self.backup_dispatch_reconcile(request.request_id.as_str()) {
+                let admitted_operation = match &request.body {
+                    eliot_host_service::runtime_control::BackupOperationBody::RestoreStatus(
+                        body,
+                    ) => body.identity.mutation.canonical_request_hash.as_str(),
+                    eliot_host_service::runtime_control::BackupOperationBody::ReconcileRestore(
+                        body,
+                    ) => body.identity.mutation.canonical_request_hash.as_str(),
+                    _ => {
+                        return Err(BackupDispatchRefusal::new(
+                            operation,
+                            "a reconcile/status read needs an admitted restore operation body \
+                             carrying the operation hash",
+                        ));
+                    }
+                };
+                match self.backup_dispatch_reconcile(admitted_operation) {
                     // The owner re-verified this operation's recorded result
                     // against the live root. This is the owner's own read
                     // result, so it is reported as the owner retained the
@@ -6588,15 +6632,19 @@ impl HostComposition {
                             retained: retained_backup_operation(request)?,
                         })
                     }
-                    // No record at all: nothing was ever admitted for this
-                    // operation, so no effect can be outstanding and a
-                    // pre-effect refusal is exact.
-                    Ok(crate::backup_preparation::ReconcileDisposition::Absent) => {
-                        Err(BackupDispatchRefusal::new(
+                    // No journal record at all: fall back to the installation
+                    // authority's own registry, which is where the
+                    // installation-authority prepare route retains its
+                    // admission, destination row and materialisation. The
+                    // journal above only ever held the directory-route
+                    // records, so its silence says nothing about the
+                    // installation route either way.
+                    Ok(crate::backup_preparation::ReconcileDisposition::Absent) => self
+                        .reconcile_retained_isolated_destination(
                             operation,
-                            "this Host retains no isolated-restore preparation for the admitted operation",
-                        ))
-                    }
+                            admitted_operation,
+                            request,
+                        ),
                     // The reclamation finished: the recorded destination was
                     // removed and its absence was observed, so the operation is
                     // terminal. It is answered as a refusal in the same shape as
@@ -6695,10 +6743,52 @@ impl HostComposition {
             // path at all.
             //
             // No destination is created, so a refusal here still means no effect.
-            BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
-                operation,
-                "preparation is admitted up to its destination parent, which the installation root contract now declares outside the source; what is still absent is an owner-issued caller credential, and how a prepared destination may be named across this seam is a frozen #954 interface decision",
-            )),
+            //
+            // #958 A2: the destination allocation itself is now admitted by the
+            // INSTALLATION AUTHORITY, on the production path, before this arm
+            // can answer anything. `admit_owner_isolated_destination` runs
+            // `eliot_installation::admit_prepared_isolated_destination`, which
+            // derives the destination root from the owner-declared isolated
+            // restore area and the owner-issued destination installation
+            // identity, proves the area through a retained protected-root lease,
+            // refuses a client-supplied arbitrary path and an active/source
+            // installation, and binds source, archive, class, operation, current
+            // purge revision, target schema and proposed restoration
+            // requirements from owner-issued records only. A refusal from it is
+            // pre-effect and names the installation authority's own reason; it
+            // replaces the generic message for exactly those refusals and leaves
+            // the rest of the arm unchanged.
+            BackupDispatchTarget::Prepare => match self.admit_owner_isolated_destination(request) {
+                Err(IsolatedPreparationFailure::Refused(reason)) => {
+                    Err(BackupDispatchRefusal::new(operation, reason))
+                }
+                // The admission record and its destination row are retained and
+                // the root is created, but the owner result cannot be finished
+                // across this seam: finishing it would need either a `#954`
+                // `BackupPhaseAttestation` — which this Host must not mint
+                // without an attested backup role, a backup `ReceiptId` and a
+                // retained archive identity (see the `Current` arm above) — or
+                // a destination handle naming the created root, which the
+                // frozen `#954` seam cannot carry. Minting either would be
+                // exactly the fabricated owner receipt the audit forbids. The
+                // operation is therefore retained and exposed for
+                // reconciliation, which reads the retained pair back and
+                // answers `Admitted`: a no-effect refusal here would claim
+                // nothing happened after the effect boundary was crossed.
+                Ok(()) => Ok(BackupOwnerOutcome::PossibleEffect {
+                    retained: retained_backup_operation(request)?,
+                }),
+                // The admission record is retained (or its CAS response was
+                // lost), the materialisation may have created the root, or the
+                // creation record may have committed without an observed
+                // response. Only reconciliation can say which: the operation
+                // is retained and exposed, never refused as no-effect.
+                Err(IsolatedPreparationFailure::EffectUncertain(_)) => {
+                    Ok(BackupOwnerOutcome::PossibleEffect {
+                        retained: retained_backup_operation(request)?,
+                    })
+                }
+            },
             // Named owner refusal, also PRE-EFFECT: it refuses before
             // `backup_dispatch_cutover` is entered. A cutover needs a separately
             // admitted `CutoverRequest` body that the closed `#954` envelope does
@@ -6722,6 +6812,582 @@ impl HostComposition {
         outcome
     }
 
+    /// Admits one isolated destination installation through the INSTALLATION
+    /// AUTHORITY, before any effect (#958, A2).
+    ///
+    /// This is the production caller of
+    /// [`eliot_installation::admit_prepared_isolated_destination`], reached from
+    /// `main.rs::process_backup_dispatch_requests` on the live registered backup
+    /// owner loop through
+    /// [`Self::process_backup_dispatch_requests`] ->
+    /// [`Self::dispatch_backup_owner_operation`]'s
+    /// [`BackupDispatchTarget::Prepare`] arm. A refused destination creates no
+    /// directory and retains nothing; once the admission record is retained,
+    /// failures are uncertain rather than refusals, and the arm answers them
+    /// with a retained possible-effect (see [`IsolatedPreparationFailure`).
+    ///
+    /// Every input is an owner record:
+    ///
+    /// - the owner-issued authenticated `#954` request identity carried on the
+    ///   admitted `BackupRuntimeControlRequest`'s own `PrepareIsolatedRestore`
+    ///   body, from which the installation authority issues the
+    ///   `PreparedDestinationFacts` (source, archive, class, operation, target
+    ///   schema and destination installation identity) and the
+    ///   `ProposedRestorationRequirements`;
+    /// - this composition's registry-committed owner evidence
+    ///   ([`crate::backup_preparation::OwnerEvidence::inspect`]), which supplies
+    ///   the source runtime roots, the SET of approved generations this authority
+    ///   itself retains (from which the installation authority resolves the
+    ///   approved target and validates that row's own approval against that same
+    ///   row's manifest), the set of installation identities already in existence,
+    ///   and the current purge-ledger revision read from the ORS purge-ledger owner
+    ///   — the same revision then handed to the record seam, which compares it
+    ///   against the one the admission bound rather than against zero;
+    /// - a retained no-follow `ProtectedRootLease` over the owner-declared
+    ///   isolated restore area, which the installation authority resolves and
+    ///   re-verifies.
+    ///
+    /// On success the admitted record AND the proof that its root was created
+    /// are written into the installation registry through the authority's own
+    /// compare-and-swap, so the destination becomes a real PREPARED, UNACTIVATED
+    /// installation this authority retains, with the created object's own
+    /// observed file identity recorded beside it -- and the downstream refusal
+    /// for the missing owner-issued caller credential is left exactly as it was,
+    /// because materialising a destination does not name it across the frozen
+    /// `#954` seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns one `&'static str` reason per failure class, because the
+    /// dispatch refusal this answers is a `&'static str` reason; no owner error
+    /// text, path or record body is echoed and nothing is allocated per refusal.
+    /// The typed failure itself is the installation authority's
+    /// [`eliot_installation::IsolatedDestinationError`], which is matched
+    /// variant-by-variant in [`Self::isolated_destination_reason`] rather than
+    /// collapsed into one message.
+    #[cfg(windows)]
+    /// Looks up what this authority already retains for one admitted operation
+    /// identity, BEFORE any fresh allocation.
+    ///
+    /// `IncompleteObservation` is this authority's own "retains no record for
+    /// that operation" signal and is the ONLY outcome that means "allocate".
+    /// A retained creation pair whose content matches the admitted facts is a
+    /// replay of the same verified destination. A retained admission without
+    /// its creation pair is durable intent with an unknown outcome — the
+    /// materialisation may have created the root, or the creation record may
+    /// have committed without an observed response — so the operation stays
+    /// retained and reconciling instead of allocating again. Any other error
+    /// — a capability refusal or a durable read fault — is uncertain rather
+    /// than a refusal: a faulted read is not absence, and answering it with a
+    /// fresh allocation could strand a SECOND destination beside one this
+    /// operation already owns, while answering it as no-effect would deny an
+    /// effect that may already have happened.
+    #[cfg(windows)]
+    fn replay_retained_preparation(
+        store: &eliot_installation::RedbInstallationRegistry,
+        capability: &eliot_platform_windows::HostOwnerEpochCapability,
+        facts: &eliot_installation::PreparedDestinationFacts,
+    ) -> Result<RetainedReplay, IsolatedPreparationFailure> {
+        let uncertain = |detail: &'static str| IsolatedPreparationFailure::EffectUncertain(detail);
+        match store.read_prepared_isolated_destination_creation(capability, &facts.operation_id) {
+            Ok((retained, materialisation)) => {
+                if !Self::retained_isolated_destination_matches(&retained, &materialisation, facts)
+                {
+                    return Err(IsolatedPreparationFailure::Refused(
+                        "a different isolated destination was already admitted for this \
+                         operation, so the request conflicts instead of allocating a second \
+                         installation",
+                    ));
+                }
+                Ok(RetainedReplay::Replay)
+            }
+            Err(eliot_installation::InstallationError::IncompleteObservation(_)) => {
+                match store.read_prepared_isolated_destination(capability, &facts.operation_id) {
+                    Err(eliot_installation::InstallationError::IncompleteObservation(_)) => {
+                        Ok(RetainedReplay::Allocate)
+                    }
+                    Err(_) => Err(uncertain(
+                        "the retained isolated-destination admission for this operation could \
+                         not be re-proved, so no second destination is allocated: reconcile \
+                         the operation to learn what it retains",
+                    )),
+                    Ok(retained) => {
+                        if !Self::retained_admission_matches_facts(&retained, facts) {
+                            return Err(IsolatedPreparationFailure::Refused(
+                                "a different isolated destination was already admitted for \
+                                 this operation, so the request conflicts instead of \
+                                 allocating a second installation",
+                            ));
+                        }
+                        Err(uncertain(
+                            "the isolated destination for this operation is admitted but its \
+                             creation is not yet recorded: reconcile the operation instead of \
+                             allocating a second installation",
+                        ))
+                    }
+                }
+            }
+            Err(_) => Err(uncertain(
+                "the retained isolated destination for this operation could not be read back \
+                 with its created root re-proved, so no second destination is allocated: \
+                 reconcile the operation to learn what it retains",
+            )),
+        }
+    }
+
+    /// Records the admission and its destination row BEFORE any materialisation.
+    ///
+    /// This is the owner-issued durable intent the effect boundary is drawn
+    /// at: a crash after this record leaves "admitted, not yet materialised",
+    /// which the reconcile path resolves by preserving the operation. A
+    /// failure here — including a lost CAS response after the write committed
+    /// — is uncertain rather than a refusal. A repeat of the same pair is
+    /// idempotent and returns the same verified admission.
+    #[cfg(windows)]
+    fn record_admission_before_materialise(
+        store: &eliot_installation::RedbInstallationRegistry,
+        capability: &eliot_platform_windows::HostOwnerEpochCapability,
+        allocation: &eliot_installation::IsolatedDestinationAllocation,
+        expected_revision: u64,
+        current_purge_ledger_revision: u64,
+    ) -> Result<(), IsolatedPreparationFailure> {
+        store
+            .record_prepared_isolated_destination(
+                capability,
+                expected_revision,
+                &allocation.admission,
+                &allocation.destination_generation,
+                current_purge_ledger_revision,
+            )
+            .map(|_| ())
+            .map_err(|_| {
+                IsolatedPreparationFailure::EffectUncertain(
+                    "the admitted isolated destination may or may not be retained: reconcile \
+                     the operation to learn whether the admission committed",
+                )
+            })
+    }
+
+    /// Proves the source authority and allocates the destination, all before
+    /// any effect.
+    ///
+    /// Reads the owner evidence, proves the isolated restore area through its
+    /// retained lease, issues the restoration requirements and runs the pure
+    /// admission — which resolves the approved target out of this
+    /// composition's OWN registry and binds the allocation fence and required
+    /// owner from the admitted request. Returns the retained area lease, the
+    /// allocation, the live purge revision and the evidence revision the
+    /// record fences on. Every failure here ran reads only, so every failure
+    /// is a refusal.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the allocation proves source, area, requirements and admission in one auditable pre-effect sequence"
+    )]
+    fn admit_allocation(
+        &self,
+        body: &eliot_protocol::backup::BackupIsolatedRestorePrepare,
+        facts: &eliot_installation::PreparedDestinationFacts,
+        max_restore_bytes: u64,
+    ) -> Result<
+        (
+            eliot_platform_windows::ProtectedRootLease,
+            eliot_installation::IsolatedDestinationAllocation,
+            u64,
+            u64,
+        ),
+        IsolatedPreparationFailure,
+    > {
+        use eliot_installation::{
+            IsolatedDestinationAdmissionInput, ProposedRestorationRequirements,
+        };
+        let evidence = crate::backup_preparation::OwnerEvidence::inspect(&self.registry_host_root)
+            .map_err(|_| {
+                IsolatedPreparationFailure::Refused(
+                    "the source installation owner evidence could not be inspected, so no \
+                     isolated destination can be admitted",
+                )
+            })?;
+        let purge_revision = evidence.owner_purge_ledger_revision().map_err(|_| {
+            IsolatedPreparationFailure::Refused(
+                "no current owner-issued purge-ledger revision is available",
+            )
+        })?;
+        let evidence_revision = evidence.revision();
+        let roots = evidence.runtime_roots();
+        let area = roots.isolated_restore_root().map_err(|_| {
+            IsolatedPreparationFailure::Refused(
+                "this installation profile declares no isolated restore area",
+            )
+        })?;
+        let area_lease = eliot_platform_windows::ProtectedRootLease::open_existing(
+            std::path::Path::new(area.as_str()),
+        )
+        .map_err(|_| {
+            IsolatedPreparationFailure::Refused(
+                "the owner-declared isolated restore area could not be proved through its \
+                 protected-root lease",
+            )
+        })?;
+        let requirements =
+            ProposedRestorationRequirements::issue_for_facts(facts, max_restore_bytes).map_err(
+                |error| {
+                    IsolatedPreparationFailure::Refused(Self::isolated_destination_reason(&error))
+                },
+            )?;
+        let known = evidence.known_installations();
+        // The approved target is resolved by the installation authority out of the
+        // approved set this composition's OWN registry retains, and the ACTIVE
+        // generation is that set's own active row — the same record, for the reason
+        // documented on the input field: a restore is prepared FOR the currently
+        // approved build of the installation that owns the archive, so no inequality
+        // against the source is demanded. What is demanded is that the handle name
+        // a row this authority approved, with that row's own approval validated
+        // against that same row's manifest.
+        let approved_generations = evidence.approved_generations();
+        let approved_target_generation = evidence.approved().manifest.generation.clone();
+        // The allocation fence is the exact state fence the admitted request
+        // was observed under: it becomes the destination row's own fence, so
+        // the row is fenced at allocation rather than inheriting a stale one.
+        // The required owner is the authenticated principal the owner admitted.
+        let required_owner = eliot_installation::PlatformHandle::new(
+            body.identity.principal.principal.as_str(),
+        )
+        .map_err(|_| {
+            IsolatedPreparationFailure::Refused(
+                "the admitted principal cannot name the required owner of the destination row",
+            )
+        })?;
+        let allocation = eliot_installation::admit_prepared_isolated_destination(
+            &IsolatedDestinationAdmissionInput {
+                facts,
+                max_restore_bytes,
+                source_roots: roots,
+                source_active_generation: &approved_target_generation,
+                isolated_area_lease: &area_lease,
+                approved_generations,
+                approved_target_generation: &approved_target_generation,
+                restoration_requirements: &requirements,
+                current_purge_ledger_revision: purge_revision,
+                known_installations: &known,
+                allocation_fence: &body.identity.fence,
+                required_owner: &required_owner,
+            },
+        )
+        .map_err(|error| {
+            IsolatedPreparationFailure::Refused(Self::isolated_destination_reason(&error))
+        })?;
+        Ok((area_lease, allocation, purge_revision, evidence_revision))
+    }
+
+    fn admit_owner_isolated_destination(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<(), IsolatedPreparationFailure> {
+        use eliot_host_service::runtime_control::BackupOperationBody;
+        use eliot_installation::PreparedDestinationFacts;
+        let max_restore_bytes =
+            u64::try_from(eliot_protocol::backup::MAX_BACKUP_PAYLOAD_BYTES).unwrap_or(u64::MAX);
+        let BackupOperationBody::PrepareIsolatedRestore(ref body) = request.body else {
+            return Err(IsolatedPreparationFailure::Refused(
+                "the admitted backup request body is not an isolated-restore preparation",
+            ));
+        };
+        let facts = PreparedDestinationFacts::issue_for_admitted_identity(&body.identity).map_err(
+            |error| IsolatedPreparationFailure::Refused(Self::isolated_destination_reason(&error)),
+        )?;
+
+        // A repeated request — including one whose response was lost after the
+        // destination was already created — resolves the SAME verified
+        // destination this authority already retains, and conflicts when the
+        // bound inputs changed. It never admits a second installation and never
+        // re-creates a root it already created. The readback compares the
+        // retained records' CONTENT against the owner-issued request: the
+        // operation identity, the bound archive, the class, the target schema
+        // and the destination installation all have to be the ones this request
+        // names, so a changed same-operation input is a conflict rather than a
+        // second allocation.
+        //
+        // The lookup runs BEFORE the fresh allocation below, because the
+        // allocation refuses an already-held destination (`ExistingInstallation`):
+        // reaching it on a replay would refuse an operation this authority
+        // already retains instead of resolving it. An admission-only replay —
+        // the admission recorded, the creation not yet — stays retained and
+        // reconciling for the same reason: allocating again could strand a
+        // second destination beside the first.
+        //
+        // The writer store is opened for the lookup and DROPPED before the
+        // allocation: `OwnerEvidence::inspect` (inside `admit_allocation`)
+        // opens the registry read-only while an open writer `Database` holds
+        // the file's exclusive lock, so the inspection would fail closed on
+        // lock contention every time, deterministically. Nothing is written
+        // between the drop and the re-open below — the allocation runs reads
+        // only — so no retained state can move under the lookup.
+        let replay = {
+            let store = self.open_registry_store().map_err(|_| {
+                IsolatedPreparationFailure::Refused(
+                    "the installation registry could not be opened to admit the isolated \
+                     destination",
+                )
+            })?;
+            let capability = self.owner_lease.activation_capability();
+            Self::replay_retained_preparation(&store, &capability, &facts)?
+        };
+        if matches!(replay, RetainedReplay::Replay) {
+            return Ok(());
+        }
+        // The source authority is proved and the destination allocated, all
+        // before any effect; every failure in there ran reads only.
+        let (area_lease, allocation, purge_revision, evidence_revision) =
+            self.admit_allocation(body, &facts, max_restore_bytes)?;
+
+        let store = self.open_registry_store().map_err(|_| {
+            IsolatedPreparationFailure::Refused(
+                "the installation registry could not be opened to admit the isolated destination",
+            )
+        })?;
+        let capability = self.owner_lease.activation_capability();
+
+        // The destination is now actually CREATED, through the installation
+        // authority's own create-new owned-directory publication, under the very
+        // retained protected-root lease the admission was proved against. The
+        // created object's own observed file identity and the admission digest it
+        // was created under come back together, so the recorded admission and the
+        // created root are the SAME fact rather than two facts a reader has to
+        // correlate.
+        //
+        // The authority is RE-READ here, between admitting and materialising, and it
+        // is this SECOND read — not the one above — that supplies both operands
+        // the seam compares. `OwnerEvidence::inspect` opens its own
+        // `ProtectedRootLease` pair and runs its own read-only registry
+        // inspection, so the operands now come from two registry reads separated
+        // in time by this operation: the admission's recorded source generation
+        // from the first, the authority's own currently ACTIVE approved row from
+        // the second. Reusing the FIRST read is exactly what made the seam's
+        // comparison `x != x` at the only production call site —
+        // `approved_generations()` is that same projection's approved rows and
+        // `approved()` its own active row — so it could never fire. Currency is
+        // re-read in this crate rather than inside `eliot-installation` precisely
+        // because that crate holds no registry handle, and acquiring one would
+        // be a new trust boundary rather than a refactor.
+        //
+        // A cutover committed in between therefore moves the ACTIVE generation,
+        // and the seam refuses BEFORE the first step of the publication, creating
+        // nothing. The record-time comparison in the record call below is not
+        // redundant with that: on THIS path it cannot run at all, because the
+        // caller still holds the pre-cutover `evidence.revision()` and the CAS
+        // fence refuses the write before the record clause is reached — which is
+        // precisely the orphan this re-read prevents, the publication having
+        // already committed by then. That comparison remains the fence for a
+        // caller passing a current `expected_revision`, and for the
+        // admission-only seam `record_prepared_isolated_destination`, which
+        // never materialises anything. The two divide the work; neither is dead
+        // code.
+        //
+        // The admission and its destination row are recorded BEFORE the
+        // materialisation below: this is the owner-issued durable intent the
+        // effect boundary is drawn at. Everything above ran reads only, so
+        // every refusal above is pre-effect; everything from here on may have
+        // an effect, so every failure from here on is uncertain rather than a
+        // refusal.
+        Self::record_admission_before_materialise(
+            &store,
+            &capability,
+            &allocation,
+            evidence_revision,
+            purge_revision,
+        )?;
+        // The writer lock releases here: the time-separated re-read below
+        // opens the registry read-only, which the exclusive lock above would
+        // refuse. The final record re-opens the writer afterwards; its CAS
+        // fence still fails closed on any revision movement in between.
+        drop(store);
+
+        // The admission above is already durable, so a failed read here must
+        // preserve the operation as uncertain. No root is created by this read;
+        // reconciliation resolves the retained admission before any retry.
+        let re_inspected = crate::backup_preparation::OwnerEvidence::inspect(
+            &self.registry_host_root,
+        )
+        .map_err(|_| {
+            IsolatedPreparationFailure::EffectUncertain(
+                "the source installation owner evidence could not be re-inspected, so the \
+                 currency of the destination cannot be proved before it is created",
+            )
+        })?;
+        let materialisation = eliot_installation::materialise_prepared_isolated_destination(
+            &allocation.admission,
+            &area_lease,
+            re_inspected.approved_generations(),
+            &re_inspected.approved().manifest.generation,
+        )
+        .map_err(|error| {
+            IsolatedPreparationFailure::EffectUncertain(Self::isolated_destination_reason(&error))
+        })?;
+
+        // One compare-and-swap writes the admission and its materialisation
+        // together, under the registry CAS revision fence and the live exclusive
+        // Host owner capability the authority requires of every mutation of its
+        // own projection. The writer re-opens here (released above for the
+        // read-only re-inspection); the fence below pins the live revision the
+        // re-opened handle observes — which includes our own intent write, so a
+        // fence on the older evidence revision would refuse our own committed
+        // admission — and any movement after this observation still fails
+        // closed into uncertainty. Repeating the request with the same pair is
+        // idempotent and resolves the same verified destination. A failure here
+        // — including a lost CAS response after the write committed — is
+        // uncertain rather than a refusal: the root may exist, and only
+        // reconciliation can say.
+        let store = self.open_registry_store().map_err(|_| {
+            IsolatedPreparationFailure::EffectUncertain(
+                "the created isolated destination may or may not be retained: reconcile the \
+                 operation to learn whether the creation committed",
+            )
+        })?;
+        let creation_expected_revision = store
+            .load()
+            .map(|projection| projection.revision())
+            .map_err(|_| {
+                IsolatedPreparationFailure::EffectUncertain(
+                    "the created isolated destination may or may not be retained: reconcile the \
+                 operation to learn whether the creation committed",
+                )
+            })?;
+        store
+            .record_prepared_isolated_destination_creation(
+                &capability,
+                creation_expected_revision,
+                &allocation.admission,
+                &allocation.destination_generation,
+                &materialisation,
+                purge_revision,
+            )
+            .map(|_| ())
+            .map_err(|_| {
+                IsolatedPreparationFailure::EffectUncertain(
+                    "the created isolated destination may or may not be retained: reconcile the \
+                     operation to learn whether the creation committed",
+                )
+            })
+    }
+
+    /// Compares one retained admission's content with the exact admitted request.
+    ///
+    /// These are the six bound inputs a replay must repeat exactly: the
+    /// operation identity is the lookup key, and the archive, class, target
+    /// schema and both installation identities are the compared content, so a
+    /// changed same-operation input is a conflict rather than a second
+    /// allocation.
+    #[cfg(windows)]
+    fn retained_admission_matches_facts(
+        retained: &eliot_installation::PreparedDestinationAdmission,
+        facts: &eliot_installation::PreparedDestinationFacts,
+    ) -> bool {
+        retained.archive_id == facts.archive_id
+            && retained.archive_digest == facts.archive_digest
+            && retained.archive_class == facts.archive_class
+            && retained.target_schema_digest == facts.target_schema_digest
+            && retained.source_installation == facts.source_installation
+            && retained.destination_installation == facts.destination_installation
+    }
+
+    /// Compares retained destination content with the exact admitted request.
+    #[cfg(windows)]
+    fn retained_isolated_destination_matches(
+        retained: &eliot_installation::PreparedDestinationAdmission,
+        materialisation: &eliot_installation::PreparedDestinationMaterialisation,
+        facts: &eliot_installation::PreparedDestinationFacts,
+    ) -> bool {
+        Self::retained_admission_matches_facts(retained, facts)
+            && materialisation.destination_installation == retained.destination_installation
+            && materialisation.destination_installation_root
+                == retained.isolation.destination_installation_root
+    }
+
+    /// Renders one installation-authority refusal as its own static reason.
+    ///
+    /// The match is variant-by-variant rather than `to_string()`, so an owner
+    /// error body never reaches a dispatch answer and a new refusal class is a
+    /// compile error rather than a silently merged message.
+    #[cfg(windows)]
+    fn isolated_destination_reason(
+        error: &eliot_installation::IsolatedDestinationError,
+    ) -> &'static str {
+        use eliot_installation::{IsolatedDestinationError, IsolatedDestinationRefusal};
+        match error {
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ArbitraryDestination) => {
+                "the admitted destination identity is not an owner installation key, so no \
+                 isolated destination root can be derived for it"
+            }
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::SourceInstallationDestination,
+            ) => {
+                "the admitted destination is the source installation and is never a restore \
+                    destination"
+            }
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::DestinationOverlapsSource,
+            ) => "the admitted destination root is not isolated from the source installation root",
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ExistingInstallation) => {
+                "the admitted destination is an installation this authority already holds, so it \
+                 is not a new distinct isolated installation"
+            }
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::ForeignInstallationOwner,
+            ) => {
+                "the destination is inside a foreign installation's own contour, so this \
+                    operation does not own it"
+            }
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ClassNotRestorable) => {
+                "the declared archive class is not an installation-backup class and cannot name an \
+                 isolated restore destination"
+            }
+            // The disagreeing field is itself a `&'static str` naming one of the
+            // owner's own bound records, so it is matched rather than formatted:
+            // each field keeps its own static reason and a field this seam does
+            // not know is still refused rather than admitted.
+            IsolatedDestinationError::Refused(
+                IsolatedDestinationRefusal::BoundRecordConflict { field },
+            ) => match *field {
+                "target_schema_digest" => {
+                    "an owner-issued bound record (target_schema_digest) \
+                    does not match the destination under admission"
+                }
+                "destination_installation" => {
+                    "an owner-issued bound record \
+                    (destination_installation) does not match the destination under admission"
+                }
+                "destination_installation_root" => {
+                    "an owner-issued bound record \
+                    (destination_installation_root) does not match the destination under \
+                    admission"
+                }
+                "admitted_classes" => {
+                    "an owner-issued bound record (admitted_classes) does not \
+                    match the destination under admission"
+                }
+                "max_restore_bytes" => {
+                    "an owner-issued bound record (max_restore_bytes) does not \
+                    match the destination under admission"
+                }
+                _ => "an owner-issued bound record does not match the destination under admission",
+            },
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::IsolatedAreaUnproved) => {
+                "the owner-declared isolated restore area is not resolvable through its \
+                 protected-root lease"
+            }
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationNotAbsent) => {
+                "the derived destination leaf already exists and is not owned by this operation"
+            }
+            IsolatedDestinationError::BoundRecord(_) => {
+                "an owner-issued backup record bound to this operation did not validate"
+            }
+            IsolatedDestinationError::Installation(_) => {
+                "the installation authority could not admit and materialise the isolated destination"
+            }
+        }
+    }
+
     /// Reconciles one admitted backup operation against the preparation this
     /// Host actually retained (#958 owner read, #962 dispatch).
     ///
@@ -6743,6 +7409,84 @@ impl HostComposition {
     /// when the operation identity is unusable or the owner's own journal
     /// refuses the read. A refusal here is a real read failure, not a claim
     /// that no preparation ran.
+    /// Resolves one admitted operation against the installation authority's
+    /// own registry, for status/reconciliation reads the preparation journal
+    /// does not own (#958, A4).
+    ///
+    /// The selector is the admitted canonical request hash, the same hash
+    /// prepare and replay key by. The read re-validates the retained records
+    /// through the registry's own projection validation, and the creation
+    /// read re-proves the created root, so this answers from the authority's
+    /// durable state rather than from anything the request carries:
+    /// - admission with its materialisation and destination row retained and
+    ///   re-verified: the owner retained the operation, answered as
+    ///   `Admitted` exactly like the journal's `Current` arm;
+    /// - admission retained but no materialisation: the intent is durable and
+    ///   the outcome is unknown, answered as `PossibleEffect` exactly like
+    ///   the journal's `AdmittedWithoutResult` arm;
+    /// - nothing retained for the hash: a pre-effect refusal is exact;
+    /// - the registry cannot be opened or read: a read fault is not absence,
+    ///   so the operation is preserved as `PossibleEffect`, never refused.
+    #[cfg(windows)]
+    fn reconcile_retained_isolated_destination(
+        &self,
+        operation: eliot_protocol::backup::BackupOperationKind,
+        admitted_operation: &str,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
+        // A re-verified pair is the owner retaining the operation; an
+        // admission without a materialisation is durable intent with an
+        // unknown outcome; anything else the registry reports — absence or a
+        // read fault — is answered by `classify_retained_preparation`,
+        // because a read fault is not absence.
+        enum RetainedPreparation {
+            Pair,
+            AdmissionOnly,
+            Unreadable,
+        }
+        let Some(operation_id) = eliot_installation::PlatformHandle::new(admitted_operation).ok()
+        else {
+            return Err(BackupDispatchRefusal::new(
+                operation,
+                "the admitted operation hash names no retained isolated-restore preparation",
+            ));
+        };
+        let Ok(store) = self.open_registry_store() else {
+            return Ok(BackupOwnerOutcome::PossibleEffect {
+                retained: retained_backup_operation(request)?,
+            });
+        };
+        let capability = self.owner_lease.activation_capability();
+        let retained = match store
+            .read_prepared_isolated_destination_creation(&capability, &operation_id)
+        {
+            Ok(_) => RetainedPreparation::Pair,
+            Err(eliot_installation::InstallationError::IncompleteObservation(_)) => {
+                match store.read_prepared_isolated_destination(&capability, &operation_id) {
+                    Ok(_) => RetainedPreparation::AdmissionOnly,
+                    Err(eliot_installation::InstallationError::IncompleteObservation(_)) => {
+                        return Err(BackupDispatchRefusal::new(
+                            operation,
+                            "this Host retains no isolated-restore preparation for the admitted operation",
+                        ));
+                    }
+                    Err(_) => RetainedPreparation::Unreadable,
+                }
+            }
+            Err(_) => RetainedPreparation::Unreadable,
+        };
+        match retained {
+            RetainedPreparation::Pair => Ok(BackupOwnerOutcome::Admitted {
+                retained: retained_backup_operation(request)?,
+            }),
+            RetainedPreparation::AdmissionOnly | RetainedPreparation::Unreadable => {
+                Ok(BackupOwnerOutcome::PossibleEffect {
+                    retained: retained_backup_operation(request)?,
+                })
+            }
+        }
+    }
+
     pub fn backup_dispatch_reconcile(
         &self,
         operation_id: &str,
@@ -13036,6 +13780,9 @@ mod watchdog_service_tests;
 
 #[cfg(test)]
 mod journal_tests;
+
+#[cfg(all(test, windows))]
+mod backup_dispatch_success_tests;
 
 #[cfg(all(test, windows))]
 mod tests;

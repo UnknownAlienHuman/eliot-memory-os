@@ -29,7 +29,7 @@ SCHEMA: Final = "eliot.integration.ignored-test-inventory.v1"
 # TOOL_VERSION binds the emitted artifact identity: any change to the header,
 # row schema, requirement classes, or classification rules bumps it, so two
 # different tool states never certify indistinguishable artifacts (issue #905 W3).
-TOOL_VERSION: Final = "0.5.0"
+TOOL_VERSION: Final = "0.8.0"
 OUTPUT_ROOT: Final = ".eliot"
 _TARGET_ROOT_PARTS: Final = (".eliot", "integration", "ignored-test-inventory", "target")
 _CARGO_METADATA_ARGV: Final = ("cargo", "metadata", "--locked", "--format-version", "1")
@@ -120,6 +120,10 @@ class SourceTest:
     # Declared isolation/serialization/reset/timeout tokens (issue #905 row
     # contract). Last with a default so existing constructions stay valid.
     isolation: tuple[str, ...] = ()
+    # Exact offsets into the scanned source text (issue #905 W3): the test
+    # fn name token and first-attribute start to last-attribute end.
+    fn_span: tuple[int, int] | None = None
+    attribute_span: tuple[int, int] | None = None
 
     def identity(self) -> tuple[str, str, str, str]:
         return (self.package_id, self.target_kind, self.target_name, self.test_name)
@@ -162,6 +166,10 @@ class InventoryRow:
     # Declared isolation/serialization/reset/timeout tokens, digest-covered via
     # the _row payload (issue #905 row contract). Default keeps the field additive.
     isolation: tuple[str, ...] = ()
+    # Exact offsets into the scanned source text (issue #905 W3): the test
+    # fn name token and first-attribute start to last-attribute end.
+    fn_span: tuple[int, int] | None = None
+    attribute_span: tuple[int, int] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -880,6 +888,35 @@ def _remaining(deadline: float | None) -> float:
     return value
 
 
+def _fixed_command_env(target_root: str) -> dict[str, str]:
+    """Fail-closed environment for owned cargo/process execution (issue #905 W1).
+
+    Only toolchain-locating variables pass through: PATH-like lookup roots,
+    cargo/rustup homes, the admitted target dir, and the Windows MSVC locator
+    pair SystemDrive/ProgramData (rustc needs one of them to find link.exe;
+    without it every workspace link fails under the scrubbed environment).
+    Absent variables drop out via the falsy filter, so non-Windows runs are
+    unaffected. The values locate the toolchain only; they add no build input.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "USERPROFILE": os.environ.get("USERPROFILE", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        "SystemDrive": os.environ.get("SystemDrive", ""),
+        "ProgramData": os.environ.get("ProgramData", ""),
+        "WINDIR": os.environ.get("WINDIR", ""),
+        "TEMP": os.environ.get("TEMP", os.environ.get("TMP", "")),
+        "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),
+        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", ""),
+        "CARGO_HOME": os.environ.get("CARGO_HOME", ""),
+        "CARGO_TARGET_DIR": target_root,
+        "CARGO_TERM_COLOR": "never",
+        "RUST_BACKTRACE": "0",
+    }
+    return {key: value for key, value in env.items() if value}
+
+
 def _run_fixed(
     root: Path,
     argv: Sequence[str],
@@ -912,21 +949,7 @@ def _run_fixed(
         target_root = Path(os.path.abspath(admitted_target_root))
     else:
         target_root = _admitted_target_root(root)
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", ""),
-        "USERPROFILE": os.environ.get("USERPROFILE", ""),
-        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
-        "WINDIR": os.environ.get("WINDIR", ""),
-        "TEMP": os.environ.get("TEMP", os.environ.get("TMP", "")),
-        "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),
-        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", ""),
-        "CARGO_HOME": os.environ.get("CARGO_HOME", ""),
-        "CARGO_TARGET_DIR": str(target_root),
-        "CARGO_TERM_COLOR": "never",
-        "RUST_BACKTRACE": "0",
-    }
-    env = {key: value for key, value in env.items() if value}
+    env = _fixed_command_env(str(target_root))
     budget = timeout if timeout is not None else float(BOUNDS.command_timeout_seconds)
     if budget <= 0:
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "fixed command has no remaining deadline budget")
@@ -1902,6 +1925,7 @@ def _scan_file(
     module_stack: list[tuple[str, int, tuple[str, ...]]] = [(part, 0, ()) for part in seed_module_path]
     brace_depth = 0
     pending_attributes: list[str] = []
+    pending_spans: list[tuple[int, int]] = []
     pending_module: str | None = None
     results: list[SourceTest] = []
     index = 0
@@ -1926,6 +1950,7 @@ def _scan_file(
             if end - start > BOUNDS.max_attribute_bytes:
                 raise InventoryError("ATTRIBUTE_TOO_LARGE", _redact_detail(f"attribute exceeds bound in {path}"))
             pending_attributes.append(text[start:end])
+            pending_spans.append((start, end))
             index = cursor + 1
             continue
         if token.value == "mod" and index + 1 < len(tokens) and tokens[index + 1].kind == "ident":
@@ -1991,9 +2016,12 @@ def _scan_file(
                         requirements=requirements,
                         source_digest=_sha256(_canonical_bytes(source_identity)),
                         isolation=isolation,
+                        fn_span=(name_token.start, name_token.end),
+                        attribute_span=(pending_spans[0][0], pending_spans[-1][1]) if pending_spans else None,
                     )
                 )
             pending_attributes.clear()
+            pending_spans.clear()
         elif token.value == "{":
             brace_depth += 1
             if pending_module is not None:
@@ -2002,14 +2030,17 @@ def _scan_file(
                 module_stack.append((pending_module, brace_depth, inline_cfg))
                 pending_module = None
             pending_attributes.clear()
+            pending_spans.clear()
         elif token.value == "}":
             while module_stack and module_stack[-1][1] == brace_depth:
                 module_stack.pop()
             brace_depth = max(0, brace_depth - 1)
             pending_attributes.clear()
+            pending_spans.clear()
             pending_module = None
         elif token.value == ";":
             pending_attributes.clear()
+            pending_spans.clear()
             pending_module = None
         elif token.kind == "ident" and token.value not in {"pub", "async", "unsafe", "const", "extern", "crate", "self", "super"}:
             if token.value not in {"fn", "mod"} and pending_module is None:
@@ -2017,6 +2048,7 @@ def _scan_file(
                 # but discard them when another item begins.
                 if token.value in {"struct", "enum", "trait", "impl", "type", "static", "use", "macro_rules"}:
                     pending_attributes.clear()
+                    pending_spans.clear()
         index += 1
     return results
 
@@ -2073,6 +2105,20 @@ _REQUIREMENT_MATCHERS: Final = (
     _NETWORK_MATCHER,
 )
 
+# Literal words of the finite rule table (issue #905 W7/W24/W6). A leftover
+# unit word the table itself names (e.g. "runtime" inside "windows runtime")
+# is table vocabulary, never an unknown provider; anything else uncovered is.
+_TABLE_LITERAL_WORDS: Final = frozenset(
+    word
+    for patterns in (
+        _STORE_PATTERNS, _RUNTIME_PATTERNS, _GIT_PATTERNS,
+        _EXTERNAL_PATTERNS, _NETWORK_PATTERNS,
+    )
+    for pattern in patterns
+    for word in re.findall(r"[a-z_]+", re.sub(r"\\.", "", pattern))
+)
+
+
 # Negation remains local to the clause containing a recognized requirement
 # token. The bounded prefix/suffix windows catch explicit forms such as "no
 # network", "without local SurrealDB", and "network access not required";
@@ -2094,11 +2140,83 @@ _NEGATION_SUFFIX: Final = re.compile(
 )
 
 
+# Provider-position unknown-vocabulary guard (issue #905 W7/W24: conservative
+# unknown dependency treatment, refuting comment 5981399706). A supported
+# Store/Runtime/... word must not certify the whole row while the reason names
+# another explicit provider the rule table does not know ("requires SurrealDB
+# and Redis", "requires store with PostgreSQL"): the extra provider is an
+# unleased dependency (I18.32:3), so the composed set keeps UNKNOWN and
+# reconcile leaves the row UNCLASSIFIED. Proper nouns are providers and
+# lowercase words are modifiers: every unit of a multi-provider enumeration
+# (conjunction- or comma-separated, first unit included) accounts for each
+# word (match span, glue, table literal, or lowercase descriptor), so
+# all-known phrases are unaffected; single declarations keep matcher-only
+# semantics. A capitalized leftover ("Redis" beside generic "database") is
+# an explicit unknown name; lowercase leftovers ("local", "running") ride
+# the unit's known anchor as modifiers.
+
+
+def _has_unknown_provider(raw_text: str) -> bool:
+    """An explicit additional provider the rule table does not cover.
+
+    Every unit of a multi-provider enumeration (conjunction- or
+    comma-separated, including the first) must account for each of its words:
+    inside a known-phrase match span, verb/determiner glue, a literal word of
+    the rule table itself, or a lowercase descriptor of the unit's known
+    anchor. A capitalized leftover word (e.g. "Redis" beside generic
+    "database") names an explicit dependency the table does not know: proper
+    nouns are providers, lowercase words are modifiers. Single declarations
+    keep matcher-only semantics, so all-known phrases are unaffected.
+    """
+    value = raw_text.casefold()
+    units = [unit.strip() for unit in _PROVIDER_UNIT_SPLIT.split(value)]
+    units = [unit for unit in units if unit]
+    if len(units) < 2:
+        return False
+    raw_units = [unit.strip() for unit in _PROVIDER_UNIT_SPLIT_CI.split(raw_text)]
+    raw_units = [unit for unit in raw_units if unit]
+    if len(raw_units) != len(units):
+        return True
+    for unit, raw_unit in zip(units, raw_units):
+        if len(unit) != len(raw_unit):
+            return True
+        covered: set[int] = set()
+        for matcher in _REQUIREMENT_MATCHERS:
+            for match in matcher.finditer(unit):
+                covered.update(range(match.start(), match.end()))
+        for token in re.finditer(r"\S+", unit):
+            if set(range(token.start(), token.end())) <= covered:
+                continue
+            raw_word = raw_unit[token.start():token.end()]
+            key = raw_word.strip(_WORD_STRIP_CHARS).casefold()
+            if not key:
+                continue
+            if key in _PROVIDER_GLUE_WORDS or key in _TABLE_LITERAL_WORDS:
+                continue
+            if raw_word == raw_word.lower():
+                continue
+            return True
+    return False
+
+
+_PROVIDER_UNIT_SPLIT: Final = re.compile(r"\b(?:and|or|with|plus)\b|,")
+_PROVIDER_NON_PROVIDER_WORDS: Final = frozenset({"a", "an", "the"})
+_PROVIDER_GLUE_WORDS: Final = _PROVIDER_NON_PROVIDER_WORDS | frozenset({"requires", "require", "needs", "need"})
+# Case-insensitive twin of the unit splitter: the same separators applied to
+# the raw reason, so capitalized (proper-noun) words keep their case for the
+# explicit-provider test below. Derived from the bound pattern, not new rules.
+_PROVIDER_UNIT_SPLIT_CI = re.compile(_PROVIDER_UNIT_SPLIT.pattern, re.IGNORECASE)
+# Leading/trailing punctuation stripped before glue/literal comparison, so a
+# "requires:" verb or '"store",' token still reads as its word.
+_WORD_STRIP_CHARS: Final = ".,:;!?()[]\"'"
+
+
+
 # Versioned finite rule-table identity (issue #905: "versioned finite rule
 # table"). RULE_TABLE_VERSION is the human identity; RULE_TABLE_SHA256 binds the
 # exact pattern literals, so any rule edit changes the emitted header and
 # aggregate digest even when no row's composed requirement set changes.
-RULE_TABLE_VERSION: Final = "1.2.0"
+RULE_TABLE_VERSION: Final = "1.5.0"
 RULE_TABLE_SHA256: Final = _sha256(
     _canonical_bytes(
         {
@@ -2111,6 +2229,12 @@ RULE_TABLE_SHA256: Final = _sha256(
                 "clauses": _NEGATION_CLAUSES.pattern,
                 "prefix": _NEGATION_PREFIX.pattern,
                 "suffix": _NEGATION_SUFFIX.pattern,
+            },
+            "provider_conjunction": {
+                "conjunction": _PROVIDER_UNIT_SPLIT.pattern,
+                "non_provider_words": sorted(_PROVIDER_NON_PROVIDER_WORDS),
+                "glue_words": sorted(_PROVIDER_GLUE_WORDS),
+                "word_strip": _WORD_STRIP_CHARS,
             },
         }
     )
@@ -2144,6 +2268,8 @@ def _requirements(text: str) -> tuple[str, ...]:
     if _EXTERNAL_MATCHER.search(value):
         result.add(Requirement.EXTERNAL_CREDENTIALED_MANUAL_ONLY)
     if not result:
+        result.add(Requirement.UNKNOWN)
+    elif _has_unknown_provider(text):
         result.add(Requirement.UNKNOWN)
     return tuple(sorted(item.value for item in result))
 
@@ -3202,9 +3328,14 @@ def _validate_compiler_diagnostic(value: Any, depth: int = 0) -> None:
     if depth > 64 or not isinstance(value, dict):
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic shape is invalid")
     required = {"message", "code", "level", "spans", "children"}
-    allowed = required | {"rendered"}
+    allowed = required | {"rendered", "$message_type"}
     if not required.issubset(value) or set(value) - allowed:
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic schema is not recognized")
+    # Current rustc envelopes every JSON diagnostic with "$message_type":
+    # "diagnostic". Admit exactly that value so the live toolchain validates,
+    # while any other extra key or marker value stays refused (closed shape).
+    if "$message_type" in value and value["$message_type"] != "diagnostic":
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic marker is invalid")
     if not isinstance(value["message"], str) or not isinstance(value["level"], str):
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic text is invalid")
     code = value["code"]
@@ -3644,6 +3775,8 @@ def _row(source: SourceTest | None, compiled: CompiledTest | None, state: RowSta
         "cfg_evidence": source.cfg_evidence if source else (),
         "requirements": source.requirements if source else (Requirement.UNKNOWN.value,),
         "isolation": source.isolation if source else (),
+        "fn_span": source.fn_span if source else None,
+        "attribute_span": source.attribute_span if source else None,
         "executable": compiled.executable if compiled else None,
         "executable_digest": compiled.executable_digest if compiled else None,
         "remediation_owner": owner,
@@ -3673,7 +3806,7 @@ def reconcile(source: Sequence[SourceTest], compiled: Sequence[CompiledTest]) ->
             rows.append(_row(None, compiled_item, RowState.COMPILED_ONLY, "build-test-graph-owner"))
         elif compiled_item is None:
             rows.append(_row(source_item, None, RowState.SOURCE_ONLY, "test-target-owner"))
-        elif source_item.reason is None or source_item.requirements == (Requirement.UNKNOWN.value,):
+        elif source_item.reason is None or Requirement.UNKNOWN.value in source_item.requirements:
             rows.append(_row(source_item, compiled_item, RowState.UNCLASSIFIED, "test-declaration-owner"))
         else:
             rows.append(_row(source_item, compiled_item, RowState.CLASSIFIED, "declared-environment-owner"))
