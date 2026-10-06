@@ -1957,7 +1957,7 @@ fn check_reclaim_quiescent(
 }
 
 /// Reports whether the named delivery may still have a live child claim
-/// with no settled result (issue #2786 W4): the child writes its InFlight
+/// with no settled result (issue #2786 W4): the child writes its `InFlight`
 /// marker after claim and before any guest effect and clears it only after
 /// the served record is durable, so a marker naming this set with no
 /// settling served record reads as a possibly-live process. Anything
@@ -1991,9 +1991,9 @@ fn live_delivery_outstanding(
     if (marker_operation, marker_claim, marker_generation) != (operation_id, claim_id, generation) {
         return false;
     }
-    let served_bytes = match std::fs::read(install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME)) {
-        Ok(bytes) => bytes,
-        Err(_) => return true,
+    let Ok(served_bytes) = std::fs::read(install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME))
+    else {
+        return true;
     };
     let served: serde_json::Value = match serde_json::from_slice(&served_bytes) {
         Ok(served) => served,
@@ -2704,10 +2704,10 @@ mod tests {
         dir
     }
 
-    fn write_json(dir: &std::path::Path, name: &str, value: serde_json::Value) {
+    fn write_json(dir: &std::path::Path, name: &str, value: &serde_json::Value) {
         std::fs::write(
             dir.join(name),
-            serde_json::to_vec(&value).expect("marker serializes"),
+            serde_json::to_vec(value).expect("marker serializes"),
         )
         .expect("marker writable");
     }
@@ -2846,10 +2846,14 @@ mod tests {
                 }
                 let mut winners = 0u32;
                 for handle in handles {
-                    match handle.join().expect("thread joins") {
-                        Ok(_) => winners += 1,
-                        Err(WasmDispatchError::Backpressure(_)) => {}
-                        Err(_) => panic!("loser takes typed backpressure"),
+                    let outcome = handle.join().expect("thread joins");
+                    if outcome.is_ok() {
+                        winners += 1;
+                    } else {
+                        assert!(
+                            matches!(outcome, Err(WasmDispatchError::Backpressure(_))),
+                            "loser takes typed backpressure"
+                        );
                     }
                 }
                 assert_eq!(winners, 1);
@@ -2895,14 +2899,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A live InFlight claim with no served record reads as outstanding.
+    /// A live `InFlight` claim with no served record reads as outstanding.
     #[test]
     fn outstanding_with_inflight_claim() {
         let dir = stage_dir("eliot-2786-outstanding-claim");
         write_json(
             &dir,
             WASM_HOST_INFLIGHT_FILE_NAME,
-            serde_json::json!({"operation_id": "op-a", "claim_id": "claim-a",
+            &serde_json::json!({"operation_id": "op-a", "claim_id": "claim-a",
                 "generation": 7, "grant_digest": "d"}),
         );
         assert!(live_delivery_outstanding(&dir, "op-a", "claim-a", 7));
@@ -2916,13 +2920,13 @@ mod tests {
         write_json(
             &dir,
             WASM_HOST_INFLIGHT_FILE_NAME,
-            serde_json::json!({"operation_id": "op-a", "claim_id": "claim-a",
+            &serde_json::json!({"operation_id": "op-a", "claim_id": "claim-a",
                 "generation": 7, "grant_digest": "d"}),
         );
         write_json(
             &dir,
             WASM_HOST_SERVED_RESULT_FILE_NAME,
-            serde_json::json!({"operation_id": "op-a", "generation": 7,
+            &serde_json::json!({"operation_id": "op-a", "generation": 7,
                 "claim_id": "claim-a", "grant_digest": "g", "retained_at_unix_ms": 1}),
         );
         assert!(!live_delivery_outstanding(&dir, "op-a", "claim-a", 7));
@@ -2936,7 +2940,7 @@ mod tests {
         write_json(
             &dir,
             WASM_HOST_INFLIGHT_FILE_NAME,
-            serde_json::json!({"operation_id": "op-a", "claim_id": "claim-b",
+            &serde_json::json!({"operation_id": "op-a", "claim_id": "claim-b",
                 "generation": 7, "grant_digest": "d"}),
         );
         assert!(!live_delivery_outstanding(&dir, "op-a", "claim-a", 7));
@@ -2954,7 +2958,7 @@ mod tests {
     }
 
     /// The W4 proof: a replacement arriving after the live grant expired
-    /// backpressures while the live set has an unsettled InFlight claim
+    /// backpressures while the live set has an unsettled `InFlight` claim
     /// (A's bytes stay staged), and publishes fresh once the served record
     /// settles it. No wall clock gates admission, so the far-future
     /// admission time is legitimate input.
@@ -2982,7 +2986,7 @@ mod tests {
         write_json(
             &dir,
             WASM_HOST_INFLIGHT_FILE_NAME,
-            serde_json::json!({"operation_id": "operation-bundle-001",
+            &serde_json::json!({"operation_id": "operation-bundle-001",
                 "claim_id": "claim-bundle-001", "generation": 7, "grant_digest": "d"}),
         );
         let mut claim_b = test_claim();
@@ -3002,14 +3006,14 @@ mod tests {
                 assert_eq!(backpressure.live_operation_id, "operation-bundle-001");
                 assert!(backpressure.retry_condition.contains("inflight"));
             }
-            Err(_) => panic!("expected inflight backpressure, got another error"),
+            Err(error) => panic!("expected inflight backpressure, got {error:?}"),
             Ok(_) => panic!("expected inflight backpressure, got a published bundle"),
         }
         assert!(dir.join(WASM_HOST_MATERIAL_FILE_NAME).is_file());
         write_json(
             &dir,
             WASM_HOST_SERVED_RESULT_FILE_NAME,
-            serde_json::json!({"operation_id": "operation-bundle-001", "generation": 7,
+            &serde_json::json!({"operation_id": "operation-bundle-001", "generation": 7,
                 "claim_id": "claim-bundle-001", "grant_digest": "g",
                 "retained_at_unix_ms": 1}),
         );
@@ -3254,10 +3258,13 @@ mod tests {
         assert_eq!(join, replay);
     }
 
-    #[test]
-    fn material_publish_validates_envelope() {
-        let material = publish_wasm_dispatch_material(
-            "claim-wasm-r1-001",
+    fn publish_material_case(
+        claim_id: &str,
+        profile: &str,
+        prior_conformance_artifact: Option<String>,
+    ) -> Result<WasmDispatchMaterial, WasmDispatchError> {
+        publish_wasm_dispatch_material(
+            claim_id,
             "operation-wasm-r1-001",
             Generation::new(7).expect("generation"),
             &test_epoch(),
@@ -3266,15 +3273,20 @@ mod tests {
             &"a".repeat(64),
             &"d".repeat(64),
             test_guest(),
-            "D2_OPERATIONAL",
+            profile,
             test_manifest(),
             test_work(),
             test_assurance(),
             test_promotion(),
             test_snapshot(),
-            None,
+            prior_conformance_artifact,
         )
-        .expect("material publishes");
+    }
+
+    #[test]
+    fn material_publish_validates_envelope() {
+        let material = publish_material_case("claim-wasm-r1-001", "D2_OPERATIONAL", None)
+            .expect("material publishes");
         assert_eq!(material.wire_id, WASM_DISPATCH_MATERIAL_WIRE_ID);
         assert_eq!(material.wire_version, WASM_DISPATCH_MATERIAL_WIRE_VERSION);
         assert_eq!(material.profile, "D2_OPERATIONAL");
@@ -3285,88 +3297,22 @@ mod tests {
         assert_eq!(reparsed, material);
         // Blank claim fails closed.
         assert!(matches!(
-            publish_wasm_dispatch_material(
-                "",
-                "operation-wasm-r1-001",
-                Generation::new(7).expect("generation"),
-                &test_epoch(),
-                "launch-nonce-wasm-r1-0001",
-                4_000_000_000_000,
-                &"a".repeat(64),
-                &"d".repeat(64),
-                test_guest(),
-                "D2_OPERATIONAL",
-                test_manifest(),
-                test_work(),
-                test_assurance(),
-                test_promotion(),
-                test_snapshot(),
-                None,
-            ),
+            publish_material_case("", "D2_OPERATIONAL", None),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
-        // Unknown profile fails closed.
+        // Second admitted profile publishes.
+        assert!(publish_material_case("claim-wasm-r1-001", "FULL_COMPOSITION", None).is_ok());
+        // Unadmitted profile fails closed.
         assert!(matches!(
-            publish_wasm_dispatch_material(
-                "claim-wasm-r1-001",
-                "operation-wasm-r1-001",
-                Generation::new(7).expect("generation"),
-                &test_epoch(),
-                "launch-nonce-wasm-r1-0001",
-                4_000_000_000_000,
-                &"a".repeat(64),
-                &"d".repeat(64),
-                test_guest(),
-                "FULL_COMPOSITION",
-                test_manifest(),
-                test_work(),
-                test_assurance(),
-                test_promotion(),
-                test_snapshot(),
-                None,
-            ),
-            Ok(_)
-        ));
-        assert!(matches!(
-            publish_wasm_dispatch_material(
-                "claim-wasm-r1-001",
-                "operation-wasm-r1-001",
-                Generation::new(7).expect("generation"),
-                &test_epoch(),
-                "launch-nonce-wasm-r1-0001",
-                4_000_000_000_000,
-                &"a".repeat(64),
-                &"d".repeat(64),
-                test_guest(),
-                "LABORATORY",
-                test_manifest(),
-                test_work(),
-                test_assurance(),
-                test_promotion(),
-                test_snapshot(),
-                None,
-            ),
+            publish_material_case("claim-wasm-r1-001", "LABORATORY", None),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
         // Malformed prior digest fails closed.
         assert!(matches!(
-            publish_wasm_dispatch_material(
+            publish_material_case(
                 "claim-wasm-r1-001",
-                "operation-wasm-r1-001",
-                Generation::new(7).expect("generation"),
-                &test_epoch(),
-                "launch-nonce-wasm-r1-0001",
-                4_000_000_000_000,
-                &"a".repeat(64),
-                &"d".repeat(64),
-                test_guest(),
                 "D2_OPERATIONAL",
-                test_manifest(),
-                test_work(),
-                test_assurance(),
-                test_promotion(),
-                test_snapshot(),
-                Some("not-a-digest".to_owned()),
+                Some("not-a-digest".to_owned())
             ),
             Err(WasmDispatchError::InvalidMaterial(_))
         ));

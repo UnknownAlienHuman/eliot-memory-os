@@ -2247,13 +2247,11 @@ pub fn write_inflight_marker(
         Ok(Some(mark)) if mark.names(identity) => {
             return InFlightClaimOutcome::ExistingInFlight;
         }
-        Ok(_) => return InFlightClaimOutcome::Conflict,
-        Err(_) => return InFlightClaimOutcome::Conflict,
+        Ok(Some(_)) | Err(_) => return InFlightClaimOutcome::Conflict,
     }
     let marker = InFlightDeliveryMarker::from_identity(identity, claimed_at_unix_ms);
-    let bytes = match serde_json::to_vec(&marker) {
-        Ok(bytes) => bytes,
-        Err(_) => return InFlightClaimOutcome::Unavailable,
+    let Ok(bytes) = serde_json::to_vec(&marker) else {
+        return InFlightClaimOutcome::Unavailable;
     };
     let partial = install_dir.join(format!(
         ".{}.{}.partial",
@@ -2318,7 +2316,8 @@ fn served_settlement(
         == Some(identity.operation_id.as_str())
         && record.get("claim_id").and_then(|value| value.as_str())
             == Some(identity.claim_id.as_str())
-        && record.get("generation").and_then(|value| value.as_u64()) == Some(identity.generation);
+        && record.get("generation").and_then(serde_json::Value::as_u64)
+            == Some(identity.generation);
     if settles {
         ServedSettlement::Settled
     } else {
@@ -2347,7 +2346,7 @@ pub fn clear_inflight_marker(
     // Claim the marker aside by rename, then re-verify: a successor staged
     // after the read above now sits aside instead of under the fixed name,
     // and only bytes that still name this identity are removed.
-    let aside = install_dir.join(format!(".{}.clearing", WASM_HOST_INFLIGHT_FILE_NAME));
+    let aside = install_dir.join(format!(".{WASM_HOST_INFLIGHT_FILE_NAME}.clearing"));
     let _ = std::fs::remove_file(&aside);
     let fixed = install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME);
     match std::fs::rename(&fixed, &aside) {
