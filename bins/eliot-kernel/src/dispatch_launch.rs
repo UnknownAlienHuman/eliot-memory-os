@@ -2456,8 +2456,9 @@ fn testd_material_bytes(
 /// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
 ///   vocabulary; its `receipt_digest` is the admission identity).
 /// * `epoch`/`generation` — the live authority bound at admission.
-/// * `nonce` — the I7.5/I15.2 session nonce, independent of the v2
-///   executable-join launch nonce bound by `request`.
+/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
+///   executable-join launch nonce when the join is present; the caller
+///   request already binds it, and the child re-proves binding).
 /// * `grant` — the shared `DispatchGrant` object.
 ///
 /// The concrete `ProcessRequest` plus the composed provider ports arrive
@@ -2502,6 +2503,15 @@ pub fn native_worker_material_bytes(
     {
         return Err(DispatchLaunchError::Inconsistent(
             "native action envelope authority epoch is not the live admitted epoch".to_owned(),
+        ));
+    }
+    if request
+        .executable_binding
+        .as_ref()
+        .is_some_and(|binding| binding.launch_nonce != nonce)
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker launch nonce does not match its owner executable binding".to_owned(),
         ));
     }
     let derivation = native_worker_dispatch_derivation(
@@ -5182,6 +5192,16 @@ pub fn prepare_native_worker_launch(
         admitted_at_nanos,
         contour.principal_owner.as_str(),
     )?;
+    if material
+        .request
+        .executable_binding
+        .as_ref()
+        .is_some_and(|binding| binding.launch_nonce != nonce)
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native worker launch nonce does not match its owner executable binding".to_owned(),
+        ));
+    }
     let generation = Generation::new(generation)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let operation_id = OperationId::new(format!(

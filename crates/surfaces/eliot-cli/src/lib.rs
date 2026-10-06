@@ -508,7 +508,7 @@ pub mod kernel_client {
     };
     pub use eliot_user_broker_core::{OperatorLaunchReceipt, OperatorLaunchRestartReceipt};
     use serde::Deserialize;
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
     use sha2::{Digest, Sha256};
     use thiserror::Error;
 
@@ -806,6 +806,42 @@ pub mod kernel_client {
             }
         }
 
+        /// Sends one flat operation frame whose claim fields ride beside the
+        /// operation selector at the payload top level (issue #1701,
+        /// R2-owners/W5).
+        ///
+        /// The Kernel capacity route reads the claim identity (`claim_id`)
+        /// and the typed pair (`permit`) from the outer object — the same
+        /// level as `operation` — so the nested `{operation, payload}` shape
+        /// of [`KernelClient::transact_json`] never reaches it. Every other
+        /// lifecycle operation keeps the nested shape its route arm parses.
+        pub fn transact_flat_json(
+            &mut self,
+            operation: &str,
+            fields: Map<String, Value>,
+        ) -> Result<Value, KernelClientError> {
+            let envelope = flat_request_envelope(operation, fields)?;
+            let identity = self
+                .request_identity
+                .clone()
+                .ok_or(KernelClientError::MissingRequestIdentity)?;
+            #[cfg(not(windows))]
+            {
+                let _ = (identity, envelope);
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                runtime.block_on(self.execute_envelope_async(envelope, identity))
+            }
+        }
+
         #[cfg(windows)]
         async fn connect(
             &self,
@@ -875,6 +911,19 @@ pub mod kernel_client {
             payload: Value,
             identity: RequestIdentity,
         ) -> Result<Value, KernelClientError> {
+            let envelope = json!({
+                "operation": operation,
+                "payload": payload,
+            });
+            self.execute_envelope_async(envelope, identity).await
+        }
+
+        #[cfg(windows)]
+        async fn execute_envelope_async(
+            &self,
+            envelope: Value,
+            identity: RequestIdentity,
+        ) -> Result<Value, KernelClientError> {
             let (mut transport, limits) = self.connect().await?;
             let request_id = identity.request.metadata.request_id.clone();
             let frame = Frame {
@@ -885,10 +934,7 @@ pub mod kernel_client {
                 kind: FrameKind::Request,
                 message_type: MessageType::Execute,
                 request_identity: Some(identity),
-                payload: ProtocolPayload::Json(json!({
-                    "operation": operation,
-                    "payload": payload,
-                })),
+                payload: ProtocolPayload::Json(envelope),
                 trace_context: BTreeMap::new(),
             };
             require_delivery(
@@ -1130,6 +1176,30 @@ pub mod kernel_client {
         Ok(())
     }
 
+    /// Builds one flat EBP Execute payload: the operation selector beside
+    /// the caller fields at the top level, never nested under `payload`
+    /// (issue #1701, R2-owners/W5).
+    ///
+    /// Pure so the exact wire bytes are pinned without a session; shared by
+    /// [`KernelClient::transact_flat_json`] and its seam tests. A field
+    /// literally named `operation` or `payload` is refused: it would shadow
+    /// the selector or rebuild the nested shape the capacity route rejects.
+    pub fn flat_request_envelope(
+        operation: &str,
+        fields: Map<String, Value>,
+    ) -> Result<Value, KernelClientError> {
+        validate_operation(operation)?;
+        if fields.contains_key("operation") || fields.contains_key("payload") {
+            return Err(KernelClientError::Configuration(
+                "flat Kernel request fields must not shadow the envelope keys".to_owned(),
+            ));
+        }
+        let mut envelope = Map::with_capacity(fields.len() + 1);
+        envelope.insert("operation".to_owned(), Value::String(operation.to_owned()));
+        envelope.extend(fields);
+        Ok(Value::Object(envelope))
+    }
+
     /// Decodes the serving owner's launch receipt closed: the operation
     /// identity is the exact admitted request identity, the status is one of
     /// the two admitted dispositions, and the receipt body is the closed
@@ -1254,6 +1324,39 @@ pub mod kernel_client {
                 rejection_reason: None,
                 authority_epoch: test_epoch(7),
             }
+        }
+
+        #[test]
+        fn flat_request_envelope_carries_fields_beside_operation() {
+            let mut fields = Map::new();
+            fields.insert("claim_id".to_owned(), json!("claim-1"));
+            fields.insert(
+                "permit".to_owned(),
+                json!({"request": {"operation_id": "op-1"}, "binding": {}}),
+            );
+            let envelope = flat_request_envelope("native_worker.capacity_verify", fields)
+                .expect("flat envelope builds");
+            assert_eq!(
+                envelope.get("operation").and_then(Value::as_str),
+                Some("native_worker.capacity_verify")
+            );
+            assert_eq!(
+                envelope.get("claim_id").and_then(Value::as_str),
+                Some("claim-1")
+            );
+            assert!(envelope.get("permit").is_some());
+            assert!(envelope.get("payload").is_none());
+        }
+
+        #[test]
+        fn flat_request_envelope_refuses_shadowed_envelope_keys() {
+            let mut shadowed = Map::new();
+            shadowed.insert("payload".to_owned(), json!({}));
+            assert!(flat_request_envelope("native_worker.capacity_verify", shadowed).is_err());
+            let mut operation = Map::new();
+            operation.insert("operation".to_owned(), json!("other"));
+            assert!(flat_request_envelope("native_worker.capacity_verify", operation).is_err());
+            assert!(flat_request_envelope("", Map::new()).is_err());
         }
 
         #[test]

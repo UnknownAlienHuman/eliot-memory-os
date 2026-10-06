@@ -3014,6 +3014,36 @@ fn capacity_permit_generation_change_refuses_recovery_after_restart() {
     );
 }
 
+/// A holding released after presentation refuses the claimed recovery
+/// through the live lookup: the per-use recheck runs before any retained
+/// inspect or replay suffix (issue #1701, R2-owners/W5-W6). The first
+/// core's recorded P-03 start is untouched; no second start is attempted.
+#[test]
+fn capacity_permit_released_refuses_recovery_after_restart() {
+    let (mut first, executor, admission, replay, claim, _) = claimed_setup();
+    claimed_start(&mut first, &claim);
+    let mut restarted = restarted_core(&executor, &admission, &replay);
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    restarted
+        .admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits on the restarted core");
+    authority.release();
+    let error = block_on(restarted.recover_after_restart_claimed(
+        claim,
+        claim_hello("connection-claim-2", "recover-claim-1"),
+        process_request(),
+        0,
+    ))
+    .expect_err("released holding must refuse recovery");
+    assert!(
+        matches!(error, WorkerError::AdmissionRejected(ref detail) if detail.contains("capacity_permit_released")),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 1);
+}
+
 /// Owner/consumer composition: one live owner-issued reservation drives the
 /// real claimed start to `Ready` (issue #1701, R2-owners/W5).
 ///

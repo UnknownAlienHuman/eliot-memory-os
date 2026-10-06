@@ -838,9 +838,9 @@ mod tests {
         AdmittedLifecycle, BoundedEvidenceSink, KernelReplayPort, KernelReplayTransport,
         NATIVE_WORKER_CAPACITY_VERIFY_OPERATION, NativeWorker, NativeWorkerDispatchAuthority,
         NativeWorkerError, PresentationEchoAdmission, ReconcileSubmission, ValidatedDispatchGrant,
-        capacity_verify_payload, derive_admitted_intent, drive_admitted_claimed,
-        governed_action::ActionEnvelope, map_capacity_verify_reply, require_launch_grant,
-        select_factory_for_admitted,
+        capacity_verify_payload, capacity_verify_wire_frame, derive_admitted_intent,
+        drive_admitted_claimed, governed_action::ActionEnvelope, map_capacity_verify_reply,
+        require_launch_grant, select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
         ActionEnvelopeCarrier, AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope,
@@ -2216,6 +2216,56 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(1)
         );
+        // The actual transport frame carries the claim fields flat beside
+        // the operation selector — the shape the Kernel capacity route
+        // parses (`native_worker_capacity_verify_route.rs` reads top-level
+        // `claim_id`; `parse_capacity_verify_presentation` reads top-level
+        // `claim_id`/`registration_id`/`worker_generation`/`authority_epoch`
+        // plus `permit.request`/`permit.binding`). The nested
+        // `{operation, payload}` shape the other lifecycle operations use
+        // would fail that parse before any holding is checked.
+        let frame = capacity_verify_wire_frame(&claim, &binding, &request)
+            .unwrap_or_else(|error| panic!("capacity wire frame builds: {error:?}"));
+        assert_eq!(
+            frame.get("operation").and_then(serde_json::Value::as_str),
+            Some(NATIVE_WORKER_CAPACITY_VERIFY_OPERATION)
+        );
+        assert_eq!(
+            frame.get("claim_id").and_then(serde_json::Value::as_str),
+            Some("claim-1")
+        );
+        assert_eq!(
+            frame
+                .get("registration_id")
+                .and_then(serde_json::Value::as_str),
+            Some(claim.registration_id.as_str())
+        );
+        assert_eq!(
+            frame
+                .get("worker_generation")
+                .and_then(serde_json::Value::as_u64),
+            Some(claim.worker_generation)
+        );
+        assert_eq!(
+            frame
+                .get("permit")
+                .and_then(|permit| permit.get("binding"))
+                .and_then(|binding_json| binding_json.get("permit_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(binding.permit_id.as_str())
+        );
+        assert!(
+            frame.get("payload").is_none(),
+            "the capacity query must not nest under a payload key"
+        );
+        let nested = serde_json::json!({
+            "operation": NATIVE_WORKER_CAPACITY_VERIFY_OPERATION,
+            "payload": payload,
+        });
+        assert!(
+            nested.get("claim_id").is_none(),
+            "the nested shape hides the claim identity from the route"
+        );
     }
 
     #[test]
@@ -3037,7 +3087,6 @@ mod tests {
         let operation_id = "operation-kernel-drive-1";
         let worker_generation = 1_u64;
         let join_nonce = "launch-nonce-kernel-drive-0001";
-        let kernel_nonce = "kernel-session-nonce-drive-0001";
         let epoch_json = serde_json::to_value(epoch()).unwrap_or_else(|_| panic!("epoch json"));
         let fence_json = serde_json::to_value(fence()).unwrap_or_else(|_| panic!("fence json"));
         let executable = kernel_drive_executable();
@@ -3236,12 +3285,16 @@ mod tests {
             expires_at: grant_expires_at,
             testd_owner_store_path: None,
         };
+        // The accepted nonce relation (issue #1701, R2-owners/W5/A7): the
+        // dispatch nonce equals the owner join launch nonce when the join
+        // is present — the Kernel writer and prepare gates retain that
+        // equality, and the spawn gates re-prove it against the record.
         let bytes = load(eliot_kernel::native_worker_material_bytes(
             &request,
             &receipt,
             &epoch(),
             worker_generation,
-            kernel_nonce,
+            join_nonce,
             &grant,
         ));
         std::fs::write(staged, bytes).unwrap_or_else(|_| panic!("stage kernel file"));
@@ -3284,8 +3337,9 @@ mod tests {
         );
         assert_eq!(valid_binding_again, valid_binding);
 
-        // The kernel file validates, binds the session nonces distinctly
-        // (kernel nonce independent of the join nonce), and is consumed once.
+        // The kernel file validates, binds the dispatch nonce to the owner
+        // join launch nonce (the accepted relation the Kernel writer
+        // retains), and is consumed once.
         let material = read_admitted_material_from(&staged)
             .unwrap_or_else(|error| panic!("kernel file must read: {error:?}"))
             .unwrap_or_else(|| panic!("kernel file must be present"));
@@ -3308,9 +3362,9 @@ mod tests {
         assert_eq!(material.nonce, "launch-nonce-kernel-drive-0001");
         assert_eq!(
             material.kernel_nonce.as_deref(),
-            Some("kernel-session-nonce-drive-0001")
+            Some("launch-nonce-kernel-drive-0001")
         );
-        assert_ne!(
+        assert_eq!(
             material.nonce,
             material.kernel_nonce.as_deref().unwrap_or_default()
         );

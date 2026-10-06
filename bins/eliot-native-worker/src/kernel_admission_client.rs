@@ -35,7 +35,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_cli::kernel_client::{KernelClient, KernelClientError, flat_request_envelope};
 use eliot_contracts::RequestId;
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_native_worker_core::{
@@ -701,14 +701,14 @@ impl KernelNativeWorkerClient {
         claim
             .validate()
             .map_err(|_| CapacityAuthorityError::Unavailable)?;
-        let payload = capacity_verify_payload(claim, binding, request)
+        let frame = capacity_verify_wire_frame(claim, binding, request)
             .map_err(|_| CapacityAuthorityError::Unavailable)?;
         let fence_json = serde_json::to_value(&claim.state_fence)
             .map_err(|_| CapacityAuthorityError::Unavailable)?;
         bind_request_identity(&mut self.client, fence_json, claim.claim_id.as_str())
             .map_err(|_| CapacityAuthorityError::Unavailable)?;
         let reply = self
-            .transact(NATIVE_WORKER_CAPACITY_VERIFY_OPERATION, payload)
+            .transact_flat(frame)
             .map_err(|_| CapacityAuthorityError::Unavailable)?;
         map_capacity_verify_reply(&reply, claim, binding)
     }
@@ -721,6 +721,38 @@ impl KernelNativeWorkerClient {
     ) -> Result<serde_json::Value, NativeWorkerError> {
         self.client
             .transact_json(operation, payload)
+            .map_err(|error| kernel_admission_error(&error))
+    }
+
+    /// Sends one flat wire frame built by [`capacity_verify_wire_frame`];
+    /// transport failures stay transport failures. The split is lossless:
+    /// the frame carries exactly one string `operation` beside the fields,
+    /// so removing it recovers the fields the envelope was built from and
+    /// the transport re-merges the identical outer object.
+    fn transact_flat(
+        &mut self,
+        frame: serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        let mut frame = frame;
+        let operation = frame
+            .as_object_mut()
+            .and_then(|frame| frame.remove("operation"))
+            .and_then(|operation| match operation {
+                serde_json::Value::String(operation) => Some(operation),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                NativeWorkerError::KernelAdmissionRequired(
+                    "capacity verify wire frame names no operation".to_owned(),
+                )
+            })?;
+        let fields = frame.as_object().cloned().ok_or_else(|| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "capacity verify wire frame is not shaped".to_owned(),
+            )
+        })?;
+        self.client
+            .transact_flat_json(&operation, fields)
             .map_err(|error| kernel_admission_error(&error))
     }
 
@@ -811,6 +843,39 @@ pub fn capacity_verify_payload(
             "binding": serde_json::to_value(binding)?,
         },
     }))
+}
+
+/// Builds the exact outer capacity-verify frame the transport sends
+/// (issue #1701, R2-owners/W5).
+///
+/// The Kernel capacity route (`native_worker.capacity_verify`, served
+/// contour-side by #1679) reads the claim identity and the typed pair
+/// from the outer object — the same level as `operation`
+/// (`bins/eliot-kernel/src/native_worker_capacity_verify_route.rs`
+/// reads top-level `claim_id`; `dispatch_launch.rs`
+/// `parse_capacity_verify_presentation` reads top-level `claim_id`,
+/// `registration_id`, `worker_generation`, `authority_epoch`, and
+/// `permit.request`/`permit.binding`). The nested `{operation, payload}`
+/// shape therefore never carries this query: the fields ride flat beside
+/// the operation selector, and [`KernelNativeWorkerClient`] sends exactly
+/// this value. Pure so the seam shape is pinned without a session; `pub`
+/// for the same route-schema reason as [`capacity_verify_payload`].
+pub fn capacity_verify_wire_frame(
+    claim: &NativeWorkerClaim,
+    binding: &CapacityPermitBinding,
+    request: &CapacityRequest,
+) -> Result<serde_json::Value, NativeWorkerError> {
+    let payload = capacity_verify_payload(claim, binding, request)?;
+    let fields = payload.as_object().cloned().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "capacity verify payload is not shaped".to_owned(),
+        )
+    })?;
+    flat_request_envelope(NATIVE_WORKER_CAPACITY_VERIFY_OPERATION, fields).map_err(|_| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "capacity verify wire frame is not shaped".to_owned(),
+        )
+    })
 }
 
 /// Reads an epoch sequence the way the lifecycle projections do: an object

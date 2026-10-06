@@ -61,7 +61,8 @@ pub use kernel_admission_client::{
     NATIVE_WORKER_REPLAY_APPEND_OPERATION, NATIVE_WORKER_REPLAY_BEGIN_OPERATION,
     NATIVE_WORKER_REPLAY_LOOKUP_OPERATION, NATIVE_WORKER_REPLAY_OPERATION,
     NATIVE_WORKER_RESULT_SUBMIT_OPERATION, ReconcileRetainedReceipt, ReconcileSubmission,
-    SharedKernelTransport, capacity_verify_payload, map_capacity_verify_reply,
+    SharedKernelTransport, capacity_verify_payload, capacity_verify_wire_frame,
+    map_capacity_verify_reply,
 };
 
 const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
