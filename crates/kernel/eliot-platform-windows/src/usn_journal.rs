@@ -79,15 +79,20 @@ pub struct UsnJournalState {
 /// One parsed change record: identity and cause only, never file contents.
 ///
 /// Names are hints for counting and correlation, never principal identity
-/// (norm I8.2: file changes alone cannot establish attribution).
+/// (norm I8.2: file changes alone cannot establish attribution). `usn` is a
+/// stream byte offset and `record_length` is this record's byte length, so
+/// the next contiguous record starts at `usn + record_length` — consecutive
+/// records never differ by one (issue #1755, CS1 return).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsnRecordView {
-    /// Record USN.
+    /// Record USN (byte offset in the journal stream).
     pub usn: u64,
     /// `USN_REASON_*` bitmask.
     pub reason: u32,
     /// File name in UTF-16 lossy form (see [`read_usn_journal_page`]).
     pub file_name: String,
+    /// `RecordLength` header value in bytes (never zero from the parser).
+    pub record_length: u32,
 }
 
 /// One bounded journal page read through a cursor.
@@ -559,10 +564,12 @@ pub(crate) fn parse_usn_record_page(buffer: &[u8]) -> Result<Vec<UsnRecordView>,
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
+        let record_length = u32::try_from(length).map_err(|_| UsnJournalError::TruncatedRecord)?;
         records.push(UsnRecordView {
             usn,
             reason,
             file_name: String::from_utf16_lossy(&units),
+            record_length,
         });
         offset += length;
     }

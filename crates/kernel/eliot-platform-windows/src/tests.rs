@@ -5054,8 +5054,10 @@ fn usn_record_parser_reads_v2_and_v3_records_in_order() {
     assert_eq!(records[0].usn, 0x1234_5678);
     assert_eq!(records[0].reason, 0x100);
     assert_eq!(records[0].file_name, "t.txt");
+    assert_eq!(records[0].record_length, 60 + 10);
     assert_eq!(records[1].usn, 0x9999);
     assert_eq!(records[1].file_name, "log");
+    assert_eq!(records[1].record_length, 68 + 6);
     assert!(
         parse_usn_record_page(&[])
             .unwrap_or_else(|_| unreachable!())
