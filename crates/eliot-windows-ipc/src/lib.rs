@@ -804,6 +804,15 @@ impl RetirablePinnedFile {
     }
 }
 
+/// Returns the stable identity of an already-open file handle.
+///
+/// Lets an owner that published through its own creation handle bind the
+/// published object without re-resolving the path (which could adopt a
+/// replacement object published between a write and a separate capture open).
+pub fn file_identity_of(file: &File) -> io::Result<FileIdentity> {
+    file_identity(file)
+}
+
 fn file_identity(file: &File) -> io::Result<FileIdentity> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the file handle is live and `information` is a valid out pointer.

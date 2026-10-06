@@ -80,8 +80,8 @@ pub use publication_owner::{BlobArchivePublicationBinding, BlobArchivePublicatio
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use stream_sink::{
-    BlobStoreStreamSink, BlobStreamPublication, BlobStreamSinkStoreBinding,
-    BlobStreamUnavailableReason,
+    BlobStoreStreamSink, BlobStreamPartialPrefix, BlobStreamPublication,
+    BlobStreamSinkStoreBinding, BlobStreamUnavailableReason,
 };
 
 const FORMAT_ID: &str = "eliot-blob-envelope";

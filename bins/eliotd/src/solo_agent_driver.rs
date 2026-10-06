@@ -67,15 +67,11 @@
 //!
 //! The runtime queue poll snapshots its head plus the expected
 //! task/route/admission/fence revisions under a short composition lock and
-//! releases that guard before any await. The verified drive then borrows the
-//! composition across the seam await: `agent_fabric_new_verified_async`
-//! resolves the session halves and verifies through the Kernel
-//! provider-admission verifier on `&DaemonComposition`, so the borrow cannot
-//! drop before the fabric exists without forking the closed admission path
-//! (a prepare/adopt split of the seam itself is a lib.rs residual). The
-//! poll flight stays single-flighted, so ticks never overlap a drive and
-//! other composition users queue on the mutex only for the bounded seam
-//! await. Both the drive adopt and the queue adopt revalidate the consumed
+//! releases that guard before any await. The verified drive prepares an
+//! owned snapshot under a short lock, runs the seam with no composition
+//! borrow held, and re-locks briefly to adopt and revalidate; the runtime
+//! admits one poll flight, so ticks never overlap a drive. Both the drive
+//! adopt and the queue adopt revalidate the consumed
 //! revisions before adopting; a stale or moved revision refuses typed with
 //! the head left queued. Until the owner ports bind (B-MOD #694 for the
 //! route, the native-worker executable-binding digest for execution), the
@@ -100,14 +96,14 @@ use eliot_agent_coordinator::{
 use eliot_contracts::{fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::agent_fabric::ModelRegistryPort;
 use crate::agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric, DispatchAck,
     DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricOperation,
-    FabricPortId, FabricSnapshot, PortBindingState, Reservation, RouteRequirements,
+    FabricPortId, FabricPorts, FabricSnapshot, PortBindingState, Reservation, RouteRequirements,
     SwarmDefinition, VerifiedProviderMaterial, daemon_coordinator_config,
 };
-#[cfg(test)]
-use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
 use crate::daemon_kernel_client::DaemonKernelClient;
 use crate::staffing_policy::{
     StaffedLane, StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
@@ -183,6 +179,31 @@ impl SoloDelegateBody {
             ));
         }
         Ok(())
+    }
+
+    /// Builds the delegate body from the canonical admitted carrier's
+    /// primitives plus the ORIGINAL canonical delegate bytes the digest binds.
+    ///
+    /// Primitives on purpose: the MCP carrier types stay test-only
+    /// (`eliot-mcp` is a dev-dependency), so production gains no surfaces
+    /// edge. Tests parse the real `eliot_mcp::CoordinateInput::Delegate` and
+    /// feed its fields here, which keeps the primitives bound to the contract
+    /// shape (I07-06:37) instead of hand-mirrored JSON.
+    pub fn from_canonical_delegate(
+        goal: &str,
+        owned_resources: Vec<String>,
+        expected_result: &str,
+        source_bytes: &[u8],
+    ) -> Result<Self, FabricError> {
+        let body = Self {
+            goal: goal.to_owned(),
+            owned_resources,
+            expected_result: expected_result.to_owned(),
+            source_bytes: source_bytes.to_vec(),
+            source_digest: sha256_hex(source_bytes),
+        };
+        body.validate()?;
+        Ok(body)
     }
 }
 
@@ -1030,6 +1051,96 @@ fn load_verified_projection(
     })
 }
 
+/// Discovers retained solo operations that a restart must recover (issue #2567 A2).
+///
+/// Scans the projection directory for verified envelopes and returns the
+/// operation identities whose projections are NOT settled, in sorted order.
+/// A settled projection (result observed or terminal cancellation reconciled)
+/// needs no recovery and is skipped; a file that does not verify refuses the
+/// whole discovery instead of being silently skipped, because a damaged
+/// durable row is a finding, not an absence. Names that are not solo
+/// projection files are ignored: the directory holds only this driver's
+/// files, and anything else is not a projection this recovery may adopt.
+pub fn discover_retained_solo_operations(
+    state_root: &std::path::Path,
+) -> Result<Vec<String>, DaemonError> {
+    let dir = state_root.join(SOLO_PROJECTION_DIR);
+    let entries = std::fs::read_dir(&dir).map_err(|error| {
+        DaemonError::Composition(CompositionError::Recovery(format!(
+            "solo projection directory unreadable: {error}"
+        )))
+    })?;
+    let mut retained = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "solo projection directory entry unreadable: {error}"
+            )))
+        })?;
+        let name = entry.file_name();
+        let Some(operation_id) = name.to_str().and_then(|name| {
+            name.strip_prefix("attempt-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+        }) else {
+            continue;
+        };
+        require_text(operation_id, "retained operation identity")
+            .map_err(DaemonError::ProviderAdmission)?;
+        // Same split as the recovery/cancel/ingest callers: the verified
+        // loader (plus coordinator-document cross-check) on the production
+        // path, the digest-verified envelope loader under test. Both refuse a
+        // damaged envelope instead of skipping it.
+        #[cfg(not(test))]
+        let payload = load_verified_projection(state_root, operation_id)?.payload;
+        #[cfg(test)]
+        let payload = load_projection(state_root, operation_id)?;
+        if !projection_settled(&payload) {
+            retained.push(operation_id.to_owned());
+        }
+    }
+    retained.sort();
+    Ok(retained)
+}
+
+/// Revalidates a recovered snapshot after the restore await (issue #2567 A6).
+///
+/// The recovery captured the live operation, the exact durable bytes, and the
+/// presented fence BEFORE awaiting owner IO; after the await this re-proves
+/// all three against the current world before the restored snapshot may drive
+/// or repersist: the live slot must still name the captured operation, the
+/// durable bytes must be byte-identical (no concurrent repersist moved them),
+/// and the live fence must still bind the captured one. Each drift refuses
+/// typed and nothing is applied.
+fn revalidate_recovered_capture(
+    captured_operation: &str,
+    live_operation: Option<&str>,
+    captured_bytes: &[u8],
+    current_bytes: &[u8],
+    captured_fence: &eliot_contracts::StateFence,
+    live_fence: &eliot_contracts::StateFence,
+) -> Result<(), DaemonError> {
+    if live_operation != Some(captured_operation) {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo recovery refuses: live slot moved during restore".to_owned(),
+            ),
+        ));
+    }
+    if captured_bytes != current_bytes {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo recovery refuses: durable projection moved during restore".to_owned(),
+            ),
+        ));
+    }
+    if !fences_match_exact(live_fence, captured_fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo recovery refuses a fence moved during restore".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
 /// Guards the solo slice shape: one lane, no fanout, the solo recipe.
 ///
 /// Anything requiring peer or swarm behavior refuses here, before any port
@@ -1684,6 +1795,84 @@ fn adopt_solo_drive(
     Ok(())
 }
 
+/// Owned drive preparation snapshot (issue #2567 W3).
+///
+/// Everything the verified drive needs past the prepare step, taken under
+/// one short composition borrow and releasable before any await: the
+/// production ports, a state-root copy, the admitted intake, the resolved
+/// (session-checked, fence-stamped) material, and the clock. The seam and
+/// the post-seam chain consume only this snapshot plus short re-locks for
+/// adopt-time revalidation — never a borrow held across owner IO.
+pub(crate) struct SoloDrivePrepared {
+    pub(crate) ports: FabricPorts,
+    pub(crate) state_root: std::path::PathBuf,
+    pub(crate) intake: SoloDelegateIntake,
+    pub(crate) material: VerifiedProviderMaterial,
+    pub(crate) now_unix_ms: u64,
+}
+
+/// Prepares one verified drive under a short borrow (issue #2567 W3).
+///
+/// Synchronous: readiness, intake shape, solo recipe, binding cross-check,
+/// single live slot, session-bound material resolution, production ports,
+/// state-root copy. No await inside by construction, so the caller drops
+/// its guard before the seam await. Fail-closed order mirrors the current
+/// drive head exactly — this step only moves it.
+///
+/// # Errors
+///
+/// Returns the readiness, admission, binding, slot, session-resolution, or
+/// port-construction refusal unchanged, each typed (same as the drive head).
+pub(crate) fn prepare_solo_drive(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<SoloDrivePrepared, DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+    let material = intake.claimed.material();
+    check_verified_binds_intake(&intake, &material)?;
+    let operation_id = material.operation_id.clone();
+    let attempt_id = AttemptId::new(material.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if let Some(live) = state.live_operation.clone()
+            && live != operation_id
+        {
+            let settled = load_projection(composition.state_root(), &live)
+                .is_ok_and(|projection| projection_settled(&projection));
+            if !settled {
+                return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                    format!("solo slice holds live attempt {live}; settle or cancel it first"),
+                )));
+            }
+            state.live_operation = None;
+        }
+    }
+    let material = composition.resolve_verified_material(kernel, material)?;
+    let ports = composition.production_fabric_ports()?;
+    let state_root = composition.state_root().to_owned();
+    let _ = attempt_id;
+    Ok(SoloDrivePrepared {
+        ports,
+        state_root,
+        intake,
+        material,
+        now_unix_ms,
+    })
+}
+
 /// Drives one admitted solo delegate intake through the verified async
 /// seam to a retained dispatch (issue #1108 W4/A2).
 ///
@@ -1710,27 +1899,25 @@ fn adopt_solo_drive(
 /// before `emit` exactly as in the sync drive, so a restart reads back the
 /// same digest-bound attempt.
 ///
-/// The caller holds the composition guard across the seam await (see
-/// [`solo_poll_queue_async`]); this function takes `&DaemonComposition`
-/// like the sync drive and performs no locking of its own.
+/// The caller holds no composition guard: prepare runs under one short
+/// lock, the seam IO runs on owned inputs, and adopt re-locks briefly
+/// (see [`solo_poll_queue_async`]).
 async fn drive_solo_delegate_verified_async(
-    composition: &DaemonComposition,
+    composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
     intake: SoloDelegateIntake,
     now_unix_ms: u64,
 ) -> Result<SoloDriveOutcome, DaemonError> {
-    let material = intake.claimed.material();
-    // The admitted-material future below is heap-pinned so the queue-poll
-    // future that awaits this wrapper stays small: the intake would
-    // otherwise be counted in both frames across the seam await.
-    Box::pin(drive_admitted_material_async(
-        composition,
-        kernel,
-        intake,
-        material,
-        now_unix_ms,
-    ))
-    .await
+    // Prepare under one short lock, then release before any await (issue
+    // #2567 W3): the snapshot below owns everything past this point.
+    let prepared = {
+        let composition = composition.lock().await;
+        prepare_solo_drive(&composition, kernel, intake, now_unix_ms)?
+    };
+    // The admitted-material future stays heap-pinned so the queue-poll
+    // future that awaits this wrapper stays small: the prepared snapshot
+    // would otherwise be counted in both frames across the seam await.
+    Box::pin(drive_admitted_material_async(composition, kernel, prepared)).await
 }
 
 /// Drives one intake on its consumed binding through the verified async seam
@@ -1749,46 +1936,21 @@ async fn drive_solo_delegate_verified_async(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::needless_pass_by_value)]
 async fn drive_admitted_material_async(
-    composition: &DaemonComposition,
+    composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
-    intake: SoloDelegateIntake,
-    material: VerifiedProviderMaterial,
-    now_unix_ms: u64,
+    prepared: SoloDrivePrepared,
 ) -> Result<SoloDriveOutcome, DaemonError> {
-    if composition.readiness() != CompositionReadiness::Ready {
-        return Err(DaemonError::Composition(CompositionError::NotReady));
-    }
-    intake
-        .validate(now_unix_ms)
-        .map_err(DaemonError::ProviderAdmission)?;
-    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
-    check_verified_binds_intake(&intake, &material)?;
+    let SoloDrivePrepared {
+        ports,
+        state_root,
+        intake,
+        material,
+        now_unix_ms,
+    } = prepared;
     let prepared = Box::new(material.clone());
     let operation_id = material.operation_id.clone();
     let attempt_id = AttemptId::new(material.attempt_id.clone())
         .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
-    // Single live slot: a second drive while the slot holds an unsettled
-    // attempt refuses instead of overlapping ownership. A settled slot
-    // clears so the next admitted operation may proceed.
-    {
-        let mut state = composition.solo_state.lock().map_err(|_| {
-            DaemonError::Composition(CompositionError::Recovery(
-                "solo driver state lock poisoned".to_owned(),
-            ))
-        })?;
-        if let Some(live) = state.live_operation.clone()
-            && live != operation_id
-        {
-            let settled = load_projection(composition.state_root(), &live)
-                .is_ok_and(|projection| projection_settled(&projection));
-            if !settled {
-                return Err(DaemonError::ProviderAdmission(FabricError::Contract(
-                    format!("solo slice holds live attempt {live}; settle or cancel it first"),
-                )));
-            }
-            state.live_operation = None;
-        }
-    }
     let config = daemon_coordinator_config()?;
     let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
         DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
@@ -1807,29 +1969,41 @@ async fn drive_admitted_material_async(
     // binding through the Kernel provider-admission verifier, and builds
     // the sealed capability through the closed admission port before the
     // coordinator is constructed.
-    let ports = composition.production_fabric_ports()?;
-    let mut fabric = composition
-        .agent_fabric_new_verified_async(kernel, ports, material, &intake.claimed)
-        .await?;
+    // Owner IO with no composition borrow held (issue #2567 W3): the seam
+    // takes owned inputs only (see
+    // `DaemonComposition::agent_fabric_new_verified_from_resolved_async`).
+    let mut fabric = DaemonComposition::agent_fabric_new_verified_from_resolved_async(
+        kernel,
+        ports,
+        material,
+        &intake.claimed,
+    )
+    .await?;
     // AUD9: adopt revalidates the consumed revisions after owner IO, before
     // touching the fabric (see `adopt_solo_drive`): fence, epoch,
     // task/route, and live-slot admission. Any move refuses with a typed
     // stale/conflict instead of adopting verified material under another
     // generation; the queue head stays queued for a fresh evaluation.
-    adopt_solo_drive(composition, kernel, &intake, &prepared)?;
+    {
+        let composition = composition.lock().await;
+        adopt_solo_drive(&composition, kernel, &intake, &prepared)?;
+    }
     // Issue #1702 W2: the drive runs against the daemon state root, so every
     // owner-separated revision published on this fabric is committed and
     // verified durably before anything reports it current. Attaching the store
     // before the first semantic write is what makes the ordering property
     // reachable from the production path instead of a separate test seam.
-    fabric.attach_semantic_revision_store(composition.state_root());
-    let evidence = composition.capability_admission()?;
-    let route = fabric.require_model_route(
-        &intake.requirements,
-        evidence,
-        &intake.observed_scope,
-        now_unix_ms,
-    )?;
+    fabric.attach_semantic_revision_store(&state_root);
+    let route = {
+        let composition = composition.lock().await;
+        let evidence = composition.capability_admission()?;
+        fabric.require_model_route(
+            &intake.requirements,
+            evidence,
+            &intake.observed_scope,
+            now_unix_ms,
+        )?
+    };
     let (definition, _) = fabric.define_and_plan(intake.plan.clone())?;
     let reservation = fabric.stage_reservation(&definition.definition_id)?;
     let admission = fabric.commit_admission(&reservation.reservation_id)?;
@@ -1838,14 +2012,17 @@ async fn drive_admitted_material_async(
     // after the last owner write and before the first possible external
     // effect. Missing, substituted, moved-route, or stale-activation
     // material refuses here instead of launching.
-    revalidate_launch_gate(
-        composition,
-        kernel,
-        &admission,
-        &attempt_id,
-        &activation,
-        &prepared,
-    )?;
+    {
+        let composition = composition.lock().await;
+        revalidate_launch_gate(
+            &composition,
+            kernel,
+            &admission,
+            &attempt_id,
+            &activation,
+            &prepared,
+        )?;
+    }
     // AUD12/I4: the resolved material is re-resolved immediately before
     // dispatch: frozen definition, staged reservation, committed admission,
     // frozen packet bytes, staffed route, digest-bound receipt (budget,
@@ -1915,7 +2092,7 @@ async fn drive_admitted_material_async(
         result_digest: None,
         cancellation_evidence: None,
     };
-    persist_projection(composition.state_root(), &projection)?;
+    persist_projection(&state_root, &projection)?;
     // Issue #1108 W3 (acceptance A3/A7/A10/A11): the verified-path
     // production caller of the provider-capability frame. The frame binds
     // the recorded intent's operation/attempt identity, the admitted
@@ -1939,8 +2116,9 @@ async fn drive_admitted_material_async(
             "solo provider capability frame was not recorded for the dispatched intent".to_owned(),
         )));
     }
-    persist_projection(composition.state_root(), &projection)?;
+    persist_projection(&state_root, &projection)?;
     {
+        let composition = composition.lock().await;
         let mut state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
                 "solo driver state lock poisoned".to_owned(),
@@ -1960,25 +2138,6 @@ async fn drive_admitted_material_async(
         retained: true,
         dispatch,
     })
-}
-
-/// The synchronous solo path is retained only for unit tests. Production
-/// drives through the async verified seam: the runtime poll uses
-/// [`drive_solo_delegate_verified_async`], while direct production calls
-/// stay on the [`drive_solo_delegate_async`] probe; both refuse this
-/// synchronous path because authenticated Kernel verification requires an
-/// async call.
-#[cfg(not(test))]
-pub fn drive_solo_delegate(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-    _intake: SoloDelegateIntake,
-    _now_unix_ms: u64,
-) -> Result<SoloDriveOutcome, DaemonError> {
-    Err(DaemonError::Kernel(
-        "synchronous solo driving is disabled; use the async Kernel-verified entry point"
-            .to_owned(),
-    ))
 }
 
 /// Returns true when the persisted projection needs no further drive.
@@ -2160,9 +2319,9 @@ fn restore_solo_fabric(
 /// A6/A8/A9, production restore caller for the async path).
 ///
 /// Production counterpart of the test-only synchronous `restore_solo_fabric`:
-/// builds the closed production ports through
+/// consumes the caller-prepared ports from
 /// [`DaemonComposition::production_fabric_ports`], then restores through
-/// [`DaemonComposition::agent_fabric_restore_verified_async`] with the
+/// [`DaemonComposition::agent_fabric_restore_verified_from_resolved_async`] with the
 /// projection's own claimed halves as both the resolution input and the
 /// per-operation `claimed` argument. Session halves are re-resolved over the
 /// live authenticated session and the binding is verified through the Kernel
@@ -2178,9 +2337,9 @@ fn restore_solo_fabric(
 /// dispatched reconciles to unknown instead of relaunching, blocking blind
 /// retry and route substitution until exact reconciliation.
 ///
-/// The caller holds the composition guard across the seam await (see
-/// [`solo_fair_pull_recovery`]); this function takes `&DaemonComposition`
-/// like the construct path and performs no locking of its own.
+/// The production caller holds no composition guard: the state root,
+/// ports and resolved material are prepared under short locks and the
+/// seam runs on owned inputs (see [`solo_fair_pull_recovery`]).
 ///
 /// `coordinator_document` is the coordinator snapshot JSON selected out of the
 /// persisted projection FILE bytes by [`load_verified_projection`] after that
@@ -2190,23 +2349,23 @@ fn restore_solo_fabric(
 /// in-memory snapshot is never reserialized to stand in for the durable bytes.
 #[cfg(not(test))]
 async fn restore_solo_fabric_async(
-    composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     projection: &SoloPersistedAttempt,
     coordinator_document: &str,
+    state_root: std::path::PathBuf,
+    ports: FabricPorts,
+    material: VerifiedProviderMaterial,
 ) -> Result<AgentFabric, DaemonError> {
-    let material = projection.claimed.material();
-    let ports = composition.production_fabric_ports()?;
-    let mut fabric = composition
-        .agent_fabric_restore_verified_async(
-            kernel,
-            projection.snapshot.clone(),
-            ports,
-            material,
-            &projection.claimed,
-            coordinator_document,
-        )
-        .await?;
+    let mut fabric = DaemonComposition::agent_fabric_restore_verified_from_resolved_async(
+        kernel,
+        state_root,
+        projection.snapshot.clone(),
+        ports,
+        material,
+        &projection.claimed,
+        coordinator_document,
+    )
+    .await?;
     // Reconcile the unknown: an emitted dispatch with no ingested result
     // cannot relaunch and cannot release; its outcome stays unknown until
     // the worker observation arrives through the ingest leg.
@@ -2379,6 +2538,11 @@ pub enum FairPullRecovery {
 ///
 /// Returns the owner rejection unchanged. A refusal is a refusal, not a
 /// degraded poll: the caller records it and the next tick polls again.
+/// Recovery poll: long by necessity (snapshot, discover-adopt, load, resolve,
+/// restore, revalidate, drive, repersist), kept in one place so the
+/// prepare/IO/adopt order stays reviewable; see `drive_admitted_material_async`
+/// for the same convention.
+#[allow(clippy::too_many_lines)]
 pub async fn solo_fair_pull_recovery(
     composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
     kernel: &Arc<DaemonKernelClient>,
@@ -2392,38 +2556,111 @@ pub async fn solo_fair_pull_recovery(
         if composition.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        let state = composition.solo_state.lock().map_err(|_| {
+        let mut state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
                 "solo driver state lock poisoned".to_owned(),
             ))
         })?;
-        // Absent live slot: nothing is admitted, so there is no projection that
-        // a missed wake could have stranded. That is the honest idle answer and
-        // it costs no owner IO.
-        let Some(live) = state.live_operation.clone() else {
-            return Ok(FairPullRecovery::NoLiveProjection);
-        };
-        live
+        // Absent live slot: a restart may have stranded a retained projection
+        // (issue #2567 A2). Discover verified unsettled operations and adopt
+        // the first into the live slot; only a truly empty retain set is the
+        // honest idle answer, and it still costs no owner IO. The scan runs
+        // under this short sync section and each file is digest-bounded, so no
+        // await inside can interleave a slot change.
+        if let Some(live) = state.live_operation.clone() {
+            live
+        } else {
+            let state_root = composition.state_root().to_owned();
+            let retained = discover_retained_solo_operations(&state_root)?;
+            let Some(operation_id) = retained.into_iter().next() else {
+                return Ok(FairPullRecovery::NoLiveProjection);
+            };
+            state.live_operation = Some(operation_id.clone());
+            operation_id
+        }
     };
-    let composition = composition.lock().await;
-    // Production restores the coordinator from the durable document selected
-    // out of the verified projection bytes; the test-only synchronous seam
-    // keeps the typed readback it has always used.
+    // Prepare under one short lock, then release before any await (issue
+    // #2567 A6): the values below own everything past this point.
+    let state_root = {
+        let composition = composition.lock().await;
+        composition.state_root().to_owned()
+    };
+    // Projection file IO with no composition borrow held (issue #2567 A6).
     #[cfg(not(test))]
     let (mut projection, coordinator_document) = {
-        let verified = load_verified_projection(composition.state_root(), &operation_id)?;
+        let verified = load_verified_projection(&state_root, &operation_id)?;
         (verified.payload, verified.coordinator_document)
     };
     #[cfg(test)]
-    let mut projection = load_projection(composition.state_root(), &operation_id)?;
-    #[cfg(test)]
-    let mut fabric = restore_solo_fabric(&composition, kernel, &projection)?;
+    let mut projection = load_projection(&state_root, &operation_id)?;
+    // A6 capture BEFORE the restore await: the exact durable bytes plus the
+    // presented fence the restore must still bind when it returns.
+    let captured_bytes = read_projection_bytes(&state_root, &operation_id)?;
+    let captured_fence = projection.claimed.presented_fence.clone();
+    // Resolve only on the production path: the test-only synchronous seam
+    // below takes `&DaemonComposition` directly and never consumes these.
     #[cfg(not(test))]
-    let mut fabric =
-        restore_solo_fabric_async(&composition, kernel, &projection, &coordinator_document).await?;
-    let profile = load_scheduling_profile(&composition)?;
+    let (ports, material) = {
+        let composition = composition.lock().await;
+        (
+            composition.production_fabric_ports()?,
+            composition.resolve_verified_material(kernel, projection.claimed.material())?,
+        )
+    };
+    // Owner IO with no composition borrow held (issue #2567 A6): the seam
+    // takes owned inputs only (see
+    // `DaemonComposition::agent_fabric_restore_verified_from_resolved_async`).
+    #[cfg(not(test))]
+    let mut fabric = restore_solo_fabric_async(
+        kernel,
+        &projection,
+        &coordinator_document,
+        state_root,
+        ports,
+        material,
+    )
+    .await?;
+    #[cfg(test)]
+    let mut fabric = {
+        let composition = composition.lock().await;
+        restore_solo_fabric(&composition, kernel, &projection)?
+    };
+    // A6: re-prove the captured snapshot after the restore await, before the
+    // restored fabric drives or repersists. One short re-lock; any drift of
+    // the live slot, the durable bytes, or the fence refuses typed and nothing
+    // is applied.
+    {
+        let composition = composition.lock().await;
+        let live = composition
+            .solo_state
+            .lock()
+            .map_err(|_| {
+                DaemonError::Composition(CompositionError::Recovery(
+                    "solo driver state lock poisoned".to_owned(),
+                ))
+            })?
+            .live_operation
+            .clone();
+        let state_root = composition.state_root().to_owned();
+        let current_bytes = read_projection_bytes(&state_root, &operation_id)?;
+        revalidate_recovered_capture(
+            &operation_id,
+            live.as_deref(),
+            &captured_bytes,
+            &current_bytes,
+            &captured_fence,
+            &kernel.kernel_fence(),
+        )?;
+    }
+    let profile = {
+        let composition = composition.lock().await;
+        load_scheduling_profile(&composition)?
+    };
     let outcome = fabric.drive_fair_pull(&profile, true)?;
-    repersist_after_control(&composition, &fabric, &mut projection)?;
+    {
+        let composition = composition.lock().await;
+        repersist_after_control(&composition, &fabric, &mut projection)?;
+    }
     let started = outcome.started.len();
     tracing::debug!(
         algorithm = outcome.algorithm,
@@ -2455,7 +2692,21 @@ pub fn solo_status(
     if composition.readiness() != CompositionReadiness::Ready {
         return Err(DaemonError::Composition(CompositionError::NotReady));
     }
-    let projection = load_projection(composition.state_root(), operation_id)?;
+    solo_status_in_root(composition.state_root(), operation_id)
+}
+
+/// Reads one retained attempt back through the durable path (issue #2567 A2).
+///
+/// Post-readiness half of [`solo_status`]: the projection is loaded from the
+/// state-root file (digest-verified envelope, never memory), and the status
+/// is correlated under the same operation/attempt identity. Extracted so
+/// restart readback is provable without a live composition: a fresh reader
+/// over the same state root observes the original retained attempt.
+pub fn solo_status_in_root(
+    state_root: &std::path::Path,
+    operation_id: &str,
+) -> Result<SoloAttemptStatus, DaemonError> {
+    let projection = load_projection(state_root, operation_id)?;
     let attempt_key = projection.attempt_id.clone();
     let lifecycle = projection
         .snapshot
@@ -2523,6 +2774,71 @@ pub fn solo_reconcile_cancel(
     solo_status(composition, operation_id)
 }
 
+/// Requests cancellation of the exact admitted attempt through the verified
+/// async seam (issue #2567 W5).
+///
+/// Same retained operation as [`solo_request_cancel`]: records the request
+/// only, with effects reconciling until a terminal disposition is observed
+/// through the reconcile leg. The sync leg restores through the test-only
+/// seam, which refuses in a normal build; this entry restores through
+/// [`restore_solo_fabric_async`] on owned inputs prepared under short locks,
+/// so the control path works outside tests. No new tick caller: cancellation
+/// stays event-driven and dispatcher-owned.
+pub async fn solo_request_cancel_async(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+) -> Result<SoloAttemptStatus, DaemonError> {
+    {
+        let composition = composition.lock().await;
+        if composition.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+    }
+    let state_root = {
+        let composition = composition.lock().await;
+        composition.state_root().to_owned()
+    };
+    #[cfg(not(test))]
+    let (mut projection, coordinator_document) = {
+        let verified = load_verified_projection(&state_root, operation_id)?;
+        (verified.payload, verified.coordinator_document)
+    };
+    #[cfg(test)]
+    let mut projection = load_projection(&state_root, operation_id)?;
+    #[cfg(not(test))]
+    let (ports, material) = {
+        let composition = composition.lock().await;
+        (
+            composition.production_fabric_ports()?,
+            composition.resolve_verified_material(kernel, projection.claimed.material())?,
+        )
+    };
+    #[cfg(not(test))]
+    let mut fabric = restore_solo_fabric_async(
+        kernel,
+        &projection,
+        &coordinator_document,
+        state_root,
+        ports,
+        material,
+    )
+    .await?;
+    #[cfg(test)]
+    let mut fabric = {
+        let composition = composition.lock().await;
+        restore_solo_fabric(&composition, kernel, &projection)?
+    };
+    let attempt = AttemptId::new(projection.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    fabric.request_cancellation(&attempt, &projection.operation_id)?;
+    {
+        let composition = composition.lock().await;
+        repersist_after_control(&composition, &fabric, &mut projection)?;
+        solo_status(&composition, operation_id)
+    }
+}
+
 /// Ingests one worker observation as the correlated candidate result.
 ///
 /// Records the worker acknowledgement (never success) and submits the
@@ -2564,6 +2880,87 @@ pub fn solo_ingest_result(
     // command. The candidate result is already durable above.
     drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
     solo_status(composition, operation_id)
+}
+
+/// Ingests one worker observation through the verified async seam
+/// (issue #2567 W5).
+///
+/// Same retained operation as [`solo_ingest_result`]: the worker
+/// acknowledgement (never success) and the candidate result digest (never
+/// Finish) under the same attempt identity, then the fair-pull join on the
+/// release path. Restores through [`restore_solo_fabric_async`] on owned
+/// inputs prepared under short locks, so the ingest path works outside
+/// tests. No new tick caller: ingest stays event-driven and
+/// dispatcher-owned.
+pub async fn solo_ingest_result_async(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+    worker_id: &str,
+    result_digest: &str,
+    observed_via: &str,
+) -> Result<SoloAttemptStatus, DaemonError> {
+    {
+        let composition = composition.lock().await;
+        if composition.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+    }
+    require_text(worker_id, "worker identity").map_err(DaemonError::ProviderAdmission)?;
+    require_text(result_digest, "result digest").map_err(DaemonError::ProviderAdmission)?;
+    require_text(observed_via, "observation leg").map_err(DaemonError::ProviderAdmission)?;
+    let state_root = {
+        let composition = composition.lock().await;
+        composition.state_root().to_owned()
+    };
+    #[cfg(not(test))]
+    let (mut projection, coordinator_document) = {
+        let verified = load_verified_projection(&state_root, operation_id)?;
+        (verified.payload, verified.coordinator_document)
+    };
+    #[cfg(test)]
+    let mut projection = load_projection(&state_root, operation_id)?;
+    #[cfg(not(test))]
+    let (ports, material) = {
+        let composition = composition.lock().await;
+        (
+            composition.production_fabric_ports()?,
+            composition.resolve_verified_material(kernel, projection.claimed.material())?,
+        )
+    };
+    #[cfg(not(test))]
+    let mut fabric = restore_solo_fabric_async(
+        kernel,
+        &projection,
+        &coordinator_document,
+        state_root,
+        ports,
+        material,
+    )
+    .await?;
+    #[cfg(test)]
+    let mut fabric = {
+        let composition = composition.lock().await;
+        restore_solo_fabric(&composition, kernel, &projection)?
+    };
+    let attempt = AttemptId::new(projection.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    let worker = crate::agent_fabric::WorkerAck {
+        attempt_id: attempt.clone(),
+        worker_id: worker_id.to_owned(),
+    };
+    fabric.observe_worker_ack(&worker)?;
+    let record = crate::agent_fabric::AttemptResultRecord {
+        attempt_id: attempt,
+        result_digest: result_digest.to_owned(),
+    };
+    fabric.submit_attempt_result(&record)?;
+    projection.result_digest = Some(result_digest.to_owned());
+    {
+        let composition = composition.lock().await;
+        drive_fair_pull_after_release(&composition, &mut fabric, &mut projection)?;
+        solo_status(&composition, operation_id)
+    }
 }
 
 /// Ingests one bridge-projected tool result as attempt evidence for the
@@ -2737,15 +3134,29 @@ pub fn solo_enqueue(
     if composition.readiness() != CompositionReadiness::Ready {
         return Err(DaemonError::Composition(CompositionError::NotReady));
     }
-    intake
-        .validate(now_unix_ms)
-        .map_err(DaemonError::ProviderAdmission)?;
-    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
     let mut state = composition.solo_state.lock().map_err(|_| {
         DaemonError::Composition(CompositionError::Recovery(
             "solo driver state lock poisoned".to_owned(),
         ))
     })?;
+    push_validated_intake(&mut state, intake, now_unix_ms)
+}
+
+/// Validates one intake and pushes it onto the driver queue (issue #2567 W2).
+///
+/// Pure queue half of [`solo_enqueue`]: intake shape, solo plan guard, and the
+/// `SOLO_QUEUE_MAX_LEN` bound, with no readiness or composition touch, so the
+/// queue-fill proof runs without a daemon composition. The readiness gate
+/// stays in `solo_enqueue`.
+pub(crate) fn push_validated_intake(
+    state: &mut SoloDriverState,
+    intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<(), DaemonError> {
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
     if state.queue.len() >= SOLO_QUEUE_MAX_LEN {
         return Err(DaemonError::ProviderAdmission(FabricError::Contract(
             "solo intake queue is full; backpressure instead of unbounded growth".to_owned(),
@@ -2800,22 +3211,18 @@ pub fn solo_poll_queue(
 /// drive refuses or when the post-drive adopt recheck finds moved revisions,
 /// preserving the exact operation for a later fresh evaluation.
 ///
-/// Prepare/IO/adopt (issue #2567 AUD9/AUD10): the head intake is snapshotted
-/// under a short `try_lock` and that guard is released before any await. The
-/// verified drive then borrows the composition across the seam await because
-/// the sole-path seam
-/// ([`DaemonComposition::agent_fabric_new_verified_async`]) resolves the
-/// session halves and verifies through the Kernel provider-admission
-/// verifier on `&DaemonComposition`; invoking it without that borrow would
-/// fork the closed admission path, so a prepare/adopt split of the seam
-/// itself stays a lib.rs residual (see below). The poll flight stays
-/// single-flighted (see `daemon_runtime`), so ticks never overlap a drive,
-/// and the drive adopt plus the queue adopt below both revalidate the
-/// consumed task/route/admission/fence revisions before adopting. Other
-/// composition users queue on the mutex during the bounded seam await. Until
-/// the owner ports bind, the drive refuses with the typed
-/// missing-prerequisite residual and the head stays queued; a refusal is a
-/// refusal, never a degraded drive.
+/// Prepare/IO/adopt (issue #2567 AUD9/AUD10, W3 round-2): the head intake is
+/// snapshotted under a short `try_lock` and that guard is released before
+/// any await. The verified drive prepares an owned snapshot under one short
+/// lock, runs the owner-IO seam with no composition borrow held (see
+/// [`drive_solo_delegate_verified_async`]), and re-locks briefly to adopt
+/// and revalidate. The poll flight stays single-flighted (see
+/// `daemon_runtime`), so ticks never overlap a drive, and the drive adopt
+/// plus the queue adopt below both revalidate the consumed
+/// task/route/admission/fence revisions before adopting. Until the owner
+/// ports bind, the drive refuses with the typed missing-prerequisite
+/// residual and the head stays queued; a refusal is a refusal, never a
+/// degraded drive.
 pub async fn solo_poll_queue_async(
     composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
@@ -2848,19 +3255,12 @@ pub async fn solo_poll_queue_async(
     let expected = intake.clone();
     // Issue #1108 W4/A2: the runtime drive chain
     // (`run_loop` -> `solo_poll_queue_async` -> verified drive) enters the
-    // async seam here with the driver's claimed halves. The composition
-    // guard is held across this await: the seam needs `&DaemonComposition`
-    // for the production ports, the session-half resolution, and the closed
-    // capability construction, and the single live slot the drive adopts
-    // must not move underneath it. Releasing this borrow across the owner
-    // IO needs a prepare/adopt split of the seam itself
-    // (`agent_fabric_new_verified_async` takes `&self` across its internal
-    // verifier awaits), which lives in `lib.rs` and is out of this slice's
-    // scope; the single-flighted poll flight bounds the hold to one drive.
-    let outcome = {
-        let composition = composition.lock().await;
-        drive_solo_delegate_verified_async(&composition, kernel, intake, crate::unix_ms()).await?
-    };
+    // async seam here with the driver's claimed halves.
+    // No composition guard is held across the drive await: the drive
+    // prepares, awaits owner IO on owned inputs, and re-locks briefly to
+    // revalidate and adopt (see `drive_solo_delegate_verified_async`).
+    let outcome =
+        drive_solo_delegate_verified_async(composition, kernel, intake, crate::unix_ms()).await?;
     // Queue adopt (issue #2567 AUD9): recheck the consumed revisions under a
     // short lock before dequeuing. The drive adopt already revalidated
     // post-seam; this closes the remaining window over the sync fabric
@@ -2930,15 +3330,967 @@ pub async fn solo_poll_queue_async(
     })
 }
 
-/// Synchronous queue polling cannot perform authenticated owner IO. It
-/// refuses without dequeuing the retained intake.
-#[cfg(not(test))]
-pub fn solo_poll_queue(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-) -> Result<SoloPollOutcome, DaemonError> {
-    Err(DaemonError::Kernel(
-        "synchronous solo polling is disabled; use the async Kernel-verified poll entry point"
-            .to_owned(),
-    ))
+/// Test-only valid admitted-solo pair (issue #2567 W2/A3).
+///
+/// Builds one fully valid [`SoloDelegateIntake`] plus its matching admitted
+/// envelope and the `now` the pair is valid under. The plan mirrors the
+/// proven `agent_fabric_wiring::test_request` fixture: [`guard_solo_plan`]
+/// checks only launch validity, the solo recipe id, one lane, and fanout
+/// one — never lane content — so lane and route-candidate content is echoed
+/// verbatim instead of reinvented. `observed_scope` stays default because
+/// [`SoloDelegateIntake::validate`] never reads it. Every load-bearing
+/// binding (digest, task, fence, deadline, principal, operation) is exact,
+/// so the pair is the positive control for both the binding check and the
+/// queue push; tests mutate one field at a time for refusals.
+#[cfg(test)]
+#[allow(clippy::too_many_lines, clippy::expect_used)]
+pub(crate) fn solo_test_pair() -> (
+    crate::agent_fabric::AdmittedSoloCoordinateRequest,
+    SoloDelegateIntake,
+    u64,
+) {
+    use eliot_agent_api::{
+        AgentWorkUnitBrief, BudgetEnvelope, EffectCeiling, EffectKind, LaunchRequestId,
+        LowercaseSha256, TaskId, WorkUnitId,
+    };
+    use eliot_agent_contracts::{PublicReference, RevisionId, TargetId};
+    use eliot_agent_coordinator::{
+        CandidateId, HumanStaffingIntent, LearningRole, ProviderIdentity, RecipeId, RecipeManifest,
+        RoleProfileId, RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest,
+        StaffingPlanRequest, StaffingPreset, WorkClass,
+    };
+    use eliot_contracts::{
+        ContractVersion, EpochId, EpochLineageId, ResourceGeneration, StateFence, contract_identity,
+    };
+    use eliot_evaluation_contracts::BudgetEvidence;
+    use eliot_kernel_service::ProviderCapabilityExpectation;
+    use eliot_security_contracts::PrivacyClass;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
+
+    use crate::agent_fabric::SOLO_ROUTE_OPERATION;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const NOW: u64 = 1_800_000_000_000;
+
+    fn test_epoch() -> EpochId {
+        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("test lineage parses");
+        let sequence = NonZeroU64::new(1).expect("non-zero test sequence");
+        EpochId::new(lineage, sequence).expect("test epoch builds")
+    }
+
+    fn test_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(serde_json::json!(sha256_hex(seed.as_bytes())))
+            .expect("test digest decodes")
+    }
+
+    fn fixture_reference(label: &str) -> PublicReference {
+        PublicReference {
+            kind: "fixture".to_owned(),
+            id: TargetId::new(format!("fixture-{label}")).expect("fixture target builds"),
+            revision: RevisionId::new("fixture-v1").expect("fixture revision builds"),
+            digest: None,
+        }
+    }
+
+    fn fixture_schema_identity(
+        label: &str,
+    ) -> Result<eliot_contracts::ContractIdentity, eliot_contracts::ContractError> {
+        contract_identity(
+            format!("fixture-{label}"),
+            ContractVersion::new(1, 0, 0),
+            &serde_json::json!({ "fixture_schema": label }),
+        )
+    }
+
+    fn test_budget() -> BudgetEnvelope {
+        BudgetEnvelope {
+            context_tokens: 8_000,
+            wall_time_ms: 60_000,
+            output_bytes: 256_000,
+            cost_microunits: 1_000_000,
+            max_depth: 3,
+            max_descendants: 8,
+        }
+    }
+
+    // The plan-only coordinator binds route selection to the fence's policy
+    // revision (absent revision is not a default); the fixture carries the
+    // explicit genesis revision, never live policy evidence.
+    let fence = StateFence {
+        policy_revision: Some(eliot_contracts::PolicyRevision::genesis()),
+        ..StateFence::new(test_epoch(), ResourceGeneration::genesis())
+    };
+    let route = RouteFingerprint {
+        host_family: "test-host".to_owned(),
+        adapter: "adapter-fabric-a".to_owned(),
+        protocol_transport: "fabric-fixture".to_owned(),
+        runtime_hash: test_digest("fabric-runtime"),
+        adapter_hash: test_digest("fabric-adapter"),
+        provider: "provider-fabric-a".to_owned(),
+        model: "model-fabric-a".to_owned(),
+        auth_billing: "fixture-account".to_owned(),
+        serializer_hash: test_digest("fabric-serializer"),
+        tool_semantics_hash: test_digest("fabric-tools"),
+        reasoning_mode: "bounded".to_owned(),
+        continuation_behavior: "fresh".to_owned(),
+        feature_flags_hash: test_digest("fabric-features"),
+    };
+    let work = AgentWorkUnitBrief {
+        id: WorkUnitId::new("work-1").expect("work id builds"),
+        objective: "bounded responsibility work-1".to_owned(),
+        causal_property: "causal property work-1".to_owned(),
+        scope_ref: "scope-work-1".to_owned(),
+        expected_outputs: vec!["candidate artifact".to_owned()],
+        source_refs: vec!["architecture:10635".to_owned()],
+        verifier_ref: "cargo-test".to_owned(),
+        integration_owner: "independent-integrator".to_owned(),
+        contract_revision: "work-v1".to_owned(),
+        budget: test_budget(),
+        effect_ceiling: EffectCeiling {
+            scope_ref: "scope-work-1".to_owned(),
+            allowed: BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace]),
+            max_external_effects: 0,
+        },
+        stop_condition: "candidate submitted".to_owned(),
+    };
+    let role_effects = work.effect_ceiling.clone();
+    let plan = StaffingPlanRequest {
+        candidate_id: CandidateId::new("solo-2567").expect("candidate id builds"),
+        launch: eliot_agent_api::AgentLaunchRequest {
+            id: LaunchRequestId::new("launch-2567").expect("launch id builds"),
+            task_id: TaskId::new("task-2567").expect("task id builds"),
+            parent_attempt: None,
+            work_units: vec![work],
+            required_competence: vec!["rust".to_owned()],
+            allowed_route_classes: vec!["provider-fabric-a".to_owned()],
+            native_child_policy: "bounded".to_owned(),
+            root_context_revision: "root-v1".to_owned(),
+            context_budget: test_budget(),
+            evidence_capability_refs: vec!["capability-fixture".to_owned()],
+            privacy_profile: "PRIVATE".to_owned(),
+            effect_ceiling: EffectCeiling {
+                scope_ref: "task-scope".to_owned(),
+                allowed: BTreeSet::from([EffectKind::Observe, EffectKind::ReadWorkspace]),
+                max_external_effects: 0,
+            },
+            max_depth: 3,
+            max_fanout: 1,
+            cumulative_descendant_budget: test_budget(),
+            verifier_ref: "cargo-test".to_owned(),
+            synthesis_owner: "synthesis-owner".to_owned(),
+            integration_owner: "integration-owner".to_owned(),
+            cancellation_policy: "cascade".to_owned(),
+        },
+        recipe: RecipeManifest {
+            recipe_id: RecipeId::new(SOLO_RECIPE_ID).expect("solo recipe id builds"),
+            manifest_revision: RevisionId::new("recipe-rev-2567").expect("recipe rev builds"),
+            schema_identity: fixture_schema_identity("recipe-2567").expect("schema builds"),
+            content_digest: test_digest("recipe-manifest-2567"),
+            route_policy_revision: RevisionId::new("route-policy-1").expect("policy rev builds"),
+            max_lanes: 1,
+            max_descendants: 8,
+            stage_templates: vec![fixture_reference("stage-template")],
+            work_item_templates: vec![fixture_reference("work-item-template")],
+            dependency_templates: vec![fixture_reference("dependency-template")],
+            merge_templates: vec![fixture_reference("merge-template")],
+            eligible_route_classes: vec!["provider-fabric-a".to_owned()],
+            expansion_conditions: vec![fixture_reference("expansion-condition")],
+            contraction_conditions: vec![fixture_reference("contraction-condition")],
+            verifier_requirements: vec![fixture_reference("verifier-requirement")],
+            audit_requirements: vec![fixture_reference("audit-requirement")],
+            budget: test_budget(),
+            partial_result_behavior: fixture_reference("partial-result-behavior"),
+            failure_behavior: fixture_reference("failure-behavior"),
+            role_profiles: vec![RoleProfileManifest {
+                role_id: RoleProfileId::new("role-1").expect("role id builds"),
+                manifest_revision: RevisionId::new("role-rev-role-1").expect("role rev builds"),
+                schema_identity: fixture_schema_identity("role-1").expect("role schema builds"),
+                content_digest: test_digest("role-manifest-1"),
+                required_competence: vec!["rust".to_owned()],
+                allowed_operations: vec![fixture_reference("role-operation")],
+                allowed_effects: role_effects,
+                independence_requirement: fixture_reference("independence-requirement"),
+                input_schemas: vec![fixture_reference("role-input-schema")],
+                output_schemas: vec![fixture_reference("role-output-schema")],
+                visibility_policy: fixture_reference("visibility-policy"),
+                learning_role: LearningRole::NotApplicable,
+                stop_condition: fixture_reference("candidate-submitted"),
+                escalation_policy: fixture_reference("integration-owner"),
+                allowed_route_classes: vec!["provider-fabric-a".to_owned()],
+                mutation_capable: false,
+            }],
+        },
+        task_revision: "task-rev-1".to_owned(),
+        plan_revision: RevisionId::new("plan-rev-2567").expect("plan rev builds"),
+        state_fence: fence.clone(),
+        human_staffing_intent: HumanStaffingIntent {
+            preset: StaffingPreset::Balanced,
+            per_job_budget: test_budget(),
+        },
+        privacy_class: PrivacyClass::Private,
+        work_class: "swarm".parse::<WorkClass>().expect("swarm class parses"),
+        lanes: vec![StaffingLaneRequest {
+            work_unit_id: WorkUnitId::new("work-1").expect("lane work builds"),
+            role_id: RoleProfileId::new("role-1").expect("lane role builds"),
+            work_class: "swarm".parse::<WorkClass>().expect("lane class parses"),
+            route_candidates: vec![RouteCandidateEvidence {
+                route: route.clone(),
+                preference_rank: 0,
+                capacity_identity: crate::agent_fabric::FABRIC_CAPACITY_IDENTITY.to_owned(),
+                capacity_revision: RevisionId::new(crate::agent_fabric::FABRIC_CAPACITY_REVISION)
+                    .expect("capacity rev builds"),
+                capacity_limit: 4,
+                budget_evidence: BudgetEvidence {
+                    arm_id: "route-arm-0".to_owned(),
+                    model_calls: 1,
+                    wall_time_ms: 100,
+                    ..BudgetEvidence::default()
+                },
+                route_classes: vec!["provider-fabric-a".to_owned()],
+                route_class_evidence_refs: vec!["route-class-evidence-0".to_owned()],
+                privacy_classes: vec![PrivacyClass::Private],
+                privacy_evidence_refs: vec!["privacy-evidence-0".to_owned()],
+                evidence_refs: vec!["route-evidence-0".to_owned()],
+            }],
+            budget: test_budget(),
+            priority: 0,
+            mutation_scope: None,
+        }],
+    };
+    let source_bytes = b"solo-2567-delegate".to_vec();
+    let intake = SoloDelegateIntake {
+        delegate: SoloDelegateBody {
+            goal: "solo delegate goal".to_owned(),
+            owned_resources: vec!["scope-work-2567".to_owned()],
+            expected_result: "candidate artifact".to_owned(),
+            source_digest: sha256_hex(&source_bytes),
+            source_bytes: source_bytes.clone(),
+        },
+        plan,
+        claimed: SoloClaimedHalves {
+            identity: ProviderIdentity {
+                verifier_identity: "verifier-2567".to_owned(),
+                a01_acceptance_receipt_ref: "receipt-2567".to_owned(),
+                a01_contract_revision: "a01-rev-1".to_owned(),
+                g11_provider_revision: "g11-rev-1".to_owned(),
+                capacity_identity: crate::agent_fabric::FABRIC_CAPACITY_IDENTITY.to_owned(),
+                capacity_revision: RevisionId::new(crate::agent_fabric::FABRIC_CAPACITY_REVISION)
+                    .expect("identity capacity rev builds"),
+            },
+            claim_id: "claim-2567-1".to_owned(),
+            attempt_id: "attempt-2567-1".to_owned(),
+            operation_id: "op-2567-1".to_owned(),
+            binding_digest: "b".repeat(64),
+            executable_digest: "c".repeat(64),
+            route_revision: "route-rev-1".to_owned(),
+            capacity_revision: "capacity-rev-1".to_owned(),
+            worker_generation: 1,
+            presented_fence: fence.clone(),
+            expectation: ProviderCapabilityExpectation {
+                current_route_revision: "route-rev-1".to_owned(),
+                current_capacity_revision: "capacity-rev-1".to_owned(),
+                live_authority_epoch: test_epoch(),
+                revoked: false,
+            },
+            minimum_event_sequence: 0,
+        },
+        requirements: crate::agent_fabric::RouteRequirements {
+            role: "solo-delegate".to_owned(),
+            competence: vec!["rust".to_owned()],
+        },
+        observed_scope: eliot_governor::RouteScopeFingerprint::default(),
+        deadline_unix_ms: NOW + 60_000,
+    };
+    let request = crate::agent_fabric::AdmittedSoloCoordinateRequest {
+        operation: SOLO_ROUTE_OPERATION.to_owned(),
+        delegate_bytes: source_bytes,
+        task_id: "task-2567".to_owned(),
+        fence,
+        deadline_unix_ms: NOW + 60_000,
+        cancelled: false,
+        principal: "solo-test-principal".to_owned(),
+    };
+    (request, intake, NOW)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod solo_enqueue_push_tests {
+    use super::*;
+
+    #[test]
+    fn solo_enqueue_push_accepts_valid_intake() {
+        let (_, intake, now) = solo_test_pair();
+        let expected = intake.clone();
+        let mut state = SoloDriverState::new();
+        assert!(push_validated_intake(&mut state, intake, now).is_ok());
+        assert_eq!(state.queue.len(), 1);
+        assert!(intake_revisions_match(
+            state.queue.front().expect("validated intake is queued"),
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn solo_enqueue_push_refuses_invalid_and_full() {
+        let (_, intake, now) = solo_test_pair();
+        let mut expired = intake.clone();
+        expired.deadline_unix_ms = now;
+        let mut state = SoloDriverState::new();
+        match push_validated_intake(&mut state, expired, now) {
+            Err(DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected Contract refusal, got {other:?}"),
+        }
+        let (_, intake, now) = solo_test_pair();
+        let mut state = SoloDriverState::new();
+        for _ in 0..SOLO_QUEUE_MAX_LEN {
+            push_validated_intake(&mut state, intake.clone(), now).expect("queue fills");
+        }
+        match push_validated_intake(&mut state, intake, now) {
+            Err(DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected backpressure refusal, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod solo_intake_consume_chain_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Issue #2567 W2: the admitted intake queued by `push_validated_intake`
+    /// is the exact item the drive leg consumes, and the direct-entry drive
+    /// settles it with a typed daemon refusal before any fabric effect. The
+    /// unconnected test kernel fails every exchange as an unestablished
+    /// outcome, so the refusal names the kernel seam rather than inventing
+    /// an answer.
+    /// Issues #2567 W3/A6: the real async drive takes owned inputs only — no
+    /// composition guard exists to hold — so an independent queue control
+    /// progresses while the drive suspends in the Kernel verifier (owner IO).
+    /// The intake speaks the staffed `bulk_implementation` vocabulary (same
+    /// mutation as the A3 order proof), so the drive passes validation and
+    /// staffing, awaits the owner verifier, and refuses with the typed Kernel
+    /// transport error (no live Kernel on the test pipe). Reaching the
+    /// transport refusal proves the future traversed the verifier await; the
+    /// concurrent control proves nothing was blocked behind it. Guarded by a
+    /// timeout: a shared lock held across the await would stall the join.
+    #[tokio::test]
+    async fn verified_drive_awaits_owner_io_while_control_progresses() {
+        const CLASS: &str = "bulk_implementation";
+        let (_, mut intake, now) = solo_test_pair();
+        intake.plan.recipe.eligible_route_classes = vec![CLASS.to_owned()];
+        for profile in &mut intake.plan.recipe.role_profiles {
+            profile.allowed_route_classes = vec![CLASS.to_owned()];
+        }
+        intake.plan.launch.allowed_route_classes = vec![CLASS.to_owned()];
+        for lane in &mut intake.plan.lanes {
+            for candidate in &mut lane.route_candidates {
+                candidate.route_classes = vec![CLASS.to_owned()];
+                candidate.route.provider = CLASS.to_owned();
+            }
+        }
+        let fence = intake.claimed.presented_fence.clone();
+        let kernel = Arc::new(
+            crate::daemon_kernel_client::DaemonKernelClient::new_for_test(
+                fence.authority_epoch.clone(),
+                fence,
+            ),
+        );
+        kernel.seed_validated_session_binding_for_test("test-session-binding");
+        let drive = Box::pin(drive_solo_delegate_async(&kernel, intake, now));
+        let control = async {
+            let (_, control_intake, control_now) = solo_test_pair();
+            let mut state = SoloDriverState::new();
+            push_validated_intake(&mut state, control_intake, control_now)?;
+            Ok::<_, DaemonError>(state.queue.len())
+        };
+        let (drive_outcome, control_outcome) =
+            tokio::time::timeout(std::time::Duration::from_mins(1), async {
+                tokio::join!(drive, control)
+            })
+            .await
+            .expect("drive and control complete without stalling");
+        assert_eq!(control_outcome.expect("independent control progresses"), 1);
+        match drive_outcome {
+            Err(DaemonError::Kernel(_)) => {}
+            other => panic!(
+                "expected typed Kernel transport refusal after the verifier await, got {other:?}"
+            ),
+        }
+    }
+
+    /// Issues #2567 W5/A6: the async owner-verified drive-transport seam
+    /// (`agent_fabric_new_verified_from_resolved_async`, the prepare half of
+    /// the verified drive) takes owned inputs only, so it awaits the Kernel
+    /// verifier with no composition guard held. With a seeded owner session
+    /// the seam reaches the transport, which refuses typed (no live Kernel on
+    /// the test pipe); reaching that refusal proves the future traversed the
+    /// owner-IO await instead of refusing before it. The cancel/ingest legs
+    /// use the sibling restore seam with the same guard discipline (short
+    /// locks, owned inputs into the await). Guarded by a timeout: a guard
+    /// held across the await would stall.
+    #[tokio::test]
+    async fn verified_transport_seam_awaits_owner_io_guard_free() {
+        let (_, intake, _) = solo_test_pair();
+        let fence = intake.claimed.presented_fence.clone();
+        let kernel = Arc::new(
+            crate::daemon_kernel_client::DaemonKernelClient::new_for_test(
+                fence.authority_epoch.clone(),
+                fence,
+            ),
+        );
+        kernel.seed_validated_session_binding_for_test("test-session-binding");
+        let ports = crate::agent_fabric::FabricPorts {
+            model_registry: std::sync::Arc::new(crate::ProductionModelRegistryPort),
+            peer_channel: std::sync::Arc::new(crate::ProductionPeerChannelPort),
+            swarm_control: std::sync::Arc::new(crate::ProductionSwarmControlPort),
+            admission_authority: std::sync::Arc::new(crate::ProductionAdmissionAuthorityPort),
+            activation_authority: std::sync::Arc::new(crate::ProductionActivationAuthorityPort),
+            dispatch_egress: std::sync::Arc::new(crate::ProductionDispatchEgressPort),
+        };
+        let material = intake.claimed.material();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            crate::DaemonComposition::agent_fabric_new_verified_from_resolved_async(
+                &kernel,
+                ports,
+                material,
+                &intake.claimed,
+            ),
+        )
+        .await
+        .expect("transport seam completes without stalling");
+        assert!(
+            matches!(outcome, Err(DaemonError::Kernel(_))),
+            "expected typed Kernel transport refusal after the verifier await"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_intake_drives_to_typed_refusal() {
+        let (_, intake, now) = solo_test_pair();
+        let mut state = SoloDriverState::new();
+        push_validated_intake(&mut state, intake.clone(), now).expect("valid intake queues");
+        assert_eq!(state.queue.len(), 1);
+        let consumed = state
+            .queue
+            .pop_front()
+            .expect("queued intake is consumable");
+        assert!(intake_revisions_match(&consumed, &intake));
+        let fence = consumed.claimed.presented_fence.clone();
+        let kernel = Arc::new(
+            crate::daemon_kernel_client::DaemonKernelClient::new_for_test(
+                fence.authority_epoch.clone(),
+                fence,
+            ),
+        );
+        match drive_solo_delegate_async(&kernel, consumed, now).await {
+            Err(DaemonError::Kernel(_) | DaemonError::ProviderAdmission(_)) => {}
+            other => panic!("expected typed drive refusal, got {other:?}"),
+        }
+        assert!(state.queue.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod canonical_delegate_tests {
+    use super::*;
+
+    fn canonical_delegate_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "operation": "delegate",
+            "goal": "bounded valve survey",
+            "owned_resources": ["rig-1"],
+            "expected_result": "valve-report",
+        }))
+        .expect("canonical delegate bytes build")
+    }
+
+    #[test]
+    fn canonical_delegate_binds_contract_shape() {
+        let source_bytes = canonical_delegate_bytes();
+        // NOTE: `contract` is a private module (`contract.rs:11`); the carrier
+        // parses through the crate-root re-export (`lib.rs:20`).
+        let input: eliot_mcp::CoordinateInput =
+            serde_json::from_slice(&source_bytes).expect("carrier parses");
+        let eliot_mcp::CoordinateInput::Delegate(request) = input else {
+            panic!("expected a Delegate carrier, got {input:?}");
+        };
+        let body = SoloDelegateBody::from_canonical_delegate(
+            &request.goal,
+            request.owned_resources.clone(),
+            &request.expected_result,
+            &source_bytes,
+        )
+        .expect("valid carrier builds");
+        assert_eq!(body.goal, request.goal);
+        assert_eq!(body.owned_resources, request.owned_resources);
+        assert_eq!(body.expected_result, request.expected_result);
+        assert_eq!(body.source_bytes, source_bytes);
+        assert_eq!(body.source_digest, sha256_hex(&source_bytes));
+    }
+
+    #[test]
+    fn canonical_delegate_detects_tampered_bytes() {
+        let mut source_bytes = canonical_delegate_bytes();
+        let last = source_bytes.len() - 1;
+        source_bytes[last] = u8::MAX - source_bytes[last];
+        let input: eliot_mcp::CoordinateInput =
+            serde_json::from_slice(&canonical_delegate_bytes()).expect("carrier parses");
+        let eliot_mcp::CoordinateInput::Delegate(request) = input else {
+            panic!("expected a Delegate carrier, got {input:?}");
+        };
+        let mut body = SoloDelegateBody::from_canonical_delegate(
+            &request.goal,
+            request.owned_resources.clone(),
+            &request.expected_result,
+            &canonical_delegate_bytes(),
+        )
+        .expect("valid carrier builds");
+        body.source_bytes = source_bytes;
+        match body.validate() {
+            Err(FabricError::IdentityConflict(_)) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod solo_consume_chain_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Issue #2567 W2: the admitted request enters through the production
+    /// consumer head (`validate_admitted_solo_binding`), queues through the
+    /// production push, and the consumed intake drives to the production
+    /// plan-only staffing gate, which refuses typed before any capability,
+    /// reservation, or owner IO: no writer route is eligible without owner
+    /// evidence, and the drive mints none. The Kernel seam past the gate
+    /// stays unrunnable without the Kernel owner, and the runtime poll entry
+    /// plus the MCP dispatcher producer stay documented residuals: the first
+    /// needs a live composition, the second another owner's bridge module.
+    #[tokio::test]
+    async fn admitted_request_consumes_to_typed_drive_refusal() {
+        let (mut request, mut intake, now) = solo_test_pair();
+        // W2 carrier bind: the delegate body and the request envelope bytes
+        // come from a real `eliot_mcp::CoordinateInput::Delegate` parse (the
+        // same canonical JSON `canonical_delegate_binds_contract_shape`
+        // proves), never hand-made bytes. The admitted-envelope halves the
+        // #2565 producer supplies (claimed halves, fence, plan) stay the
+        // fixture pair on purpose: this test binds the carrier, not the
+        // producer.
+        let source_bytes = serde_json::to_vec(&serde_json::json!({
+            "operation": "delegate",
+            "goal": "bounded valve survey",
+            "owned_resources": ["rig-1"],
+            "expected_result": "valve-report",
+        }))
+        .expect("canonical delegate bytes build");
+        let input: eliot_mcp::CoordinateInput =
+            serde_json::from_slice(&source_bytes).expect("carrier parses");
+        let eliot_mcp::CoordinateInput::Delegate(carrier) = input else {
+            panic!("expected a Delegate carrier, got {input:?}");
+        };
+        intake.delegate = SoloDelegateBody::from_canonical_delegate(
+            &carrier.goal,
+            carrier.owned_resources.clone(),
+            &carrier.expected_result,
+            &source_bytes,
+        )
+        .expect("carrier builds the intake body");
+        request.delegate_bytes = source_bytes;
+        crate::agent_fabric::validate_admitted_solo_binding(&request, &intake)
+            .expect("admitted pair validates at the consumer head");
+        let mut state = SoloDriverState::new();
+        push_validated_intake(&mut state, intake.clone(), now).expect("valid intake queues");
+        assert_eq!(state.queue.len(), 1);
+        let consumed = state
+            .queue
+            .pop_front()
+            .expect("queued intake is consumable");
+        assert!(intake_revisions_match(&consumed, &intake));
+        let fence = consumed.claimed.presented_fence.clone();
+        let kernel = Arc::new(
+            crate::daemon_kernel_client::DaemonKernelClient::new_for_test(
+                fence.authority_epoch.clone(),
+                fence,
+            ),
+        );
+        match drive_solo_delegate_async(&kernel, consumed, now).await {
+            Err(DaemonError::ProviderAdmission(FabricError::Contract(_))) => {}
+            other => panic!("expected staffing-gate Contract refusal, got {other:?}"),
+        }
+        assert!(state.queue.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod solo_adopt_gate_tests {
+    use super::*;
+    use eliot_agent_api::TaskId;
+
+    #[test]
+    fn adopt_gate_holds_identical_revisions() {
+        let (_, intake, _) = solo_test_pair();
+        assert!(intake_revisions_match(&intake, &intake.clone()));
+        let material = intake.claimed.material();
+        assert!(check_verified_binds_intake(&intake, &material).is_ok());
+    }
+
+    #[test]
+    fn adopt_gate_refuses_moved_route_revision() {
+        let (_, intake, _) = solo_test_pair();
+        let mut moved = intake.clone();
+        moved.claimed.route_revision = "moved-route-rev".to_owned();
+        assert!(!intake_revisions_match(&moved, &intake));
+        let material = moved.claimed.material();
+        match check_verified_binds_intake(&intake, &material) {
+            Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(_))) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adopt_gate_refuses_moved_fence() {
+        let (_, intake, _) = solo_test_pair();
+        let mut moved = intake.clone();
+        moved.claimed.presented_fence = eliot_contracts::StateFence {
+            policy_revision: None,
+            ..moved.claimed.presented_fence.clone()
+        };
+        assert!(!intake_revisions_match(&moved, &intake));
+    }
+
+    #[test]
+    fn adopt_gate_refuses_moved_task() {
+        let (_, intake, _) = solo_test_pair();
+        let mut moved = intake.clone();
+        moved.plan.launch.task_id = TaskId::new("task-moved-away").expect("task id builds");
+        assert!(!intake_revisions_match(&moved, &intake));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod solo_recovery_revalidate_tests {
+    use super::*;
+
+    fn capture_pair() -> (String, Vec<u8>, eliot_contracts::StateFence) {
+        let (_, intake, _) = solo_test_pair();
+        (
+            intake.claimed.operation_id.clone(),
+            b"recovery-captured-bytes".to_vec(),
+            intake.claimed.presented_fence.clone(),
+        )
+    }
+
+    #[test]
+    fn revalidate_accepts_unchanged_capture() {
+        let (op, bytes, fence) = capture_pair();
+        assert!(
+            revalidate_recovered_capture(&op, Some(&op), &bytes, &bytes, &fence, &fence).is_ok()
+        );
+    }
+
+    #[test]
+    fn revalidate_refuses_moved_live_slot() {
+        let (op, bytes, fence) = capture_pair();
+        match revalidate_recovered_capture(
+            &op,
+            Some("other-operation"),
+            &bytes,
+            &bytes,
+            &fence,
+            &fence,
+        ) {
+            Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(_))) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
+        }
+        match revalidate_recovered_capture(&op, None, &bytes, &bytes, &fence, &fence) {
+            Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(_))) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revalidate_refuses_moved_durable_bytes() {
+        let (op, bytes, fence) = capture_pair();
+        let moved = b"recovery-repersisted-bytes".to_vec();
+        match revalidate_recovered_capture(&op, Some(&op), &bytes, &moved, &fence, &fence) {
+            Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(_))) => {}
+            other => panic!("expected IdentityConflict refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revalidate_refuses_moved_fence() {
+        let (op, bytes, fence) = capture_pair();
+        let moved = eliot_contracts::StateFence {
+            policy_revision: None,
+            ..fence.clone()
+        };
+        match revalidate_recovered_capture(&op, Some(&op), &bytes, &bytes, &fence, &moved) {
+            Err(DaemonError::ProviderAdmission(FabricError::StaleFence(_))) => {}
+            other => panic!("expected StaleFence refusal, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod solo_retained_discover_tests {
+    use super::*;
+    use eliot_agent_contracts::RevisionId;
+    use eliot_agent_coordinator::{
+        CoordinatorConfig, CoordinatorSnapshot, PlanGap, ProviderBindingSnapshot,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DISCOVER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Scratch state root unique to one test, with the production
+    /// protected-path lease pointed at it for the test's duration. The
+    /// override is the platform crate's explicit test-only RAII seam
+    /// (thread-local, restored on drop), so `persist_projection` and
+    /// `discover_retained_solo_operations` exercise the real lease against
+    /// scratch bytes. The guard must stay alive until the test is done:
+    /// callers hold the returned override alongside the root.
+    fn scratch_state_root(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        eliot_platform_windows::test_support::ProtectedRootOverride,
+    ) {
+        let id = DISCOVER_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("solo-discover-{label}-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("scratch root builds");
+        let guard = eliot_platform_windows::test_support::override_protected_root(&root);
+        (root, guard)
+    }
+
+    fn drop_scratch(
+        root: &std::path::Path,
+        _guard: eliot_platform_windows::test_support::ProtectedRootOverride,
+    ) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Minimal durable projection off the shared valid pair: the claimed
+    /// halves, requirements, scope, delegate digest and staffing receipt are
+    /// the pair's own production values, so the envelope verifies exactly as
+    /// a driven projection would; only the snapshot is a bare carrier (no
+    /// definitions, one registered attempt) because discovery reads the
+    /// envelope and the settled flag, never fabric semantics.
+    fn solo_projection_for_test(
+        operation_id: &str,
+        attempt_id: &str,
+        settled: bool,
+    ) -> SoloPersistedAttempt {
+        let (_, intake, _) = solo_test_pair();
+        let mut claimed = intake.claimed.clone();
+        claimed.operation_id = operation_id.to_owned();
+        claimed.attempt_id = attempt_id.to_owned();
+        // The receipt below is envelope dressing, never evidence: discovery
+        // reads the digest-verified envelope and the settled flag only, so
+        // the receipt carries the pair's own route/budget/privacy/preset
+        // values with an explicitly unsigned digest rather than a staffing
+        // decision no owner made in-test (`plan_coordinator_staffing` refuses
+        // `NoWriterRoute` here, which is the honest gate, not fixture input).
+        let lane = intake
+            .plan
+            .lanes
+            .first()
+            .expect("fixture plan carries a lane");
+        let route = lane
+            .route_candidates
+            .first()
+            .expect("fixture lane carries a candidate")
+            .route
+            .clone();
+        let receipt = crate::staffing_policy::StaffingPlanReceipt {
+            preset: intake.plan.human_staffing_intent.preset,
+            task_class: "solo-discover".to_owned(),
+            lanes: vec![crate::staffing_policy::StaffedLane {
+                role: "writer".to_owned(),
+                route_class: "solo-discover-class".to_owned(),
+                route,
+                evidence_refs: Vec::new(),
+            }],
+            unavailable: Vec::new(),
+            route_policy_evidence: Vec::new(),
+            route_outcome_evidence: Vec::new(),
+            policy_budget: intake.plan.human_staffing_intent.per_job_budget.clone(),
+            budget: lane.budget.clone(),
+            privacy_ceiling: intake.plan.privacy_class,
+            evidence_refs: Vec::new(),
+            receipt_digest: "solo-discover-unsigned".to_owned(),
+        };
+        let snapshot = crate::agent_fabric::FabricSnapshot {
+            coordinator_snapshot: CoordinatorSnapshot {
+                schema_version: "solo-discover-1".to_owned(),
+                config: CoordinatorConfig {
+                    max_ready_items: 1,
+                    max_admitted_attempts: 1,
+                    max_active_per_route: 1,
+                    capacity_identity: "solo-discover-cap".to_owned(),
+                    capacity_revision: RevisionId::new("solo-discover-cap-rev")
+                        .expect("capacity revision builds"),
+                },
+                provider_binding: ProviderBindingSnapshot::Gap {
+                    gap: PlanGap::G11Unavailable {
+                        reason: "solo discover fixture binds no provider".to_owned(),
+                    },
+                },
+                event_sequence: 0,
+                event_digest: "solo-discover-events".to_owned(),
+                events: Vec::new(),
+            },
+            definitions: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            admissions: BTreeMap::new(),
+            activations: BTreeMap::new(),
+            intents: BTreeMap::new(),
+            ledger: Vec::new(),
+            attempt_states: BTreeMap::from([(
+                attempt_id.to_owned(),
+                crate::agent_fabric::AttemptLifecycle::Admitted,
+            )]),
+            cancellations: BTreeMap::new(),
+            semantic_definitions: BTreeMap::new(),
+            semantic_admissions: BTreeMap::new(),
+            semantic_executions: BTreeMap::new(),
+            semantic_supersessions: BTreeMap::new(),
+            semantic_unknown_effects: BTreeMap::new(),
+            staffing_receipts: BTreeMap::new(),
+            attempt_routes: BTreeMap::new(),
+            provider_frames: BTreeMap::new(),
+            tool_results: BTreeMap::new(),
+        };
+        SoloPersistedAttempt {
+            operation_id: operation_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            delegate_digest: intake.delegate.source_digest.clone(),
+            plan_digest: "solo-discover-plan".to_owned(),
+            requirements: intake.requirements.clone(),
+            observed_scope: intake.observed_scope.clone(),
+            claimed,
+            receipt,
+            snapshot,
+            dispatch: None,
+            emitted: false,
+            result_digest: settled.then(|| "solo-discover-result".to_owned()),
+            cancellation_evidence: None,
+        }
+    }
+
+    #[test]
+    fn discover_returns_only_unsettled_operations() {
+        let (root, guard) = scratch_state_root("sorted");
+        persist_projection(
+            &root,
+            &solo_projection_for_test("op-discover-b", "att-b", false),
+        )
+        .expect("open projection persists");
+        persist_projection(
+            &root,
+            &solo_projection_for_test("op-discover-a", "att-a", true),
+        )
+        .expect("settled projection persists");
+        std::fs::write(
+            root.join(SOLO_PROJECTION_DIR).join("notes.txt"),
+            b"not a projection",
+        )
+        .expect("foreign file writes");
+        let retained =
+            discover_retained_solo_operations(&root).expect("discovery reads the retain set");
+        assert_eq!(retained, vec!["op-discover-b".to_owned()]);
+        drop_scratch(&root, guard);
+    }
+
+    #[test]
+    fn discover_empty_directory_is_empty() {
+        let (root, guard) = scratch_state_root("empty");
+        std::fs::create_dir_all(root.join(SOLO_PROJECTION_DIR)).expect("projection dir builds");
+        let retained = discover_retained_solo_operations(&root).expect("empty retain set reads");
+        assert!(retained.is_empty());
+        drop_scratch(&root, guard);
+    }
+
+    #[test]
+    fn persisted_attempt_reads_back_through_status_path() {
+        let (root, guard) = scratch_state_root("readback");
+        persist_projection(
+            &root,
+            &solo_projection_for_test("op-readback-1", "att-readback-1", false),
+        )
+        .expect("open projection persists");
+        // Fresh readback over the same state root, no memory carried: the
+        // public status path observes the original retained attempt with its
+        // attempt/route/fence correlation intact.
+        let status = solo_status_in_root(&root, "op-readback-1").expect("status reads back");
+        assert_eq!(status.operation_id, "op-readback-1");
+        assert_eq!(status.attempt_id, "att-readback-1");
+        assert_eq!(
+            status.lifecycle,
+            crate::agent_fabric::AttemptLifecycle::Admitted
+        );
+        assert!(!status.emitted);
+        assert_eq!(status.result_digest, None);
+        assert_eq!(status.cancellation, None);
+        // Discovery agrees on the same durable row.
+        let retained = discover_retained_solo_operations(&root).expect("discovery reads");
+        assert_eq!(retained, vec!["op-readback-1".to_owned()]);
+        drop_scratch(&root, guard);
+    }
+
+    #[test]
+    fn status_readback_refuses_tampered_envelope() {
+        let (root, guard) = scratch_state_root("tampered-status");
+        persist_projection(
+            &root,
+            &solo_projection_for_test("op-readback-2", "att-readback-2", false),
+        )
+        .expect("open projection persists");
+        let path = root
+            .join(SOLO_PROJECTION_DIR)
+            .join("attempt-op-readback-2.json");
+        let bytes = std::fs::read(&path).expect("envelope reads");
+        let text = String::from_utf8(bytes).expect("envelope is JSON text");
+        let tampered = text.replacen("op-readback-2", "op-readback-X", 1);
+        assert_ne!(tampered, text);
+        std::fs::write(&path, tampered).expect("tampered envelope writes");
+        match solo_status_in_root(&root, "op-readback-2") {
+            Err(DaemonError::Composition(CompositionError::Recovery(_))) => {}
+            other => panic!("expected Recovery refusal, got {other:?}"),
+        }
+        drop_scratch(&root, guard);
+    }
+
+    #[test]
+    fn discover_refuses_damaged_envelope() {
+        let (root, guard) = scratch_state_root("damaged");
+        persist_projection(
+            &root,
+            &solo_projection_for_test("op-discover-a", "att-a", false),
+        )
+        .expect("open projection persists");
+        std::fs::write(
+            root.join(SOLO_PROJECTION_DIR)
+                .join("attempt-op-discover-b.json"),
+            b"{truncated",
+        )
+        .expect("damaged file writes");
+        match discover_retained_solo_operations(&root) {
+            Err(DaemonError::Composition(CompositionError::Recovery(_))) => {}
+            other => panic!("expected Recovery refusal, got {other:?}"),
+        }
+        drop_scratch(&root, guard);
+    }
 }

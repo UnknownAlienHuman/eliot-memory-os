@@ -78,6 +78,7 @@ __all__ = [
     "validate_run_evidence",
     "analyze_samples",
     "encode_analysis_semantic",
+    "profile_content_digest",
 ]
 
 ANALYSIS_SCHEMA_FAMILY = "eliot.soak_analysis"
@@ -333,6 +334,23 @@ class AnalysisProfile:
             "algorithm_revision": self.algorithm_revision,
             "limits": self.limits.to_dict(),
         }
+
+
+def profile_content_digest(profile: AnalysisProfile) -> str:
+    """Canonical digest of the complete normalized profile content.
+
+    The pre-run commitment binds this digest: reusing the same profile_ref
+    and revision with altered thresholds, rules, or limits after the run
+    changes the digest and is rejected as post-run substitution.
+    """
+    encoded = json.dumps(
+        profile.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 _PROFILE_KEYS = (
@@ -808,6 +826,8 @@ class PreRunCommitment:
     source_ref: str
     artifact_ref: str
     committed_before_workload: bool
+    plan_digest: str = ""  # must equal the sampled plan's canonical digest
+    profile_digest: str = ""  # must equal profile_content_digest(profile)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -818,6 +838,8 @@ class PreRunCommitment:
             "source_ref": self.source_ref,
             "artifact_ref": self.artifact_ref,
             "committed_before_workload": self.committed_before_workload,
+            "plan_digest": self.plan_digest,
+            "profile_digest": self.profile_digest,
         }
 
 
@@ -958,6 +980,8 @@ _COMMITMENT_KEYS = (
     "source_ref",
     "artifact_ref",
     "committed_before_workload",
+    "plan_digest",
+    "profile_digest",
 )
 _EVIDENCE_PHASE_KEYS = ("phase_id", "first_slot", "last_slot")
 _OPERATION_KEYS = (
@@ -1039,6 +1063,16 @@ def _evidence_int(
     return value
 
 
+def _evidence_digest(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(ch not in "0123456789abcdef" for ch in value)
+    ):
+        raise _evidence_fail(f"{name}: must be a lowercase SHA-256 digest")
+    return value
+
+
 def _evidence_bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise _evidence_fail(f"{name}: must be a boolean")
@@ -1103,6 +1137,12 @@ def validate_run_evidence(data: Any) -> RunEvidence:
             commitment_raw["committed_before_workload"],
             "commitment.committed_before_workload",
         ),
+        plan_digest=_evidence_digest(
+            commitment_raw["plan_digest"], "commitment.plan_digest"
+        ),
+        profile_digest=_evidence_digest(
+            commitment_raw["profile_digest"], "commitment.profile_digest"
+        ),
     )
     phases_raw = data["phases"]
     if not isinstance(phases_raw, Sequence) or isinstance(phases_raw, (str, bytes)):
@@ -1127,6 +1167,11 @@ def validate_run_evidence(data: Any) -> RunEvidence:
                 first_slot=first,
                 last_slot=last,
             )
+        )
+    phase_ids = [p.phase_id for p in phases]
+    if len(set(phase_ids)) != len(phase_ids):
+        raise _evidence_fail(
+            "phases: duplicate phase_id rejected (substitution rejected)"
         )
     operations_raw = data["operations"]
     if not isinstance(operations_raw, Sequence) or isinstance(
@@ -1161,6 +1206,11 @@ def validate_run_evidence(data: Any) -> RunEvidence:
                 ),
             )
         )
+    op_refs = [o.op_ref for o in operations]
+    if len(set(op_refs)) != len(op_refs):
+        raise _evidence_fail(
+            "operations: duplicate op_ref rejected (outcome double-count rejected)"
+        )
     restarts_raw = data["restarts"]
     if not isinstance(restarts_raw, Sequence) or isinstance(
         restarts_raw, (str, bytes)
@@ -1188,6 +1238,25 @@ def validate_run_evidence(data: Any) -> RunEvidence:
                 slot=_evidence_int(entry["slot"], f"{where}.slot"),
             )
         )
+    seen_restarts = set()
+    for entry in restarts:
+        if entry.old_generation == entry.new_generation:
+            raise _evidence_fail(
+                "restarts: old_generation == new_generation rejected"
+            )
+        link = (
+            entry.owner_ref,
+            entry.component,
+            entry.pid,
+            entry.old_generation,
+            entry.new_generation,
+            entry.slot,
+        )
+        if link in seen_restarts:
+            raise _evidence_fail(
+                "restarts: duplicate restart entry rejected"
+            )
+        seen_restarts.add(link)
     cancellation_raw = data["cancellation"]
     if not isinstance(cancellation_raw, Mapping):
         raise _evidence_fail("cancellation: must be an object")
@@ -1408,7 +1477,13 @@ class _Reasons:
         return len(self._items)
 
 
-def _stream_key_of(stream: Mapping[str, Any]) -> str:
+def _stream_id_of(stream: Mapping[str, Any]) -> str:
+    """Identity key of one stream: the full binding digest, never 4 fields."""
+    return str(stream["binding_digest"])
+
+
+def _stream_display(stream: Mapping[str, Any]) -> str:
+    """Human display of a stream: four fields, never an identity key."""
     return "|".join(
         (
             str(stream["owner_ref"]),
@@ -1417,6 +1492,17 @@ def _stream_key_of(stream: Mapping[str, Any]) -> str:
             str(stream["generation"]),
         )
     )
+
+
+_TERMINAL_LIFECYCLE_CODES = frozenset(
+    {
+        _soak.LifecycleCode.PROCESS_EXIT,
+        _soak.LifecycleCode.PROCESS_REPLACEMENT,
+        _soak.LifecycleCode.UNKNOWN_OWNERSHIP,
+        _soak.LifecycleCode.IDENTITY_UNAVAILABLE,
+        _soak.LifecycleCode.LIFECYCLE_UPDATE_REJECTED,
+    }
+)
 
 
 def _checked_int(value: Any, name: str) -> int:
@@ -1522,9 +1608,125 @@ def analyze_samples(
     budget = _Budget(limits)
     limits_exceeded = False
 
-    plan_keys: Tuple[str, ...] = ()
+    plan_digests: Dict[str, Any] = {}
+    plan_four_field: Dict[str, str] = {}
+    seen_four_field: Dict[str, str] = {}
+    replacement_start: Dict[str, int] = {}
+    replacement_note: Dict[str, str] = {}
+
+    def _replacement_linkage(
+        stream: Mapping[str, Any], slot: int
+    ) -> Optional[str]:
+        """Admit a replacement generation stream only with owner approval.
+
+        A digest unknown to the plan is admitted only when run evidence links
+        it to a restart entry (same owner/component/pid, new generation), the
+        plan permits replace_generation, the record slot is at or after the
+        restart slot, and the old generation is plan-bound or already
+        observed. Anything else stays a foreign binding rejection.
+        """
+        if evidence is None or plan is None:
+            return None
+        if "replace_generation" not in plan.permitted_lifecycle_updates:
+            return None
+        owner = str(stream["owner_ref"])
+        component = str(stream["component"])
+        pid = int(stream["pid"])
+        generation = str(stream["generation"])
+        for restart in evidence.restarts:
+            if (
+                restart.owner_ref != owner
+                or restart.component != component
+                or restart.pid != pid
+                or restart.new_generation != generation
+                or slot < restart.slot
+            ):
+                continue
+            old_key = "|".join(
+                (owner, component, str(pid), restart.old_generation)
+            )
+            if old_key in plan_four_field or old_key in seen_four_field:
+                return (
+                    f"replace_generation {restart.old_generation}->"
+                    f"{restart.new_generation} at slot {restart.slot}"
+                )
+        return None
+
+    def _check_plan_binding(normalized: Mapping[str, Any]) -> None:
+        """Enforce plan digest, binding membership, slot/phase/workload.
+
+        Raises RecordRejected like the #942 owner validator so rejections
+        stay counted input failures, never dropped rows.
+        """
+        if plan is None:
+            return
+        stream = normalized["stream"]
+        digest = str(stream["binding_digest"])
+        if str(normalized["plan_digest"]) != plan.plan_digest:
+            raise _soak.RecordRejected(
+                "record: canonical plan digest mismatch"
+            )
+        if digest in plan_digests:
+            expected = plan_digests[digest]
+            for field in ("owner_ref", "component", "pid", "generation"):
+                if str(stream[field]) != str(getattr(expected, field)):
+                    raise _soak.RecordRejected(
+                        "record: stream identity differs from plan binding"
+                    )
+        else:
+            linkage = _replacement_linkage(stream, int(normalized["slot"]))
+            if linkage is None:
+                raise _soak.RecordRejected(
+                    "record: stream is not plan-bound and has no "
+                    "owner-approved replacement linkage "
+                    "(foreign binding rejected)"
+                )
+            replacement_note[digest] = linkage
+            for restart in evidence.restarts:
+                if (
+                    restart.new_generation == str(stream["generation"])
+                    and restart.owner_ref == str(stream["owner_ref"])
+                    and restart.component == str(stream["component"])
+                    and restart.pid == int(stream["pid"])
+                ):
+                    if digest not in replacement_start:
+                        replacement_start[digest] = int(restart.slot)
+                    else:
+                        replacement_start[digest] = min(
+                            replacement_start[digest], int(restart.slot)
+                        )
+        kind = normalized["kind"]
+        slot = int(normalized["slot"])
+        if kind == _soak.RecordKind.TERMINAL:
+            if slot != plan.expected_slots:
+                raise _soak.RecordRejected(
+                    "record: terminal slot outside plan range"
+                )
+            probe = plan.expected_slots - 1
+        else:
+            if slot >= plan.expected_slots:
+                raise _soak.RecordRejected("record: slot outside plan range")
+            probe = slot
+        phase = next(
+            (
+                candidate
+                for candidate in plan.phases
+                if candidate.first_slot <= probe <= candidate.last_slot
+            ),
+            None,
+        )
+        if (
+            phase is None
+            or str(normalized["phase_id"]) != phase.phase_id
+            or str(normalized["workload_ref"]) != phase.workload_ref
+        ):
+            raise _soak.RecordRejected(
+                "record: slot/phase/workload binding mismatch"
+            )
     if plan is not None:
-        plan_keys = tuple(b.stream_key() for b in plan.bindings)
+        for binding in plan.bindings:
+            plan_digests[binding.binding_digest] = binding
+            plan_four_field[binding.stream_key()] = binding.binding_digest
 
     # -- Step 1: three-way plan/profile/commitment bindings -------------------
     if plan is not None and profile is not None and evidence is not None:
@@ -1544,6 +1746,16 @@ def analyze_samples(
                 "integrity:commitment.profile_revision != profile.revision "
                 "(post-run substitution rejected)"
             )
+        if commitment.plan_digest != plan.plan_digest:
+            input_r.add(
+                "integrity:commitment.plan_digest != plan.plan_digest "
+                "(post-run substitution rejected)"
+            )
+        if commitment.profile_digest != profile_content_digest(profile):
+            input_r.add(
+                "integrity:commitment.profile_digest != profile content digest "
+                "(post-run substitution rejected)"
+            )
         if commitment.plan_id != plan.plan_id:
             input_r.add("integrity:commitment.plan_id != plan.plan_id")
         if commitment.source_ref != plan.source_ref:
@@ -1561,6 +1773,18 @@ def analyze_samples(
         evidence_phase_map = {
             p.phase_id: (p.first_slot, p.last_slot) for p in evidence.phases
         }
+        plan_phase_ids = [p.phase_id for p in plan.phases]
+        if len(set(plan_phase_ids)) != len(plan_phase_ids):
+            input_r.add(
+                "integrity:plan phases carry duplicate phase_id "
+                "(substitution rejected)"
+            )
+        for operation in evidence.operations:
+            if operation.phase_id not in plan_phase_map:
+                input_r.add(
+                    f"integrity:operation {operation.op_ref} phase "
+                    f"{operation.phase_id} not in plan (foreign-phase rejected)"
+                )
         if evidence_phase_map != plan_phase_map:
             input_r.add(
                 "integrity:run_evidence phases differ from plan phases "
@@ -1598,7 +1822,8 @@ def analyze_samples(
                 f"unsupported:algorithm_revision "
                 f"{profile.qualification.status}:{profile.algorithm_revision!r}"
             )
-            resource_r.add(
+            # W7: an unsupported algorithm leaves resources unevaluated.
+            resource_unknown.add(
                 f"not_evaluated:unsupported algorithm_revision "
                 f"{profile.algorithm_revision!r}"
             )
@@ -1633,7 +1858,13 @@ def analyze_samples(
     rejected_count = 0
     curtailed = False
     transport_hash = hashlib.sha256()
-    validator = _soak.StreamValidator(plan)
+    # Order/conflict/terminal semantics come from the #942 owner validator
+    # without its plan membership gate; membership stays analyzer-side in
+    # _check_plan_binding so owner-approved replacement generations are
+    # admittable instead of foreign-rejected.
+    validator = _soak.StreamValidator(None)
+    raw_provenance = 0
+    synthesized_provenance = 0
     seen_streams: Dict[str, bool] = {}
 
     def _note_rejected(index: int, message: str) -> None:
@@ -1664,10 +1895,16 @@ def analyze_samples(
                     normalized = _soak.decode_record(
                         body,
                         max_bytes=limits.max_record_bytes,
-                        plan=plan,
+                        plan=None,
                     )
+                    _check_plan_binding(normalized)
                     normalized = validator.observe(normalized)
                     wire = _soak.encode_transport(normalized)
+                    # AUD6: transport provenance is the raw arrival bytes, never a
+                    # re-encoding of the accepted subset (the encode above is
+                    # superseded here for bytes inputs).
+                    wire = body
+                    raw_provenance += 1
                 elif isinstance(raw, Mapping):
                     wire = _canonical_record_bytes(raw)
                     if len(wire) > limits.max_record_bytes:
@@ -1675,14 +1912,18 @@ def analyze_samples(
                             "record: body exceeds profile limits.max_record_bytes"
                         )
                     budget.spend_bytes(len(wire), f"record[{index}]")
-                    normalized = validator.observe(raw)
+                    preview = _soak.validate_record(raw, plan=None)
+                    _check_plan_binding(preview)
+                    normalized = validator.observe(preview)
+                    synthesized_provenance += 1
                     wire = _soak.encode_transport(normalized)
                 else:
                     raise _soak.RecordRejected(
                         f"record: unsupported encoding "
                         f"{type(raw).__name__!r} (mapping/bytes only)"
                     )
-                key = _stream_key_of(normalized["stream"])
+                key = _stream_id_of(normalized["stream"])
+                seen_four_field[_stream_display(normalized["stream"])] = key
                 if key not in seen_streams:
                     seen_streams[key] = True
                     if len(seen_streams) > limits.max_streams:
@@ -1690,7 +1931,13 @@ def analyze_samples(
                             f"stream limit exceeded: {len(seen_streams)} > "
                             f"{limits.max_streams}"
                         )
-                if plan is not None and key not in plan_keys:
+                # Membership was enforced pre-observe in _check_plan_binding, so
+                # only plan-bound or owner-approved replacement streams arrive.
+                if (
+                    plan is not None
+                    and key not in plan_digests
+                    and key not in replacement_note
+                ):
                     raise _soak.RecordRejected(
                         f"record: stream {key} is not plan-bound "
                         "(foreign binding rejected)"
@@ -1729,7 +1976,7 @@ def analyze_samples(
     # re-sorted, so a broken stream can never be sorted into validity.
     by_stream: Dict[str, List[Dict[str, Any]]] = {}
     for record in accepted:
-        by_stream.setdefault(_stream_key_of(record["stream"]), []).append(record)
+        by_stream.setdefault(_stream_id_of(record["stream"]), []).append(record)
 
     required_names = [c.value for c in _soak.REQUIRED_COUNTERS]
     profile_counters: Tuple[str, ...] = tuple(required_names)
@@ -1750,14 +1997,49 @@ def analyze_samples(
         r for r in accepted if r["kind"] == _soak.RecordKind.SAMPLE
     ]
 
+    # Restart linkage (AUD7): every restart entry must name a real old
+    # generation and an observed successor; otherwise the lifecycle claim is
+    # incomplete evidence, never a silent denominator change.
+    observed_four_field: Dict[str, str] = {}
+    for _digest, _recs in by_stream.items():
+        observed_four_field[_stream_display(_recs[0]["stream"])] = _digest
+    if evidence is not None:
+        for restart in evidence.restarts:
+            old_key = "|".join(
+                (
+                    restart.owner_ref,
+                    restart.component,
+                    str(restart.pid),
+                    restart.old_generation,
+                )
+            )
+            new_key = "|".join(
+                (
+                    restart.owner_ref,
+                    restart.component,
+                    str(restart.pid),
+                    restart.new_generation,
+                )
+            )
+            if old_key not in plan_four_field and old_key not in observed_four_field:
+                input_r.add(
+                    f"restart:old generation {old_key} neither plan-bound nor "
+                    "observed (linkage rejected)"
+                )
+            if new_key not in observed_four_field:
+                input_r.add(
+                    f"restart:successor {new_key} unobserved "
+                    "(replacement without evidence)"
+                )
     stream_ids: List[str] = sorted(by_stream.keys())
+    active_samples: List[Dict[str, Any]] = []
+    active_spans: Dict[str, Tuple[int, int]] = {}
     if plan is not None:
-        stream_ids = sorted(set(plan_keys) | set(by_stream.keys()))
+        stream_ids = sorted(set(plan_digests) | set(by_stream.keys()))
 
     for stream_id in stream_ids:
         stream_records = by_stream.get(stream_id, [])
         samples = [r for r in stream_records if r["kind"] == _soak.RecordKind.SAMPLE]
-        sample_slots = {int(r["slot"]) for r in samples}
         missed_records = [
             r for r in stream_records
             if r["kind"] == _soak.RecordKind.MISSED_SLOT
@@ -1777,8 +2059,63 @@ def analyze_samples(
             )
         ]
         boundaries.sort(key=lambda b: (b["slot"], b["kind"], b["code"]))
+        # Active interval (AUD4): a generation answers only for its admitted
+        # span. Replacements open at the restart slot; every stream closes at
+        # its first terminal-closure record (TERMINAL or a typed lifecycle
+        # disposition from _TERMINAL_LIFECYCLE_CODES).
+        active_start = replacement_start.get(stream_id, 0)
+        closure_slot: Optional[int] = None
+        closure_code: Optional[str] = None
+        for boundary_record in stream_records:
+            if boundary_record["kind"] == _soak.RecordKind.TERMINAL:
+                closure_slot = (
+                    plan.expected_slots - 1
+                    if plan is not None
+                    else int(boundary_record["slot"])
+                )
+                closure_code = str(boundary_record["event"]["code"])
+                break
+            if (
+                boundary_record["kind"] == _soak.RecordKind.LIFECYCLE
+                and boundary_record["event"]["code"]
+                in _TERMINAL_LIFECYCLE_CODES
+            ):
+                # The closure slot carries the lifecycle record, never a
+                # sample: the generation answers through the slot before.
+                closure_slot = int(boundary_record["slot"]) - 1
+                closure_code = str(boundary_record["event"]["code"])
+                break
+        if plan is not None:
+            active_end = (
+                closure_slot if closure_slot is not None else expected_slots - 1
+            )
+        else:
+            observed_slots = [int(r["slot"]) for r in stream_records]
+            active_end = max(observed_slots) if observed_slots else -1
+        active_len = active_end - active_start + 1
+        if plan is not None and active_len <= 0:
+            input_r.add(
+                f"coverage:{stream_id} empty active interval "
+                f"[{active_start}, {active_end}] (linkage rejected)"
+            )
+            active_len = 0
+        in_active = [
+            r
+            for r in samples
+            if active_len > 0
+            and active_start <= int(r["slot"]) <= active_end
+        ]
+        active_sample_slots = {int(r["slot"]) for r in in_active}
+        if len(in_active) != len(samples):
+            input_r.add(
+                f"coverage:{stream_id} {len(samples) - len(in_active)} "
+                "sample(s) outside the active interval "
+                "(spliced generation rejected)"
+            )
+        active_samples.extend(in_active)
+        active_spans[stream_id] = (active_start, active_end)
 
-        present = len(sample_slots)
+        present = len(active_sample_slots)
         known = 0
         unknown_slots = 0
         unknown_by_counter: Dict[str, Dict[str, int]] = {}
@@ -1788,7 +2125,7 @@ def analyze_samples(
         per_counter_unknown: Dict[str, int] = {
             name: 0 for name in profile_counters
         }
-        for record in samples:
+        for record in in_active:
             slot = int(record["slot"])
             all_ok = True
             seen_here = set()
@@ -1812,15 +2149,24 @@ def analyze_samples(
                 known += 1
             else:
                 unknown_slots += 1
-        missed = expected_slots - present if plan is not None else 0
+        # The issue goal: missing counters never become a leak-free claim.
+        # Unknown readings stay unknown on the resource axis (A8), so no
+        # acceptance can silently rest on unread counters.
+        for counter_name, unknown_count in per_counter_unknown.items():
+            if unknown_count:
+                resource_unknown.add(
+                    f"unknown:{stream_id}:{counter_name} "
+                    f"readings_unknown={unknown_count}"
+                )
+        missed = active_len - present if plan is not None else 0
         if missed < 0:
             missed = 0
 
         max_gap = 0
         if plan is not None:
             run = 0
-            for slot in range(expected_slots):
-                if slot in sample_slots:
+            for slot in range(active_start, active_end + 1):
+                if slot in active_sample_slots:
                     run = 0
                 else:
                     run += 1
@@ -1833,11 +2179,11 @@ def analyze_samples(
 
         if plan is not None and profile is not None and not curtailed:
             cov = profile.coverage
-            # Exact rational comparison: present/expected >= num/den.
-            if present * cov.min_coverage_den < expected_slots * cov.min_coverage_num:
+            # Exact rational comparison: present/active >= num/den.
+            if present * cov.min_coverage_den < active_len * cov.min_coverage_num:
                 input_r.add(
-                    f"coverage:{stream_id} present {present}/"
-                    f"{expected_slots} below "
+                    f"coverage:{stream_id} present {present}/active {active_len} "
+                    "below "
                     f"{cov.min_coverage_num}/{cov.min_coverage_den}"
                 )
             if max_gap > cov.max_gap_slots:
@@ -1845,7 +2191,11 @@ def analyze_samples(
                     f"coverage:{stream_id} gap {max_gap} exceeds "
                     f"max_gap_slots {cov.max_gap_slots}"
                 )
-            if cov.require_terminal and terminal_code is None:
+            if (
+                cov.require_terminal
+                and terminal_code is None
+                and closure_code is None
+            ):
                 input_r.add(
                     f"coverage:{stream_id} missing terminal record (truncated)"
                 )
@@ -1907,6 +2257,11 @@ def analyze_samples(
             "counters": counter_measurements,
         }
         coverage_streams[stream_id] = {
+            "active_start_slot": active_start,
+            "active_end_slot": active_end,
+            "active_slots": active_len,
+            "closure_code": closure_code,
+            "replacement": replacement_note.get(stream_id),
             "expected_slots": expected_slots,
             "present_slots": present,
             "known_slots": known,
@@ -1917,6 +2272,9 @@ def analyze_samples(
             "terminal": terminal_code,
         }
 
+    # Windows, bounds, and the working-set sum below consume only in-active
+    # samples: out-of-interval rows are rejected evidence, never measurements.
+    sample_records = list(active_samples)
     non_unique_ws: Dict[str, Any] = {
         "label": "non-unique-shared-pages",
         "total_working_set_bytes": 0,
@@ -1979,7 +2337,7 @@ def analyze_samples(
     slot_value: Dict[Tuple[str, int, str], int] = {}
     if plan is not None and profile is not None and algorithm_supported:
         for record in sample_records:
-            key = _stream_key_of(record["stream"])
+            key = _stream_id_of(record["stream"])
             slot = int(record["slot"])
             slot_present.add((key, slot))
             for counter in record["counters"]:
@@ -2004,6 +2362,14 @@ def analyze_samples(
                             for window in range(count):
                                 start = phase.first_slot + window * width
                                 stop = min(start + width, phase.last_slot + 1)
+                                # Windows outside the generation's active
+                                # interval are not its evidence: a truncated
+                                # generation leaves no empty-window verdicts.
+                                live = active_spans.get(stream_id)
+                                if live is not None and (
+                                    start > live[1] or stop - 1 < live[0]
+                                ):
+                                    continue
                                 budget.spend_window(
                                     f"{stream_id}:{phase.phase_id}:{name}"
                                 )
@@ -2086,7 +2452,8 @@ def analyze_samples(
             curtailed = True
             input_r.add(f"limit_exceeded:{exc}")
     elif profile is not None and not algorithm_supported:
-        resource_r.add(
+        # W7: skipped windows are unevaluated, never satisfied.
+        resource_unknown.add(
             "not_evaluated:windows skipped for unsupported algorithm_revision"
         )
 
@@ -2111,7 +2478,7 @@ def analyze_samples(
         rules_evaluated = True
         role_cache = {p.phase_id: profile.role_of(p.phase_id) for p in plan.phases}
         for record in sample_records:
-            stream_id = _stream_key_of(record["stream"])
+            stream_id = _stream_id_of(record["stream"])
             slot = int(record["slot"])
             try:
                 budget.spend_work(1, f"bounds:{stream_id}:{slot}")
@@ -2127,8 +2494,9 @@ def analyze_samples(
                 if counter["status"] != _soak.CounterStatus.OK:
                     continue
                 bound = profile.bound_of(name)
+                # W7: a counter without a bound is unevaluated, never satisfied.
                 if bound is None:
-                    resource_r.add(
+                    resource_unknown.add(
                         f"not_evaluated:no absolute bound for {name}"
                     )
                     continue
@@ -2226,7 +2594,8 @@ def analyze_samples(
                         input_r.add(f"limit_exceeded:{exc}")
                         break
     elif profile is not None and algorithm_supported:
-        resource_r.add("not_evaluated:growth rule has no counters/roles")
+        # W7: an unevaluated rule is unknown evidence, never satisfaction.
+        resource_unknown.add("not_evaluated:growth rule has no counters/roles")
 
     # -- Quiescent recovery (declared baseline window + tolerance) -----------
     if (
@@ -2250,6 +2619,21 @@ def analyze_samples(
             )
         for stream_id in stream_ids:
             for name in rec.counters:
+                # A generation that never lived through both the baseline
+                # and the quiescent span cannot falsify recovery: no verdict,
+                # no unknown — its successor is judged on its own interval.
+                span = active_spans.get(stream_id)
+                if span is not None and (
+                    not any(
+                        p.first_slot <= span[1] and span[0] <= p.last_slot
+                        for p in baseline_phases
+                    )
+                    or not any(
+                        p.first_slot <= span[1] and span[0] <= p.last_slot
+                        for p in quiescent_phases
+                    )
+                ):
+                    continue
                 baseline_stats: List[Tuple[int, int]] = []
                 for phase in baseline_phases:
                     node = window_index.get((stream_id, phase.phase_id, name))
@@ -2306,7 +2690,8 @@ def analyze_samples(
                         }
                     )
     elif profile is not None and algorithm_supported:
-        resource_r.add("not_evaluated:recovery rule has no counters")
+        # W7: an unevaluated rule is unknown evidence, never satisfaction.
+        resource_unknown.add("not_evaluated:recovery rule has no counters")
 
     # -- Step 6: workload semantics ------------------------------------------
     workload_violated = False
@@ -2316,6 +2701,14 @@ def analyze_samples(
         workload_r.add("workload:run_evidence missing")
     else:
         producer_ok = bool(evidence.producer.producer_ref)
+        if not evidence.operations:
+            # AUD3: with no declared operations there is no required-work
+            # denominator; an empty list never proves required work complete.
+            workload_unknown = True
+            workload_r.add(
+                "workload:no operations declared "
+                "(required-work denominator missing)"
+            )
         committed = evidence.commitment.committed_before_workload
         for operation in evidence.operations:
             if not operation.required:
@@ -2484,6 +2877,12 @@ def analyze_samples(
         "expected_slots": expected_slots,
         "streams_expected": len(stream_ids),
         "streams_observed": len(by_stream),
+        # AUD6: raw arrival bytes vs caller-synthesized mappings behind the
+        # transport digest (valid-prefix sink receipts stay #944-owned).
+        "provenance": {
+            "raw_bytes_records": raw_provenance,
+            "synthesized_records": synthesized_provenance,
+        },
     }
     result = AnalysisResult(
         schema=ANALYSIS_SCHEMA_ID,
