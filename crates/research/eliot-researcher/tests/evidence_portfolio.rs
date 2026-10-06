@@ -880,6 +880,84 @@ fn acquisition_dispositions_stay_distinct() {
     assert_eq!(account.digest().len(), 64);
 }
 
+// Issue #1767 W3: the aggregate acquisition-attempt budget binds before the
+// append. Two retained attempts on a bound of two record; the third refuses
+// with `BudgetExhausted` before mutating, so the digest, the chain and the
+// frontier note are exactly what a replay from retained material reproduces,
+// and an already-recorded binding still replays idempotently.
+#[test]
+fn attempt_budget_refuses_before_append_and_preserves_replay() {
+    let members: BTreeSet<String> = ["w3-a"].into_iter().map(str::to_owned).collect();
+    let mut account = CoverageAccount::open_bounded(members.clone(), 2).expect("bounded");
+    for disposition in [SourceDisposition::Unknown, SourceDisposition::Unavailable] {
+        account
+            .record("w3-a", disposition, Some("h-w3".to_owned()))
+            .expect("within-budget record");
+    }
+    account
+        .note_frontier("attempt budget exhausted at w3-a")
+        .expect("frontier");
+    let retained = account.digest();
+    assert!(
+        matches!(
+            account.record("w3-a", SourceDisposition::Stale, Some("h-w3".to_owned())),
+            Err(PortfolioError::BudgetExhausted { .. })
+        ),
+        "the over-budget attempt must refuse before appending"
+    );
+    assert_eq!(
+        account.digest(),
+        retained,
+        "a refused attempt must not mutate retained accounting"
+    );
+    account
+        .record(
+            "w3-a",
+            SourceDisposition::Unavailable,
+            Some("h-w3".to_owned()),
+        )
+        .expect("an already-recorded binding replays idempotently under exhaustion");
+    let mut replay = CoverageAccount::open_bounded(members, 2).expect("replay");
+    for disposition in [SourceDisposition::Unknown, SourceDisposition::Unavailable] {
+        replay
+            .record("w3-a", disposition, Some("h-w3".to_owned()))
+            .expect("replay record");
+    }
+    assert_eq!(
+        replay.digest(),
+        retained,
+        "replaying the retained bindings reproduces the digest"
+    );
+}
+
+// Issue #1767 W3: `EvidencePortfolio::open` enforces the frozen inquiry's
+// `budgets.attempts` (8 in this fixture) across the whole portfolio: eight
+// ingests record, the ninth refuses with `BudgetExhausted`.
+#[test]
+fn portfolio_ingest_enforces_inquiry_attempt_budget() {
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let mut portfolio = EvidencePortfolio::open(&inquiry).expect("portfolio");
+    let members = ["primary#0", "primary#1", "secondary#0", "negative#0"];
+    for (index, member) in members.iter().cycle().take(8).enumerate() {
+        let mut params = source_params(&format!("budget-{index}"));
+        params.acquisition = SourceDisposition::Unavailable;
+        let attempt = SourceRecord::new(params).expect("attempt record");
+        portfolio
+            .ingest(attempt, member)
+            .expect("within-budget ingest");
+    }
+    let mut params = source_params("budget-over");
+    params.acquisition = SourceDisposition::Unavailable;
+    let over = SourceRecord::new(params).expect("over-budget record");
+    assert!(
+        matches!(
+            portfolio.ingest(over, "primary#0"),
+            Err(PortfolioError::BudgetExhausted { .. })
+        ),
+        "ingest past budgets.attempts must refuse"
+    );
+}
+
 // WORK_UNIT_CASE: 700/8
 #[test]
 fn absence_requires_complete_authoritative_lookup() {

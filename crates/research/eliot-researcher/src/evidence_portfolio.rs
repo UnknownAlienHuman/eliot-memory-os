@@ -183,6 +183,15 @@ pub enum PortfolioError {
         /// Failing field path.
         field: &'static str,
     },
+    /// The frozen inquiry's aggregate acquisition-attempt budget is exhausted.
+    ///
+    /// Refused before any mutation, so the retained attempt chain stays intact
+    /// for replay and the run stops with a named frontier instead of a
+    /// silently growing history.
+    BudgetExhausted {
+        /// Failing field path.
+        field: &'static str,
+    },
 }
 
 /// Why one claim-audit job refused its run-bound reference authorization.
@@ -1697,11 +1706,27 @@ pub struct CoverageAccount {
     exclusions: BTreeMap<String, String>,
     frontier: Option<String>,
     observed: BTreeMap<String, ObservedOutsideScope>,
+    /// Aggregate acquisition-attempt budget bound at construction: at most this
+    /// many attempts may be recorded across all members. The value is the
+    /// frozen inquiry's [`BudgetCaps::attempts`] ("Maximum acquisition
+    /// attempts"); accounts rebuilt from retained material carry no live budget
+    /// and therefore no bound.
+    attempt_limit: u64,
 }
 
 impl CoverageAccount {
     /// Opens accounting over the exact expected denominator members.
     pub fn open(expected: BTreeSet<String>) -> Result<Self, PortfolioError> {
+        Self::open_bounded(expected, u64::MAX)
+    }
+
+    /// Opens accounting with the aggregate attempt budget enforced: recording
+    /// refuses with [`PortfolioError::BudgetExhausted`] once `max_attempts`
+    /// attempts are retained, before any mutation.
+    pub fn open_bounded(
+        expected: BTreeSet<String>,
+        max_attempts: u64,
+    ) -> Result<Self, PortfolioError> {
         if expected.is_empty() {
             return Err(PortfolioError::IncompleteDenominator {
                 field: "coverage.expected",
@@ -1713,6 +1738,7 @@ impl CoverageAccount {
             exclusions: BTreeMap::new(),
             frontier: None,
             observed: BTreeMap::new(),
+            attempt_limit: max_attempts,
         })
     }
 
@@ -1751,6 +1777,7 @@ impl CoverageAccount {
             exclusions: BTreeMap::new(),
             frontier: None,
             observed: BTreeMap::new(),
+            attempt_limit: u64::MAX,
         };
         for item in examined {
             account.observe(
@@ -1844,6 +1871,16 @@ impl CoverageAccount {
                 field: "coverage.member",
             });
         }
+        // W3 (#1767): the aggregate attempt budget is enforced before any
+        // append. The count is taken up front so the gate below cannot mutate;
+        // an already-recorded binding still replays idempotently through the
+        // first arm, and a refusal leaves the retained chain, frontier and
+        // observations untouched for replay.
+        let recorded_attempts: u64 = self
+            .outcomes
+            .values()
+            .map(|accounting| accounting.attempts.len() as u64)
+            .sum();
         match self.outcomes.get_mut(member) {
             // The identical binding repeating is a repeated receipt delivery:
             // idempotent, and it must not append a phantom attempt.
@@ -1852,6 +1889,11 @@ impl CoverageAccount {
                 field: "coverage.member",
             }),
             Some(current) => {
+                if recorded_attempts >= self.attempt_limit {
+                    return Err(PortfolioError::BudgetExhausted {
+                        field: "coverage.attempts",
+                    });
+                }
                 let recovery = MemberAttempt {
                     links_earlier_attempt: true,
                     ..attempt
@@ -1861,6 +1903,11 @@ impl CoverageAccount {
                 Ok(())
             }
             None => {
+                if recorded_attempts >= self.attempt_limit {
+                    return Err(PortfolioError::BudgetExhausted {
+                        field: "coverage.attempts",
+                    });
+                }
                 let mut accounting = MemberAccounting {
                     handle,
                     attempts: Vec::new(),
@@ -6603,11 +6650,18 @@ pub enum IngestResult {
 
 impl EvidencePortfolio {
     /// Opens a portfolio over a frozen inquiry denominator.
+    ///
+    /// The coverage account enforces the frozen inquiry's aggregate
+    /// acquisition-attempt budget (W3, #1767): [`BudgetCaps::attempts`] is the
+    /// only declared attempts number, and it previously gated nothing.
     pub fn open(inquiry: &FrozenInquiry) -> Result<Self, PortfolioError> {
         Ok(Self {
             inquiry_digest: inquiry.digest.clone(),
             records: BTreeMap::new(),
-            coverage: CoverageAccount::open(inquiry.denominator_members())?,
+            coverage: CoverageAccount::open_bounded(
+                inquiry.denominator_members(),
+                inquiry.budgets.attempts,
+            )?,
         })
     }
 

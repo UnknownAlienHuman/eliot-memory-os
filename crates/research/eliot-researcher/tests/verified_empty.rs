@@ -532,6 +532,84 @@ fn assurance_link_refuses_malformed() {
     );
 }
 
+// Issue #1767 A6: a receipt reopened from retained durable material is exact.
+// The admitted manifest + admissibility records are the durable record. This
+// rebuilds the account from those retained bindings — the same construction
+// the live path runs — drops it, rebuilds again, and both receipts match; a
+// substituted retained disposition moves the receipt digest, so production
+// reopen reproduces the verdict instead of minting one.
+fn reopened_receipt(
+    profile: &InquiryProtocolProfile,
+    manifest: &AllowedReferenceManifest,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> CoverageReceipt {
+    let mut members = BTreeSet::new();
+    for handle in manifest
+        .source_handles
+        .iter()
+        .chain(&manifest.evidence_handles)
+        .chain(&manifest.artifact_handles)
+    {
+        members.insert(handle.clone());
+    }
+    let mut account = match CoverageAccount::open(members) {
+        Ok(account) => account,
+        Err(error) => panic!("reopen account: {error:?}"),
+    };
+    for record in admissibility {
+        match account.observe(
+            &record.record.handle,
+            record.record.acquisition,
+            &record.record.content_digest,
+            &record.record.operation_id,
+            &manifest.digest,
+        ) {
+            Ok(()) => (),
+            Err(error) => panic!("reopen observe: {error:?}"),
+        }
+    }
+    match CoverageReceipt::compute(CoverageReceiptParams {
+        profile,
+        requested_scope: "which valve alloy survives the thermal envelope",
+        frozen_scope_digest: DIGEST_VE,
+        account: &account,
+        records: admissibility,
+        absence_evidence: None,
+        routes_used: Vec::new(),
+        provider_degradation: Vec::new(),
+        unknown_coverage: Vec::new(),
+        budget_limitation: None,
+        source_assurance_digest: None,
+        assessment_time_ms: 1_800_000_000_000,
+    }) {
+        Ok(receipt) => receipt,
+        Err(error) => panic!("reopen receipt: {error:?}"),
+    }
+}
+
+#[test]
+fn receipt_reopens_exactly_from_retained_material() {
+    let profile = receipt_profile();
+    let admissibility = vec![
+        w4_admissible(&profile, w4_record("ro-a", Vec::new())),
+        w4_admissible(&profile, w4_record("ro-b", Vec::new())),
+    ];
+    let manifest = w6_manifest(vec!["ro-a".to_owned(), "ro-b".to_owned()]);
+    let once = reopened_receipt(&profile, &manifest, &admissibility);
+    let twice = reopened_receipt(&profile, &manifest, &admissibility);
+    assert_eq!(
+        once.digest, twice.digest,
+        "reopening from the same retained material must receipt identically"
+    );
+    let mut substituted = admissibility.clone();
+    substituted[0].record.acquisition = SourceDisposition::Partial;
+    let moved = reopened_receipt(&profile, &manifest, &substituted);
+    assert_ne!(
+        once.digest, moved.digest,
+        "a substituted retained disposition must move the receipt digest"
+    );
+}
+
 #[test]
 fn receipt_separates_represented_cited_and_omitted() {
     let receipt = w2_receipt();
