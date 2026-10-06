@@ -139,6 +139,14 @@ class RetirementCoordinator(unittest.TestCase):
     def test_01_exactly_one_current_enum_in_complete_denominator(self):
         self.assertBoundCase(1)
         self.assertEqual(a.enum_declaration_files(), [A10_FILE])
+        # Occurrence denominator, not file projection: a second `enum CueKind`
+        # in the owner file or in any other file adds a site here, while the
+        # file list above would stay `[A10_FILE]` (I05-15 owner collision).
+        named = [s for s in a.enum_declaration_sites("CueKind") if s.name == "CueKind"]
+        self.assertEqual(len(named), 1)
+        self.assertEqual(named[0].path, A10_FILE)
+        self.assertEqual(named[0].module_path, ())
+        self.assertEqual(a.current_owner_site_violations(), [])
 
     # WORK_UNIT_CASE: 835/2
     def test_02_current_owner_exactly_a10_pinned(self):
@@ -340,6 +348,12 @@ class RetirementCoordinator(unittest.TestCase):
             )
         self.assertFalse(a.declares_enum(a.strip_rust("enum CueKindProvenance {}\n"), "CueKind"))
         self.assertFalse(a.declares_enum(a.strip_rust("// enum CueKind\n"), "CueKind"))
+        # The live tree carries exactly one current-kind occurrence: any second
+        # declaration, same file or elsewhere, surfaces as a site violation.
+        named = [s for s in a.enum_declaration_sites("CueKind") if s.name == "CueKind"]
+        self.assertEqual(len(named), 1)
+        self.assertEqual(named[0].path, A10_FILE)
+        self.assertEqual(a.current_owner_site_violations(), [])
 
     # WORK_UNIT_CASE: 835/17
     def test_17_oracle_detects_legacy_alias_and_reexport(self):
@@ -376,6 +390,9 @@ class RetirementCoordinator(unittest.TestCase):
         for snippet in adversarial:
             self.assertIsNotNone(escape.search(a.strip_rust(snippet)), snippet)
         self.assertEqual(a.enum_declaration_files(), [A10_FILE])
+        # Occurrence check beside the file projection: a second declaration in
+        # the owner file leaves the projection above unchanged but violates here.
+        self.assertEqual(a.current_owner_site_violations(), [])
 
     # WORK_UNIT_CASE: 835/20
     def test_20_navigation_and_source_denominators_reconcile(self):
