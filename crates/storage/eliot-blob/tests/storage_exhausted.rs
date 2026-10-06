@@ -1609,6 +1609,21 @@ fn fixture_capacity_stage(case: &serde_json::Value) -> BlobCapacityStage {
     }
 }
 
+/// Sorted distinct stages the fixture baseline covers. Compared as an exact
+/// list by the case-22 guard, so a dropped or renamed fixture row fails
+/// instead of silently shrinking the denominator.
+fn fixture_stage_baseline(fixture: &serde_json::Value) -> Vec<&str> {
+    let mut stages: Vec<&str> = Vec::new();
+    for case in fixture_cases(fixture) {
+        let stage = fixture_text(case, "stage");
+        if !stages.contains(&stage) {
+            stages.push(stage);
+        }
+    }
+    stages.sort_unstable();
+    stages
+}
+
 /// Every fixture row names a real stage, effect, recovery and identity from
 /// the closed vocabularies.
 fn assert_fixture_rows_bind_live_vocabulary(fixture: &serde_json::Value) {
@@ -1641,8 +1656,15 @@ fn assert_fixture_rows_bind_live_vocabulary(fixture: &serde_json::Value) {
     }
 }
 
-/// Exact current durable-operation denominator: every `BlobPlatformPort`
-/// method plus every `BlobStoreClient` operation of the live surface.
+/// Exact current durable-operation denominator, derived from the live API
+/// surface rather than a local guess: the 15 `BlobPlatformPort` methods
+/// (`src/lib.rs:1369`, implemented by the service's platform legs) plus the 6
+/// `BlobStoreClient` operations (declared in
+/// `crates/storage/eliot-blob-api/src/lib.rs:3608`, implemented by
+/// `impl BlobStoreClient for BlobStoreService` in `src/lib.rs:5596` — the
+/// production path). `read_sealed` (api lib.rs:3616) is a full member: equal
+/// bytes under different obligations stay distinct objects, and the sealed
+/// read path carries the same capacity evidence as `read`.
 const PORT_METHOD_DENOMINATOR: &[&str] = &[
     "fn claim_root",
     "fn inspect_root",
@@ -1659,19 +1681,50 @@ const PORT_METHOD_DENOMINATOR: &[&str] = &[
     "fn stat",
     "fn list",
     "fn now_unix_ms",
+];
+
+/// The 6 public client operations of the live `BlobStoreClient` surface.
+/// Checked against both the trait declaration (`API_RS`) and the service
+/// implementation (`BLOB_RS`), so a removed or renamed operation fails here
+/// instead of silently leaving the denominator.
+const CLIENT_METHOD_DENOMINATOR: &[&str] = &[
     "fn stage(",
     "fn read(",
+    "fn read_sealed(",
     "fn reachability(",
     "fn gc(",
     "fn health(",
 ];
 
-/// Every denominator method exists in current source.
+/// Every denominator method exists in current source: port methods in the
+/// service source, client operations in both the trait declaration and the
+/// service implementation. Counts are exact, so an added surface method
+/// without denominator coverage fails here.
 fn assert_port_method_denominator() {
+    assert_eq!(
+        PORT_METHOD_DENOMINATOR.len(),
+        15,
+        "the port surface holds exactly its 15 declared methods"
+    );
+    assert_eq!(
+        CLIENT_METHOD_DENOMINATOR.len(),
+        6,
+        "the client surface holds exactly its 6 declared operations"
+    );
     for method in PORT_METHOD_DENOMINATOR.iter().copied() {
         assert!(
             BLOB_RS.contains(method),
             "denominator method missing from current source: {method}"
+        );
+    }
+    for method in CLIENT_METHOD_DENOMINATOR.iter().copied() {
+        assert!(
+            API_RS.contains(method),
+            "client operation missing from the live trait surface: {method}"
+        );
+        assert!(
+            BLOB_RS.contains(method),
+            "client operation missing from the service implementation: {method}"
         );
     }
 }
@@ -1713,6 +1766,14 @@ const BLOB_RS: &str = include_str!("../src/lib.rs");
 
 const FIXTURE_JSON: &str = include_str!("data/storage_exhausted_cases.json");
 
+/// The subsequent downstream consumer of `BlobError`: `eliot-backup`
+/// converts it with `impl From<BlobError> for BackupError`
+/// (`crates/storage/eliot-backup/src/lib.rs:3080`, string conversion). It is
+/// accounted here by shape only — this leaf never changes it, and the local
+/// exhaustive `error_disposition` below proves this crate's own routing, not
+/// the downstream conversion.
+const BACKUP_RS: &str = include_str!("../../eliot-backup/src/lib.rs");
+
 // WORK_UNIT_CASE: 864/1
 #[test]
 fn durable_operation_and_exhaustive_consumer_denominator_is_exact() {
@@ -1727,6 +1788,10 @@ fn durable_operation_and_exhaustive_consumer_denominator_is_exact() {
 
     assert_port_method_denominator();
     assert_fixture_rows_bind_live_vocabulary(&fixture);
+    assert!(
+        BACKUP_RS.contains("impl From<BlobError> for BackupError"),
+        "the downstream backup consumer conversion must stay accounted"
+    );
 
     let error = BlobError::StorageCapacity {
         failure: Box::new(BlobCapacityFailure {
@@ -2583,10 +2648,54 @@ fn source_api_diff_guard_rejects_proxy_classification() {
     assert!(API_RS.contains("pub enum BlobCapacityCause"));
     assert!(API_RS.contains("pub enum BlobCapacityStage"));
 
-    // No cross-store semantic change: capacity failures stay BlobError, never
-    // a store/adapter error, and every fixture row binds a live vocabulary
-    // value (decoded once, through the same helper case 1 uses).
+    // Baseline diff: the fixture denominator still covers exactly the live
+    // stage baseline — every baseline stage decodes through the same helper
+    // case 1 uses, and every baseline stage names a live source variant, so
+    // drift on either side fails here instead of silently shrinking coverage.
     assert_fixture_rows_bind_live_vocabulary(&fixture);
+    let baseline = fixture_stage_baseline(&fixture);
+    assert_eq!(
+        baseline,
+        [
+            "CasJournal",
+            "Cleanup",
+            "CommitWrite",
+            "GcCleanup",
+            "JournalWrite",
+            "MetadataPublication",
+            "MetadataWrite",
+            "PayloadPublication",
+            "PayloadWrite",
+            "RootLeaseCreate",
+            "RootLeaseHeartbeat",
+        ],
+        "fixture stage baseline changed: {baseline:?}"
+    );
+    for stage in baseline {
+        assert!(
+            BLOB_RS.contains(&format!("BlobCapacityStage::{stage}")),
+            "baseline stage missing from live source: {stage}"
+        );
+    }
+
+    // No cross-store semantic change: capacity failures stay BlobError, never
+    // a store/adapter error type, and the service-produced observation is a
+    // valid typed record rather than a catch-all bucket.
+    assert!(!BLOB_RS.contains("StoreError"));
+    assert!(!BLOB_RS.contains("AdapterError"));
+    assert!(!API_RS.contains("StoreError"));
+    assert!(!API_RS.contains("AdapterError"));
+
+    // No generic enum catch: well-formed non-capacity errors keep their own
+    // dispositions through the exhaustive consumer — no catch-all arm merges
+    // them into one bucket, and capacity keeps its own.
+    assert_eq!(error_disposition(&BlobError::NotFound), "NOT_FOUND");
+    assert_eq!(error_disposition(&BlobError::StaleFence), "STALE");
+    assert_eq!(error_disposition(&BlobError::OwnerConflict), "CONFLICT");
+    assert!(
+        BLOB_RS.contains("other => other"),
+        "the error mappers must keep an explicit pass-through arm"
+    );
 
     // No hidden deletion and no unbounded retry on the live path: a failed
     // stage keeps its journal with a finite port-write count.
@@ -2602,7 +2711,13 @@ fn source_api_diff_guard_rejects_proxy_classification() {
         panic!("capacity must stay BlobError::StorageCapacity");
     };
     assert_eq!(failure.stage, BlobCapacityStage::PayloadWrite);
-    assert_eq!(file_keys(&platform).len(), 1);
+    assert!(failure.validate().is_ok());
+    let keys = file_keys(&platform);
+    assert_eq!(keys.len(), 1, "only the journal may exist: {keys:?}");
+    assert!(
+        keys[0].starts_with("transactions/"),
+        "the surviving file is the stage journal: {keys:?}"
+    );
     assert_eq!(
         platform.lock().write_new_calls,
         2,
