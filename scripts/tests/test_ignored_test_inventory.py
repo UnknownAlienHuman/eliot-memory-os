@@ -69,7 +69,10 @@ def _scan_snippet(code: str, target: PackageTarget | None = None, file_name: str
         root = Path(td).resolve()
         src_path = root / file_name
         src_path.parent.mkdir(parents=True, exist_ok=True)
-        src_path.write_text(code, encoding="utf-8")
+        # LF write: on Windows a default text write would store CRLF and
+        # shift every span past the first line, while checked-in sources
+        # (and the scanned text) use LF.
+        src_path.write_text(code, encoding="utf-8", newline="\n")
         if target is None:
             target = PackageTarget(
                 package_id="test-pkg 0.1.0 (path+file:///crates/test-pkg)",
@@ -4224,7 +4227,8 @@ class TestIgnoredTestInventory(unittest.TestCase):
         )
         tests = _scan_file(root, target, source_path)
         item = next(t for t in tests if t.test_name == "test_sync_ignored")
-        # Byte offsets into sample_test_source.rs: attributes occupy lines
+        # Character offsets into the decoded source text (the lexer runs on
+        # str, so multibyte characters count one): attributes occupy lines
         # 3-4 (`#[test]` at 66 through the closing `]` at 132) and the fn
         # name sits on line 5 (136-153). Values verified against the file.
         self.assertEqual(item.fn_span, (136, 153))
@@ -4260,6 +4264,28 @@ class TestIgnoredTestInventory(unittest.TestCase):
         perturbed_attr = dataclasses.replace(item, attribute_span=None)
         self.assertNotEqual(reconcile([perturbed_fn], [])[0].row_digest, row.row_digest)
         self.assertNotEqual(reconcile([perturbed_attr], [])[0].row_digest, row.row_digest)
+        # Non-ASCII units: multibyte characters before the item shift byte
+        # offsets but not character offsets, so this pins the span unit.
+        non_ascii_code = (
+            '#[test]\n#[ignore = "requires SurrealDB — naïve café"]\n'
+            "fn tëst_nönascii() {}\n"
+        )
+        self.assertGreater(len(non_ascii_code.encode("utf-8")), len(non_ascii_code))
+        non_ascii_tests = _scan_snippet(non_ascii_code)
+        self.assertEqual(len(non_ascii_tests), 1)
+        non_ascii_item = non_ascii_tests[0]
+        self.assertEqual(
+            non_ascii_code[
+                non_ascii_item.fn_span[0]:non_ascii_item.fn_span[1]
+            ],
+            "tëst_nönascii",
+        )
+        self.assertEqual(
+            non_ascii_code[
+                non_ascii_item.attribute_span[0]:non_ascii_item.attribute_span[1]
+            ],
+            '#[test]\n#[ignore = "requires SurrealDB — naïve café"]',
+        )
 
 
 if __name__ == "__main__":
