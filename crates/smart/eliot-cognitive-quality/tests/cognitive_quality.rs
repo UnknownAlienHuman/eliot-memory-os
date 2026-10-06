@@ -189,6 +189,7 @@ fn receipt_with(binding: ContractBinding) -> HarnessActivationReceiptCandidate {
         downstream_decision_action_artifact_and_verifier_refs: vec![],
         receipt_completeness_and_missing_fields: vec![],
         invalidation_expiry_and_missingness: vec![],
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     receipt.seal().expect("fixture seal");
