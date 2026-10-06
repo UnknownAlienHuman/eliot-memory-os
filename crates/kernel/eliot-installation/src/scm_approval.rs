@@ -253,7 +253,7 @@ struct TestSupportApprovalParts<'a> {
 
 #[cfg(feature = "test-support")]
 impl TestSupportApprovalParts<'_> {
-    fn field(&self, value: &str, field: &str) -> Result<PlatformHandle, InstallationError> {
+    fn field(value: &str, field: &str) -> Result<PlatformHandle, InstallationError> {
         PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
             field: field.to_owned(),
             reason: error.to_string(),
@@ -275,7 +275,7 @@ impl TestSupportApprovalParts<'_> {
     ) -> Result<InstallerServiceRegistrationApproval, InstallationError> {
         let role_tag = Self::role_tag(role);
         let service_control_grant = Some(test_support_service_control_grant(role)?);
-        let registration_nonce = self.field(
+        let registration_nonce = Self::field(
             sha256_hex(
                 format!(
                     "eliot.test-support.scm-registration-nonce.v1\0{}\0{}\0{role_tag}",
@@ -323,7 +323,7 @@ impl TestSupportApprovalParts<'_> {
         let approval = InstallerServiceRegistrationApproval {
             transaction_id: self.transaction_id.clone(),
             generation: self.manifest.generation.clone(),
-            effect_id: self.field(
+            effect_id: Self::field(
                 &format!(
                     "test-support:service-effect:{role_tag}:{}",
                     self.transaction_id.as_str(),
@@ -331,13 +331,13 @@ impl TestSupportApprovalParts<'_> {
                 "test_support.effect_id",
             )?,
             role,
-            service_name: self.field(service_name, "test_support.service_name")?,
+            service_name: Self::field(service_name, "test_support.service_name")?,
             executable_path,
             account: InstallerServiceAccount::LocalService,
             automatic_start: true,
             service_bootstrap: self.bootstrap.clone(),
             registration_nonce,
-            configuration_digest: self.field(
+            configuration_digest: Self::field(
                 request.expected_configuration_digest().as_str(),
                 "test_support.configuration_digest",
             )?,
