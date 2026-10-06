@@ -1482,6 +1482,23 @@ impl KernelComposition {
         Self::assemble(config, ors, ors_path, None, platform)
     }
 
+    /// Returns the control-reserve profile this composition compiled at
+    /// assembly (issue #1679 W2). The composition retains the compiled value;
+    /// this hands out a borrow, never a recompilation.
+    pub fn control_reserve_profile(&self) -> &eliot_runtime_contracts::ControlReserveProfile {
+        &self.control_reserve_profile
+    }
+
+    /// Projects the retained control-reserve profile into the bounded status
+    /// snapshot (issue #1679 W2). Read-only: the projection revalidates the
+    /// retained profile and names the lowered guarantees without touching any
+    /// owner or capacity state.
+    pub fn control_reserve_status(
+        &self,
+    ) -> eliot_kernel_core::KernelResult<eliot_kernel_core::ControlReserveStatusSnapshot> {
+        eliot_kernel_core::project_control_reserve_status(&self.control_reserve_profile)
+    }
+
     /// Keeps ordered generation, authority, and handoff construction in one
     /// composition path so no intermediate partially wired authority escapes.
     #[allow(clippy::too_many_lines)]
@@ -1898,7 +1915,7 @@ impl KernelComposition {
         // in every startup mode, including a shadow candidate. It is the
         // reason `synchronize_authority_epoch` carries no shadow refusal.
         service
-            .synchronize_authority_epoch(canonical_epoch)
+            .synchronize_authority_epoch(canonical_epoch.clone())
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let mut policy = front_door_policy;
         if shadow_candidate {
@@ -2138,6 +2155,53 @@ impl KernelComposition {
             EntrypointStage::Composition,
             "kernel.composition.constructed_not_ready",
         );
+        // Issue #1679 W2 (I14.3; frozen contract `profile_compiler_owner =
+        // "Kernel composition over owner-produced capacity evidence"`,
+        // `control-reserve.contract.toml:21`): the composition joins
+        // owner-produced capacity evidence into the control-reserve profile
+        // here, from the resolved Authority Epoch, generation, approved
+        // config hash and clock above. Owner adapters publish evidence
+        // (`ControlReserve::publish_owner_row`, `OrsReserve::publish_owner_rows`,
+        // `StoreReserve::publish_claimed_row`, `IpcReserve::publish_claimed_row`),
+        // but no reserve instance exists at assembly — the running service
+        // admits through its own counters — so the composition joins zero
+        // records and every dimension lowers to an explicit UNKNOWN row; the
+        // frozen validator still enforces the exact 15-row denominator. The identity strings
+        // are the composition's own resolved values, never defaults: the
+        // service name it was built as, the generation and epoch it was
+        // admitted under, the Host-approved config hash (or the standalone
+        // name the sibling `ArtifactId` convention already uses when no
+        // approved hash exists), and its own clock reading. A contradictory
+        // future record fails the build closed here instead of entering the
+        // running composition. This allocates only the profile value: no
+        // queue, no semaphore, no permit, no durable write, so shadow
+        // candidates compile on the same path.
+        let mut control_reserve_generation_refs =
+            vec![format!("resource-generation:{}", generation.value())];
+        if let Some(digest) = kernel_artifact_sha256.as_deref() {
+            control_reserve_generation_refs.push(format!("kernel-artifact:{digest}"));
+        }
+        control_reserve_generation_refs.sort_unstable();
+        let control_reserve_profile = eliot_kernel_core::compile_control_reserve_profile(
+            eliot_kernel_core::ControlReserveProfileIdentity {
+                profile_id: format!("{SERVICE_NAME}-control-reserve-profile"),
+                profile_revision: format!(
+                    "generation={}:epoch={canonical_epoch:?}",
+                    generation.value()
+                ),
+                product_identity_ref: SERVICE_NAME.to_owned(),
+                source_build_and_runtime_generation_refs: control_reserve_generation_refs,
+                config_snapshot_ref: approved_config_hash
+                    .clone()
+                    .unwrap_or_else(|| "eliot-kernel-standalone".to_owned()),
+                authority_epoch_ref: canonical_epoch.clone(),
+                compiled_at_ms: unix_ms(),
+                profile_evidence_refs: Vec::new(),
+                invalidation_set: Vec::new(),
+            },
+            &[],
+        )
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         // I12.14 step 4: bind the approved hot-path declaration against the
         // running build's real registered queue settings before the composition
         // is constructed. A declaration that does not bind is refused here, so
@@ -2215,6 +2279,7 @@ impl KernelComposition {
             #[cfg(windows)]
             store_rebind_gate: tokio::sync::Mutex::new(()),
             approved_config_hash,
+            control_reserve_profile,
             canonical_store_claimed: AtomicBool::new(false),
             blob_store: Mutex::new(blob_store),
             backup_restore,
