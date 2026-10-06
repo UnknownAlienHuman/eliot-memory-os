@@ -2552,13 +2552,14 @@ impl KernelComposition {
         // so this route and every path that is about to start a child apply the
         // SAME owner verifier to the SAME durable row instead of a route-local
         // load plus a route-local verify. It is a pure read: it provisions
-        // nothing, launches nothing and changes no lifecycle position. The nine
+        // nothing, launches nothing and changes no lifecycle position. The ten
         // states are NOT re-derived here — `MISSING`, `STAGED`, `RELEASED`,
-        // `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER` and
-        // `IDENTITY_CONFLICT` are the owner's own variants, and only its sealed
-        // `Active` typestate carries launch authority (#1701's single issuance
-        // point). This runs on EVERY path, so the refusal below carries the same
-        // sealed evidence a consumer would have read.
+        // `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`,
+        // `IDENTITY_CONFLICT` and `STALE_CAPACITY_PROFILE` are the owner's own
+        // variants, and only its sealed `Active` typestate carries launch
+        // authority (#1701's single issuance point). This runs on EVERY path,
+        // so the refusal below carries the same sealed evidence a consumer
+        // would have read.
         let disposition =
             super::admission_reservation_saga::read_admission_reservation_launch_prerequisite(
                 self.generation_gateway.ors.as_ref(),
@@ -2567,6 +2568,9 @@ impl KernelComposition {
                 &proposed_attempt_id,
                 &authority_epoch,
                 &state_fence,
+                // The CURRENT retained profile revision from this
+                // composition's own handle (#1679 W11).
+                &self.control_reserve_profile().profile_revision,
                 now_unix_ms,
             )
             .map_err(|_| NativeWorkerRouteError::Fence {
@@ -2586,11 +2590,11 @@ impl KernelComposition {
                 // `require_admission_reservation_launch` is the ONE gate: it
                 // returns the sealed value or refuses with the owner's own
                 // discriminant — `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
-                // `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`
-                // or `UNREADABLE:<tag>` — as a TYPED refusal that says which
-                // state blocked the launch. A reservation still `STAGED` behind
-                // an unrun activation is therefore refused by name rather than
-                // admitted for launch.
+                // `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`,
+                // `STALE_CAPACITY_PROFILE`, `MISSING` or `UNREADABLE:<tag>` —
+                // as a TYPED refusal that says which state blocked the launch.
+                // A reservation still `STAGED` behind an unrun activation is
+                // therefore refused by name rather than admitted for launch.
                 match super::admission_reservation_saga::require_active_admission_reservation(
                     self.generation_gateway.ors.as_ref(),
                     reservation_id,
@@ -2598,6 +2602,9 @@ impl KernelComposition {
                     &proposed_attempt_id,
                     &authority_epoch,
                     &state_fence,
+                    // The CURRENT retained profile revision from this
+                    // composition's own handle (#1679 W11).
+                    &self.control_reserve_profile().profile_revision,
                     now_unix_ms,
                 ) {
                     Ok(prerequisite) => Ok(prerequisite),

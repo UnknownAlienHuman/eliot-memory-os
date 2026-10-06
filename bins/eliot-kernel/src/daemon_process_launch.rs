@@ -599,7 +599,8 @@ impl KernelComposition {
     /// exists so that a reservation bound to this launch's own operation
     /// identity can never reach a spawn while `STAGED`, `RELEASED`, `EXPIRED`,
     /// `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`,
-    /// `MISSING`, or unreadable. It never stages a reservation.
+    /// `STALE_CAPACITY_PROFILE`, `MISSING`, or unreadable. It never stages a
+    /// reservation.
     ///
     /// # Errors
     ///
@@ -648,6 +649,10 @@ impl KernelComposition {
             &proposed_attempt,
             &lineage,
             &fence_snapshot,
+            // The CURRENT retained profile revision from this composition's
+            // own handle, so a reservation activated under a superseded
+            // capacity view refuses here instead of launching (#1679 W11).
+            &self.control_reserve_profile().profile_revision,
             now_unix_ms,
         )
         .map(|_| ())

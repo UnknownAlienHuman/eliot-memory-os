@@ -3286,6 +3286,10 @@ fn require_dispatch_launch_reservation(
         &proposed_attempt,
         &authority_epoch,
         &fence_snapshot,
+        // The CURRENT retained profile revision from the composition's own
+        // handle, so a reservation activated under a superseded capacity view
+        // refuses here instead of launching (#1679 W11).
+        &kernel.control_reserve_profile().profile_revision,
         now_unix_ms,
     )
     .map(|_| ())

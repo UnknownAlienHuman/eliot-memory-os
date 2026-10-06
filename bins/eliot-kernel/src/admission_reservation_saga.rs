@@ -208,7 +208,7 @@ fn observe_admission_saga(event: &'static str, outcome: &'static str) {
 /// This is a typed refusal, not prose: the state that refused is the owner's
 /// own [`AdmissionReservationLaunchPrerequisite`] variant, and the rendered
 /// message uses the owner's `Serialize` discriminant so it is the owner's
-/// spelling rather than a route-local label that could drift from the nine
+/// spelling rather than a route-local label that could drift from the ten
 /// states.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AdmissionReservationLaunchRefusal {
@@ -216,8 +216,8 @@ pub(crate) struct AdmissionReservationLaunchRefusal {
     pub(crate) reservation_id: String,
     /// The owner's own variant name (`MISSING`, `STAGED`, `RELEASED`,
     /// `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`,
-    /// `IDENTITY_CONFLICT`, or `ACTIVE`), plus `UNREADABLE:<tag>` for a
-    /// durable row the owner itself refused.
+    /// `IDENTITY_CONFLICT`, `STALE_CAPACITY_PROFILE`, or `ACTIVE`), plus
+    /// `UNREADABLE:<tag>` for a durable row the owner itself refused.
     pub(crate) state: String,
 }
 
@@ -238,8 +238,8 @@ impl AdmissionReservationLaunchRefusal {
     ///
     /// The discriminant is read out of the owner's `Serialize` output — the
     /// same projection the claim route's sealed receipt uses — so the refusal
-    /// names a state from the owner's closed nine-state set and can never
-    /// advertise a tenth one this module invented.
+    /// names a state from the owner's closed ten-state set and can never
+    /// advertise an eleventh one this module invented.
     pub(crate) fn from_prerequisite(
         reservation_id: &OperationIdentity,
         prerequisite: &AdmissionReservationLaunchPrerequisite,
@@ -297,9 +297,15 @@ fn ors_error_tag(error: &OrsError) -> &'static str {
 /// `load_kernel_admission_reservation` read and hands the result to
 /// [`eliot_ors::verify_admission_reservation_launch_prerequisite`], so every
 /// consumer — the claim route and [`require_admission_reservation_launch`] —
-/// sees the SAME owner-verified nine-state disposition rather than a
+/// sees the SAME owner-verified ten-state disposition rather than a
 /// route-local guess. It is a pure read: it provisions nothing, launches
 /// nothing, and mutates no durable state.
+///
+/// The expected profile revision is the composition-retained CURRENT
+/// control-reserve profile revision (#1679 W11), read by the caller from its
+/// own composition handle — never from the launch caller — so a reservation
+/// activated under a superseded capacity view reads back as the owner's own
+/// `STALE_CAPACITY_PROFILE` variant.
 ///
 /// A caller that needs to decide for itself (the claim route echoes the state
 /// on its sealed receipt) reads the owner's variant directly. A caller that is
@@ -310,8 +316,9 @@ fn ors_error_tag(error: &OrsError) -> &'static str {
 /// # Errors
 ///
 /// Returns [`OrsError`] when the durable row is unreadable, violates its own
-/// validator, or when the caller's epoch/fence pair does not hold together.
-/// The row's own state is NOT an error here: it is the owner's typed
+/// validator, when the caller's epoch/fence pair does not hold together, or
+/// when the expected profile revision is blank. The row's own state is NOT an
+/// error here: it is the owner's typed
 /// [`AdmissionReservationLaunchPrerequisite`] variant.
 pub(crate) fn read_admission_reservation_launch_prerequisite<
     S: OperationalRecoveryStore + ?Sized,
@@ -322,6 +329,7 @@ pub(crate) fn read_admission_reservation_launch_prerequisite<
     proposed_attempt_id: &OperationIdentity,
     authority_epoch: &EpochLineage,
     state_fence: &StateFenceSnapshot,
+    expected_capacity_profile_revision: &str,
     now_unix_ms: i64,
 ) -> Result<AdmissionReservationLaunchPrerequisite, OrsError> {
     let current = store.load_kernel_admission_reservation(reservation_id)?;
@@ -331,6 +339,7 @@ pub(crate) fn read_admission_reservation_launch_prerequisite<
         proposed_attempt_id,
         authority_epoch,
         state_fence,
+        expected_capacity_profile_revision,
         now_unix_ms,
     )
 }
@@ -415,7 +424,7 @@ pub(crate) fn find_admission_reservation_for_launch<S: OperationalRecoveryStore 
 ///
 /// This is the gate for a launching seam that already holds the reservation
 /// identity. Every path that is about to start a child reaches the owner's
-/// nine-state decision through this function or through
+/// ten-state decision through this function or through
 /// [`require_bound_admission_reservation_launch`], which delegates here once it
 /// has resolved the identity. The states are therefore decided once, by the owner
 /// verifier ([`eliot_ors::verify_admission_reservation_launch_prerequisite`] —
@@ -425,17 +434,17 @@ pub(crate) fn find_admission_reservation_for_launch<S: OperationalRecoveryStore 
 /// The check is a pure read plus the owner's verifier: it provisions nothing,
 /// launches nothing, mutates no lifecycle position, and grants no authority by
 /// itself. A reservation in `MISSING`, `STAGED`, `RELEASED`, `EXPIRED`,
-/// `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER` or `IDENTITY_CONFLICT` is
-/// refused with that exact state named, and no caller reaches a spawn past
-/// this function.
+/// `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT` or
+/// `STALE_CAPACITY_PROFILE` is refused with that exact state named, and no
+/// caller reaches a spawn past this function.
 ///
 /// # Errors
 ///
 /// Returns [`AdmissionReservationLaunchRefusal`] naming the owner's own state
 /// when the reservation is not an exact `ACTIVE` row under the caller's
-/// current work item, attempt, Authority Epoch lineage, State Fence and
-/// unexpired deadline, and naming the typed ORS refusal when the durable row
-/// itself is unreadable or violates its own validator.
+/// current work item, attempt, Authority Epoch lineage, State Fence, current
+/// profile revision and unexpired deadline, and naming the typed ORS refusal
+/// when the durable row itself is unreadable or violates its own validator.
 pub(crate) fn require_admission_reservation_launch<S: OperationalRecoveryStore + ?Sized>(
     store: &S,
     reservation_id: &OperationIdentity,
@@ -443,6 +452,7 @@ pub(crate) fn require_admission_reservation_launch<S: OperationalRecoveryStore +
     proposed_attempt_id: &OperationIdentity,
     authority_epoch: &EpochLineage,
     state_fence: &StateFenceSnapshot,
+    expected_capacity_profile_revision: &str,
     now_unix_ms: i64,
 ) -> Result<ActiveAdmissionReservation, AdmissionReservationLaunchRefusal> {
     // An absent durable row is the owner's own `MISSING` disposition, not an
@@ -454,6 +464,7 @@ pub(crate) fn require_admission_reservation_launch<S: OperationalRecoveryStore +
         proposed_attempt_id,
         authority_epoch,
         state_fence,
+        expected_capacity_profile_revision,
         now_unix_ms,
     )
     .map_err(|error| AdmissionReservationLaunchRefusal::from_ors_error(reservation_id, &error))?;
@@ -495,13 +506,17 @@ pub(crate) fn require_admission_reservation_launch<S: OperationalRecoveryStore +
 /// * **a reservation binds it in any other state** — refused by name. This is
 ///   the W8 requirement: `MISSING` under a named identity, `STAGED`,
 ///   `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`,
-///   `IDENTITY_CONFLICT` and an unreadable row each reach the caller as a
-///   typed [`AdmissionReservationLaunchRefusal`] carrying the owner's own
-///   discriminant, never as a generic launch error.
+///   `IDENTITY_CONFLICT`, `STALE_CAPACITY_PROFILE` and an unreadable row each
+///   reach the caller as a typed [`AdmissionReservationLaunchRefusal`] carrying
+///   the owner's own discriminant, never as a generic launch error.
 ///
 /// An ambiguous binding (two durable reservations claiming the same work item
 /// and attempt) is an owner integrity refusal and is refused, because a launch
 /// cannot be authorised by a row it did not uniquely name.
+///
+/// The expected profile revision is the composition-retained CURRENT
+/// control-reserve profile revision (#1679 W11), read by the caller from its
+/// own composition handle — never from the launch caller.
 ///
 /// # Errors
 ///
@@ -516,6 +531,7 @@ pub(crate) fn require_bound_admission_reservation_launch<S: OperationalRecoveryS
     proposed_attempt_id: &OperationIdentity,
     authority_epoch: &EpochLineage,
     state_fence: &StateFenceSnapshot,
+    expected_capacity_profile_revision: &str,
     now_unix_ms: i64,
 ) -> Result<Option<ActiveAdmissionReservation>, AdmissionReservationLaunchRefusal> {
     // The epoch/fence pair the caller presents is validated by the owner BEFORE
@@ -554,6 +570,7 @@ pub(crate) fn require_bound_admission_reservation_launch<S: OperationalRecoveryS
         proposed_attempt_id,
         authority_epoch,
         state_fence,
+        expected_capacity_profile_revision,
         now_unix_ms,
     )
     .map(Some)
@@ -575,11 +592,16 @@ pub(crate) fn require_bound_admission_reservation_launch<S: OperationalRecoveryS
 /// [`require_admission_reservation_launch`], differing only in what the caller
 /// receives on success: the sealed typestate there, the enum variant here.
 ///
+/// The expected profile revision is the composition-retained CURRENT
+/// control-reserve profile revision (#1679 W11), read by the caller from its
+/// own composition handle — never from the launch caller.
+///
 /// # Errors
 ///
 /// Returns [`AdmissionReservationLaunchRefusal`] naming the owner's own state
-/// when the reservation is not an exact `Active` row, and naming the typed ORS
-/// refusal when the durable row is unreadable or violates its validator.
+/// when the reservation is not an exact `Active` row under the current profile
+/// revision, and naming the typed ORS refusal when the durable row is
+/// unreadable or violates its validator.
 pub(crate) fn require_active_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
     store: &S,
     reservation_id: &OperationIdentity,
@@ -587,6 +609,7 @@ pub(crate) fn require_active_admission_reservation<S: OperationalRecoveryStore +
     proposed_attempt_id: &OperationIdentity,
     authority_epoch: &EpochLineage,
     state_fence: &StateFenceSnapshot,
+    expected_capacity_profile_revision: &str,
     now_unix_ms: i64,
 ) -> Result<AdmissionReservationLaunchPrerequisite, AdmissionReservationLaunchRefusal> {
     let prerequisite = read_admission_reservation_launch_prerequisite(
@@ -596,6 +619,7 @@ pub(crate) fn require_active_admission_reservation<S: OperationalRecoveryStore +
         proposed_attempt_id,
         authority_epoch,
         state_fence,
+        expected_capacity_profile_revision,
         now_unix_ms,
     )
     .map_err(|error| AdmissionReservationLaunchRefusal::from_ors_error(reservation_id, &error))?;
@@ -1069,12 +1093,16 @@ impl KernelComposition {
         // replay (original snapshot and receipt returned) from changed evidence
         // (refused), so a second activation can never be minted under one
         // reservation.
+        // The CURRENT retained profile revision, read from this composition's
+        // own handle — never from the admission caller — so the activated row
+        // binds the capacity view it was admitted under (#1679 W11).
         let activation_request = Self::admission_reservation_activation_request(
             &reservation_id,
             &work_item,
             &proposed_attempt,
             &proven,
             staged.record(),
+            self.control_reserve_profile().profile_revision.clone(),
             now_unix_ms,
         )?;
         let activated = activate_admission_reservation_from_owner_evidence(
@@ -1174,18 +1202,21 @@ impl KernelComposition {
     ///
     /// Every field is either an identity this route re-derived from the durable
     /// reservation, a value READ BACK from the reservation's own durable record
-    /// (`claims`, `authority_epoch`, `state_fence` — never recomputed), or the
+    /// (`claims`, `authority_epoch`, `state_fence` — never recomputed), the
     /// owner's own evidence (`expected_current_receipt` and the proven canonical
-    /// admission). The activation operation identity is bound to the RESERVATION
-    /// ALONE, so the store's existing same-identity-changed-content conflict is
-    /// what distinguishes an exact replay (original active snapshot and receipt
-    /// returned) from changed evidence (refused).
+    /// admission), or the composition-retained CURRENT control-reserve profile
+    /// revision passed in by the caller (#1679 W11). The activation operation
+    /// identity is bound to the RESERVATION ALONE, so the store's existing
+    /// same-identity-changed-content conflict is what distinguishes an exact
+    /// replay (original active snapshot and receipt returned) from changed
+    /// evidence (refused).
     fn admission_reservation_activation_request(
         reservation_id: &OperationIdentity,
         work_item_id: &OperationIdentity,
         proposed_attempt_id: &OperationIdentity,
         proven: &eliot_ors::ProvenCanonicalAdmission,
         staged: &eliot_ors::AdmissionReservationRecord,
+        capacity_profile_revision: String,
         now_unix_ms: i64,
     ) -> Result<eliot_ors::AdmissionReservationActivationRequest, TransportError> {
         let activation_operation = activation_operation_identity(reservation_id)
@@ -1209,6 +1240,10 @@ impl KernelComposition {
                 reservation_id,
                 &proven.canonical_admission.admission_receipt,
             )?,
+            // The CURRENT retained profile revision, bound verbatim: the row
+            // carries the capacity view it was admitted under, and a later
+            // launch revalidates it instead of trusting it.
+            capacity_profile_revision,
             expected_current_receipt: proven.expected_current_receipt.clone(),
             authority_epoch: staged.authority_epoch.clone(),
             state_fence: staged.state_fence.clone(),

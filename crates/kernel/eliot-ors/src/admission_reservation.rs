@@ -109,6 +109,13 @@ pub enum AdmissionReservationState {
 /// reservation. The canonical half is never inferred in Kernel and never
 /// fabricated from a successful transport response; it is copied verbatim from
 /// the receipt the canonical owner issued. The ORS half names the resulting row.
+///
+/// The evidence also binds the composition-retained control-reserve profile
+/// revision the activation was admitted under (#1679 W11): a launch consumer
+/// revalidates this revision against the CURRENT profile before any effect, so
+/// a reservation activated under a superseded capacity view refuses as
+/// [`AdmissionReservationLaunchPrerequisite::StaleCapacityProfile`] instead of
+/// launching on stale capacity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionReservationActivationEvidence {
@@ -116,6 +123,11 @@ pub struct AdmissionReservationActivationEvidence {
     pub canonical_admission_receipt: ReceiptIdentity,
     /// ORS activation receipt committed alongside the resulting active row.
     pub activation_receipt: ReceiptIdentity,
+    /// Control-reserve profile revision bound at activation. Empty on rows
+    /// activated before profile binding existed; those rows read back as stale
+    /// at verify time and must re-activate under the current revision.
+    #[serde(default)]
+    pub capacity_profile_revision: String,
 }
 
 impl AdmissionReservationActivationEvidence {
@@ -350,6 +362,12 @@ pub struct AdmissionReservationRecord {
     pub canonical_admission: Option<AdmissionReservationCanonicalAdmission>,
     /// ORS activation receipt identity, when an authorized activation exists.
     pub activation_receipt: Option<ReceiptIdentity>,
+    /// Control-reserve profile revision this reservation was activated under
+    /// (#1679 W11). Bound at activation from the composition-retained profile,
+    /// never defaulted and never recomputed; empty only on rows activated
+    /// before profile binding existed, which verify as stale.
+    #[serde(default)]
+    pub capacity_profile_revision: String,
     /// Inactive reservation expiry boundary in Unix milliseconds.
     pub expires_at_ms: i64,
     /// Current reservation lifecycle state.
@@ -421,6 +439,8 @@ impl AdmissionReservationRecord {
                                         != self.canonical_admission_receipt.as_ref()
                                         || Some(&activation.activation_receipt)
                                             != self.activation_receipt.as_ref()
+                                        || activation.capacity_profile_revision
+                                            != self.capacity_profile_revision
                                 })
                     })
                 {
@@ -648,6 +668,11 @@ pub struct AdmissionReservationActivationRequest {
     pub canonical_admission: Option<AdmissionReservationCanonicalAdmission>,
     /// Durable ORS activation receipt committed with the resulting row.
     pub activation_receipt: ReceiptIdentity,
+    /// Composition-retained control-reserve profile revision this activation
+    /// binds (#1679 W11). Required: the caller supplies the CURRENT retained
+    /// revision, never a default and never a recomputation; a blank revision
+    /// is refused before any mutation.
+    pub capacity_profile_revision: String,
     /// Exact current ORS receipt observed before this transition.
     pub expected_current_receipt: OperationalMutationReceipt,
     /// Immutable authority and fence binding expected by the caller.
@@ -789,6 +814,18 @@ pub enum AdmissionReservationLaunchPrerequisite {
         /// Proposed attempt the caller verified against.
         expected_proposed_attempt_id: OperationIdentity,
     },
+    /// The reservation is active but was activated under a different
+    /// control-reserve profile revision than the caller's current one, so the
+    /// capacity view it was admitted under is superseded (#1679 W11). The
+    /// reservation is refused before any effect; it is never re-based onto the
+    /// current revision here — re-activation under the current profile is the
+    /// only path back to launch authority.
+    StaleCapacityProfile {
+        /// Exact durable record bound to the superseded revision.
+        reservation: AdmissionReservationRecord,
+        /// Current profile revision the caller verified against.
+        expected_capacity_profile_revision: String,
+    },
 }
 
 /// Sealed active launch prerequisite.
@@ -805,7 +842,8 @@ pub enum AdmissionReservationLaunchPrerequisite {
 ///
 /// #1701 obtains one by calling the verifier with the reservation snapshot it
 /// read back from ORS, plus its own current Authority Epoch lineage, State
-/// Fence, work-item and proposed-attempt identities, and current time.
+/// Fence, work-item and proposed-attempt identities, the composition-retained
+/// CURRENT control-reserve profile revision, and current time.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActiveAdmissionReservation {
     reservation: AdmissionReservationRecord,
@@ -862,6 +900,17 @@ impl ActiveAdmissionReservation {
             .as_ref()
             .ok_or(OrsError::InvalidTransition)
     }
+
+    /// Control-reserve profile revision this active reservation was activated
+    /// under (#1679 W11: the current-profile result for #1701).
+    ///
+    /// A launch consumer compares this against the composition-retained
+    /// CURRENT revision; only an exact match keeps launch authority. This is a
+    /// readback of the revision the activation committed, never a default and
+    /// never recomputed here.
+    pub fn capacity_profile_revision(&self) -> &str {
+        self.reservation.capacity_profile_revision.as_str()
+    }
 }
 
 /// Verifies one read-back reservation as the launch prerequisite #1701 must
@@ -871,31 +920,40 @@ impl ActiveAdmissionReservation {
 /// no durable state, and changes no lifecycle position: it re-derives the
 /// current disposition of the reservation it is given. The caller's current
 /// Authority Epoch lineage, State Fence, work-item and proposed-attempt
-/// identities and time are the launch authority being checked against, so an
-/// active reservation under a different epoch, fence, work item, attempt or a
-/// passed expiry boundary is refused rather than accepted.
+/// identities, CURRENT control-reserve profile revision and time are the launch
+/// authority being checked against, so an active reservation under a different
+/// epoch, fence, work item, attempt, profile revision or a passed expiry
+/// boundary is refused rather than accepted.
 ///
 /// Only an exact `Active` record carrying both its activation receipt and its
-/// canonical admission receipt returns [`AdmissionReservationLaunchPrerequisite::Active`];
+/// canonical admission receipt AND activated under the caller's current profile
+/// revision returns [`AdmissionReservationLaunchPrerequisite::Active`];
 /// every other disposition returns its own typed variant and cannot be turned
 /// into active authority.
 ///
 /// # Errors
 ///
 /// Returns [`OrsError`] when the expected epoch/fence pair does not hold
-/// together, when `now_ms` is not a positive Unix millisecond value, or when
-/// the observed durable record violates
-/// [`AdmissionReservationRecord::validate`].
+/// together, when `now_ms` is not a positive Unix millisecond value, when the
+/// expected profile revision is blank, or when the observed durable record
+/// violates [`AdmissionReservationRecord::validate`].
 pub fn verify_admission_reservation_launch_prerequisite(
     current: Option<&AdmissionReservationSnapshot>,
     expected_work_item_id: &OperationIdentity,
     expected_proposed_attempt_id: &OperationIdentity,
     expected_authority_epoch: &EpochLineage,
     expected_state_fence: &StateFenceSnapshot,
+    expected_capacity_profile_revision: &str,
     now_ms: i64,
 ) -> Result<AdmissionReservationLaunchPrerequisite, OrsError> {
     expected_authority_epoch.validate()?;
     expected_state_fence.validate_against_lineage(expected_authority_epoch)?;
+    if expected_capacity_profile_revision.trim().is_empty() {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation_launch_prerequisite.expected_capacity_profile_revision",
+            reason: "the current profile revision must be a non-blank owner value, never a default",
+        });
+    }
     if now_ms <= 0 {
         return Err(OrsError::InvalidField {
             field: "admission_reservation_launch_prerequisite.now_ms",
@@ -930,6 +988,15 @@ pub fn verify_admission_reservation_launch_prerequisite(
             {
                 return Err(OrsError::InvalidTransition);
             }
+            if reservation.capacity_profile_revision != expected_capacity_profile_revision {
+                return Ok(
+                    AdmissionReservationLaunchPrerequisite::StaleCapacityProfile {
+                        reservation,
+                        expected_capacity_profile_revision: expected_capacity_profile_revision
+                            .to_owned(),
+                    },
+                );
+            }
             if &reservation.work_item_id != expected_work_item_id
                 || &reservation.proposed_attempt_id != expected_proposed_attempt_id
             {
@@ -958,5 +1025,297 @@ pub fn verify_admission_reservation_launch_prerequisite(
                 ActiveAdmissionReservation::verified(reservation, snapshot.receipt().clone()),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_revision_tests {
+    //! Profile-revision binding proofs that need no store (#1679 W11).
+    //!
+    //! The store-backed half lives in
+    //! `tests/admission_reservation_profile_revision.rs`; these cases pin the
+    //! legacy readback tolerance, the evidence/row drift refusal and the
+    //! verifier's blank-expected shape check on records built directly.
+
+    use eliot_contracts::ReceiptId;
+    use eliot_receipts::ReceiptIdentity;
+
+    use super::*;
+    use crate::{EpochIdentity, OperationalMutationReceipt, OperationalPhase};
+
+    const REVISION: &str = "generation=7:epoch=test-lineage-1679";
+    const OTHER_REVISION: &str = "generation=6:epoch=test-lineage-1679";
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    fn hex_digest(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
+    fn claim_ref(name: &str, digest_byte: char) -> AdmissionReservationClaimRef {
+        AdmissionReservationClaimRef {
+            reference: OpaqueLabel::new(name).expect("1679 unit claim label"),
+            sha256: hex_digest(digest_byte),
+        }
+    }
+
+    fn claims() -> AdmissionReservationClaims {
+        AdmissionReservationClaims {
+            resources: claim_ref("unit-resources-1679", 'a'),
+            lane: claim_ref("unit-lane-1679", 'b'),
+            environment: claim_ref("unit-environment-1679", 'c'),
+            effects: claim_ref("unit-effects-1679", 'd'),
+            quota_view: claim_ref("unit-quota-view-1679", 'e'),
+        }
+    }
+
+    fn epoch() -> EpochLineage {
+        let lineage = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new("test-lineage-1679").expect("1679 unit lineage"),
+                epoch: 7,
+            },
+            predecessor: None,
+        };
+        lineage.validate().expect("1679 unit epoch validates");
+        lineage
+    }
+
+    fn fence() -> StateFenceSnapshot {
+        StateFenceSnapshot::capture(&serde_json::json!({"authority_epoch": 7}), 7)
+            .expect("1679 unit fence captures")
+    }
+
+    fn receipt(id: &str, digest_byte: char) -> ReceiptIdentity {
+        ReceiptIdentity {
+            receipt_id: ReceiptId::new(id).expect("1679 unit receipt id"),
+            canonical_sha256: hex_digest(digest_byte),
+        }
+    }
+
+    /// One valid `Active` record under `record_revision` whose retained
+    /// activation evidence carries `evidence_revision`.
+    fn active_record(record_revision: &str, evidence_revision: &str) -> AdmissionReservationRecord {
+        let canonical_receipt = receipt("unit-canonical-1679", 'a');
+        let activation_receipt = receipt("unit-activation-1679", 'b');
+        let authority_epoch = epoch();
+        let state_fence = fence();
+        let operation =
+            OperationIdentity::new("unit-activate-operation-1679").expect("1679 unit operation");
+        let evidence = AdmissionReservationActivationEvidence {
+            canonical_admission_receipt: canonical_receipt.clone(),
+            activation_receipt: activation_receipt.clone(),
+            capacity_profile_revision: evidence_revision.to_owned(),
+        };
+        let commit = AdmissionReservationCanonicalAdmission {
+            operation_id: OperationIdentity::new("unit-canonical-operation-1679")
+                .expect("1679 unit canonical operation"),
+            idempotency_key: "unit-idempotency-1679".to_owned(),
+            admission_digest: hex_digest('f'),
+            mutation_plan_digest: hex_digest('e'),
+            commit_id: "unit-commit-1679".to_owned(),
+            launch_outbox_operation_id: OperationIdentity::new("unit-canonical-operation-1679")
+                .expect("1679 unit outbox operation"),
+            launch_outbox_id: "unit-launch-outbox-1679".to_owned(),
+            admission_receipt: canonical_receipt.clone(),
+            committed_at_marker: NOW_MS.to_string(),
+        };
+        AdmissionReservationRecord {
+            reservation_id: OperationIdentity::new("unit-reservation-1679")
+                .expect("1679 unit reservation"),
+            work_item_id: OperationIdentity::new("unit-work-1679").expect("1679 unit work"),
+            proposed_attempt_id: OperationIdentity::new("unit-attempt-1679")
+                .expect("1679 unit attempt"),
+            stage_operation_id: OperationIdentity::new("unit-stage-operation-1679")
+                .expect("1679 unit stage operation"),
+            operation_id: operation.clone(),
+            claims: claims(),
+            authority_epoch: authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+            canonical_admission_receipt: Some(canonical_receipt),
+            canonical_admission: Some(commit),
+            activation_receipt: Some(activation_receipt),
+            capacity_profile_revision: record_revision.to_owned(),
+            expires_at_ms: NOW_MS + 3_600_000,
+            state: AdmissionReservationState::Active,
+            disposition_reason: None,
+            disposition_evidence: None,
+            last_transition: Some(AdmissionReservationTransitionRequest {
+                operation_id: operation,
+                target_state: AdmissionReservationState::Active,
+                reason: None,
+                evidence: None,
+                expected_current_receipt: OperationalMutationReceipt::issue(
+                    OperationIdentity::new("unit-reservation-1679")
+                        .expect("1679 unit receipt reservation"),
+                    OperationIdentity::new("unit-activate-operation-1679")
+                        .expect("1679 unit receipt operation"),
+                    1,
+                    OperationalPhase::Active,
+                    hex_digest('c'),
+                )
+                .expect("1679 unit receipt issues"),
+                authority_epoch,
+                state_fence,
+                now_ms: NOW_MS + 1_000,
+                activation: Some(evidence),
+            }),
+            created_at_ms: NOW_MS,
+            updated_at_ms: NOW_MS + 1_000,
+        }
+    }
+
+    fn snapshot_of(record: AdmissionReservationRecord) -> AdmissionReservationSnapshot {
+        let receipt = OperationalMutationReceipt::issue(
+            record.operation_id.clone(),
+            record.reservation_id.clone(),
+            1,
+            OperationalPhase::Active,
+            hex_digest('d'),
+        )
+        .expect("1679 unit snapshot receipt issues");
+        AdmissionReservationSnapshot::from_store(record, receipt)
+    }
+
+    fn verify_inputs() -> (
+        OperationIdentity,
+        OperationIdentity,
+        EpochLineage,
+        StateFenceSnapshot,
+    ) {
+        (
+            OperationIdentity::new("unit-work-1679").expect("1679 unit verify work"),
+            OperationIdentity::new("unit-attempt-1679").expect("1679 unit verify attempt"),
+            epoch(),
+            fence(),
+        )
+    }
+
+    #[test]
+    fn legacy_row_without_revision_reads_back_and_verifies_stale() {
+        let record = active_record(REVISION, REVISION);
+        // A row persisted before profile binding carried neither field: strip
+        // both and prove the old bytes still deserialize with empty revisions.
+        let mut value = serde_json::to_value(&record).expect("1679 unit record serializes");
+        value
+            .as_object_mut()
+            .expect("1679 unit record is an object")
+            .remove("capacity_profile_revision");
+        value
+            .get_mut("last_transition")
+            .and_then(|transition| transition.get_mut("activation"))
+            .and_then(|activation| {
+                activation
+                    .as_object_mut()
+                    .map(|object| object.remove("capacity_profile_revision"))
+            })
+            .expect("1679 unit evidence carries the revision");
+        let legacy: AdmissionReservationRecord =
+            serde_json::from_value(value).expect("1679 legacy bytes deserialize with defaults");
+        assert_eq!(
+            legacy.capacity_profile_revision, "",
+            "a pre-binding row reads back with an empty revision, never a defaulted current one"
+        );
+        legacy
+            .validate()
+            .expect("1679 legacy row stays readable so the verifier names it stale");
+        let snapshot = snapshot_of(legacy);
+        let (work, attempt, lineage, fence) = verify_inputs();
+        match verify_admission_reservation_launch_prerequisite(
+            Some(&snapshot),
+            &work,
+            &attempt,
+            &lineage,
+            &fence,
+            REVISION,
+            NOW_MS + 2_000,
+        )
+        .expect("1679 legacy verify runs")
+        {
+            AdmissionReservationLaunchPrerequisite::StaleCapacityProfile {
+                expected_capacity_profile_revision,
+                ..
+            } => assert_eq!(
+                expected_capacity_profile_revision, REVISION,
+                "a pre-binding activation refuses against the current revision"
+            ),
+            other => panic!("a pre-binding activation must verify stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_revision_drift_from_row_is_refused() {
+        let record = active_record(REVISION, OTHER_REVISION);
+        match record.validate() {
+            Err(OrsError::InvalidTransition) => {}
+            other => panic!(
+                "evidence/row revision drift must refuse as InvalidTransition, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn matching_revision_verifies_active_and_accessor_agrees() {
+        let snapshot = snapshot_of(active_record(REVISION, REVISION));
+        let (work, attempt, lineage, fence) = verify_inputs();
+        match verify_admission_reservation_launch_prerequisite(
+            Some(&snapshot),
+            &work,
+            &attempt,
+            &lineage,
+            &fence,
+            REVISION,
+            NOW_MS + 2_000,
+        )
+        .expect("1679 unit verify runs")
+        {
+            AdmissionReservationLaunchPrerequisite::Active(active) => assert_eq!(
+                active.capacity_profile_revision(),
+                REVISION,
+                "the sealed value exposes the committed revision"
+            ),
+            other => panic!("a current-revision activation must verify Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_blank_expected_revision_before_reading() {
+        let (work, attempt, lineage, fence) = verify_inputs();
+        match verify_admission_reservation_launch_prerequisite(
+            None, &work, &attempt, &lineage, &fence, "   ", NOW_MS,
+        ) {
+            Err(OrsError::InvalidField { field, .. }) => assert_eq!(
+                field,
+                "admission_reservation_launch_prerequisite.expected_capacity_profile_revision",
+                "a blank expected revision is a caller-shape refusal even with no row"
+            ),
+            other => {
+                panic!("a blank expected revision must be refused as InvalidField, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn stage_request_carries_no_revision() {
+        // The stage input has no revision slot by construction: binding happens
+        // at activation, so a staged row can never smuggle a capacity view in.
+        let stage = AdmissionReservationStage {
+            reservation_id: OperationIdentity::new("unit-stage-reservation-1679")
+                .expect("1679 unit stage reservation"),
+            work_item_id: OperationIdentity::new("unit-stage-work-1679")
+                .expect("1679 unit stage work"),
+            proposed_attempt_id: OperationIdentity::new("unit-stage-attempt-1679")
+                .expect("1679 unit stage attempt"),
+            operation_id: OperationIdentity::new("unit-stage-op-1679").expect("1679 unit stage op"),
+            claims: claims(),
+            authority_epoch: epoch(),
+            state_fence: fence(),
+            expires_at_ms: NOW_MS + 3_600_000,
+            now_ms: NOW_MS,
+        };
+        let debug = format!("{stage:?}");
+        assert!(
+            !debug.contains("revision"),
+            "the stage input carries no revision field: {debug}"
+        );
     }
 }

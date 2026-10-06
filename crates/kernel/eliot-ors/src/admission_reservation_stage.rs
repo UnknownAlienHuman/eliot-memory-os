@@ -1054,6 +1054,10 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         canonical_admission_receipt: None,
         canonical_admission: None,
         activation_receipt: None,
+        // The revision binds at activation, never at staging: a staged row
+        // carries no capacity view yet, so it starts empty and the activation
+        // write is what commits the current profile revision.
+        capacity_profile_revision: String::new(),
         expires_at_ms: request.expires_at_ms,
         state: AdmissionReservationState::StagedInactive,
         disposition_reason: None,
@@ -1294,9 +1298,21 @@ pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecovery
     request
         .state_fence
         .validate_against_lineage(&request.authority_epoch)?;
+    // The profile revision is required at activation, never defaulted: it is
+    // the composition-retained CURRENT revision the saga read, so a reservation
+    // can never be activated without binding the capacity view it was admitted
+    // under. The check runs before any store read so a blank revision refuses
+    // without touching durable state.
+    if request.capacity_profile_revision.trim().is_empty() {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation_activation.capacity_profile_revision",
+            reason: "activation must bind the current control-reserve profile revision, never a blank default",
+        });
+    }
     AdmissionReservationActivationEvidence {
         canonical_admission_receipt: request.canonical_admission_receipt.clone(),
         activation_receipt: request.activation_receipt.clone(),
+        capacity_profile_revision: request.capacity_profile_revision.clone(),
     }
     .validate()?;
 
@@ -1346,6 +1362,7 @@ pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecovery
             canonical_admission_receipt: request.canonical_admission_receipt.clone(),
             canonical_admission: request.canonical_admission.clone(),
             activation_receipt: request.activation_receipt.clone(),
+            capacity_profile_revision: request.capacity_profile_revision.clone(),
             expected_current_receipt: request.expected_current_receipt.clone(),
             authority_epoch: request.authority_epoch.clone(),
             state_fence: request.state_fence.clone(),
@@ -1362,6 +1379,7 @@ pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecovery
         || persisted.canonical_admission_receipt.as_ref()
             != Some(&request.canonical_admission_receipt)
         || persisted.activation_receipt.as_ref() != Some(&request.activation_receipt)
+        || persisted.capacity_profile_revision != request.capacity_profile_revision
     {
         return Err(OrsError::IntegrityProblem {
             record_type: "admission_reservation",

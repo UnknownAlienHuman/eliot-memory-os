@@ -35359,6 +35359,7 @@ impl AdmissionReservationTransitionSpec<'_> {
                 activation: Some(AdmissionReservationActivationEvidence {
                     canonical_admission_receipt: request.canonical_admission_receipt.clone(),
                     activation_receipt: request.activation_receipt.clone(),
+                    capacity_profile_revision: request.capacity_profile_revision.clone(),
                 }),
             },
         }
@@ -35481,9 +35482,20 @@ impl RedbRecoveryStore {
                 disposition.evidence.validate()?;
             }
             AdmissionReservationTransitionSpec::Activation { request } => {
+                // The write boundary re-checks the required revision itself:
+                // the evidence shape check below stays legacy-tolerant so rows
+                // activated before profile binding kept reading back, while no
+                // NEW activation can commit without the current revision.
+                if request.capacity_profile_revision.trim().is_empty() {
+                    return Err(OrsError::InvalidField {
+                        field: "admission_reservation_activation.capacity_profile_revision",
+                        reason: "activation must bind the current control-reserve profile revision, never a blank default",
+                    });
+                }
                 AdmissionReservationActivationEvidence {
                     canonical_admission_receipt: request.canonical_admission_receipt.clone(),
                     activation_receipt: request.activation_receipt.clone(),
+                    capacity_profile_revision: request.capacity_profile_revision.clone(),
                 }
                 .validate()?;
             }
@@ -35587,6 +35599,10 @@ impl RedbRecoveryStore {
                     record.canonical_admission = Some(committed.clone());
                 }
                 record.activation_receipt = Some(request.activation_receipt.clone());
+                // #1679 W11: commit the capacity view this activation was
+                // admitted under. The non-blank requirement above guarantees a
+                // real owner revision lands here, never a default.
+                record.capacity_profile_revision = request.capacity_profile_revision.clone();
             }
         }
         record.operation_id = spec.operation_id().clone();
@@ -36255,6 +36271,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             canonical_admission_receipt: None,
             canonical_admission: None,
             activation_receipt: None,
+            // The revision binds at activation, never at staging: a staged row
+            // carries no capacity view yet (see the stage owner's candidate).
+            capacity_profile_revision: String::new(),
             expires_at_ms: stage.expires_at_ms,
             state: AdmissionReservationState::StagedInactive,
             disposition_reason: None,
