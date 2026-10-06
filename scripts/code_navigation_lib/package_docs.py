@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .cargo import nearest_agents
-from .common import NavigationError, normalize_repo_path, relative_to_root
+from .common import NavigationError, normalize_repo_path, path_matches, relative_to_root
 from .handle_destinations import get_resolver, natural_handle_key
 from .registry import build_registry
 
@@ -127,6 +127,54 @@ def _handles(package: dict[str, Any], blocks: dict[str, dict[str, Any]]) -> list
     return sorted(result, key=natural_handle_key)
 
 
+def _target_blocks(target_path: str, blocks: dict[str, dict[str, Any]]) -> list[str]:
+    """Ids of logical blocks whose path globs match one target path (issue #690 P3)."""
+    return sorted(
+        block_id
+        for block_id, block in blocks.items()
+        if any(
+            path_matches(target_path, str(pattern))
+            for pattern in block.get("path_globs", []) or []
+        )
+    )
+
+
+def target_relations(
+    package: dict[str, Any], blocks: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Per-target documentation relation shared by validate and render (#690 P3/P4).
+
+    Each record binds one target to the logical blocks selected for its own
+    path and the governing handles derived from exactly those blocks. Family
+    (package-level) evidence is reused but never replaces a target record:
+    when the registry carries no block path globs (minimal synthetic
+    registries), every target inherits the package block set.
+    """
+    package_blocks = [str(item) for item in package.get("logical_blocks", [])]
+    globbed = any(
+        bool(blocks[block_id].get("path_globs"))
+        for block_id in package_blocks
+        if block_id in blocks
+    )
+    relations: list[dict[str, Any]] = []
+    for target in package.get("targets", []) or []:
+        relative = normalize_repo_path(str(target.get("path", "")))
+        target_path = normalize_repo_path(str(package.get("root_path", "")) + "/" + relative)
+        selected = (
+            _target_blocks(target_path, blocks) if globbed else list(package_blocks)
+        )
+        scoped = dict(package, logical_blocks=selected)
+        relations.append(
+            {
+                "target": target,
+                "path": target_path,
+                "blocks": selected,
+                "handles": _handles(scoped, blocks),
+            }
+        )
+    return relations
+
+
 def validate(root: Path, registry: dict[str, Any]) -> None:
     root = root.resolve()
     packages = _packages(registry)
@@ -189,6 +237,28 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
                 resolver = get_resolver(root)
             resolver.resolve(handle)
 
+        # Per-target closure (issue #690 P3): every target reconciles its own
+        # inherited AGENTS chain, block selection and governing handles. The
+        # package-level evidence above is reused, never a replacement.
+        for relation in target_relations(package, blocks):
+            target = relation["target"]
+            relative = normalize_repo_path(str(target.get("path", "")))
+            chain = nearest_agents(root, relation["path"])
+            if contract not in chain:
+                raise NavigationError(
+                    f"workspace package target does not inherit {contract}: "
+                    f"{package_root}/{relative}"
+                )
+            if not relation["blocks"]:
+                raise NavigationError(
+                    f"workspace package target matches no logical block: "
+                    f"{package_root}/{relative}"
+                )
+            for handle in relation["handles"]:
+                if resolver is None:
+                    resolver = get_resolver(root)
+                resolver.resolve(handle)
+
 
 def _md_link(label: str, destination: str) -> str:
     return f"[{label}]({destination})"
@@ -220,9 +290,16 @@ def render(registry: dict[str, Any], root: Path | None = None) -> str:
     used_contracts = sorted({family_contract(str(item["root_path"])) for item in packages})
 
     total_targets = sum(len(p.get("targets", [])) for p in packages)
+    # Shared per-target relation (issue #690 P4): forward rows and the reverse
+    # index below are both derived from these records, never from a cartesian
+    # package-blocks x all-targets product.
+    relations_by_package = [
+        (package, target_relations(package, blocks)) for package in packages
+    ]
     all_governing_handles: set[str] = set()
-    for package in packages:
-        all_governing_handles.update(_handles(package, blocks))
+    for _package, relations in relations_by_package:
+        for relation in relations:
+            all_governing_handles.update(relation["handles"])
     sorted_handles = sorted(all_governing_handles, key=natural_handle_key)
 
     lines = [
@@ -289,7 +366,7 @@ def render(registry: dict[str, Any], root: Path | None = None) -> str:
             "|---|---|---|---|---|---|",
         ]
     )
-    for package in packages:
+    for package, relations in relations_by_package:
         root_path = str(package["root_path"])
         manifest_path = str(package["manifest_path"])
         admission = "default" if package.get("default_member") else "workspace"
@@ -297,7 +374,10 @@ def render(registry: dict[str, Any], root: Path | None = None) -> str:
         sorted_targets = sorted(raw_targets, key=lambda t: (t.get("kind", ""), t.get("name", ""), t.get("path", "")))
         targets_str = "<br>".join(target_cell(t) for t in sorted_targets)
         blocks_str = "<br>".join(f"`{item}`" for item in package["logical_blocks"])
-        package_handles = _handles(package, blocks)
+        package_handles = sorted(
+            {handle for relation in relations for handle in relation["handles"]},
+            key=natural_handle_key,
+        )
         handle_links = []
         dest_links = []
         for handle in package_handles:
@@ -326,14 +406,21 @@ def render(registry: dict[str, Any], root: Path | None = None) -> str:
         dest_link = _md_link(f"`{rec['direct_destination']}`", rel)
         admitted = []
         target_list = []
-        for package in packages:
-            if handle in _handles(package, blocks):
+        for package, relations in relations_by_package:
+            related = [relation for relation in relations if handle in relation["handles"]]
+            if related:
                 p_root = str(package["root_path"])
                 p_manifest = str(package["manifest_path"])
                 admitted.append(_md_link(f"`{p_root}`", f"../../{p_manifest}"))
-                raw_targets = package.get("targets", [])
-                for t in sorted(raw_targets, key=lambda x: (x.get("kind", ""), x.get("name", ""), x.get("path", ""))):
-                    target_list.append(reverse_target_cell(p_root, t))
+                for relation in sorted(
+                    related,
+                    key=lambda item: (
+                        item["target"].get("kind", ""),
+                        item["target"].get("name", ""),
+                        item["target"].get("path", ""),
+                    ),
+                ):
+                    target_list.append(reverse_target_cell(p_root, relation["target"]))
         lines.append(
             f"| {handle_link} | {dest_link} | {'<br>'.join(admitted)} | {'<br>'.join(target_list)} |"
         )

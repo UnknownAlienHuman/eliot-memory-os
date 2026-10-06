@@ -793,6 +793,13 @@ pub struct KernelComposition {
     /// able to roll back.
     store_rebind_gate: tokio::sync::Mutex<()>,
     approved_config_hash: Option<String>,
+    /// Control-reserve profile this composition compiled at assembly (issue
+    /// #1679 W2, I14.3). Compiled once by `assemble` from the resolved
+    /// Authority Epoch, generation, approved config hash and clock over the
+    /// currently published owner evidence (none yet: owner adapters are W3,
+    /// so every dimension is an explicit `UNKNOWN` row). Immutable after
+    /// construction, like the launch descriptor it was compiled under.
+    control_reserve_profile: eliot_runtime_contracts::ControlReserveProfile,
     canonical_store_claimed: AtomicBool,
     /// Kernel-owned Blob Store demand controller (I1.11 step 4). `None`
     /// while no approved blob manifest was injected; `Some` validates the
