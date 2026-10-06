@@ -2029,10 +2029,12 @@ fn handle_reorder_keeps_packet_id() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("base projection");
     let mut reordered = handles.clone();
     reordered.reverse();
-    assert_ne!(handles, reordered, "the fixture must carry distinct handles");
-    let packet_b =
-        project_orientation(&job, &bundle, &candidate, &reordered, &policy)
-            .expect("reordered projection");
+    assert_ne!(
+        handles, reordered,
+        "the fixture must carry distinct handles"
+    );
+    let packet_b = project_orientation(&job, &bundle, &candidate, &reordered, &policy)
+        .expect("reordered projection");
     assert_eq!(
         packet_a.packet_id, packet_b.packet_id,
         "handle order is not content and must not move packet_id"
