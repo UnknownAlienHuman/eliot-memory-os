@@ -1247,6 +1247,50 @@ mod tests {
         }
     }
 
+    /// `I12.24:76`: an unknown pulse shares the `Missing` arm deliberately and
+    /// must be reconciled before retry, never read as a pass.
+    #[test]
+    fn weak_pulse_unknown_needs_more_evidence() {
+        let mut unknown = evidence();
+        unknown.pulse = ImprovementPulseOutcome::Unknown;
+        match decide(&candidate(), &unknown, &policy()) {
+            ImprovementAdmissionDecision::NeedsMoreEvidence { missing, .. } => {
+                assert!(missing.contains("missing-product-pulse"));
+            }
+            other => panic!("unknown pulse must need evidence, got {other:?}"),
+        }
+    }
+
+    /// `I12.24:76`: a passing verdict with no bound evidence ref is not evidence.
+    #[test]
+    fn weak_pulse_pass_without_ref_needs_more_evidence() {
+        let mut unbound = evidence();
+        unbound.pulse = ImprovementPulseOutcome::Pass;
+        unbound.pulse_ref = None;
+        match decide(&candidate(), &unbound, &policy()) {
+            ImprovementAdmissionDecision::NeedsMoreEvidence { missing, .. } => {
+                assert!(missing.contains("missing-product-pulse"));
+            }
+            other => panic!("passing pulse without a ref must need evidence, got {other:?}"),
+        }
+    }
+
+    /// `I12.24:143`: a `STALE`/`BLOCKED` binding cannot be silently filled, so
+    /// a valid-but-stale closure blocks until it is revalidated.
+    #[test]
+    fn stale_closure_blocks_until_revalidated() {
+        let mut stale = evidence();
+        stale.closure_valid = true;
+        stale.closure_stale = true;
+        match decide(&candidate(), &stale, &policy()) {
+            ImprovementAdmissionDecision::Blocked { cause, reason, .. } => {
+                assert_eq!(cause, ImprovementBlockCause::StaleClosure);
+                assert!(reason.contains("stale-closure-binding"));
+            }
+            other => panic!("stale closure binding must block, got {other:?}"),
+        }
+    }
+
     #[test]
     fn self_report_cannot_admit() {
         let mut dependent = evidence();
