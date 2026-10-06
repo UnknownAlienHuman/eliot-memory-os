@@ -91,6 +91,89 @@ def _fixture_rustc_verbose(toolchain: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+_WRITE_CALLS = frozenset({"open", "write_text", "write_bytes", "mkdir", "unlink"})
+_PATH_FACTORY_CALLS = frozenset(
+    {"Path", "PurePath", "PurePosixPath", "PureWindowsPath", "PosixPath", "WindowsPath"}
+)
+
+
+def _resolve_path_literal(node: ast.AST) -> str | None:
+    """Fold a path expression to a string when fully constant, else None.
+
+    Covers string constants, Path(...) factories over constants, ``/`` joins
+    and ``+`` concatenations of constants, and constant-only f-strings.
+    Anything computed (names, calls, formatted values) is not resolved: the
+    oracle cannot certify it, and the production writes it only to admitted
+    computed destinations the closed argv/lease checks already bound.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = (
+            func.attr if isinstance(func, ast.Attribute)
+            else func.id if isinstance(func, ast.Name)
+            else None
+        )
+        if name == "joinpath" and isinstance(func, ast.Attribute) and node.args:
+            base = _resolve_path_literal(func.value)
+            tail = [_resolve_path_literal(arg) for arg in node.args]
+            if base is not None and all(part is not None for part in tail):
+                return base + "/" + "/".join(tail)
+            return None
+        if name in _PATH_FACTORY_CALLS and node.args:
+            parts = [_resolve_path_literal(arg) for arg in node.args]
+            if all(part is not None for part in parts):
+                return parts[0] if len(parts) == 1 else "/".join(parts)
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+        left = _resolve_path_literal(node.left)
+        right = _resolve_path_literal(node.right)
+        if left is not None and right is not None:
+            if isinstance(node.op, ast.Add):
+                return left + right
+            return left.rstrip("/") + "/" + right.lstrip("/")
+        return None
+    if isinstance(node, ast.JoinedStr):
+        if all(isinstance(value, ast.Constant) for value in node.values):
+            return "".join(value.value for value in node.values if isinstance(value.value, str))
+        return None
+    return None
+
+
+def _forbidden_write_destinations(tree: ast.AST) -> list[str]:
+    """Resolved workflow/secret write destinations in a source tree.
+
+    Every file-mutation call contributes its receiver (when attribute-form)
+    plus all positional/keyword arguments, each constant-folded; only fully
+    resolved destinations are reported, so computed admitted paths stay out.
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            call_name = node.func.id
+            receiver: ast.AST | None = None
+        elif isinstance(node.func, ast.Attribute):
+            call_name = node.func.attr
+            receiver = node.func.value
+        else:
+            continue
+        if call_name not in _WRITE_CALLS:
+            continue
+        candidates = ([receiver] if receiver is not None else []) + list(node.args)
+        candidates.extend(keyword.value for keyword in node.keywords)
+        for candidate in candidates:
+            resolved = _resolve_path_literal(candidate)
+            if resolved is None:
+                continue
+            lowered = resolved.lower()
+            if ".github/workflows" in lowered or "secret" in lowered:
+                found.append(resolved)
+    return found
+
+
 class TestIgnoredTestInventory(unittest.TestCase):
     """Test suite verifying the exact ignored-test denominator contract (issue #905)."""
 
@@ -3035,7 +3118,8 @@ class TestIgnoredTestInventory(unittest.TestCase):
 
     # WORK_UNIT_CASE: 905/25
     def test_path_reparse_escape_and_file_test_output_time_bounds_fail_within_limits(self) -> None:
-        """Path/reparse escape and file/test/output/time bounds fail within limits."""
+        """Path/reparse escape, file/test/output/time bounds, and source/compiled count bounds."""
+        self._check_source_and_compiled_count_bounds()
         with tempfile.TemporaryDirectory() as td:
             troot = Path(td).resolve()
             (troot / ".eliot").mkdir()
@@ -3790,8 +3874,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
                 ns=(admitted_identity["mtime_ns"], admitted_identity["mtime_ns"]),
             )
 
-    # WORK_UNIT_CASE: 905/25
-    def test_source_and_compiled_count_bounds_refuse_over_limit(self) -> None:
+    def _check_source_and_compiled_count_bounds(self) -> None:
         """Source/compiled count bounds refuse listings past the limit."""
         fixture = json.loads((self.fixture_dir / "sample_inventory.json").read_bytes())
         target_record = fixture["header"]["target_denominator"][0]
@@ -3967,27 +4050,32 @@ class TestIgnoredTestInventory(unittest.TestCase):
         self.assertEqual(len(list_argv_tuples), 1)
         self.assertEqual(len(list_argv_tuples[0].elts), 2)
 
-        # No file-mutation call targets a workflow path or a secret-bearing
-        # literal: writes go to computed admitted paths only (W35). Secret
-        # _patterns_ (diagnostic redaction) are not write targets and are out
-        # of scope here; only open/write call arguments are collected.
-        write_calls = {"open", "write_text", "write_bytes", "mkdir", "unlink"}
-        for node in ast.walk(parsed_ast):
-            if not isinstance(node, ast.Call):
-                continue
-            if isinstance(node.func, ast.Name):
-                call_name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                call_name = node.func.attr
-            else:
-                continue
-            if call_name not in write_calls:
-                continue
-            for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    lowered = arg.value.lower()
-                    self.assertNotIn(".github/workflows", lowered)
-                    self.assertNotIn("secret", lowered)
+        # No file-mutation call resolves to a workflow path or a secret-bearing
+        # destination: receivers fold (Path(...) factories, `/` joins, `+`
+        # concats) and only fully resolved destinations are judged; the rest are
+        # computed admitted paths (W35). Secret _patterns_ (diagnostic
+        # redaction) are not write targets.
+        self.assertEqual(_forbidden_write_destinations(parsed_ast), [])
+        # Executable discriminator: the resolver rejects the audit
+        # counterexample and equivalent receiver/constructed-path forms, while
+        # admitted computed writes (unresolvable receivers) stay clean.
+        benign_tree = ast.parse('output.open("xb")\npath.write_text("data")\n')
+        self.assertEqual(_forbidden_write_destinations(benign_tree), [])
+        hostile_sources = [
+            'from pathlib import Path\nPath(".github/workflows/ci.yml").write_text("x")\n',
+            'open("out" + "/.github/workflows/report.json", "w")\n',
+            'open(Path("repo") / ".github" / "workflows" / "x.yml", "w")\n',
+            'Path("d").joinpath("my-secret-key.txt").write_text("k")\n',
+        ]
+        for hostile in hostile_sources:
+            with self.subTest(hostile=hostile):
+                hits = _forbidden_write_destinations(ast.parse(hostile))
+                self.assertTrue(hits, hostile)
+        self.assertIn(
+            ".github/workflows/ci.yml",
+            _forbidden_write_destinations(ast.parse(hostile_sources[0])),
+        )
+        self.assertEqual(_forbidden_write_destinations(parsed_ast), [])
 
     # WORK_UNIT_CASE: 905/27
     def test_supported_cfg_attr_ignore_forms_reconcile_without_evaluating_cfg(self) -> None:
