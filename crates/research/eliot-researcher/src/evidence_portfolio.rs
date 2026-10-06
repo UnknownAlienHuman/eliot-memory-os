@@ -293,6 +293,9 @@ impl std::fmt::Display for PortfolioError {
             Self::InvalidDigest { field } => {
                 write!(f, "{field} does not match its recomputed canonical digest")
             }
+            Self::BudgetExhausted { field } => {
+                write!(f, "{field} exhausted its frozen attempt budget")
+            }
         }
     }
 }

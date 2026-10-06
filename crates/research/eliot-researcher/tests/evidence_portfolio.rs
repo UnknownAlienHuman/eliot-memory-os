@@ -923,6 +923,9 @@ fn attempt_budget_refuses_before_append_and_preserves_replay() {
             .record("w3-a", disposition, Some("h-w3".to_owned()))
             .expect("replay record");
     }
+    replay
+        .note_frontier("attempt budget exhausted at w3-a")
+        .expect("replay frontier");
     assert_eq!(
         replay.digest(),
         retained,

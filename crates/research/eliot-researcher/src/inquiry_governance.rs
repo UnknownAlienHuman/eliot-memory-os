@@ -796,6 +796,52 @@ impl std::fmt::Display for EnumerationState {
 /// the observed population that is provably outside the frozen scope, keeps
 /// those two facts apart instead of letting an enumeration that never ran read
 /// as a verified empty scope.
+/// Norm-required source populations of one coverage receipt (I21.6, #1767 W2).
+///
+/// Derived from the same account + records the rest of the receipt binds,
+/// never restated: `eligible` is every admitted record's handle, `represented`
+/// the eligible handles the account observed, `omitted` the eligible handles
+/// it did not, `cited` the deduplicated citations that resolve to an eligible
+/// handle. Route staleness/skips and page cursors have no admitted input on
+/// this path, so they are not synthesized here.
+fn receipt_populations(
+    account: &CoverageAccount,
+    records: &[SourceAdmissibilityRecord],
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut eligible_handles: Vec<String> = records
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .map(|record| record.record.handle.clone())
+        .collect();
+    eligible_handles.sort();
+    eligible_handles.dedup();
+    let observed = account.observed_members();
+    let represented_handles: Vec<String> = eligible_handles
+        .iter()
+        .filter(|handle| observed.contains(*handle))
+        .cloned()
+        .collect();
+    let omitted_handles: Vec<String> = eligible_handles
+        .iter()
+        .filter(|handle| !observed.contains(*handle))
+        .cloned()
+        .collect();
+    let mut cited_handles: Vec<String> = records
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .flat_map(|record| record.record.cites.iter().cloned())
+        .collect();
+    cited_handles.retain(|handle| eligible_handles.contains(handle));
+    cited_handles.sort();
+    cited_handles.dedup();
+    (
+        eligible_handles,
+        represented_handles,
+        cited_handles,
+        omitted_handles,
+    )
+}
+
 fn enumeration_state(
     account: &CoverageAccount,
     observed_outside_scope: &[ObservedOutsideScope],
@@ -3390,36 +3436,8 @@ impl CoverageReceipt {
         }
         let accounted = account.is_accounted();
         let all_closed = account.all_closed();
-        let mut eligible_handles: Vec<String> = records
-            .iter()
-            .filter(|record| record.eligibility == SourceEligibility::Eligible)
-            .map(|record| record.record.handle.clone())
-            .collect();
-        eligible_handles.sort();
-        eligible_handles.dedup();
-        // W2 (#1767, I21.6): the norm-required source populations, derived
-        // from the same account + records the rest of the receipt binds,
-        // never restated. Route staleness/skips and page cursors have no
-        // admitted input on this path, so they are not synthesized here.
-        let observed = account.observed_members();
-        let represented_handles: Vec<String> = eligible_handles
-            .iter()
-            .filter(|handle| observed.contains(*handle))
-            .cloned()
-            .collect();
-        let omitted_handles: Vec<String> = eligible_handles
-            .iter()
-            .filter(|handle| !observed.contains(*handle))
-            .cloned()
-            .collect();
-        let mut cited_handles: Vec<String> = records
-            .iter()
-            .filter(|record| record.eligibility == SourceEligibility::Eligible)
-            .flat_map(|record| record.record.cites.iter().cloned())
-            .collect();
-        cited_handles.retain(|handle| eligible_handles.contains(handle));
-        cited_handles.sort();
-        cited_handles.dedup();
+        let (eligible_handles, represented_handles, cited_handles, omitted_handles) =
+            receipt_populations(account, records);
         let observed_outside_scope = account.observed_outside_scope();
         let enumeration_state = enumeration_state(account, &observed_outside_scope);
         // The evaluation and the manifest it was issued under arrive together or
@@ -7827,19 +7845,7 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
-        // W6 (#1767): re-prove the receipt's accounting from the retained
-        // run material. The carried receipt binds `account_digest`, but a
-        // binding alone cannot catch an account swapped after compute:
-        // rebuilding from the retained manifest + admissibility and
-        // comparing digests makes the substitution observable. This runs on
-        // the live path because `record` ends with `validate_integrity`.
-        let rederived_account_digest =
-            rederive_coverage_account_digest(&self.run_reference_manifest, &self.admissibility)?;
-        if rederived_account_digest != self.coverage_receipt.account_digest {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.coverage_accounting",
-            });
-        }
+        self.validate_coverage_accounting()?;
         self.validate_source_admission_requests()?;
         self.validate_committed_freeze_and_synthesis_input()?;
         for diagnostic in &self.unadmitted_references {
@@ -7889,6 +7895,30 @@ impl InquiryGovernance {
         if recorded != derived {
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.certified_obligations",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves the receipt's accounting from the retained run material
+    /// (W6, #1767).
+    ///
+    /// The carried receipt binds `account_digest`, but a binding alone cannot
+    /// catch an account swapped after compute: rebuilding from the retained
+    /// manifest + admissibility and comparing digests makes the substitution
+    /// observable. This runs on the live path because `record` ends with
+    /// `validate_integrity`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming
+    /// `inquiry.coverage_accounting` when the re-derived digest disagrees.
+    fn validate_coverage_accounting(&self) -> Result<(), InquiryError> {
+        let rederived_account_digest =
+            rederive_coverage_account_digest(&self.run_reference_manifest, &self.admissibility)?;
+        if rederived_account_digest != self.coverage_receipt.account_digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.coverage_accounting",
             });
         }
         Ok(())
