@@ -1401,11 +1401,23 @@ async fn read_authority_records(
 ///
 /// The writer bound the exact bytes to version/encoding/digest/length; any
 /// durable mismatch fails closed here instead of serving a lossy projection.
-/// Returns the decoded admitted parameters on success.
+/// Decode is operation-aware (issue #10, W6): the bytes decode without the
+/// generic control check, the closed (class, parameters) shape infers the
+/// operation, and the inferred operation re-validates every name — declared
+/// operation parameters (`task_id`, `idempotency_key`, ...) pass, any other
+/// control name fails closed. Returns the decoded admitted parameters and
+/// the inferred operation on success.
 fn validate_authority_record(
     row: &AuthorityReceiptRow,
     record: &AuthorityRecordRow,
-) -> Result<BTreeMap<String, Value>, StoreError> {
+    transition_class: eliot_store_api::TransitionClass,
+) -> Result<
+    (
+        BTreeMap<String, Value>,
+        eliot_store_api::NamedMutationOperation,
+    ),
+    StoreError,
+> {
     if record.version != PAYLOAD_AUTHORITY_VERSION {
         return Err(StoreError::Serialization(
             "authority record version mismatch".to_owned(),
@@ -1430,9 +1442,11 @@ fn validate_authority_record(
             "authority record digest mismatch".to_owned(),
         ));
     }
-    let parameters = bound.decode_object_parameters()?;
+    let loose = bound.decode_object_parameters_without_control_check()?;
+    let operation = infer_authority_operation(transition_class, &loose)?;
+    let parameters = bound.decode_object_parameters_for(operation)?;
     let _ = record_operation_count(row, record)?;
-    Ok(parameters)
+    Ok((parameters, operation))
 }
 
 fn record_operation_count(
@@ -1452,51 +1466,148 @@ fn record_operation_count(
 }
 
 /// Infers the closed mutation operation for one decoded authority parameter
-/// map within its receipt transition class.
+/// map within its receipt transition class (issue #10, W6/W8).
 ///
 /// The atomic writer does not persist operation names beside the opaque
 /// bytes; the closed parameter shapes plus the receipt transition class
-/// discriminate exactly one activated mutation per class on base
-/// (`TaskControl` → `UpdateTaskState`, `LifecyclePolicy` →
-/// `ApplyLifecyclePolicy`, `RecoverySchema` → `ApplyProblemOwnerState` when the
-/// named-transition discriminator is present and `ReconcileRecovery`
-/// otherwise, `CaptureCandidate` → `CaptureObservation`/`AppendAuditEvent`,
-/// `Epistemic` → `ApplyEpistemicRevision`). Anything else fails closed.
+/// discriminate exactly one activated mutation per class on base:
+/// `TaskControl` → `UpdateTaskState` (`task_id`+`event_id`), owner `record`
+/// documents (swarm revisions carry `owner_kind`, task acceptance sets carry
+/// `task_id`); `LifecyclePolicy` → `ApplyLifecyclePolicy`; `RecoverySchema` →
+/// `ApplyProblemOwnerState` (`transition`), `RecordAuthorityRevocation`
+/// (`origin_ref`), `RecordFinishDecision` (`receipt_json`),
+/// `RecordFinishEvidence`/`RecordModuleCatalogSnapshot` (their distinct
+/// expected-revision keys beside `snapshot_json`), and `ReconcileRecovery`
+/// (`problem_id`); `CaptureCandidate` → `AppendAuditEvent`, learning
+/// (`record_kind`), capability evidence (`scope_key`), experience bank vs
+/// feedback (the admitted document's `bank_revision` vs `feedback_revision`
+/// field), blackboard (`revision`), mailbox (`admission`), and
+/// `CaptureObservation` (`subject`); `Epistemic` → `ApplyEpistemicRevision`;
+/// `Erasure` → `ApplyErasure`; `NotificationState` →
+/// `ApplyNotificationState`; `ReactiveState` → ledger (`ledger_json`) vs
+/// snapshot (`content_sha256`); `UserAutomation` →
+/// `ApplyUserAutomationState`. `ApplyInstrumentRegistryState` stays
+/// known-but-unsupported and can never arrive through the catalogue gate.
+/// Anything else fails closed.
 fn infer_authority_operation(
     transition_class: eliot_store_api::TransitionClass,
     parameters: &BTreeMap<String, Value>,
 ) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
     use eliot_store_api::{NamedMutationOperation, TransitionClass};
+    let has = |name: &str| parameters.contains_key(name);
     match transition_class {
-        TransitionClass::TaskControl
-            if parameters.contains_key("task_id") && parameters.contains_key("event_id") =>
-        {
+        TransitionClass::TaskControl if has("task_id") && has("event_id") => {
             Ok(NamedMutationOperation::UpdateTaskState)
         }
-        TransitionClass::LifecyclePolicy if parameters.contains_key("skill_id") => {
+        // Owner records travel whole under one `record` key; the closed inner
+        // shapes discriminate: swarm revisions carry `owner_kind`, task
+        // acceptance sets carry `task_id`.
+        TransitionClass::TaskControl if has("record") => {
+            let inner_has = |name: &str| {
+                parameters
+                    .get("record")
+                    .and_then(Value::as_object)
+                    .is_some_and(|object| object.contains_key(name))
+            };
+            if inner_has("owner_kind") && inner_has("owner_id") {
+                Ok(NamedMutationOperation::ApplySwarmOwnerRevisions)
+            } else if inner_has("task_id") && inner_has("acceptance_digest") {
+                Ok(NamedMutationOperation::RecordTaskContractAcceptanceSet)
+            } else {
+                Err(StoreError::InvalidReceipt)
+            }
+        }
+        TransitionClass::LifecyclePolicy if has("skill_id") => {
             Ok(NamedMutationOperation::ApplyLifecyclePolicy)
         }
         // The named owner transitions are discriminated first: they are also
         // `RecoverySchema` and also carry `problem_id`, so without this arm a
         // committed `ApplyProblemOwnerState` row would be read back under
         // `ReconcileRecovery`'s name and its verb would be lost.
-        TransitionClass::RecoverySchema if parameters.contains_key("transition") => {
+        TransitionClass::RecoverySchema if has("transition") => {
             Ok(NamedMutationOperation::ApplyProblemOwnerState)
         }
-        TransitionClass::RecoverySchema if parameters.contains_key("problem_id") => {
+        TransitionClass::RecoverySchema if has("origin_ref") && has("closure_id") => {
+            Ok(NamedMutationOperation::RecordAuthorityRevocation)
+        }
+        TransitionClass::RecoverySchema if has("attempt_id") && has("receipt_json") => {
+            Ok(NamedMutationOperation::RecordFinishDecision)
+        }
+        TransitionClass::RecoverySchema
+            if has("expected_canonical_revision") && has("snapshot_json") =>
+        {
+            Ok(NamedMutationOperation::RecordFinishEvidence)
+        }
+        TransitionClass::RecoverySchema
+            if has("expected_module_registry_revision") && has("snapshot_json") =>
+        {
+            Ok(NamedMutationOperation::RecordModuleCatalogSnapshot)
+        }
+        TransitionClass::RecoverySchema if has("problem_id") => {
             Ok(NamedMutationOperation::ReconcileRecovery)
         }
-        TransitionClass::CaptureCandidate
-            if parameters.contains_key("operation_id")
-                && parameters.contains_key("idempotency_key") =>
-        {
+        TransitionClass::CaptureCandidate if has("operation_id") && has("idempotency_key") => {
             Ok(NamedMutationOperation::AppendAuditEvent)
         }
-        TransitionClass::CaptureCandidate if parameters.contains_key("subject") => {
+        TransitionClass::CaptureCandidate
+            if has("record_kind") && has("handle") && has("record_json") =>
+        {
+            Ok(NamedMutationOperation::RecordLearningRecord)
+        }
+        TransitionClass::CaptureCandidate
+            if has("skill_id") && has("scope_key") && has("record_json") =>
+        {
+            Ok(NamedMutationOperation::RecordCapabilityEvidenceRecord)
+        }
+        // Bank and feedback share one parameter table; the admitted document's
+        // family revision field discriminates (admission already proved the
+        // field matches the committed operation).
+        TransitionClass::CaptureCandidate
+            if has("record_revision")
+                && has("scope_digest")
+                && has("fence_digest")
+                && has("record_json") =>
+        {
+            let document = parameters
+                .get("record_json")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok());
+            match document {
+                Some(document) if document.contains_key("bank_revision") => {
+                    Ok(NamedMutationOperation::CommitExperienceBank)
+                }
+                Some(document) if document.contains_key("feedback_revision") => {
+                    Ok(NamedMutationOperation::CommitAgentFeedback)
+                }
+                _ => Err(StoreError::InvalidReceipt),
+            }
+        }
+        TransitionClass::CaptureCandidate if has("revision") => {
+            Ok(NamedMutationOperation::ApplyBlackboardItem)
+        }
+        TransitionClass::CaptureCandidate if has("admission") => {
+            Ok(NamedMutationOperation::AdmitMailboxMessage)
+        }
+        TransitionClass::CaptureCandidate if has("subject") => {
             Ok(NamedMutationOperation::CaptureObservation)
         }
-        TransitionClass::Epistemic if parameters.contains_key("revision") => {
+        TransitionClass::Epistemic if has("revision") => {
             Ok(NamedMutationOperation::ApplyEpistemicRevision)
+        }
+        TransitionClass::Erasure if has("subject") && has("erasure_operation_id") => {
+            Ok(NamedMutationOperation::ApplyErasure)
+        }
+        TransitionClass::NotificationState if has("mutation") && has("dedup_key") => {
+            Ok(NamedMutationOperation::ApplyNotificationState)
+        }
+        TransitionClass::ReactiveState if has("session_id") && has("ledger_json") => {
+            Ok(NamedMutationOperation::ApplyReactiveInjectionState)
+        }
+        TransitionClass::ReactiveState if has("uri") && has("content_sha256") => {
+            Ok(NamedMutationOperation::ApplyResourceSnapshot)
+        }
+        TransitionClass::UserAutomation if has("operation") && has("automation_id") => {
+            Ok(NamedMutationOperation::ApplyUserAutomationState)
         }
         _ => Err(StoreError::InvalidReceipt),
     }
@@ -1550,17 +1661,18 @@ fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthor
             ))
         };
         for record in authorities {
-            let parameters = validate_authority_record(row, record)?;
+            let (transition_class, scope_id) = in_scope_receipt
+                .as_ref()
+                .ok_or(StoreError::InvalidReceipt)?;
+            let (parameters, operation) =
+                validate_authority_record(row, record, *transition_class)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
-            if let Some((transition_class, scope_id)) = &in_scope_receipt {
-                let operation = infer_authority_operation(*transition_class, &parameters)?;
-                indexed.push(IndexedAuthority {
-                    capture_index,
-                    operation,
-                    parameters,
-                    scope_id: scope_id.clone(),
-                });
-            }
+            indexed.push(IndexedAuthority {
+                capture_index,
+                operation,
+                parameters,
+                scope_id: scope_id.clone(),
+            });
         }
         operation_base =
             operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
@@ -4931,12 +5043,13 @@ mod admitted_read_tests {
 
     #[test]
     fn task_state_returns_exact_history_with_current() {
-        // Surreal persistence gap (reported as residual): `UpdateTaskState`
-        // owner parameters contain `task_id`, which the generic
-        // `ExactJsonBytes` control denylist rejects, so no
-        // operation-aware authority binding exists yet (needs `plan.rs` /
-        // `atomic_write.rs`, unclaimed here). The handler itself is real
-        // (authority-row walk, exact scope/`task_id` match, bound,
+        // Operation-aware authority binding (issue #10, W6) exists:
+        // `UpdateTaskState` parameters carry `task_id`, which the generic
+        // `ExactJsonBytes` control denylist rejects, but the planner and the
+        // read boundary decode operation-aware (`decode_object_parameters_for`
+        // after closed (class, parameters) inference), so declared control
+        // names bind while foreign ones still fail closed. The handler itself
+        // is real (authority-row walk, exact scope/`task_id` match, bound,
         // history + current, provenance); the reference memory handler
         // proves the data path end to end. Here we prove the gate, the
         // exact-empty contract, and filtering against real lifecycle rows.

@@ -617,7 +617,17 @@ pub(crate) fn recompute_allocation(
 ///
 /// Length, digest, duplicate-key, control-field, and narrowing checks all
 /// run here, before any durable effect is planned: a mismatched authority
-/// fails the plan instead of reaching the transaction writer.
+/// Builds the exact-byte authority record for every named operation.
+///
+/// With a supplied authority the original raw bytes travel verbatim after
+/// validation against the admitted parameters. Without one (the production
+/// legacy path) the canonical JSON of the admitted parameters is the exact
+/// recoverable representation — the same fallback [`evidence_records`]
+/// applies to captures — so every body family (observation, evidence, claim,
+/// verification, failure) persists versioned, digest-bound exact bytes, not
+/// just `CaptureObservation` (issue #10, W6). A count mismatch or an
+/// authority/parameter disagreement fails the plan instead of reaching the
+/// transaction writer.
 fn payload_authority_records(
     transition: &PreparedTransition,
     authorities: &[Option<ExactJsonBytes>],
@@ -637,7 +647,7 @@ fn payload_authority_records(
     {
         if let Some(authority) = authority {
             authority.validate()?;
-            let decoded = authority.decode_object_parameters()?;
+            let decoded = authority.decode_object_parameters_for(operation.operation)?;
             if decoded != operation.parameters {
                 return Err(StoreError::InvalidField {
                     field: "payload.authority",
@@ -651,6 +661,18 @@ fn payload_authority_records(
                 digest_hex: authority.digest_hex(),
                 byte_len: authority.byte_len(),
                 bytes: authority.bytes.clone(),
+            });
+        } else {
+            let canonical = canonical_json_bytes(&operation.parameters)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, &canonical)?;
+            records.push(PayloadAuthorityRecord {
+                operation_index: index,
+                version: bound.version,
+                encoding: bound.encoding.mnemonic().to_owned(),
+                digest_hex: bound.digest_hex(),
+                byte_len: bound.byte_len(),
+                bytes: bound.bytes.clone(),
             });
         }
     }
@@ -1348,17 +1370,33 @@ mod tests {
     }
 
     #[test]
-    fn plan_routing_keeps_legacy_path_without_authorities() -> Result<(), StoreError> {
+    fn plan_routing_binds_canonical_fallback_without_authorities() -> Result<(), StoreError> {
         use crate::plan::select_apply_plan;
+        use eliot_store_api::{ExactJsonBytes, PayloadSource};
 
         let (_, transition) = fixture()?;
+        // Issue #10 (W6): without a supplied authority every operation still
+        // persists exact bytes — the canonical JSON of the admitted parameters
+        // — so all body families carry a versioned, digest-bound authority,
+        // not just `CaptureObservation`.
         let legacy = plan_apply(&transition, &[], &[], 1, 1)?;
-        assert!(legacy.payload_authority.is_empty());
+        assert_eq!(
+            legacy.payload_authority.len(),
+            1,
+            "one operation plans exactly one fallback authority record"
+        );
+        let record = &legacy.payload_authority[0];
+        let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, &record.bytes)?;
+        assert_eq!(bound.digest_hex(), record.digest_hex);
+        assert_eq!(
+            bound.decode_object_parameters()?,
+            transition.named_operations[0].parameters,
+            "fallback bytes decode to the admitted parameters"
+        );
         let routed = select_apply_plan(&transition, &[None], &[], &[], 1, 1)?;
-        assert!(routed.payload_authority.is_empty());
         assert_eq!(
             routed.outbox_records, legacy.outbox_records,
-            "all-None authorities keep the exact historical digest path"
+            "all-None authorities plan identically"
         );
         Ok(())
     }

@@ -284,6 +284,52 @@ impl ExactJsonBytes {
     /// narrowing numbers fail closed, and duplicate keys were already
     /// rejected at parse time so the map collapse is exact.
     pub fn decode_object_parameters(&self) -> Result<BTreeMap<String, Value>, StoreError> {
+        let map = self.decode_object_parameters_without_control_check()?;
+        for name in map.keys() {
+            reject_control_parameter_name(name)?;
+        }
+        Ok(map)
+    }
+
+    /// Decodes a top-level object authority for one named operation (issue
+    /// #10, W6).
+    ///
+    /// Mirrors `validate_typed_mutation_parameters` (exact declared membership):
+    /// names declared
+    /// for `operation` are legitimate operation parameters even when they
+    /// appear on [`CONTROL_FIELD_DENYLIST`] (`task_id`, `session_id`,
+    /// `operation_id`, `idempotency_key`); any other control name fails
+    /// closed exactly as [`Self::decode_object_parameters`] refuses it. The
+    /// declaration gate ([`crate::verify_declaration_holds_no_payload_encoding`])
+    /// already proved that no structured payload encoding hides behind a
+    /// control name, so allowing the declared scalar names here creates no
+    /// second payload owner.
+    pub fn decode_object_parameters_for(
+        &self,
+        operation: crate::NamedMutationOperation,
+    ) -> Result<BTreeMap<String, Value>, StoreError> {
+        let map = self.decode_object_parameters_without_control_check()?;
+        let declared = crate::operation_parameters::declared_mutation_parameters(operation);
+        for name in map.keys() {
+            if CONTROL_FIELD_DENYLIST.contains(&name.as_str())
+                && !declared.iter().any(|field| field.name == name.as_str())
+            {
+                reject_control_parameter_name(name)?;
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes a top-level object authority without the control-field check.
+    ///
+    /// Intermediate step only, never a terminal validation: shape,
+    /// blank/control-name, narrowing-number, and duplicate-key checks still
+    /// run here, but every caller must re-validate names — via
+    /// [`Self::decode_object_parameters`] or
+    /// [`Self::decode_object_parameters_for`] — before trusting the map.
+    pub fn decode_object_parameters_without_control_check(
+        &self,
+    ) -> Result<BTreeMap<String, Value>, StoreError> {
         let value = self.projection_value()?;
         let Value::Object(object) = value else {
             return Err(StoreError::InvalidField {
@@ -292,7 +338,6 @@ impl ExactJsonBytes {
             });
         };
         for name in object.keys() {
-            reject_control_parameter_name(name)?;
             if name.trim().is_empty() || name.chars().any(char::is_control) {
                 return Err(StoreError::InvalidField {
                     field: "operation.parameter_name",
