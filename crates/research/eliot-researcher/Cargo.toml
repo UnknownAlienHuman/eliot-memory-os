@@ -11,6 +11,11 @@ eliot-research-exchange-api.workspace = true
 eliot-research-exchange.workspace = true
 eliot-contracts.workspace = true
 serde.workspace = true
+# The read path of the evidence-freeze store owner decodes the retained bytes
+# this crate committed, and `serde_json` is the same decoder every other owner
+# of a canonical serializer in the workspace uses against
+# `eliot_contracts::canonical_json_bytes` output.
+serde_json.workspace = true
 
 [lints]
 workspace = true
