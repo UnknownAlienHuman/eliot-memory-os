@@ -320,3 +320,335 @@ impl FrontDoor {
         )
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn genesis_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch")
+    }
+
+    /// The positive complement of
+    /// `normal_saturation_response_refuses_an_unsaturated_partition` in
+    /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`:
+    /// that test pins refusal while capacity remains, this one pins a real
+    /// `BUSY` report once normal capacity is truly gone, so pressure evidence is
+    /// reported only while the partition is live-saturated.
+    #[test]
+    fn normal_saturation_response_reports_live_saturation_as_busy() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([17u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single normal slot is consumed and held: the permit releases on
+        // drop, so the response below observes the live saturated partition.
+        let _held =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-fill-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        let response = front_door.normal_saturation_response(
+            NormalWorkClass::Interactive,
+            "op-report-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert!(matches!(
+            response.disposition,
+            eliot_runtime_contracts::BackpressureDisposition::Busy
+        ));
+        Ok(())
+    }
+
+    /// The bottleneck-identity complement of
+    /// `normal_saturation_response_reports_live_saturation_as_busy`
+    /// (issue #1679): that test pins only the `Busy` disposition, while
+    /// this one pins WHICH bottleneck the report names, so a report
+    /// naming the wrong bottleneck fails here while still showing
+    /// `Busy` there. The observation binds the front-door bottleneck
+    /// in its exact unit (`docs/architecture/I14-04-backpressure-responses.md:13`:
+    /// every response includes a `RecoveryDirective` naming the real
+    /// bottleneck).
+    #[test]
+    fn normal_saturation_response_binds_front_door_bottleneck_in_exact_unit()
+    -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([17u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single normal slot is consumed and held: the permit releases on
+        // drop, so the response below observes the live saturated partition.
+        let _held =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-fill-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        let response = front_door.normal_saturation_response(
+            NormalWorkClass::Interactive,
+            "op-report-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert_eq!(response.directive.bottlenecks.len(), 1);
+        assert_eq!(
+            response.directive.bottlenecks[0].bottleneck,
+            FRONT_DOOR_BOTTLENECK
+        );
+        assert_eq!(
+            response.directive.bottlenecks[0].unit,
+            FRONT_DOOR_BOTTLENECK.unit()
+        );
+        Ok(())
+    }
+
+    /// The positive complement of
+    /// `protected_exhaustion_response_refuses_a_remaining_partition` in
+    /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`:
+    /// that test pins refusal while protected capacity remains, this one pins a
+    /// real recovery-boundary report once the protected partition is truly gone,
+    /// so boundary evidence is reported only for live exhaustion.
+    #[test]
+    fn protected_exhaustion_response_reports_live_boundary() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([21u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single protected slot is consumed and held: the permit releases on
+        // drop, so the report below observes the live exhausted partition.
+        let _held = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+
+        let response = front_door.protected_exhaustion_response(
+            ControlOperationClass::CancelOperation,
+            "op-report-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert!(matches!(
+            response.disposition,
+            eliot_runtime_contracts::BackpressureDisposition::Busy
+        ));
+        Ok(())
+    }
+
+    /// The positive complement of
+    /// `guarantee_lost_response_refuses_a_remaining_last_resort_path` in
+    /// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`:
+    /// that test pins refusal while a recording path is live, this one pins a
+    /// real guarantee-loss record once both the protected partition and the
+    /// preallocated last-resort slot are truly gone, so the loss is never
+    /// dropped silently.
+    #[test]
+    fn guarantee_lost_response_records_live_guarantee_loss() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([23u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // Both recording paths are consumed and held: the permits release on
+        // drop, so the record below observes the live guarantee loss.
+        let _held_protected = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        let _held_emergency = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-gap-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+        assert_eq!(front_door.available_emergency(), 0);
+
+        let response = front_door.guarantee_lost_response(
+            "op-loss-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        )?;
+        assert!(matches!(
+            response.disposition,
+            eliot_runtime_contracts::BackpressureDisposition::CapabilityDegraded
+        ));
+        Ok(())
+    }
+
+    /// The identity complement of `normal_saturation_response_reports_live_saturation_as_busy`
+    /// in this module: that test pins a real `BUSY` report, this one pins that a
+    /// blank operation identity is still refused as
+    /// `InvalidField { field: "rejection.operation_id" }` on a live-saturated
+    /// partition, so a malformed identity never produces pressure evidence.
+    #[test]
+    fn normal_saturation_response_rejects_malformed_operation_id() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([27u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The single normal slot is consumed and held: the permit releases on
+        // drop, so the refusal below comes from the malformed identity and not
+        // from an unsaturated partition.
+        let _held =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-fill-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        let err = front_door
+            .normal_saturation_response(
+                NormalWorkClass::Interactive,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "rejection.operation_id",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /// The protected-dimension identity complement of
+    /// `normal_saturation_response_rejects_malformed_operation_id` and
+    /// `protected_exhaustion_response_reports_live_boundary` in this module:
+    /// even a truly exhausted protected partition still refuses a blank
+    /// operation identity as `InvalidField { field: "rejection.operation_id" }`,
+    /// so a malformed identity never produces pressure evidence (#1679 A10).
+    #[test]
+    fn protected_exhaustion_response_rejects_malformed_operation_id() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([29u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        let _held = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+
+        let err = front_door
+            .protected_exhaustion_response(
+                ControlOperationClass::CancelOperation,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "rejection.operation_id",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /// The recording-identity complement of
+    /// `guarantee_lost_response_records_live_guarantee_loss` in this module:
+    /// even a truly live guarantee loss still refuses a blank recording
+    /// identity as `InvalidField { field: "rejection.recording_operation_id" }`,
+    /// so a malformed identity never produces a loss record (#1679 A10).
+    #[test]
+    fn guarantee_lost_response_rejects_malformed_recording_id() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([31u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // Both recording paths are consumed and held: the permits release on
+        // drop, so the refusal below comes from the malformed identity and not
+        // from a live recording path.
+        let _held_protected = front_door.acquire_protected(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-fill-1",
+        )?;
+        let _held_emergency = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-gap-1",
+        )?;
+        assert_eq!(front_door.available_protected(), 0);
+        assert_eq!(front_door.available_emergency(), 0);
+
+        let err = front_door
+            .guarantee_lost_response(
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed recording identity must never produce a loss record");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "rejection.recording_operation_id",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /// The partial-loss boundary (issue #1679, W9/A11): the emergency
+    /// slot is gone but the protected partition is still live, so a
+    /// recording path remains and no guarantee loss is reported — the
+    /// loss record exists only when NO path remains (I14.3). This
+    /// contrasts the neighbours: one pins refusal with both paths
+    /// live, one pins the record with both gone; this one pins
+    /// refusal with exactly one gone.
+    #[test]
+    fn guarantee_lost_response_refuses_while_protected_path_live() -> Result<(), KernelError> {
+        let authority = crate::authority::KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([35u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // Only the emergency path is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the live
+        // protected path, not from a fully lost guarantee.
+        let _held_emergency = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-gap-1",
+        )?;
+        assert_eq!(front_door.available_emergency(), 0);
+        assert!(front_door.available_protected() > 0);
+
+        // The `I14BackpressureResponseV1` Debug status is not
+        // re-verified here, so the error is taken by pattern instead
+        // of through `expect_err`.
+        let Err(err) = front_door.guarantee_lost_response(
+            "op-loss-1",
+            eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+        ) else {
+            panic!("a live recording path must not produce a loss record");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.last_resort_path",
+                ..
+            }
+        ));
+        Ok(())
+    }
+}

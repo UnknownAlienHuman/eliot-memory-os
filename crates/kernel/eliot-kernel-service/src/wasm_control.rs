@@ -875,7 +875,9 @@ fn advance_disposition(
 /// joins acks into dispositions (persisting advances), removes the
 /// owner's own stale staging temps by exact name, and reports bounded
 /// foreign/malformed evidence. Never deletes a delivery, sidecar, ack,
-/// or head: retirement is the publisher's explicit pressure valve.
+/// or head: retirement is the publisher's explicit pressure valve. A
+/// byte-corrupt ack is quarantined to a separate .poisoned evidence handle
+/// with every byte preserved; nothing is ever deleted.
 /// Reaps one staging temp when the owner staged it: a delivery,
 /// sidecar, or head stem at this generation. Ack staging belongs to the
 /// child and foreign temps are never touched.
@@ -963,6 +965,10 @@ fn join_scanned_delivery(
                 *foreign_files = foreign_files.saturating_add(1);
             }
             None => {
+                // Byte-corrupt ack bytes quarantine to a separate evidence
+                // handle so the slot frees; a structured-but-foreign ack
+                // above stays counted and is never moved.
+                quarantine_poisoned_ack(install_dir, generation, sequence);
                 *malformed_files = malformed_files.saturating_add(1);
             }
         }
@@ -1266,6 +1272,26 @@ fn retire_terminal_deliveries(
         let _ =
             std::fs::remove_file(install_dir.join(control_ack_name(generation, scanned.sequence)));
     }
+}
+
+/// Quarantines a poisoned ack slot under a separate evidence handle (issue
+/// #2896 AUD5): byte-corrupt ack bytes move aside so the slot frees for a
+/// fresh acknowledgement, while every poisoned byte stays on disk for
+/// forensics. The `.poisoned` suffix falls out of `parse_control_name`, so
+/// the scan ignores the evidence instead of re-reading it as an ack.
+/// Bounded to one quarantine per slot: pre-existing evidence is never
+/// overwritten. Best effort; a vanished ack simply leaves the slot as is
+/// (`docs/architecture/I07-02-frame.md:66`).
+fn quarantine_poisoned_ack(install_dir: &std::path::Path, generation: u64, sequence: u64) {
+    let ack = install_dir.join(control_ack_name(generation, sequence));
+    let evidence = install_dir.join(format!(
+        "{}.poisoned",
+        control_ack_name(generation, sequence)
+    ));
+    if evidence.exists() {
+        return;
+    }
+    let _ = std::fs::rename(&ack, &evidence);
 }
 
 /// Advances the monotonic spool head to at least `next_sequence`. An
@@ -1693,4 +1719,54 @@ pub fn reconcile_wasm_control_spool(
         malformed_files: scan.malformed_files,
         capped: scan.capped,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod poison_tests {
+    use super::*;
+
+    fn poison_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("poison dir writable");
+        dir
+    }
+
+    fn ack_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(control_ack_name(7, 0))
+    }
+
+    fn evidence_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(format!("{}.poisoned", control_ack_name(7, 0)))
+    }
+
+    /// Corrupt ack bytes move to the evidence handle with bytes intact.
+    #[test]
+    fn poisoned_ack_moves_to_evidence_handle() {
+        let dir = poison_dir("eliot-2896-poison-ack");
+        std::fs::write(ack_path(&dir), b"not-json-at-all").expect("poison writable");
+        quarantine_poisoned_ack(&dir, 7, 0);
+        assert!(!ack_path(&dir).exists());
+        assert_eq!(
+            std::fs::read(evidence_path(&dir)).expect("evidence readable"),
+            b"not-json-at-all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second poisoning never overwrites the first evidence.
+    #[test]
+    fn poisoned_ack_never_overwrites_evidence() {
+        let dir = poison_dir("eliot-2896-poison-ack-kept");
+        std::fs::write(evidence_path(&dir), b"first").expect("evidence writable");
+        std::fs::write(ack_path(&dir), b"second").expect("poison writable");
+        quarantine_poisoned_ack(&dir, 7, 0);
+        assert_eq!(
+            std::fs::read(evidence_path(&dir)).expect("evidence readable"),
+            b"first"
+        );
+        assert!(ack_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

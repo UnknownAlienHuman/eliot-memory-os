@@ -34,6 +34,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+eliot-platform-windows = { workspace = true, features = ["test-support"] }
 tempfile = "3.23"
 
 [lints]

@@ -240,6 +240,113 @@ pub struct InstallerServiceRegistrationApproval {
     pub(super) service_control_grant: Option<InstallerServiceControlGrantReceipt>,
 }
 
+/// Inputs for one fixture transaction's SCM approval pair. The bundle exists
+/// so the per-role approval builder stays a small honest helper instead of
+/// one 109-line loop body: the shared bootstrap and naming roots live here,
+/// the role-shaped parts in `approval`.
+#[cfg(feature = "test-support")]
+struct TestSupportApprovalParts<'a> {
+    transaction_id: &'a PlatformHandle,
+    manifest: &'a crate::CandidateManifest,
+    bootstrap: InstallationServiceBootstrap,
+}
+
+#[cfg(feature = "test-support")]
+impl TestSupportApprovalParts<'_> {
+    fn field(value: &str, field: &str) -> Result<PlatformHandle, InstallationError> {
+        PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    fn role_tag(role: InstallerServiceRole) -> &'static str {
+        match role {
+            InstallerServiceRole::Host => "host",
+            InstallerServiceRole::Watchdog => "watchdog",
+        }
+    }
+
+    fn approval(
+        &self,
+        role: InstallerServiceRole,
+        service_name: &'static str,
+        executable_path: PlatformHandle,
+    ) -> Result<InstallerServiceRegistrationApproval, InstallationError> {
+        let role_tag = Self::role_tag(role);
+        let service_control_grant = Some(test_support_service_control_grant(role)?);
+        let registration_nonce = Self::field(
+            sha256_hex(
+                format!(
+                    "eliot.test-support.scm-registration-nonce.v1\0{}\0{}\0{role_tag}",
+                    self.transaction_id.as_str(),
+                    self.manifest.generation.as_str(),
+                )
+                .as_bytes(),
+            )
+            .as_str(),
+            "test_support.registration_nonce",
+        )?;
+        let bootstrap_arguments = ServiceBootstrapArguments::new(
+            Path::new(self.bootstrap.descriptor_path.as_str()).to_path_buf(),
+            self.bootstrap.descriptor_digest.as_str(),
+            self.bootstrap.installation_id.as_str(),
+            self.bootstrap.plan_generation,
+            Vec::<String>::new(),
+        )
+        .and_then(|value| {
+            value.with_host_state_root(Path::new(self.bootstrap.host_state_root.as_str()))
+        })
+        .and_then(|value| value.with_registration_nonce(registration_nonce.as_str()))
+        .map_err(|_| InstallationError::InvalidField {
+            field: "test_support.service_bootstrap".to_owned(),
+            reason: "test-support SCM bootstrap could not be constructed".to_owned(),
+        })?;
+        let display_name = match role {
+            InstallerServiceRole::Host => eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            InstallerServiceRole::Watchdog => {
+                eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME
+            }
+        };
+        let request = ServiceRegistrationRequest::with_bootstrap(
+            service_name,
+            display_name,
+            Path::new(executable_path.as_str()).to_path_buf(),
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+            bootstrap_arguments,
+        )
+        .map_err(|_| InstallationError::InvalidField {
+            field: "test_support.service_registration.request".to_owned(),
+            reason: "test-support SCM request could not be constructed".to_owned(),
+        })?;
+        let approval = InstallerServiceRegistrationApproval {
+            transaction_id: self.transaction_id.clone(),
+            generation: self.manifest.generation.clone(),
+            effect_id: Self::field(
+                &format!(
+                    "test-support:service-effect:{role_tag}:{}",
+                    self.transaction_id.as_str(),
+                ),
+                "test_support.effect_id",
+            )?,
+            role,
+            service_name: Self::field(service_name, "test_support.service_name")?,
+            executable_path,
+            account: InstallerServiceAccount::LocalService,
+            automatic_start: true,
+            service_bootstrap: self.bootstrap.clone(),
+            registration_nonce,
+            configuration_digest: Self::field(
+                request.expected_configuration_digest().as_str(),
+                "test_support.configuration_digest",
+            )?,
+            service_control_grant,
+        };
+        approval.validate()?;
+        Ok(approval)
+    }
+}
 impl InstallerServiceRegistrationApproval {
     /// Returns the generation bound to this approval.
     #[must_use]
@@ -417,4 +524,124 @@ impl InstallerServiceRegistrationApproval {
         }
         Ok(request)
     }
+}
+
+/// Issues the Host + Watchdog SCM registration approval pair for one
+/// `SystemService` test-support seeding (issue #958 dispatch fixture).
+///
+/// A `SystemService` generation is invalid without exactly the two installer
+/// SCM approvals (`ApprovedGenerationRegistry::validate`), and an approval is
+/// a projection of authoritative SCM readback the test contour can never
+/// perform (no SCM handle exists in the test process). This seam mints that
+/// exact projection for one fixture transaction and manifest: the service
+/// shape (canonical names, the manifest's own images, `LocalService` account,
+/// automatic start), the installer-policy DACL grant receipts (the real
+/// platform digest authority over the canonical Host SID) and the canonical
+/// SCM configuration digest (the real `ServiceRegistrationRequest` binding
+/// over the manifest's bootstrap) are all derived, never canned. Only the
+/// installer effect identity and the registration nonces are
+/// domain-separated test-support values, bound to the caller's transaction
+/// and generation so two fixtures can never share them. No production path
+/// calls this function: initial staging stays available only through the
+/// transaction-bound activation gate.
+#[cfg(feature = "test-support")]
+pub fn issue_test_support_service_registration_approvals(
+    transaction_id: &PlatformHandle,
+    manifest: &crate::CandidateManifest,
+) -> Result<Vec<InstallerServiceRegistrationApproval>, InstallationError> {
+    if manifest.runtime_launch.profile != crate::InstallationProfile::SystemService {
+        return Err(InstallationError::ProfileViolation(
+            "test-support SCM approvals require the SystemService profile".to_owned(),
+        ));
+    }
+    let runtime = &manifest.runtime_launch;
+    let parts = TestSupportApprovalParts {
+        transaction_id,
+        manifest,
+        bootstrap: InstallationServiceBootstrap {
+            descriptor_path: runtime.authority_descriptor_path.clone(),
+            descriptor_digest: crate::approved_generation_registry::phase_b_scm_digest(
+                &runtime.authority_descriptor_digest,
+            )?,
+            installation_id: runtime.installation_epoch.installation.clone(),
+            plan_generation: runtime.authority_generation.value(),
+            host_state_root: runtime.runtime_state_roots.host_state_root.clone(),
+        },
+    };
+    let mut approvals = Vec::with_capacity(2);
+    for (role, service_name, executable_path) in [
+        (
+            InstallerServiceRole::Host,
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            manifest.host_executable_path.clone(),
+        ),
+        (
+            InstallerServiceRole::Watchdog,
+            eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_NAME,
+            manifest.runtime_launch.watchdog_executable_path.clone(),
+        ),
+    ] {
+        approvals.push(parts.approval(role, service_name, executable_path)?);
+    }
+    Ok(approvals)
+}
+
+/// Mints the installer-policy DACL grant receipt for one test-support SCM
+/// approval: the canonical Host SID principal, the role's concrete access
+/// mask and owner/group SIDs, and the digest from the real platform digest
+/// authority for that SID. Mirrors the `#[cfg(test)]` grant fixtures without
+/// sharing their module.
+#[cfg(feature = "test-support")]
+fn test_support_service_control_grant(
+    role: InstallerServiceRole,
+) -> Result<InstallerServiceControlGrantReceipt, InstallationError> {
+    let field = |value: &str, field: &str| {
+        PlatformHandle::new(value).map_err(|error| InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        })
+    };
+    let principal_sid = eliot_platform_windows::ELIOT_HOST_SERVICE_SID;
+    let digest_error =
+        |error: eliot_platform_windows::WindowsAdapterError| InstallationError::InvalidField {
+            field: "test_support.service_control_grant.digest".to_owned(),
+            reason: error.to_string(),
+        };
+    let (access_mask, security_descriptor_digest) = match role {
+        InstallerServiceRole::Host => (
+            eliot_platform_windows::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+            eliot_platform_windows::host_service_security_descriptor_digest(principal_sid)
+                .map_err(digest_error)?,
+        ),
+        InstallerServiceRole::Watchdog => (
+            eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+            eliot_platform_windows::watchdog_service_security_descriptor_digest(principal_sid)
+                .map_err(digest_error)?,
+        ),
+    };
+    let receipt = InstallerServiceControlGrantReceipt {
+        principal_service: field(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            "test_support.service_control_grant.principal_service",
+        )?,
+        principal_sid: field(
+            principal_sid,
+            "test_support.service_control_grant.principal_sid",
+        )?,
+        access_mask,
+        security_descriptor_owner: field(
+            eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
+            "test_support.service_control_grant.owner",
+        )?,
+        security_descriptor_group: field(
+            eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
+            "test_support.service_control_grant.group",
+        )?,
+        security_descriptor_digest: field(
+            security_descriptor_digest.as_str(),
+            "test_support.service_control_grant.digest",
+        )?,
+    };
+    receipt.validate()?;
+    Ok(receipt)
 }

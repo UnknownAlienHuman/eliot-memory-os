@@ -21,12 +21,14 @@ use eliot_host::backup_config_projection::{
     project_backup_config,
 };
 use eliot_host::backup_preparation::{
-    BackupCallerAuth, CleanupReport, DelegatedPreparation, DestinationAdmission, OwnerEvidence,
-    PreparationClass, PreparationError, PreparationJournal, PreparedDestination,
-    PresentedPreparationRequest, ReconcileDisposition, RootIdentity, cancel_preparation,
-    cleanup_preparations, derive_destination_epoch, derive_destination_id,
-    prepare_isolated_destination, reconcile_preparation,
+    BackupCallerAuth, CleanupReport, DelegatedPreparation, DestinationAdmission,
+    DestinationCustody, OwnerEvidence, PreparationClass, PreparationError, PreparationJournal,
+    PreparedDestination, PresentedPreparationRequest, ReconcileDisposition, RootIdentity,
+    cancel_preparation, cleanup_preparations, derive_destination_epoch, derive_destination_id,
+    owner_identity_evidence, prepare_isolated_destination, reconcile_preparation,
+    verify_staging_parent_lease,
 };
+use eliot_platform_windows::test_support::override_protected_root;
 use serde_json::Value;
 
 const LINEAGE_958: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -146,6 +148,15 @@ struct MemJournal {
 }
 
 impl PreparationJournal for MemJournal {
+    /// No restore/cutover custody claim can be outstanding against this sink: it
+    /// retains no custody records and no other party can hold one, so every root
+    /// it prepared is reclaimable here. The fail-closed `Unresolved` default stays
+    /// for sinks that cannot prove their owners clear; the production Host sink
+    /// reads the real owners instead of this stub.
+    fn destination_custody(&self, _root: &Path) -> DestinationCustody {
+        DestinationCustody::Released
+    }
+
     fn record_intent(
         &mut self,
         operation_id: &str,
@@ -374,9 +385,19 @@ fn valid_admitted_destination_prepares() {
         let _ = std::fs::remove_dir_all(&source_root);
         return;
     }
-    let (source_root, sentinel) = source_tree("05");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("05", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
-    let parent = isolated_root("05", "staging");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let admission =
         admission_from_fixture("destination-admission-valid.json", &source_root, &parent);
     assert_eq!(admission.operation_id, "op-958-dest-05");
@@ -398,8 +419,7 @@ fn valid_admitted_destination_prepares() {
     assert_eq!(sentinel_bytes(&sentinel), before, "source untouched");
     assert!(journal.intents.contains_key("op-958-dest-05"));
     assert!(journal.results.contains_key("op-958-dest-05"));
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/6
@@ -409,8 +429,18 @@ fn source_active_and_foreign_destinations_rejected() {
         eprintln!("SKIP 958/6 on non-Windows: admission ordering needs the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("06");
-    let parent = isolated_root("06", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("06", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     // Staging parent IS the source root: active installation refused.
     let active = admission("op-958-active", &source_root, &source_root);
@@ -427,17 +457,24 @@ fn source_active_and_foreign_destinations_rejected() {
         PreparationError::ArbitraryPath { .. }
     ),);
     // Preexisting foreign content at the exact destination path: refused,
-    // never adopted or overwritten. The foreign-owner fixture binds the
-    // takeover values (operation, nonce, foreign installation identity).
+    // never adopted or overwritten. The plant resolves the same owner-derived
+    // destination the admission does (operation plus owner identity evidence
+    // over the verified parent), so the simulated takeover is exact; a
+    // caller-chosen name such as the nonce can never coincide by design.
     let foreign = admission_from_fixture(
         "destination-admission-foreign-owner.json",
         &source_root,
         &parent,
     );
     assert_eq!(foreign.source_installation_id, "install-958-foreign");
-    let planted = parent.join(format!(
+    let verified_parent =
+        verify_staging_parent_lease(&foreign.operation_id, &parent).expect("parent verifies");
+    let planted = verified_parent.join(format!(
         "dest-{}",
-        derive_destination_id(&foreign.operation_id, &foreign.authority_nonce)
+        derive_destination_id(
+            &foreign.operation_id,
+            &owner_identity_evidence(&foreign, &verified_parent)
+        )
     ));
     std::fs::create_dir_all(&planted).expect("plant foreign dir");
     std::fs::write(planted.join("foreign-bytes.bin"), b"not-ours").expect("plant file");
@@ -450,8 +487,7 @@ fn source_active_and_foreign_destinations_rejected() {
         planted.join("foreign-bytes.bin").exists(),
         "foreign bytes preserved"
     );
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/7
@@ -550,8 +586,18 @@ fn alias_substitution_refused_and_identity_pinned() {
         let _ = std::fs::remove_dir_all(&source_root);
         return;
     }
-    let (source_root, _) = source_tree("08");
-    let parent = isolated_root("08", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("08", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     // A symlinked staging parent is an alias substitution, refused before
     // any destination effect. Symlink creation needs privilege: when the
@@ -596,49 +642,83 @@ fn alias_substitution_refused_and_identity_pinned() {
     std::fs::create_dir_all(&prepared.root).expect("recreate");
     match reconcile_preparation(&journal, "op-958-alias").expect("reconcile") {
         ReconcileDisposition::Uncertain { reason } => {
-            assert!(reason.contains("identity changed"), "names cause: {reason}");
+            assert!(
+                reason.contains("identity mismatch"),
+                "names cause: {reason}"
+            );
         }
         other => panic!("expected Uncertain, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/9
+//
+// The previous revision of this case hashed literal caller nonces and
+// compared decoys, which proved the hash helper but not the identity: the
+// production derivation takes owner-issued evidence, never a caller nonce
+// (see `owner_identity_evidence`: the nonce is excluded on purpose). This
+// case drives the real evidence builder and the real derivations.
 #[test]
 fn fresh_identities_never_archive_or_caller_copies() {
-    let archive_id = "archive-opaque-id-123";
-    let caller_decoy = "caller-chosen-9";
-    let first = derive_destination_id("op-958-fresh", "nonce-958-fresh");
-    assert_ne!(first, archive_id);
-    assert_ne!(first, caller_decoy);
+    let case_root = isolated_root("fresh", "case");
+    let (source_root, _sentinel) = source_tree("fresh");
+    let parent = case_root.join("staging-parent");
+    std::fs::create_dir_all(&parent).expect("staging parent");
+    let admission = admission("op-958-fresh", &source_root, &parent);
+    // Owner-issued evidence: authority generation, owner-projected config
+    // digest, owner-resolved parent. Sixty-four hex, stable across reads.
+    let evidence = owner_identity_evidence(&admission, &parent);
+    assert_eq!(evidence.len(), 64);
+    assert_eq!(evidence, owner_identity_evidence(&admission, &parent));
+    // Caller-controlled fields cannot move the evidence: rotating the
+    // authority nonce leaves it byte-equal, so no caller-selected value
+    // can select the destination identity, and neither can the operation
+    // name itself (freshness across operations comes from the derivation,
+    // not from caller-steered evidence).
+    let mut rotated = admission.clone();
+    rotated.authority_nonce = "nonce-958-rotated-by-caller".to_owned();
+    assert_eq!(evidence, owner_identity_evidence(&rotated, &parent));
+    // Owner-issued facts DO move it: a new authority generation, a new
+    // projected config, or another resolved parent each rebind the identity.
+    let mut moved_generation = admission.clone();
+    moved_generation.authority_generation = admission.authority_generation + 1;
+    assert_ne!(
+        evidence,
+        owner_identity_evidence(&moved_generation, &parent)
+    );
+    let mut moved_config = admission.clone();
+    moved_config.config_projection_digest = HEX_C.to_owned();
+    assert_ne!(evidence, owner_identity_evidence(&moved_config, &parent));
+    let other_parent = case_root.join("other-parent");
+    std::fs::create_dir_all(&other_parent).expect("other parent");
+    assert_ne!(evidence, owner_identity_evidence(&admission, &other_parent));
+    // The destination identity is bound to that evidence: fresh per
+    // operation, stable across repeats, and neither the source (archive
+    // side) identity nor any caller-chosen value.
+    let first = derive_destination_id("op-958-fresh", &evidence);
     assert_eq!(first.len(), 64);
-    // Stable across repeats (idempotent), distinct across operations and
-    // across nonces for the same operation.
-    assert_eq!(
-        first,
-        derive_destination_id("op-958-fresh", "nonce-958-fresh")
-    );
-    assert_ne!(
-        first,
-        derive_destination_id("op-958-other", "nonce-958-fresh")
-    );
-    assert_ne!(
-        first,
-        derive_destination_id("op-958-fresh", "nonce-958-rotated")
-    );
-    let epoch = derive_destination_epoch("op-958-fresh", "nonce-958-fresh");
+    assert_ne!(first, admission.source_installation_id);
+    assert_ne!(first, admission.authority_nonce);
+    assert_eq!(first, derive_destination_id("op-958-fresh", &evidence));
+    assert_ne!(first, derive_destination_id("op-958-other", &evidence));
+    // Preparation-scope epochs discriminate fenced preparations under
+    // identical evidence; they are never the Authority Epoch: the derived
+    // value is not the owner-issued authority generation it was derived
+    // beside, and no Authority Epoch is allocated here (I5.13, A13.7: the
+    // cutover child's owner obligation).
+    let epoch = derive_destination_epoch("op-958-fresh", &evidence);
     assert!(epoch >= 1);
-    assert_eq!(
-        epoch,
-        derive_destination_epoch("op-958-fresh", "nonce-958-fresh")
-    );
-    // Preparation-scope epochs are not caller-chosen increments: the derived
-    // value ignores any archive/caller epoch presented alongside.
+    assert_eq!(epoch, derive_destination_epoch("op-958-fresh", &evidence));
+    assert_ne!(epoch, admission.authority_generation);
     assert_ne!(
-        derive_destination_epoch("op-958-fresh", "nonce-958-fresh"),
-        0
+        epoch,
+        derive_destination_epoch(
+            "op-958-fresh",
+            &owner_identity_evidence(&moved_generation, &parent)
+        )
     );
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/10
@@ -712,10 +792,20 @@ fn no_implicit_source_shutdown_or_replacement() {
         eprintln!("SKIP 958/11 on non-Windows: preparation effects need the OS identity contour");
         return;
     }
-    let (source_root, sentinel) = source_tree("11");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("11", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
     let before_meta = std::fs::metadata(&sentinel).expect("meta");
-    let parent = isolated_root("11", "staging");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
@@ -736,8 +826,7 @@ fn no_implicit_source_shutdown_or_replacement() {
             .expect("mtime"),
         before_meta.modified().expect("mtime"),
     );
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/12
@@ -747,8 +836,18 @@ fn exact_repeat_returns_same_destination() {
         eprintln!("SKIP 958/12 on non-Windows: idempotency effects need the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("12");
-    let parent = isolated_root("12", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("12", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     let first = prepare_isolated_destination(
         &mut journal,
@@ -773,8 +872,7 @@ fn exact_repeat_returns_same_destination() {
         ReconcileDisposition::Current(current) => assert_eq!(current, first),
         other => panic!("expected Current, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/13
@@ -784,8 +882,18 @@ fn changed_same_operation_input_conflicts_by_field() {
         eprintln!("SKIP 958/13 on non-Windows: conflict detection needs the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("13");
-    let parent = isolated_root("13", "staging");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("13", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
@@ -809,8 +917,7 @@ fn changed_same_operation_input_conflicts_by_field() {
             field: "authority_nonce"
         },
     );
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/14
@@ -820,8 +927,22 @@ fn lost_response_reconciles_before_retry() {
         eprintln!("SKIP 958/14 on non-Windows: reconcile effects need the OS identity contour");
         return;
     }
-    let (source_root, _) = source_tree("14");
-    let parent = isolated_root("14", "staging");
+    // One case root keeps the source tree and the staging parent inside a single
+    // protected contour: `override_protected_root` pins one root and
+    // `ProtectedRootLease::open_existing` demands `path.starts_with(root)`.
+    // `admit_staging_parent` still refuses a parent nested under the source.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore
+    // ("restore to isolated root;").
+    let case_root = isolated_root("14", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    // Thread-local contour pin, restored on drop; parallel tests in this binary
+    // observe their own contour only.
+    let _protected = override_protected_root(&case_root);
     // Fresh operation with no record reconciles Absent: retry may proceed.
     let mut journal = MemJournal::default();
     assert_eq!(
@@ -872,8 +993,7 @@ fn lost_response_reconciles_before_retry() {
     assert!(report.removed.is_empty(), "unknown never removed");
     assert_eq!(report.preserved.len(), 1);
     assert!(prepared.root.exists(), "unknown root preserved");
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/15
@@ -885,9 +1005,19 @@ fn cancellation_cleanup_preserves_source_and_unknown() {
         );
         return;
     }
-    let (source_root, sentinel) = source_tree("15");
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("15", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
-    let parent = isolated_root("15", "staging");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let _protected = override_protected_root(&case_root);
     let mut journal = MemJournal::default();
     let prepared = prepare_isolated_destination(
         &mut journal,
@@ -920,8 +1050,7 @@ fn cancellation_cleanup_preserves_source_and_unknown() {
         cancel_preparation(&mut journal, "op-958-nope"),
         Err(PreparationError::UnknownState { .. })
     ),);
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
 // WORK_UNIT_CASE: 958/16
@@ -986,17 +1115,33 @@ fn real_windows_isolated_root_preparation_and_cleanup() {
         eprintln!("SKIP 958/17 on non-Windows: real isolated-root preparation requires Windows");
         return;
     }
-    let (source_root, sentinel) = source_tree("17");
+    // One case root keeps the source tree and the staging parent inside a single
+    // protected contour: `override_protected_root` pins one root and
+    // `ProtectedRootLease::open_existing` demands `path.starts_with(root)`.
+    let case_root = isolated_root("17", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-installation-bytes-958").expect("sentinel");
     let before = sentinel_bytes(&sentinel);
-    let parent = isolated_root("17", "staging");
-    // Registry evidence is fail-closed on a non-protected directory: owner
-    // inspection refuses instead of inventing authority.
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    // Thread-local contour pin, restored on drop; parallel tests in this binary
+    // observe their own contour only.
+    let _protected = override_protected_root(&case_root);
+    // Fail-closed contour exactness: outside the pinned root the owner still
+    // refuses instead of inventing authority. A positive `inspect` is not
+    // asserted here: `inspect_inner` additionally demands a committed
+    // installation registry with an active generation, which no temp fixture
+    // can stage; the positive proof goes through preparation below.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore
+    // ("restore to isolated root;").
     assert!(
         matches!(
-            OwnerEvidence::inspect(&parent),
+            OwnerEvidence::inspect(&std::env::temp_dir()),
             Err(PreparationError::FilesystemEffect { .. })
         ),
-        "non-protected root yields no owner evidence"
+        "outside the pinned contour the owner yields no evidence"
     );
     let mut journal = MemJournal::default();
     let prepared = prepare_isolated_destination(
@@ -1019,35 +1164,139 @@ fn real_windows_isolated_root_preparation_and_cleanup() {
     assert_eq!(report.removed, vec!["op-958-real".to_owned()]);
     assert!(!prepared.root.exists(), "destination removed");
     assert_eq!(sentinel_bytes(&sentinel), before, "source unchanged");
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }
 
-// WORK_UNIT_CASE: 958/18
-#[test]
-fn preparation_guard_excludes_registry_restore_and_cutover() {
-    fn listing(root: &Path) -> Vec<String> {
-        let mut entries = Vec::new();
-        for entry in walkdir_like(root) {
-            entries.push(entry);
-        }
-        entries.sort();
-        entries
-    }
-    fn walkdir_like(root: &Path) -> Vec<String> {
-        let mut out = Vec::new();
+/// Sorted recursive listing of every path under one root (958/18 guard).
+fn list_tree(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, out: &mut Vec<String>) {
         let Ok(read) = std::fs::read_dir(root) else {
-            return out;
+            return;
         };
         for entry in read.flatten() {
             let path = entry.path();
             out.push(path.to_string_lossy().into_owned());
             if path.is_dir() {
-                out.extend(walkdir_like(&path));
+                walk(&path, out);
             }
         }
-        out
     }
+    let mut entries = Vec::new();
+    walk(root, &mut entries);
+    entries.sort();
+    entries
+}
+
+/// One write-decoy per excluded production path (958/18). Each path that
+/// preparation must not take would have to WRITE to act, so each gets a
+/// file it would disturb: a foreign registry file (a second-registry
+/// record would extend it), a same-installation store tree (a Store
+/// recovery rewrite would restamp it), an archive tree (an archive restore
+/// would materialize into it), and a cutover-eligible marker (a cutover
+/// would flip it into an activation record).
+struct GuardDecoys {
+    source_sentinel: PathBuf,
+    foreign_registry: PathBuf,
+    store_sentinel: PathBuf,
+    archive_sentinel: PathBuf,
+    cutover_marker: PathBuf,
+}
+
+fn plant_guard_decoys(case_root: &Path, source_root: &Path) -> GuardDecoys {
+    let source_sentinel = source_root.join("source-sentinel.txt");
+    std::fs::write(&source_sentinel, b"source-installation-bytes-958").expect("sentinel");
+    let foreign_registry = case_root.join("foreign-registry.redb");
+    std::fs::write(&foreign_registry, b"foreign-registry-bytes-958").expect("registry decoy");
+    let store_sentinel = case_root.join("store").join("recovery-sentinel.txt");
+    std::fs::create_dir_all(store_sentinel.parent().expect("store parent"))
+        .expect("store decoy tree");
+    std::fs::write(&store_sentinel, b"store-recovery-bytes-958").expect("store decoy");
+    let archive_sentinel = case_root.join("archive").join("archive-sentinel.txt");
+    std::fs::create_dir_all(archive_sentinel.parent().expect("archive parent"))
+        .expect("archive decoy tree");
+    std::fs::write(&archive_sentinel, b"archive-restore-bytes-958").expect("archive decoy");
+    let cutover_marker = case_root.join("cutover-eligible.txt");
+    std::fs::write(&cutover_marker, b"cutover-eligible-958").expect("cutover decoy");
+    GuardDecoys {
+        source_sentinel,
+        foreign_registry,
+        store_sentinel,
+        archive_sentinel,
+        cutover_marker,
+    }
+}
+
+/// The whole-tree diff guard (958/18): exactly one added path, under the
+/// staging parent, and no decoy removed.
+fn assert_only_destination_added(
+    tree_before: &[String],
+    parent: &Path,
+    decoys: &GuardDecoys,
+    prepared: &[String],
+) {
+    let added: Vec<&String> = prepared
+        .iter()
+        .filter(|entry| !tree_before.contains(entry))
+        .collect();
+    assert_eq!(
+        added.len(),
+        1,
+        "preparation adds exactly one path: {prepared:?}"
+    );
+    assert!(
+        added[0].starts_with(&parent.to_string_lossy().into_owned()),
+        "the one added path is the destination under the staging parent: {}",
+        added[0]
+    );
+    for untouched in [
+        &decoys.source_sentinel,
+        &decoys.foreign_registry,
+        &decoys.store_sentinel,
+        &decoys.archive_sentinel,
+        &decoys.cutover_marker,
+    ] {
+        assert!(
+            prepared
+                .iter()
+                .any(|entry| entry == &untouched.to_string_lossy().into_owned()),
+            "excluded path decoy was not removed: {}",
+            untouched.to_string_lossy()
+        );
+    }
+}
+
+/// Byte-equality over every decoy (958/18): nothing was modified.
+fn assert_decoys_untouched(decoys: &GuardDecoys) {
+    assert_eq!(
+        sentinel_bytes(&decoys.source_sentinel),
+        b"source-installation-bytes-958",
+        "source tree identical"
+    );
+    assert_eq!(
+        std::fs::read(&decoys.foreign_registry).expect("registry decoy readable"),
+        b"foreign-registry-bytes-958",
+        "no second-registry record touched the foreign registry"
+    );
+    assert_eq!(
+        sentinel_bytes(&decoys.store_sentinel),
+        b"store-recovery-bytes-958",
+        "no Store recovery rewrite touched the same-installation store"
+    );
+    assert_eq!(
+        sentinel_bytes(&decoys.archive_sentinel),
+        b"archive-restore-bytes-958",
+        "no archive restore materialized into the archive tree"
+    );
+    assert_eq!(
+        sentinel_bytes(&decoys.cutover_marker),
+        b"cutover-eligible-958",
+        "no cutover flipped the eligibility marker"
+    );
+}
+
+// WORK_UNIT_CASE: 958/18
+#[test]
+fn preparation_guard_excludes_registry_restore_and_cutover() {
     if !cfg!(windows) {
         // The closed class set and the fail-closed caller gate hold on every
         // platform, even where effects cannot run.
@@ -1068,23 +1317,27 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
         );
         return;
     }
-    let (source_root, _) = source_tree("18");
-    // Recursive listing before and after: preparation adds exactly one
-    // destination directory under the staging parent, nothing in source.
-    let parent = isolated_root("18", "staging");
-    let source_before = listing(&source_root);
+    // Protected-contour fixture (see 958/14 and 958/17): one case root pinned by
+    // `override_protected_root`, source and staging as siblings beneath it, so
+    // `admit_staging_parent` observes the owner contour instead of temp_dir.
+    // Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore ("restore to isolated root;").
+    let case_root = isolated_root("18", "case");
+    let source_root = case_root.join("source");
+    std::fs::create_dir_all(&source_root).expect("case source root");
+    let parent = case_root.join("staging");
+    std::fs::create_dir_all(&parent).expect("case staging parent");
+    let decoys = plant_guard_decoys(&case_root, &source_root);
+    let _protected = override_protected_root(&case_root);
+    let tree_before = list_tree(&case_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
         &admission("op-958-guard", &source_root, &parent),
     )
     .expect("admitted");
-    assert_eq!(
-        listing(&source_root),
-        source_before,
-        "source tree identical"
-    );
-    assert_eq!(listing(&parent).len(), 1, "exactly one destination created");
+    let tree_after = list_tree(&case_root);
+    assert_only_destination_added(&tree_before, &parent, &decoys, &tree_after);
+    assert_decoys_untouched(&decoys);
     // The delegation sink binds a journal without a second registry, store
     // recovery, archive import, or cutover stage: an empty sink reconciles
     // Absent and the caller gate stays fail-closed pending #954.
@@ -1110,6 +1363,5 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
     match PreparationClass::IsolatedRestoreRehearsal {
         PreparationClass::IsolatedRestoreRehearsal => {}
     }
-    let _ = std::fs::remove_dir_all(&parent);
-    let _ = std::fs::remove_dir_all(&source_root);
+    let _ = std::fs::remove_dir_all(&case_root);
 }

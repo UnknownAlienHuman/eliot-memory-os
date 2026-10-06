@@ -3282,7 +3282,15 @@ impl KernelContextReadClient {
 mod tests {
     use super::*;
 
+    use eliot_context_contracts::{
+        DOWNSTREAM_HEADROOM_SCHEMA_VERSION, HeadroomConsumer, HeadroomDemand, HeadroomQuantity,
+        HeadroomReleaseCondition,
+    };
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_kernel_core::KernelAuthority;
+    use eliot_runtime_contracts::{
+        CapacityLimit, CapacityRequest, CapacityUnit, NormalWorkClass, RequestedOperationClass,
+    };
     use eliot_store_api::ScopeId;
     use serde_json::json;
     use std::num::NonZeroU64;
@@ -3301,6 +3309,370 @@ mod tests {
             test_epoch(1)?,
             ResourceGeneration::new(generation)?,
         ))
+    }
+
+    /// W8 join fixture (issue #1679): a headroom request carrying exactly one
+    /// ownerless-dimension demand. `HeadroomDimension::Gpu` has no frozen owner
+    /// row (`owner_bottleneck()` is `None`), so `PacketHeadroomJoin::acquire`
+    /// must refuse it with `NoFrozenOwner` without consulting any owner. The
+    /// demand still carries a well-formed owner request: the refusal is about
+    /// the missing owner, never about a malformed demand.
+    fn gpu_demand_request(
+        fence: &StateFence,
+    ) -> Result<DownstreamHeadroomRequest, Box<dyn std::error::Error>> {
+        let demand = HeadroomDemand {
+            dimension: HeadroomDimension::Gpu,
+            quantity: HeadroomQuantity::Unknown {
+                reason: eliot_contracts::ArtifactId::new("reason-gpu-unknown")?,
+            },
+            request: CapacityRequest {
+                operation: RequestedOperationClass::Normal(NormalWorkClass::Interactive),
+                operation_id: "op-gpu-1".to_owned(),
+                requested_bottleneck: CapacityBottleneck::KernelRunnableControlSlots,
+                requested_limit: CapacityLimit {
+                    unit: CapacityUnit::Items,
+                    quantity: NonZeroU64::new(1).ok_or("non-zero demand")?,
+                },
+                requesting_owner_ref: "owner-a".to_owned(),
+                requesting_generation_ref: ResourceGeneration::new(1)?,
+                authority_epoch_ref: test_epoch(1)?,
+                profile_id: "profile-1".to_owned(),
+                profile_revision: "rev-1".to_owned(),
+                deadline_ms: 1_000,
+            },
+        };
+        Ok(DownstreamHeadroomRequest {
+            schema_version: DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+            pipeline_id: eliot_contracts::ArtifactId::new("pipe-gpu-1")?,
+            attempt_id: eliot_contracts::ArtifactId::new("attempt-gpu-1")?,
+            stage_id: eliot_contracts::ArtifactId::new("stage-gpu-1")?,
+            consumer: HeadroomConsumer::Verifier,
+            binding: ContextBinding {
+                task_id: eliot_contracts::TaskId::new("task-one")?,
+                attempt_id: eliot_agent_contracts::AgentAttemptId::new("attempt-one")?,
+                scope_id: eliot_receipts::WorkScopeId::new("governor")?,
+                state_fence: fence.clone(),
+                decision_id: eliot_contracts::DecisionId::new("decision-one")?,
+                operation_id: None,
+            },
+            route_id: "route-gpu-1".to_owned(),
+            serializer_id: "serializer-gpu-1".to_owned(),
+            recipe_digest: "recipe-gpu-1".to_owned(),
+            demands: vec![demand],
+            release: HeadroomReleaseCondition {
+                completion_receipt: eliot_contracts::ArtifactId::new("receipt-gpu-1")?,
+                release_on_cancel: true,
+                expires_at_ms: 9_999_999,
+            },
+        })
+    }
+
+    /// W8 join fixture (issue #1679): a live front door behind the join tests.
+    /// Partitions are roomy (4/4) so fixture setup never saturates: saturation
+    /// is arranged by each test, never by this helper.
+    fn test_front_door() -> Result<FrontDoor, Box<dyn std::error::Error>> {
+        let authority = KernelAuthority::new(
+            eliot_kernel_core::KernelAuthorityKey::from_bytes([5u8; 32]),
+            test_epoch(1)?,
+        );
+        Ok(FrontDoor::partitioned(authority, 4, 4, 8)?)
+    }
+
+    /// The join fails closed on a dimension that has no frozen owner row
+    /// (issue #1679): `HeadroomDimension::Gpu` has no `owner_bottleneck()` and
+    /// no frozen owner, so `PacketHeadroomJoin::acquire` refuses it rather than
+    /// admitting the demand without a reservation. The refusal names the exact
+    /// dimension, so the reader never has to infer which owner was missing.
+    #[test]
+    fn packet_headroom_join_refuses_dimension_without_frozen_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let request = gpu_demand_request(&fence)?;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is deliberately
+        // not `Debug`, so the error is taken by pattern instead of through
+        // `expect_err`; the refusal asserted below is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("ownerless dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::NoFrozenOwner { dimension } if dimension == HeadroomDimension::Gpu)
+        );
+        Ok(())
+    }
+
+    /// W8 wiring seam (issue #1679): the Queue dimension HAS a frozen
+    /// owner row (`HeadroomDimension::Queue.owner_bottleneck()` is
+    /// `Some(KernelRunnableControlSlots)`), but the single front-door
+    /// issuance port mints only `KernelControlChannel`, so the join
+    /// refuses with `NotIssuableByOwner` naming both bottlenecks
+    /// instead of admitting a wrong-dimension slot (I14.3: capacity is
+    /// reserved independently at every applicable bottleneck — no
+    /// borrowed capacity, one row per bottleneck).
+    #[test]
+    fn packet_headroom_join_reports_not_issuable_for_queue_dimension()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands[0].dimension = HeadroomDimension::Queue;
+        request.demands[0].request.requested_bottleneck = CapacityBottleneck::KernelControlChannel;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is
+        // deliberately not `Debug`, so the error is taken by pattern
+        // instead of through `expect_err`; the refusal asserted below
+        // is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("wrong-dimension slot must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::NotIssuableByOwner { dimension, required_bottleneck, issued_bottleneck, .. } if dimension == HeadroomDimension::Queue && required_bottleneck == CapacityBottleneck::KernelRunnableControlSlots && issued_bottleneck == CapacityBottleneck::KernelControlChannel)
+        );
+        Ok(())
+    }
+
+    /// W8 join seam (issue #1679): the Memory dimension HAS a frozen
+    /// owner row (`HeadroomDimension::Memory.owner_bottleneck()` is
+    /// `Some(ProtectedMemoryBytes)`), but the single front-door
+    /// issuance port mints only `KernelControlChannel`, so the join
+    /// reports `OwnerRefused` naming the dimension and its required
+    /// bottleneck instead of mis-issuing (I14.3: capacity is reserved
+    /// independently at every applicable bottleneck — no borrowed
+    /// capacity, one row per bottleneck).
+    #[test]
+    fn packet_headroom_join_owner_refuses_memory_dimension()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands[0].dimension = HeadroomDimension::Memory;
+        request.demands[0].request.requested_bottleneck = CapacityBottleneck::ProtectedMemoryBytes;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is
+        // deliberately not `Debug`, so the error is taken by pattern
+        // instead of through `expect_err`; the refusal asserted below
+        // is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("unissuable dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::OwnerRefused { dimension, bottleneck, .. } if dimension == HeadroomDimension::Memory && bottleneck == CapacityBottleneck::ProtectedMemoryBytes)
+        );
+        Ok(())
+    }
+
+    /// W8 join seam (issue #1679): the Network dimension HAS a frozen
+    /// owner row (`HeadroomDimension::Network.owner_bottleneck()` is
+    /// `Some(PipeMessageBytes)`), but the single front-door
+    /// issuance port mints only `KernelControlChannel`, so the join
+    /// reports `OwnerRefused` naming the dimension and its required
+    /// bottleneck instead of mis-issuing (I14.3: capacity is reserved
+    /// independently at every applicable bottleneck — no borrowed
+    /// capacity, one row per bottleneck).
+    #[test]
+    fn packet_headroom_join_owner_refuses_network_dimension()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands[0].dimension = HeadroomDimension::Network;
+        request.demands[0].request.requested_bottleneck = CapacityBottleneck::PipeMessageBytes;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is
+        // deliberately not `Debug`, so the error is taken by pattern
+        // instead of through `expect_err`; the refusal asserted below
+        // is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("unissuable dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::OwnerRefused { dimension, bottleneck, .. } if dimension == HeadroomDimension::Network && bottleneck == CapacityBottleneck::PipeMessageBytes)
+        );
+        Ok(())
+    }
+
+    /// W8 join seam (issue #1679): the Disk dimension HAS a frozen
+    /// owner row (`HeadroomDimension::Disk.owner_bottleneck()` is
+    /// `Some(DiskQueueWriteCapacity)`), but the single front-door
+    /// issuance port mints only `KernelControlChannel`, so the join
+    /// reports `OwnerRefused` naming the dimension and its required
+    /// bottleneck instead of mis-issuing (I14.3: capacity is reserved
+    /// independently at every applicable bottleneck — no borrowed
+    /// capacity, one row per bottleneck).
+    #[test]
+    fn packet_headroom_join_owner_refuses_disk_dimension() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands[0].dimension = HeadroomDimension::Disk;
+        request.demands[0].request.requested_bottleneck =
+            CapacityBottleneck::DiskQueueWriteCapacity;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is
+        // deliberately not `Debug`, so the error is taken by pattern
+        // instead of through `expect_err`; the refusal asserted below
+        // is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("unissuable dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::OwnerRefused { dimension, bottleneck, .. } if dimension == HeadroomDimension::Disk && bottleneck == CapacityBottleneck::DiskQueueWriteCapacity)
+        );
+        Ok(())
+    }
+
+    /// W8 join seam (issue #1679): the Cpu dimension HAS a frozen
+    /// owner row (`HeadroomDimension::Cpu.owner_bottleneck()` is
+    /// `Some(CpuControlTaskSlots)`), but the single front-door
+    /// issuance port mints only `KernelControlChannel`, so the join
+    /// reports `OwnerRefused` naming the dimension and its required
+    /// bottleneck instead of mis-issuing (I14.3: capacity is reserved
+    /// independently at every applicable bottleneck — no borrowed
+    /// capacity, one row per bottleneck).
+    #[test]
+    fn packet_headroom_join_owner_refuses_cpu_dimension() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands[0].dimension = HeadroomDimension::Cpu;
+        request.demands[0].request.requested_bottleneck = CapacityBottleneck::CpuControlTaskSlots;
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is
+        // deliberately not `Debug`, so the error is taken by pattern
+        // instead of through `expect_err`; the refusal asserted below
+        // is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("unissuable dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::OwnerRefused { dimension, bottleneck, .. } if dimension == HeadroomDimension::Cpu && bottleneck == CapacityBottleneck::CpuControlTaskSlots)
+        );
+        Ok(())
+    }
+
+    /// The join fails closed on a dimension that has no frozen owner row
+    /// (issue #1679, W3/AUD2): `HeadroomDimension::ModelQuota` has no
+    /// `owner_bottleneck()` and no frozen owner, so
+    /// `PacketHeadroomJoin::acquire` refuses it rather than admitting
+    /// the demand without a reservation. The refusal names the exact
+    /// dimension, so the reader never has to infer which owner was
+    /// missing.
+    #[test]
+    fn packet_headroom_join_refuses_modelquota_without_frozen_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let demand = HeadroomDemand {
+            dimension: HeadroomDimension::ModelQuota,
+            quantity: HeadroomQuantity::Unknown {
+                reason: eliot_contracts::ArtifactId::new("reason-mq-unknown")?,
+            },
+            request: CapacityRequest {
+                operation: RequestedOperationClass::Normal(NormalWorkClass::Interactive),
+                operation_id: "op-mq-1".to_owned(),
+                requested_bottleneck: CapacityBottleneck::KernelRunnableControlSlots,
+                requested_limit: CapacityLimit {
+                    unit: CapacityUnit::Items,
+                    quantity: NonZeroU64::new(1).ok_or("non-zero demand")?,
+                },
+                requesting_owner_ref: "owner-a".to_owned(),
+                requesting_generation_ref: ResourceGeneration::new(1)?,
+                authority_epoch_ref: test_epoch(1)?,
+                profile_id: "profile-1".to_owned(),
+                profile_revision: "rev-1".to_owned(),
+                deadline_ms: 1_000,
+            },
+        };
+        let request = DownstreamHeadroomRequest {
+            schema_version: DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+            pipeline_id: eliot_contracts::ArtifactId::new("pipe-mq-1")?,
+            attempt_id: eliot_contracts::ArtifactId::new("attempt-mq-1")?,
+            stage_id: eliot_contracts::ArtifactId::new("stage-mq-1")?,
+            consumer: HeadroomConsumer::Verifier,
+            binding: ContextBinding {
+                task_id: eliot_contracts::TaskId::new("task-one")?,
+                attempt_id: eliot_agent_contracts::AgentAttemptId::new("attempt-one")?,
+                scope_id: eliot_receipts::WorkScopeId::new("governor")?,
+                state_fence: fence.clone(),
+                decision_id: eliot_contracts::DecisionId::new("decision-one")?,
+                operation_id: None,
+            },
+            route_id: "route-mq-1".to_owned(),
+            serializer_id: "serializer-mq-1".to_owned(),
+            recipe_digest: "recipe-mq-1".to_owned(),
+            demands: vec![demand],
+            release: HeadroomReleaseCondition {
+                completion_receipt: eliot_contracts::ArtifactId::new("receipt-mq-1")?,
+                release_on_cancel: true,
+                expires_at_ms: 9_999_999,
+            },
+        };
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is deliberately
+        // not `Debug`, so the error is taken by pattern instead of through
+        // `expect_err`; the refusal asserted below is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("ownerless dimension must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::NoFrozenOwner { dimension } if dimension == HeadroomDimension::ModelQuota)
+        );
+        Ok(())
+    }
+
+    /// W8 join order (issue #1679): with two ownerless demands the
+    /// join refuses the FIRST one without consulting further, so no
+    /// later demand is admitted or masked (I14.3: every dimension
+    /// needs its owner).
+    #[test]
+    fn packet_headroom_join_refuses_first_ownerless_of_two_demands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let owner = test_front_door()?;
+        let mut request = gpu_demand_request(&fence)?;
+        request.demands.push(HeadroomDemand {
+            dimension: HeadroomDimension::ModelQuota,
+            quantity: HeadroomQuantity::Unknown {
+                reason: eliot_contracts::ArtifactId::new("reason-mq-1")?,
+            },
+            request: CapacityRequest {
+                operation: RequestedOperationClass::Normal(NormalWorkClass::Interactive),
+                operation_id: "op-mq-1".to_owned(),
+                requested_bottleneck: CapacityBottleneck::KernelRunnableControlSlots,
+                requested_limit: CapacityLimit {
+                    unit: CapacityUnit::Items,
+                    quantity: NonZeroU64::new(1).ok_or("non-zero demand")?,
+                },
+                requesting_owner_ref: "owner-a".to_owned(),
+                requesting_generation_ref: ResourceGeneration::new(1)?,
+                authority_epoch_ref: test_epoch(1)?,
+                profile_id: "profile-1".to_owned(),
+                profile_revision: "rev-1".to_owned(),
+                deadline_ms: 1_000,
+            },
+        });
+        // `PacketHeadroomJoin` holds a non-clone owner permit and is deliberately
+        // not `Debug`, so the error is taken by pattern instead of through
+        // `expect_err`; the refusal asserted below is the same one either way.
+        let Err(err) =
+            PacketHeadroomJoin::acquire(&owner, ResourceGeneration::new(1)?, &request, 1_000)
+        else {
+            panic!("ownerless demands must be refused, never admitted");
+        };
+        assert!(
+            matches!(err, PacketHeadroomJoinRefusal::NoFrozenOwner { dimension } if dimension == HeadroomDimension::Gpu)
+        );
+        Ok(())
     }
 
     fn evidence_request(

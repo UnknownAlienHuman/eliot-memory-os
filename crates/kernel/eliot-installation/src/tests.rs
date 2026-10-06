@@ -24,6 +24,7 @@ use crate::approved_generation_registry::{
 use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{HostOwnerEpochCapability, HostOwnerLease};
 
+mod isolated_destination;
 mod registry_concurrent_read;
 mod registry_wire_launch;
 mod rollback_recovery;
@@ -6236,6 +6237,46 @@ fn runtime_roots_reject_system_escape_and_portable_system_alias() {
         RuntimeStateRoots::derived(InstallationProfile::PortableDev, profiled.clone(), profiled,)
             .is_err(),
         "portable profile must not alias a profiled durable root"
+    );
+}
+
+/// A `SystemService` installation binding validates with the installation
+/// tree strictly below the I3.1 durable-data root, and refuses a durable
+/// root that is not the profile's own anchor child (issue #958: the
+/// admitted dispatch contour seeds a `SystemService` manifest, which can only
+/// validate when this join compares the installation root rather than the
+/// profile root, which is the durable root itself).
+#[cfg(windows)]
+#[test]
+fn system_service_installation_roots_validate_below_durable_data() {
+    let program_data = must(protected_program_data_root());
+    let anchor = test_handle(program_data.to_string_lossy().into_owned());
+    let roots = must(RuntimeStateRoots::derive_profiled(
+        InstallationProfile::SystemService,
+        anchor.clone(),
+        &"e".repeat(64),
+    ));
+    let user_root = std::env::temp_dir()
+        .join("eliot-958-user-root")
+        .to_string_lossy()
+        .into_owned();
+    let governed = InstallationRoots {
+        binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+        immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
+        durable_data: format!(r"{}\Eliot", anchor.as_str()),
+        user_config: user_root.clone(),
+        user_cache: user_root,
+        runtime_state_roots: roots,
+    };
+    must(governed.validate(InstallationProfile::SystemService));
+    let mut moved = governed.clone();
+    moved.durable_data = std::env::temp_dir()
+        .join("eliot-958-elsewhere")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        moved.validate(InstallationProfile::SystemService).is_err(),
+        "a durable root off the profile anchor still refuses"
     );
 }
 
