@@ -52,9 +52,9 @@ use eliot_blob::{
     BlobStreamUnavailableReason, LiveSetRevalidation, PublishState, RootClaimProof,
 };
 use eliot_blob_api::{
-    BlobCasCapability, BlobHash, BlobId, BlobIssuerTrustAnchor, BlobPolicyBinding,
-    BlobReceiptContext, BlobRootLease, BlobStageRequest, CompressionDescriptor, CryptoDescriptor,
-    ObjectResidencyKey, RetentionClass, VersionedContentDigest,
+    BlobCasCapability, BlobHash, BlobId, BlobIssuerTrustAnchor, BlobPolicyBinding, BlobReadRequest,
+    BlobReceiptContext, BlobRootLease, BlobStageRequest, BlobStoreClient, CompressionDescriptor,
+    CryptoDescriptor, ObjectResidencyKey, RetentionClass, VersionedContentDigest,
 };
 use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_process::{
@@ -629,6 +629,235 @@ impl BlobPlatformPort for FixturePlatform {
                     .map_err(|error| BlobError::InvalidContract(error.to_string()))
             })
             .collect()
+    }
+
+    fn now_unix_ms(&mut self) -> Result<u64, BlobError> {
+        Ok(0)
+    }
+}
+
+/// A `BlobPlatformPort` over a real temp directory: every durable byte the
+/// service hands down reaches the filesystem, so a stage leaves observable
+/// files and a read returns them. Conditional recovery stays a declared gap
+/// (`PlanGap` from `compare_and_replace_durable`, like the capacity
+/// fixture): this platform covers the stage/read path, never the CAS path.
+/// Clones share one root path and one claim slot, like the memory fixture.
+#[derive(Clone)]
+struct DirPlatform {
+    root: std::path::PathBuf,
+    claim: Arc<Mutex<Option<RootClaimProof>>>,
+}
+
+impl DirPlatform {
+    fn platform_error(context: &str, error: std::io::Error) -> BlobError {
+        BlobError::InvalidContract(format!("dir platform {context}: {error}"))
+    }
+
+    fn resolve(&self, path: &WorkScopePath) -> Result<std::path::PathBuf, BlobError> {
+        let identity = path.normalized_identity();
+        if identity.split('/').any(|component| {
+            component == ".." || component.contains('\\') || component.contains(':')
+        }) {
+            return Err(BlobError::InvalidContract(
+                "dir platform refuses non-contained path".to_owned(),
+            ));
+        }
+        Ok(self.root.join(identity))
+    }
+
+    /// Collects every file under `dir`, expressed relative to `dir`. The
+    /// service-side scope prefix applies at the caller (`list` retains only
+    /// the wanted scope), so the walk itself takes no prefix.
+    fn list_recursive(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<WorkScopePath>,
+    ) -> Result<(), BlobError> {
+        let entries =
+            std::fs::read_dir(dir).map_err(|error| Self::platform_error("list", error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| Self::platform_error("list", error))?;
+            let path = entry.path();
+            if path.is_dir() {
+                Self::list_recursive(root, &path, out)?;
+                continue;
+            }
+            let Some(identity) = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.to_str())
+            else {
+                continue;
+            };
+            out.push(
+                WorkScopePath::new(identity.replace('\\', "/"))
+                    .map_err(|error| BlobError::InvalidContract(error.to_string()))?,
+            );
+        }
+        Ok(())
+    }
+}
+
+impl BlobPlatformPort for DirPlatform {
+    fn claim_root(&mut self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
+        std::fs::create_dir_all(&self.root)
+            .map_err(|error| Self::platform_error("claim root", error))?;
+        let proof = RootClaimProof {
+            root_id: lease.root_id.as_str().to_owned(),
+            owner_id: lease.owner_id.as_str().to_owned(),
+            lease_id: lease.lease_id.as_str().to_owned(),
+            root_generation: lease.root_generation,
+            containment_proven: true,
+            permissions_proven: true,
+        };
+        match self.claim.lock() {
+            Ok(mut slot) => {
+                *slot = Some(proof.clone());
+                Ok(proof)
+            }
+            Err(_) => panic!("dir platform lock poisoned"),
+        }
+    }
+
+    fn inspect_root(&self, _lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
+        match self.claim.lock() {
+            Ok(slot) => slot.clone().ok_or(BlobError::OwnerConflict),
+            Err(_) => panic!("dir platform lock poisoned"),
+        }
+    }
+
+    fn prove_contained(
+        &self,
+        _lease: &BlobRootLease,
+        path: &WorkScopePath,
+    ) -> Result<(), BlobError> {
+        self.resolve(path).map(|_| ())
+    }
+
+    fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+        let resolved = self.resolve(path)?;
+        let bytes = std::fs::read(&resolved).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BlobError::NotFound
+            } else {
+                Self::platform_error("read", error)
+            }
+        })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(BlobError::InvalidContract(
+                "bounded platform read ceiling exceeded".to_owned(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn write_new_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+        let resolved = self.resolve(path)?;
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Self::platform_error("write parent", error))?;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&resolved)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(bytes)
+                    .map_err(|error| Self::platform_error("write", error))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(BlobError::IdempotencyConflict)
+            }
+            Err(error) => Err(Self::platform_error("write", error)),
+        }
+    }
+
+    fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+        let resolved = self.resolve(path)?;
+        if !resolved.exists() {
+            return Err(BlobError::NotFound);
+        }
+        std::fs::write(&resolved, bytes).map_err(|error| Self::platform_error("replace", error))
+    }
+
+    fn cas_capability(&self) -> BlobCasCapability {
+        BlobCasCapability::AtomicCompareAndReplace
+    }
+
+    fn compare_and_replace_durable(
+        &mut self,
+        _request: &eliot_blob_api::BlobCasRequest,
+        _bytes: &[u8],
+    ) -> Result<BlobCasProviderResult, BlobError> {
+        Err(BlobError::PlanGap(
+            "dir platform performs no conditional mutation".to_owned(),
+        ))
+    }
+
+    fn cas_status(&self, _operation_id: &str) -> Result<Option<BlobCasProviderResult>, BlobError> {
+        Ok(None)
+    }
+
+    fn backend_generation(&self) -> Result<u64, BlobError> {
+        Ok(1)
+    }
+
+    fn rename_no_replace_durable(
+        &mut self,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+    ) -> Result<(), BlobError> {
+        let from = self.resolve(source)?;
+        let to = self.resolve(destination)?;
+        if to.exists() {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Self::platform_error("rename parent", error))?;
+        }
+        std::fs::rename(&from, &to).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BlobError::NotFound
+            } else {
+                Self::platform_error("rename", error)
+            }
+        })
+    }
+
+    fn remove_durable(&mut self, path: &WorkScopePath) -> Result<(), BlobError> {
+        let resolved = self.resolve(path)?;
+        match std::fs::remove_file(&resolved) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Self::platform_error("remove", error)),
+        }
+    }
+
+    fn stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError> {
+        let resolved = self.resolve(path)?;
+        match std::fs::metadata(&resolved) {
+            Ok(metadata) => Ok(BlobPathState::File {
+                length: metadata.len(),
+                modified_unix_ms: 0,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(BlobPathState::Missing)
+            }
+            Err(error) => Err(Self::platform_error("stat", error)),
+        }
+    }
+
+    fn list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError> {
+        let mut out = Vec::new();
+        if self.root.exists() {
+            Self::list_recursive(&self.root, &self.root, &mut out)?;
+        }
+        let wanted = prefix.normalized_identity().to_owned();
+        out.retain(|path| path.normalized_identity().starts_with(&wanted));
+        Ok(out)
     }
 
     fn now_unix_ms(&mut self) -> Result<u64, BlobError> {
@@ -2155,4 +2384,179 @@ fn pressure_sheds_without_stalling_and_late_abort_conflicts() {
         before,
         "a conflicted abort stages nothing behind the recorded terminal"
     );
+}
+
+/// Source: the four injected seams (`BlobCompressionPort`, `BlobKeyPort`,
+/// `BlobAeadPort`, `BlobPlatformPort`) driven through `BlobStoreService::new`
+/// (`src/lib.rs`), with the platform leg on a real temp directory
+/// (`DirPlatform`, this file).
+/// Discovery: every sink case above runs all five seams, but always the same
+/// single fake behaviour behind each one — one codec identity, one key
+/// generation, one envelope, one memory platform. A seam that is never varied
+/// is a seam the suite assumes rather than proves, and a platform that never
+/// touches a disk proves nothing about the bytes' durable form. So this case
+/// varies each seam across at least two behaviours AND puts the platform leg
+/// on real files: the codec roundtrips, the key port pins generation 3 as
+/// current and echoes generation 9 on resolve, the AEAD seals (marker +
+/// plaintext, never plaintext) and rejects unmarked bytes, and the same bytes
+/// staged through the memory platform and through the directory platform
+/// settle the same content digest.
+/// Executed-pass: port-level pins for codec/keys/AEAD, then one stage of the
+/// same bytes on each platform; the directory leg asserts the sealed payload
+/// file exists on disk (marker-prefixed, never plaintext), the owner read
+/// returns exactly the staged bytes, and both legs agree on the digest.
+/// I05-12: one active root owner per store; the directory root is a unique
+/// temp case root removed at the end.
+// WORK_UNIT_CASE: 297/A2
+#[test]
+fn seam_matrix_stages_and_reads_through_a_real_directory() {
+    const BYTES: &[u8] = b"a2-matrix-real-fs-297";
+    let byte_len = BYTES.len() as u64;
+    let expected_sha256 = format!("{:x}", Sha256::digest(BYTES));
+
+    // Codec seam: identity roundtrip under its named algorithm.
+    let mut codec = FixtureCompression;
+    let descriptor = ok(codec.descriptor());
+    assert_eq!(ok(codec.compress(BYTES)), BYTES);
+    assert_eq!(
+        ok(codec.decompress_bounded(&descriptor, BYTES, 1024)),
+        BYTES
+    );
+
+    // Key seam: generation 3 is current; resolve echoes any generation with
+    // the same lineage, so rotation changes the selection, never the shape.
+    let mut keys = FixtureKeys;
+    let current = ok(keys.current());
+    assert_eq!(current.crypto.key_generation, 3);
+    let rotated = ok(keys.resolve(&CryptoDescriptor {
+        algorithm: ok(BlobId::new("test-only-authenticated-envelope")),
+        version: 1,
+        key_lineage: ok(BlobId::new("test-lineage")),
+        key_generation: 9,
+    }));
+    assert_eq!(rotated.crypto.key_generation, 9);
+    assert_eq!(rotated.crypto.key_lineage, current.crypto.key_lineage);
+
+    // AEAD seam: seal prepends the marker (never plaintext on the wire) and
+    // unmarked bytes fail to open.
+    let mut aead = FixtureAead;
+    let sealed = ok(aead.seal(AeadSealRequest {
+        key: &current,
+        nonce_context: b"a2-matrix",
+        associated_data: b"a2-matrix",
+        plaintext: BYTES,
+    }));
+    assert_ne!(sealed, BYTES, "sealed bytes are never the plaintext");
+    assert_eq!(&sealed[..1], &[0x01], "the envelope marker leads");
+    assert_eq!(
+        ok(aead.open(AeadOpenRequest {
+            key: &current,
+            nonce_context: b"a2-matrix",
+            associated_data: b"a2-matrix",
+            ciphertext: &sealed,
+        })),
+        BYTES
+    );
+    assert_eq!(
+        aead.open(AeadOpenRequest {
+            key: &current,
+            nonce_context: b"a2-matrix",
+            associated_data: b"a2-matrix",
+            ciphertext: BYTES,
+        }),
+        Err(BlobError::IntegrityMismatch),
+        "unmarked bytes never open as an envelope"
+    );
+
+    // Platform seam, memory leg: the same bytes through the memory platform.
+    let root = unique_test_root();
+    let mem_store = store_with_platform(FixturePlatform::default(), &root);
+    let mem_ready = ok(block_on(mem_store.stage(stage_request(
+        "a2-matrix",
+        BYTES,
+        &root,
+    ))));
+
+    // Platform seam, directory leg: a second store on the same seams except
+    // the platform, whose root is a real temp directory.
+    let dir = std::env::temp_dir().join(format!(
+        "eliot-297-a2-{}-{}",
+        std::process::id(),
+        TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    // A second store on the same root would raise `OwnerConflict` (A8): the
+    // directory leg owns a sibling root with its own lease.
+    let dir_root = format!("{root}-dir");
+    let bootstrap = stage_request("bootstrap", b"bootstrap", &dir_root);
+    let store = ok(BlobStoreService::new(
+        bootstrap.root_lease,
+        DirPlatform {
+            root: dir.clone(),
+            claim: Arc::new(Mutex::new(None)),
+        },
+        FixtureCompression,
+        FixtureKeys,
+        FixtureAead,
+        FixtureLiveSets,
+        test_anchor(),
+    ));
+    let ready = ok(block_on(store.stage(stage_request(
+        "a2-realfs",
+        BYTES,
+        &dir_root,
+    ))));
+    assert_eq!(ready.plaintext_sha256(), expected_sha256);
+    assert_eq!(ready.plaintext_length(), byte_len);
+    assert_eq!(
+        ready.locator(),
+        mem_ready.locator(),
+        "content identity does not depend on the platform behind the store"
+    );
+
+    // The sealed payload reached real files: some file under the case root
+    // holds exactly marker + plaintext, and NO file holds the plaintext.
+    let mut sealed_on_disk = false;
+    let mut plaintext_on_disk = false;
+    let mut pending = vec![dir.clone()];
+    while let Some(next) = pending.pop() {
+        for entry in ok(std::fs::read_dir(&next)) {
+            let entry = ok(entry);
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let bytes = ok(std::fs::read(&path));
+            sealed_on_disk = sealed_on_disk || bytes == sealed;
+            plaintext_on_disk = plaintext_on_disk || bytes == BYTES;
+        }
+    }
+    assert!(
+        sealed_on_disk,
+        "the staged payload reached the directory sealed, marker first"
+    );
+    assert!(
+        !plaintext_on_disk,
+        "the plaintext itself never reaches the directory"
+    );
+
+    // Owner readback through the directory platform returns exactly the
+    // staged bytes.
+    let read_context: BlobReceiptContext = ok(serde_json::from_str(&context_json(
+        "READ",
+        "sink-a2-read",
+        "request-sink-a2-read",
+    )));
+    let chunk = ok(block_on(store.read(BlobReadRequest {
+        context: read_context,
+        root_lease: lease_for(&receipt_context("sink-a2-read"), &dir_root),
+        locator: ready.locator().clone(),
+        expected_metadata_sha256: ready.metadata_sha256().to_owned(),
+        expected_ready_receipt_id: ready.receipt().identity.receipt_id.to_string(),
+        max_bytes: byte_len,
+    })));
+    assert!(chunk.validate().is_ok());
+    assert_eq!(chunk.bytes(), BYTES);
+
+    ok(std::fs::remove_dir_all(&dir));
 }
