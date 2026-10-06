@@ -101,7 +101,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
     def test_closed_descriptor_schema_round_trip(self) -> None:
         """Closed descriptor/schema round trip."""
         self.assertEqual(SCHEMA, "eliot.integration.ignored-test-inventory.v1")
-        self.assertEqual(TOOL_VERSION, "0.5.0")
+        self.assertEqual(TOOL_VERSION, "0.6.0")
 
         fixture_path = self.fixture_dir / "sample_inventory.json"
         self.assertTrue(fixture_path.is_file(), f"missing fixture: {fixture_path}")
@@ -1569,6 +1569,38 @@ class TestIgnoredTestInventory(unittest.TestCase):
             }
             compiler_message_line = json.dumps(compiler_message).encode("utf-8") + b"\n"
             valid_closed_stream = artifact_line + compiler_message_line + success_line
+            # Live rustc envelopes each diagnostic with "$message_type":
+            # "diagnostic" - admitted exactly; any other marker value or extra
+            # key stays refused so the closed shape holds on the live stream.
+            message_type_admitted = {
+                **compiler_message,
+                "message": {**compiler_message["message"], "$message_type": "diagnostic"},
+            }
+            message_type_stream = (
+                artifact_line + json.dumps(message_type_admitted).encode("utf-8") + b"\n" + success_line
+            )
+            self.assertEqual(
+                discover_compiled(troot, [target], runner=runner_for(message_type_stream)),
+                [],
+            )
+            for bad_diagnostic_message in (
+                {**compiler_message["message"], "$message_type": "artifact"},
+                {**compiler_message["message"], "$message_type": None},
+                {**compiler_message["message"], "unknown_extra": 1},
+            ):
+                with self.subTest(bad_diagnostic_message=bad_diagnostic_message):
+                    with self.assertRaises(InventoryError) as cm:
+                        discover_compiled(
+                            troot,
+                            [target],
+                            runner=runner_for(
+                                artifact_line
+                                + json.dumps({**compiler_message, "message": bad_diagnostic_message}).encode("utf-8")
+                                + b"\n"
+                                + success_line
+                            ),
+                        )
+                    self.assertEqual(cm.exception.code, "COMPILED_GRAPH_UNAVAILABLE")
             self.assertEqual(
                 discover_compiled(troot, [target], runner=runner_for(valid_closed_stream)),
                 [],

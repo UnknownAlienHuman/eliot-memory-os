@@ -1,6 +1,6 @@
 {
   "header": {
-    "aggregate_sha256": "278b77ad8a385faee5f6d772d49648b17f48c3d974e4269880752a9dde0a748a",
+    "aggregate_sha256": "c7bef5ff1515fdf9e2917e7464d57bc9ecec47516e9c83186631ef8d253b39e9",
     "artifact_denominator": [
       {
         "executable": "debug/deps/sample_package-1111111111111111",
@@ -128,7 +128,7 @@
       }
     ],
     "target_denominator_sha256": "5467214bd0687a55dfe1435a32494b593f756361b1c4025222dff0b85611d4ad",
-    "tool_version": "0.5.0",
+    "tool_version": "0.6.0",
     "toolchain": {
       "channel": "1.97.1",
       "commit_hash": "1111111111111111111111111111111111111111",

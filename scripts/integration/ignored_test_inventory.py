@@ -29,7 +29,7 @@ SCHEMA: Final = "eliot.integration.ignored-test-inventory.v1"
 # TOOL_VERSION binds the emitted artifact identity: any change to the header,
 # row schema, requirement classes, or classification rules bumps it, so two
 # different tool states never certify indistinguishable artifacts (issue #905 W3).
-TOOL_VERSION: Final = "0.5.0"
+TOOL_VERSION: Final = "0.6.0"
 OUTPUT_ROOT: Final = ".eliot"
 _TARGET_ROOT_PARTS: Final = (".eliot", "integration", "ignored-test-inventory", "target")
 _CARGO_METADATA_ARGV: Final = ("cargo", "metadata", "--locked", "--format-version", "1")
@@ -3273,9 +3273,14 @@ def _validate_compiler_diagnostic(value: Any, depth: int = 0) -> None:
     if depth > 64 or not isinstance(value, dict):
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic shape is invalid")
     required = {"message", "code", "level", "spans", "children"}
-    allowed = required | {"rendered"}
+    allowed = required | {"rendered", "$message_type"}
     if not required.issubset(value) or set(value) - allowed:
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic schema is not recognized")
+    # Current rustc envelopes every JSON diagnostic with "$message_type":
+    # "diagnostic". Admit exactly that value so the live toolchain validates,
+    # while any other extra key or marker value stays refused (closed shape).
+    if "$message_type" in value and value["$message_type"] != "diagnostic":
+        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic marker is invalid")
     if not isinstance(value["message"], str) or not isinstance(value["level"], str):
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "Cargo compiler diagnostic text is invalid")
     code = value["code"]
