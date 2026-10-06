@@ -72,8 +72,9 @@ use eliot_process::{
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
     Lease, ProcessAdmissionPermit, RawArtifactStream, SourceObservationGitPort, TestJob,
-    TestdError, TestdProviderEvidence, TestdSourceObservation, TestdSourceObservationRange,
-    TestdStore, TestdToolObservation, evaluate_testd_verification, issue_process_admission,
+    TestdError, TestdProviderEvidence, TestdReadbackContext, TestdSourceObservation,
+    TestdSourceObservationRange, TestdStore, TestdToolObservation, evaluate_testd_verification,
+    issue_process_admission,
 };
 
 use crate::kernel_client::{
@@ -767,6 +768,65 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     } = outcome;
     let finished_at = observation_clock(current_clock_ms());
     let records = collector.snapshot();
+    // Issue #456 (WB3/WB4): admit every emitted record into owner-neutral
+    // bundles before the receipt is composed, so both requested streams keep
+    // their explicit dispositions. Admission performs no readback and sets no
+    // parser/evaluator status.
+    for record in &records {
+        if let Err(error) = collector.admit_process_evidence(record) {
+            finish_unknown(
+                store,
+                claimed,
+                lease,
+                collector,
+                format!("typed evidence admission failed; outcome rescheduled as unknown: {error}"),
+            )?;
+            return Ok(());
+        }
+    }
+    // Issue #456 (WB4/D6/I3): with retention behind the executor, resolve
+    // every pending bundle through the readback port before the receipt is
+    // composed. Refusal and failure outcomes update the retained dispositions
+    // in place and never expose bytes; parser slots stay untouched when
+    // resolution fails, and the receipt below cites readback-bound bundles.
+    // The byte bound accepts every admitted length: the finish path verifies
+    // exact lengths through the core and drops the bytes without a parse
+    // consumer, so the transient allocation stays bounded by the admitted
+    // session limits. The deadline is the admitted profile wall timeout.
+    if let Some(retention) = contour.stream_retention() {
+        let deadline_ms = match profile_wall_timeout_ms(&claimed.invocation.profile) {
+            Ok(budget) => budget,
+            Err(error) => {
+                finish_unknown(
+                    store,
+                    claimed,
+                    lease,
+                    collector,
+                    format!(
+                        "readback deadline unavailable; outcome rescheduled as unknown: {error}"
+                    ),
+                )?;
+                return Ok(());
+            }
+        };
+        let context = TestdReadbackContext {
+            job_id: claimed.job_id.clone(),
+            invocation_id: claimed.invocation.request.request_id.as_str().to_owned(),
+            fence: claimed.invocation.request.state_fence.clone(),
+            max_bytes: u64::MAX,
+            deadline_ms,
+        };
+        if let Err(error) = collector.resolve_typed_sources(retention.as_ref(), &context) {
+            finish_unknown(
+                store,
+                claimed,
+                lease,
+                collector,
+                format!("typed source resolution failed; outcome rescheduled as unknown: {error}"),
+            )?;
+            return Ok(());
+        }
+    }
     if let Err(error) = capture_inline_previews(
         collector,
         &claimed.invocation.profile,
@@ -833,6 +893,31 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
             lease,
             collector,
             format!("typed restart persist failed; outcome rescheduled as unknown: {error}"),
+        )?;
+        return Ok(());
+    }
+    // Issue #456 (WD1 growth bound): drop this job's stream rows except the
+    // locators the finished receipt cites, so restart re-resolve keeps its
+    // bytes while uncited rows cannot accumulate across attempts.
+    let mut keep = Vec::new();
+    for bundle in &receipt.typed_evidence {
+        for slot in [&bundle.stdout, &bundle.stderr] {
+            if let Some(locator) = slot
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.locator.as_ref())
+            {
+                keep.push(locator.clone());
+            }
+        }
+    }
+    if let Err(error) = store.release_job_stream_sources_except(&claimed.job_id, &keep) {
+        finish_unknown(
+            store,
+            claimed,
+            lease,
+            collector,
+            format!("stream source release failed; outcome rescheduled as unknown: {error}"),
         )?;
         return Ok(());
     }

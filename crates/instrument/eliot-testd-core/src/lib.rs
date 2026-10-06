@@ -20,7 +20,7 @@ use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
 use eliot_process::{
-    EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
+    EnvironmentInheritance, EnvironmentProjection, ProcessEvidence, ProcessRequest, ResourceLimits,
 };
 use eliot_protocol::RequestIdentity;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -2971,6 +2971,23 @@ impl EvidenceCollector {
         self.typed
             .lock()
             .map_or_else(|_| Vec::new(), |items| items.clone())
+    }
+
+    /// Admits one emitted executor record into an owner-neutral bundle.
+    ///
+    /// Issue #456 (WB3): the production finish path admits every snapshot
+    /// record here, so both requested streams keep their explicit
+    /// dispositions. Admission performs no readback and sets no
+    /// parser/evaluator status.
+    pub fn admit_process_evidence(&self, record: &ProcessEvidence) -> Result<(), TestdError> {
+        let bundle = TestdProcessEvidenceBundle::admit(record)
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let mut typed = self
+            .typed
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        typed.push(bundle);
+        Ok(())
     }
 
     /// Snapshots the admitted typed bundles into a durable restart record.
