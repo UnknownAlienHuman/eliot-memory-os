@@ -502,6 +502,38 @@ class TestIgnoredTestInventory(unittest.TestCase):
             self.assertLess(failed_events.index("kill"), failed_events.index("reap"))
             self.assertLess(failed_events.index("reap"), failed_events.index("close"))
 
+        # The owned-execution environment is a closed allowlist (issue #905 W1):
+        # toolchain locators pass, everything else drops, absent vars vanish.
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "p",
+                "SystemDrive": "C:",
+                "ProgramData": "D:\\pd",
+                "EVIL_INJECTED": "x",
+                "RUSTFLAGS": "--cfg evil",
+            },
+            clear=True,
+        ):
+            owned_env = iti._fixed_command_env("troot")
+        self.assertEqual(
+            set(owned_env),
+            {
+                "PATH", "SystemDrive", "ProgramData", "CARGO_TARGET_DIR",
+                "CARGO_TERM_COLOR", "RUST_BACKTRACE",
+            },
+        )
+        self.assertEqual(owned_env["SystemDrive"], "C:")
+        self.assertEqual(owned_env["ProgramData"], "D:\\pd")
+        self.assertEqual(owned_env["CARGO_TARGET_DIR"], "troot")
+        self.assertNotIn("EVIL_INJECTED", owned_env)
+        self.assertNotIn("RUSTFLAGS", owned_env)
+        with patch.dict(os.environ, {}, clear=True):
+            empty_env = iti._fixed_command_env("troot")
+        self.assertEqual(
+            set(empty_env), {"CARGO_TARGET_DIR", "CARGO_TERM_COLOR", "RUST_BACKTRACE"}
+        )
+
     # WORK_UNIT_CASE: 905/3
     def test_ordinary_reason_bearing_ignored_sync_tests_found(self) -> None:
         """Ordinary reason-bearing ignored sync tests found."""

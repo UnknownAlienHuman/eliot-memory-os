@@ -880,6 +880,35 @@ def _remaining(deadline: float | None) -> float:
     return value
 
 
+def _fixed_command_env(target_root: str) -> dict[str, str]:
+    """Fail-closed environment for owned cargo/process execution (issue #905 W1).
+
+    Only toolchain-locating variables pass through: PATH-like lookup roots,
+    cargo/rustup homes, the admitted target dir, and the Windows MSVC locator
+    pair SystemDrive/ProgramData (rustc needs one of them to find link.exe;
+    without it every workspace link fails under the scrubbed environment).
+    Absent variables drop out via the falsy filter, so non-Windows runs are
+    unaffected. The values locate the toolchain only; they add no build input.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "USERPROFILE": os.environ.get("USERPROFILE", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        "SystemDrive": os.environ.get("SystemDrive", ""),
+        "ProgramData": os.environ.get("ProgramData", ""),
+        "WINDIR": os.environ.get("WINDIR", ""),
+        "TEMP": os.environ.get("TEMP", os.environ.get("TMP", "")),
+        "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),
+        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", ""),
+        "CARGO_HOME": os.environ.get("CARGO_HOME", ""),
+        "CARGO_TARGET_DIR": target_root,
+        "CARGO_TERM_COLOR": "never",
+        "RUST_BACKTRACE": "0",
+    }
+    return {key: value for key, value in env.items() if value}
+
+
 def _run_fixed(
     root: Path,
     argv: Sequence[str],
@@ -912,21 +941,7 @@ def _run_fixed(
         target_root = Path(os.path.abspath(admitted_target_root))
     else:
         target_root = _admitted_target_root(root)
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", ""),
-        "USERPROFILE": os.environ.get("USERPROFILE", ""),
-        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
-        "WINDIR": os.environ.get("WINDIR", ""),
-        "TEMP": os.environ.get("TEMP", os.environ.get("TMP", "")),
-        "TMP": os.environ.get("TMP", os.environ.get("TEMP", "")),
-        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", ""),
-        "CARGO_HOME": os.environ.get("CARGO_HOME", ""),
-        "CARGO_TARGET_DIR": str(target_root),
-        "CARGO_TERM_COLOR": "never",
-        "RUST_BACKTRACE": "0",
-    }
-    env = {key: value for key, value in env.items() if value}
+    env = _fixed_command_env(str(target_root))
     budget = timeout if timeout is not None else float(BOUNDS.command_timeout_seconds)
     if budget <= 0:
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "fixed command has no remaining deadline budget")
