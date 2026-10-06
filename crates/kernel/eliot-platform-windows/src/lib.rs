@@ -116,6 +116,7 @@ mod supervision_authority_key;
 mod tcp_listener_owner;
 mod terminal_containment;
 mod user_owned_leases;
+mod usn_journal;
 
 use crate::service_registration::{exact_path_text, utf16_text};
 
@@ -331,6 +332,12 @@ pub use user_owned_leases::{
     UserSelectedResourceKind, UserSelectedResourceLease, UserSelectedResourceMeasurement,
     UserSelectedResourceNodeMeasurement,
 };
+pub use usn_journal::{
+    UsnCursor, UsnJournalError, UsnJournalPage, UsnJournalState, UsnRecordView,
+    query_usn_journal_state, read_usn_journal_page,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use usn_journal::{parse_usn_record_page, volume_device_path};
 
 /// Failure returned by a Windows-only primitive before it can be projected
 /// into a provider-neutral P-01 outcome.
