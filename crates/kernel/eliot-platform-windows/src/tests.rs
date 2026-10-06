@@ -18,6 +18,7 @@ use crate::secret_store::{
     credential_write, installer_credential_target, require_exact_credential_readback,
     valid_credential_key, valid_installer_credential_target,
 };
+use crate::usn_journal::{parse_usn_record_page, volume_device_path};
 
 #[cfg(windows)]
 #[test]
@@ -4964,5 +4965,255 @@ fn kernel_front_door_proof_binds_process_image_file_and_artifact() {
             .approved_process_binding()
             .and_then(NamedPipePeerProcessBinding::executable_file_identity),
         Some(file)
+    );
+}
+
+#[test]
+fn observe_process_identity_refuses_pid_zero() {
+    assert_eq!(
+        observe_process_identity(0),
+        Err(ProcessIdentityError::InvalidProcessId)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn observe_process_identity_binds_the_current_process() {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let process_id = unsafe { GetCurrentProcessId() };
+    let identity = observe_process_identity(process_id)
+        .unwrap_or_else(|error| panic!("current process unobservable: {error}"));
+    assert_eq!(identity.process_id, process_id);
+    assert!(identity.start_time_100ns > 0);
+    assert!(!identity.image_path.is_empty());
+    assert!(identity.stable_key().starts_with("windows-pid:"));
+}
+
+#[cfg(windows)]
+#[test]
+fn observe_process_identity_refuses_an_unknown_pid() {
+    assert!(observe_process_identity(u32::MAX).is_err());
+}
+
+fn usn_v2_record(usn: u64, reason: u32, name: &str) -> Vec<u8> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let name_bytes = units.len() * 2;
+    let length = 60 + name_bytes;
+    let mut record = vec![0_u8; length];
+    record[0..4].copy_from_slice(
+        &u32::try_from(length)
+            .unwrap_or_else(|_| unreachable!())
+            .to_le_bytes(),
+    );
+    record[4..6].copy_from_slice(&2_u16.to_le_bytes());
+    record[24..32].copy_from_slice(&usn.to_le_bytes());
+    record[40..44].copy_from_slice(&reason.to_le_bytes());
+    record[56..58].copy_from_slice(
+        &u16::try_from(name_bytes)
+            .unwrap_or_else(|_| unreachable!())
+            .to_le_bytes(),
+    );
+    record[58..60].copy_from_slice(&60_u16.to_le_bytes());
+    for (index, unit) in units.iter().enumerate() {
+        record[60 + index * 2..62 + index * 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    record
+}
+
+fn usn_v3_record(usn: u64, reason: u32, name: &str) -> Vec<u8> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let name_bytes = units.len() * 2;
+    let length = 68 + name_bytes;
+    let mut record = vec![0_u8; length];
+    record[0..4].copy_from_slice(
+        &u32::try_from(length)
+            .unwrap_or_else(|_| unreachable!())
+            .to_le_bytes(),
+    );
+    record[4..6].copy_from_slice(&3_u16.to_le_bytes());
+    record[40..48].copy_from_slice(&usn.to_le_bytes());
+    record[48..52].copy_from_slice(&reason.to_le_bytes());
+    record[64..66].copy_from_slice(
+        &u16::try_from(name_bytes)
+            .unwrap_or_else(|_| unreachable!())
+            .to_le_bytes(),
+    );
+    record[66..68].copy_from_slice(&68_u16.to_le_bytes());
+    for (index, unit) in units.iter().enumerate() {
+        record[68 + index * 2..70 + index * 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    record
+}
+
+#[test]
+fn usn_record_parser_reads_v2_and_v3_records_in_order() {
+    let mut buffer = usn_v2_record(0x1234_5678, 0x100, "t.txt");
+    buffer.extend_from_slice(&usn_v3_record(0x9999, 0x2, "log"));
+    let records = parse_usn_record_page(&buffer).unwrap_or_else(|_| unreachable!());
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].usn, 0x1234_5678);
+    assert_eq!(records[0].reason, 0x100);
+    assert_eq!(records[0].file_name, "t.txt");
+    assert_eq!(records[0].record_length, 60 + 10);
+    assert_eq!(records[1].usn, 0x9999);
+    assert_eq!(records[1].file_name, "log");
+    assert_eq!(records[1].record_length, 68 + 6);
+    assert!(
+        parse_usn_record_page(&[])
+            .unwrap_or_else(|_| unreachable!())
+            .is_empty()
+    );
+}
+
+#[test]
+fn usn_record_parser_refuses_truncation_and_unknown_versions() {
+    let record = usn_v2_record(1, 1, "t.txt");
+    assert_eq!(
+        parse_usn_record_page(&record[..record.len() - 1])
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
+        UsnJournalError::TruncatedRecord
+    );
+    assert_eq!(
+        parse_usn_record_page(&record[..4])
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
+        UsnJournalError::TruncatedRecord
+    );
+    let mut bad_version = record.clone();
+    bad_version[4..6].copy_from_slice(&9_u16.to_le_bytes());
+    assert_eq!(
+        parse_usn_record_page(&bad_version)
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
+        UsnJournalError::UnsupportedRecordVersion { version: 9 }
+    );
+}
+
+#[test]
+fn usn_volume_device_path_accepts_drive_paths_only() {
+    let expected: Vec<u16> = "\\\\.\\C:".encode_utf16().chain([0]).collect();
+    assert_eq!(
+        volume_device_path(std::path::Path::new("C:\\Watch\\scope"))
+            .unwrap_or_else(|_| unreachable!()),
+        expected
+    );
+    let expected_d: Vec<u16> = "\\\\.\\D:".encode_utf16().chain([0]).collect();
+    assert_eq!(
+        volume_device_path(std::path::Path::new("d:/watch")).unwrap_or_else(|_| unreachable!()),
+        expected_d
+    );
+    assert_eq!(
+        volume_device_path(std::path::Path::new("relative/path"))
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
+        UsnJournalError::InvalidVolume
+    );
+    assert_eq!(
+        volume_device_path(std::path::Path::new("\\\\server\\share"))
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
+        UsnJournalError::InvalidVolume
+    );
+}
+
+#[cfg(windows)]
+fn usn_system_volume_root() -> std::path::PathBuf {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| unreachable!());
+    std::path::PathBuf::from(format!("{drive}\\"))
+}
+
+/// True when this test process can open a volume for journal reads.
+///
+/// Volume reads need elevation; without it every journal call fails closed
+/// with `AccessDenied`. The live tests below prove the strict path when
+/// elevated and the exact fail-closed refusal otherwise — never a silent
+/// pass in either case.
+#[cfg(windows)]
+fn usn_journal_tests_elevated() -> bool {
+    unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+}
+
+#[cfg(windows)]
+#[test]
+fn usn_journal_state_query_on_system_volume() {
+    let root = usn_system_volume_root();
+    if !usn_journal_tests_elevated() {
+        assert_eq!(
+            query_usn_journal_state(&root)
+                .err()
+                .unwrap_or_else(|| panic!("USN negative must refuse")),
+            UsnJournalError::AccessDenied
+        );
+        return;
+    }
+    let state = query_usn_journal_state(&root).unwrap_or_else(|_| unreachable!());
+    assert_ne!(state.journal_id, 0);
+    assert!(state.next_usn >= state.lowest_valid_usn);
+}
+
+#[cfg(windows)]
+#[test]
+fn usn_journal_page_read_advances_through_a_live_cursor() {
+    let root = usn_system_volume_root();
+    if !usn_journal_tests_elevated() {
+        let denied = UsnCursor {
+            journal_id: 0,
+            next_usn: 0,
+        };
+        assert_eq!(
+            read_usn_journal_page(&root, &denied, 65_536)
+                .err()
+                .unwrap_or_else(|| panic!("USN negative must refuse")),
+            UsnJournalError::AccessDenied
+        );
+        return;
+    }
+    let state = query_usn_journal_state(&root).unwrap_or_else(|_| unreachable!());
+    let cursor = UsnCursor {
+        journal_id: state.journal_id,
+        next_usn: state.next_usn,
+    };
+    let page = read_usn_journal_page(&root, &cursor, 65_536).unwrap_or_else(|_| unreachable!());
+    assert_eq!(page.journal_id, state.journal_id);
+    assert!(page.next_usn >= cursor.next_usn);
+    let advanced = UsnCursor {
+        journal_id: page.journal_id,
+        next_usn: page.next_usn,
+    };
+    let again = read_usn_journal_page(&root, &advanced, 65_536).unwrap_or_else(|_| unreachable!());
+    assert_eq!(again.journal_id, state.journal_id);
+}
+
+#[cfg(windows)]
+#[test]
+fn usn_journal_page_read_with_a_dead_journal_id_is_stale() {
+    let root = usn_system_volume_root();
+    if !usn_journal_tests_elevated() {
+        let denied = UsnCursor {
+            journal_id: 0,
+            next_usn: 0,
+        };
+        assert_eq!(
+            read_usn_journal_page(&root, &denied, 65_536)
+                .err()
+                .unwrap_or_else(|| panic!("USN negative must refuse")),
+            UsnJournalError::AccessDenied
+        );
+        return;
+    }
+    let state = query_usn_journal_state(&root).unwrap_or_else(|_| unreachable!());
+    let dead = UsnCursor {
+        journal_id: 0,
+        next_usn: 0,
+    };
+    assert_eq!(
+        read_usn_journal_page(&root, &dead, 65_536)
+            .err()
+            .unwrap_or_else(|| panic!("USN negative must refuse")),
+        UsnJournalError::StaleCursor {
+            expected_journal_id: 0,
+            observed_journal_id: state.journal_id,
+        }
     );
 }

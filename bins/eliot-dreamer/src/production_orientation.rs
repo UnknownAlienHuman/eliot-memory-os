@@ -1148,7 +1148,10 @@ fn blocked_result(parts: BlockedParts) -> Result<OrientationPulseResult, PulseEr
 /// Builds the blocked result for the absent Governor supply channel: the
 /// CC-002 boundary is present and committed, the CC-004 boundary and every
 /// stage-owner record are absent, and no packet projects.
-fn supply_missing_blocked(
+///
+/// `pub(crate)` so the dispatch-side unit proofs pin each refusal code
+/// against the same admitted fixtures production derives (issue #2901 A1).
+pub(crate) fn supply_missing_blocked(
     admission: &KernelJobAdmission,
     admitted_job: &AdmittedOrientationJob,
     candidate: &ValidatedCandidate,
@@ -1524,6 +1527,231 @@ mod curation_member_identity_tests {
             ),
             Err("conflict set task"),
             "a set carrying a foreign task must be refused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod carrier_deadline_tests {
+    use crate::pulse::PulseError;
+
+    use super::check_carrier_deadline;
+
+    /// A deadline 1ms past the Unix epoch is in the past on any real clock,
+    /// so the carrier must fail closed here rather than publish a stale pulse.
+    #[test]
+    fn past_deadline_is_refused() {
+        assert!(
+            matches!(check_carrier_deadline(1), Err(PulseError::DeadlineExceeded)),
+            "a past carrier deadline must refuse with DeadlineExceeded"
+        );
+    }
+
+    /// `u64::MAX` ms is unreachable by any real clock, so a live carrier
+    /// passes this gate (positive control for the refusal above).
+    #[test]
+    fn far_future_deadline_passes() {
+        assert!(
+            check_carrier_deadline(u64::MAX).is_ok(),
+            "a far-future carrier deadline must pass"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_disposition_tests {
+    use super::unusable_model_reason;
+    use eliot_dreamer_contracts::ModelRouteDisposition;
+
+    /// Every model-route disposition maps to exactly one gate answer
+    /// (issue #2901 A1): usable outcomes pass with no reason, and each
+    /// unusable outcome names its own static reason, so the
+    /// `unusable_model_blocked` builder below can never publish one
+    /// condition's pulse under another's reason.
+    #[test]
+    fn every_disposition_maps_to_one_answer() {
+        assert_eq!(
+            unusable_model_reason(ModelRouteDisposition::Completed),
+            None,
+            "a completed outcome is usable"
+        );
+        assert_eq!(
+            unusable_model_reason(ModelRouteDisposition::Partial),
+            None,
+            "a partial outcome is usable"
+        );
+        let reasons = [
+            unusable_model_reason(ModelRouteDisposition::Malformed),
+            unusable_model_reason(ModelRouteDisposition::Cancelled),
+            unusable_model_reason(ModelRouteDisposition::Timeout),
+        ];
+        for reason in reasons {
+            let Some(reason) = reason else {
+                panic!("an unusable outcome must name its reason")
+            };
+            assert!(
+                !reason.is_empty(),
+                "refusal reasons are static codes, never blank"
+            );
+        }
+        assert_ne!(
+            reasons[0], reasons[1],
+            "malformed and cancelled stay distinct"
+        );
+        assert_ne!(
+            reasons[1], reasons[2],
+            "cancelled and timeout stay distinct"
+        );
+        assert_ne!(
+            reasons[0], reasons[2],
+            "malformed and timeout stay distinct"
+        );
+    }
+}
+
+#[cfg(test)]
+mod blocked_result_tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+
+    use super::{BlockedIdentity, BlockedParts, blocked_result, blocked_stage_record};
+    use crate::pulse::{CEILING_BLOCKED, PulseStageId};
+    use crate::{OrientationAdmittedPrefix, OrientationBoundaryRecord, OrientationDisposition};
+
+    const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> StateFence {
+        let lineage = match EpochLineageId::new(LINEAGE) {
+            Ok(lineage) => lineage,
+            Err(error) => panic!("test lineage must parse: {error:?}"),
+        };
+        let Some(sequence) = NonZeroU64::new(1) else {
+            panic!("test sequence must be non-zero");
+        };
+        let epoch = match EpochId::new(lineage, sequence) {
+            Ok(epoch) => epoch,
+            Err(error) => panic!("test epoch must build: {error:?}"),
+        };
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    /// `blocked_result` carries every mandatory-denominator record with its
+    /// reason and loses none: ten stages, each refusing with its own reason,
+    /// both omission reasons preserved verbatim, no packet, disposition
+    /// `Blocked`.
+    #[test]
+    fn blocked_result_covers_full_denominator() {
+        let stages: Vec<_> = PulseStageId::ORDER
+            .iter()
+            .map(|id| blocked_stage_record(*id, id.missing_reason()))
+            .collect();
+        assert_eq!(
+            stages.len(),
+            PulseStageId::ORDER.len(),
+            "one ledger record per mandatory-denominator member"
+        );
+        let omissions = vec!["reason-a".to_owned(), "reason-b".to_owned()];
+        let missing_owners = vec!["owner-a".to_owned(), "owner-b".to_owned()];
+        let result = match blocked_result(BlockedParts {
+            identity: BlockedIdentity {
+                job_id: "job-a3".to_owned(),
+                task_id: "task-a3".to_owned(),
+                scope_id: "scope-a3".to_owned(),
+                operation_id: "op-a3".to_owned(),
+                fence: fence(),
+            },
+            admitted: OrientationAdmittedPrefix {
+                candidate_digest: "c".to_owned(),
+                policy_digest: "p".to_owned(),
+                bundle_digest: "b".to_owned(),
+            },
+            model_outcome: OrientationBoundaryRecord {
+                boundary: "cc002_model_route".to_owned(),
+                present: false,
+                commitment: None,
+                disposition: None,
+                reason: Some("reason-a".to_owned()),
+            },
+            projections: OrientationBoundaryRecord {
+                boundary: "cc004_canonical_projections".to_owned(),
+                present: false,
+                commitment: None,
+                disposition: None,
+                reason: Some("reason-b".to_owned()),
+            },
+            stages,
+            omissions: omissions.clone(),
+            missing_owners: missing_owners.clone(),
+        }) {
+            Ok(result) => result,
+            Err(error) => panic!("complete blocked ledger must publish: {error:?}"),
+        };
+        assert_eq!(result.disposition, OrientationDisposition::Blocked);
+        assert!(result.packet.is_none(), "a blocked pulse carries no packet");
+        assert_eq!(
+            result.stages.len(),
+            PulseStageId::ORDER.len(),
+            "all ten denominator records travel"
+        );
+        for record in &result.stages {
+            assert!(
+                record.reason.is_some(),
+                "no stage record loses its reason: {}",
+                record.stage
+            );
+        }
+        assert_eq!(result.omissions, omissions, "no omission reason is lost");
+        assert_eq!(result.missing_owners, missing_owners);
+    }
+
+    /// One blocked ledger record serializes with all ten members, including
+    /// the input/output commitments and the proof ceiling: a JSON reader
+    /// sees the same denominator shape the receipt logic binds.
+    #[test]
+    fn stage_record_json_carries_ten_members() {
+        let record = blocked_stage_record(PulseStageId::Grounding, "reason-g");
+        let value = match serde_json::to_value(&record) {
+            Ok(value) => value,
+            Err(error) => panic!("stage record must serialize: {error:?}"),
+        };
+        let Some(object) = value.as_object() else {
+            panic!("stage record serializes as a JSON object")
+        };
+        for member in [
+            "stage",
+            "owner",
+            "required",
+            "disposition",
+            "expected_input",
+            "input_commitment",
+            "output_commitment",
+            "proof_ceiling",
+            "reason",
+            "recovery",
+        ] {
+            assert!(
+                object.contains_key(member),
+                "stage JSON keeps member {member}"
+            );
+        }
+        assert_eq!(
+            object.len(),
+            10,
+            "exactly the ten denominator members, no more"
+        );
+        assert_eq!(
+            object["stage"],
+            PulseStageId::Grounding.as_str(),
+            "the record names its denominator member"
+        );
+        assert_eq!(
+            object["proof_ceiling"], CEILING_BLOCKED,
+            "a blocked record carries the blocked ceiling"
+        );
+        assert_eq!(
+            object["reason"], "reason-g",
+            "the refusal reason survives serialization"
         );
     }
 }
