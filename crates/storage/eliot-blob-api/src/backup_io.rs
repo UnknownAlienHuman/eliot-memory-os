@@ -106,14 +106,17 @@ impl SealedBlobRead {
 
 /// Owner-issued destination scope for sealed-blob backup import.
 ///
-/// Binds the admitted destination root generation, the destination key
-/// lineage/generation that re-sealed envelopes must carry, and the exact
-/// residency-key digest of the residency identity under import. Equal content
-/// in different residency domains yields different digests, so the scope can
-/// never authorize cross-domain coalescing.
+/// Binds the admitted destination root generation, the admitted destination
+/// owner, the destination key lineage/generation that re-sealed envelopes
+/// must carry, and the exact residency-key digest of the residency identity
+/// under import. Equal content in different residency domains yields
+/// different digests, so the scope can never authorize cross-domain
+/// coalescing; a lease owned by anyone else refuses as a second-owner
+/// conflict even when every other binding still matches.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BlobBackupScope {
     dest_root_generation: u64,
+    dest_owner: BlobId,
     dest_key_lineage: BlobId,
     dest_key_generation: u64,
     residency_digest: String,
@@ -123,6 +126,7 @@ pub struct BlobBackupScope {
 #[serde(deny_unknown_fields)]
 struct BlobBackupScopeWire {
     dest_root_generation: u64,
+    dest_owner: BlobId,
     dest_key_lineage: BlobId,
     dest_key_generation: u64,
     residency_digest: String,
@@ -134,7 +138,8 @@ impl BlobBackupScope {
     /// Validates the destination root lease, the destination crypto
     /// descriptor, and the residency identity through their real owner
     /// contracts, then derives the residency digest from the validated
-    /// residency — the caller supplies no digest text.
+    /// residency — the caller supplies no digest text. The issuing lease's
+    /// owner is pinned: only that owner may later present the scope.
     pub fn issue(
         lease: &BlobRootLease,
         crypto: &CryptoDescriptor,
@@ -145,6 +150,7 @@ impl BlobBackupScope {
         residency.validate()?;
         let scope = Self {
             dest_root_generation: lease.root_generation,
+            dest_owner: lease.owner_id.clone(),
             dest_key_lineage: crypto.key_lineage.clone(),
             dest_key_generation: crypto.key_generation,
             residency_digest: residency.key_digest()?,
@@ -167,9 +173,11 @@ impl BlobBackupScope {
     /// Re-verifies this scope against live owner-validated inputs.
     ///
     /// Generation drift of the destination root refuses with
-    /// [`BlobError::StaleFence`]; a rotated destination key binding refuses as
-    /// a field mismatch; a residency digest that no longer matches the exact
-    /// residency identity refuses as [`BlobError::IntegrityMismatch`].
+    /// [`BlobError::StaleFence`]; a lease owned by anyone but the issuing
+    /// owner refuses with [`BlobError::OwnerConflict`]; a rotated destination
+    /// key binding refuses as a field mismatch; a residency digest that no
+    /// longer matches the exact residency identity refuses as
+    /// [`BlobError::IntegrityMismatch`].
     pub fn verify_against(
         &self,
         lease: &BlobRootLease,
@@ -181,6 +189,9 @@ impl BlobBackupScope {
         residency.validate()?;
         if lease.root_generation != self.dest_root_generation {
             return Err(BlobError::StaleFence);
+        }
+        if lease.owner_id != self.dest_owner {
+            return Err(BlobError::OwnerConflict);
         }
         if crypto.key_lineage != self.dest_key_lineage
             || crypto.key_generation != self.dest_key_generation
@@ -200,6 +211,12 @@ impl BlobBackupScope {
     #[must_use]
     pub fn dest_root_generation(&self) -> u64 {
         self.dest_root_generation
+    }
+
+    /// Owner the scope was issued to; no second owner may present it.
+    #[must_use]
+    pub fn dest_owner(&self) -> &BlobId {
+        &self.dest_owner
     }
 
     /// Destination key lineage re-sealed envelopes must carry.
@@ -226,6 +243,7 @@ impl<'de> Deserialize<'de> for BlobBackupScope {
         let wire = BlobBackupScopeWire::deserialize(deserializer)?;
         let value = Self {
             dest_root_generation: wire.dest_root_generation,
+            dest_owner: wire.dest_owner,
             dest_key_lineage: wire.dest_key_lineage,
             dest_key_generation: wire.dest_key_generation,
             residency_digest: wire.residency_digest,
@@ -427,6 +445,52 @@ impl BlobBackupFence {
         Ok(fence)
     }
 
+    /// Fixes the denominator from canonical capture evidence.
+    ///
+    /// The member set is derived from owner-observed capture records — never
+    /// from a caller vector, a filesystem scan, or a content-hash list. Every
+    /// record re-validates here; the shared [`Self::fence`] validation then
+    /// enforces the uniform source generation and the duplicate refusal, so a
+    /// foreign-generation record refuses exactly like a foreign member.
+    pub fn fence_from_capture(
+        operation_id: String,
+        source_root_generation: u64,
+        records: &[SealedBlobCaptureRecord],
+        max_members_per_page: u32,
+        max_bytes_per_member: u64,
+        max_total_sealed_bytes: u64,
+    ) -> Result<Self, BlobError> {
+        let mut members = Vec::with_capacity(records.len());
+        for record in records {
+            record.validate()?;
+            members.push(record.locator().clone());
+        }
+        Self::fence(
+            operation_id,
+            source_root_generation,
+            members,
+            max_members_per_page,
+            max_bytes_per_member,
+            max_total_sealed_bytes,
+        )
+    }
+
+    /// Canonical digest of the fenced denominator.
+    ///
+    /// Recomputed here over fence-ordered locator hashes plus residency-key
+    /// digests — the caller supplies no digest text. Two fences over the same
+    /// canonical capture agree; any member change moves it.
+    pub fn canonical_digest(&self) -> Result<String, BlobError> {
+        let mut input = String::new();
+        for member in &self.members {
+            input.push_str(member.hash.as_str());
+            input.push('\n');
+            input.push_str(&member.residency_key_digest()?);
+            input.push('\n');
+        }
+        Ok(sha256_hex(input.as_bytes()))
+    }
+
     fn validate(&self) -> Result<(), BlobError> {
         valid_operation_id(&self.operation_id, "backup_fence.operation_id")?;
         if self.source_root_generation == 0 {
@@ -446,6 +510,12 @@ impl BlobBackupFence {
         }
         for member in &self.members {
             member.validate()?;
+            if member.root_generation != self.source_root_generation {
+                return Err(BlobError::InvalidField {
+                    field: "backup_fence.member.root_generation",
+                    reason: "member generation must equal the fenced source generation",
+                });
+            }
         }
         for (index, member) in self.members.iter().enumerate() {
             if self.members[..index].contains(member) {
@@ -1015,6 +1085,28 @@ impl BlobBackupCompletionReceipt {
         })
     }
 
+    /// Reconciles a same-operation replay against a prior receipt.
+    ///
+    /// Re-runs the full [`Self::complete`] verification over the presented
+    /// evidence and requires byte-identical agreement with the persisted
+    /// prior receipt: an exact replay re-issues the same receipt, while
+    /// changed inputs under the same operation identity refuse with
+    /// [`BlobError::IdempotencyConflict`] instead of minting a second
+    /// receipt for one operation.
+    pub fn reconcile_same_operation(
+        prior: &Self,
+        fence: &BlobBackupFence,
+        records: &[SealedBlobCaptureRecord],
+        completions: &[PageCompletion],
+        scope: &BlobBackupScope,
+    ) -> Result<Self, BlobError> {
+        let rerun = Self::complete(fence, records, completions, scope)?;
+        if rerun != *prior {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        Ok(rerun)
+    }
+
     /// Operation this receipt completes.
     #[must_use]
     pub fn operation_id(&self) -> &str {
@@ -1043,5 +1135,175 @@ impl BlobBackupCompletionReceipt {
     #[must_use]
     pub fn scope_residency_digest(&self) -> &str {
         &self.scope_residency_digest
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VersionedContentDigest;
+
+    fn test_id(value: &str) -> BlobId {
+        match BlobId::new(value) {
+            Ok(id) => id,
+            Err(error) => panic!("test id: {error}"),
+        }
+    }
+
+    /// A valid member locator carrying `root_generation`. Distinct seeds give
+    /// distinct content identities, so multi-member fences never trip the
+    /// duplicate-identity refusal for the wrong reason.
+    fn test_locator(seed: u8, root_generation: u64) -> BlobLocator {
+        let hex = format!("{seed:02x}").repeat(32);
+        let hash = match BlobHash::new(hex) {
+            Ok(hash) => hash,
+            Err(error) => panic!("test hash: {error}"),
+        };
+        BlobLocator {
+            hash: hash.clone(),
+            residency: ObjectResidencyKey {
+                scope_domain_id: test_id("scope-a"),
+                access_domain_id: test_id("access-a"),
+                confidentiality_domain_id: test_id("conf-a"),
+                encryption_key_domain_id: test_id("key-lineage-a"),
+                retention_domain_id: test_id("retention-a"),
+                erasure_domain_id: test_id("erasure-a"),
+                content_digest: VersionedContentDigest {
+                    algorithm: test_id("blake3"),
+                    version: 1,
+                    digest: hash,
+                },
+            },
+            root_generation,
+            path_generation: 1,
+        }
+    }
+
+    fn test_fence(members: Vec<BlobLocator>) -> Result<BlobBackupFence, BlobError> {
+        BlobBackupFence::fence("backup-op-1".to_owned(), 7, members, 8, 1024, 65536)
+    }
+
+    fn test_crypto() -> CryptoDescriptor {
+        CryptoDescriptor {
+            algorithm: test_id("seal-alg"),
+            version: 1,
+            key_lineage: test_id("key-lineage-a"),
+            key_generation: 1,
+        }
+    }
+
+    fn test_record(seed: u8, root_generation: u64) -> Result<SealedBlobCaptureRecord, BlobError> {
+        SealedBlobCaptureRecord::capture(
+            test_locator(seed, root_generation),
+            "a".repeat(64),
+            "b".repeat(64),
+            test_crypto(),
+        )
+    }
+
+    fn test_capture_fence(
+        records: &[SealedBlobCaptureRecord],
+    ) -> Result<BlobBackupFence, BlobError> {
+        BlobBackupFence::fence_from_capture("backup-op-1".to_owned(), 7, records, 8, 1024, 65536)
+    }
+
+    #[test]
+    fn fence_accepts_members_at_fenced_generation() {
+        let fence = match test_fence(vec![test_locator(0xA1, 7), test_locator(0xB2, 7)]) {
+            Ok(fence) => fence,
+            Err(error) => panic!("members at the fenced generation must be admitted: {error}"),
+        };
+        assert_eq!(fence.member_count(), 2);
+        assert_eq!(fence.source_root_generation(), 7);
+    }
+
+    #[test]
+    fn fence_rejects_member_root_generation_mismatch() {
+        let Err(BlobError::InvalidField { field, .. }) =
+            test_fence(vec![test_locator(0xA1, 7), test_locator(0xB2, 8)])
+        else {
+            panic!("a member generation mismatch must refuse")
+        };
+        assert_eq!(field, "backup_fence.member.root_generation");
+    }
+
+    #[test]
+    fn fence_from_capture_derives_exact_canonical_denominator() {
+        let first = match test_record(0xA1, 7) {
+            Ok(record) => record,
+            Err(error) => panic!("canonical capture record must validate: {error}"),
+        };
+        let second = match test_record(0xB2, 7) {
+            Ok(record) => record,
+            Err(error) => panic!("canonical capture record must validate: {error}"),
+        };
+        let records = vec![first, second];
+        let fence = match test_capture_fence(&records) {
+            Ok(fence) => fence,
+            Err(error) => panic!("capture denominator must fence: {error}"),
+        };
+        assert_eq!(fence.member_count(), 2);
+        assert_eq!(
+            fence.members(),
+            &[test_locator(0xA1, 7), test_locator(0xB2, 7)]
+        );
+        let again = match test_capture_fence(&records) {
+            Ok(fence) => fence,
+            Err(error) => panic!("same capture must fence again: {error}"),
+        };
+        let digest = match fence.canonical_digest() {
+            Ok(digest) => digest,
+            Err(error) => panic!("canonical digest must compute: {error}"),
+        };
+        let repeat = match again.canonical_digest() {
+            Ok(digest) => digest,
+            Err(error) => panic!("canonical digest must recompute: {error}"),
+        };
+        assert_eq!(digest, repeat);
+    }
+
+    #[test]
+    fn fence_from_capture_refuses_foreign_generation_record() {
+        let first = match test_record(0xA1, 7) {
+            Ok(record) => record,
+            Err(error) => panic!("canonical capture record must validate: {error}"),
+        };
+        let second = match test_record(0xB2, 8) {
+            Ok(record) => record,
+            Err(error) => panic!("canonical capture record must validate: {error}"),
+        };
+        let Err(BlobError::InvalidField { field, .. }) = test_capture_fence(&[first, second])
+        else {
+            panic!("a foreign-generation capture record must refuse")
+        };
+        assert_eq!(field, "backup_fence.member.root_generation");
+    }
+
+    fn must_record(seed: u8) -> SealedBlobCaptureRecord {
+        match test_record(seed, 7) {
+            Ok(record) => record,
+            Err(error) => panic!("canonical capture record must validate: {error}"),
+        }
+    }
+
+    fn must_fence(records: &[SealedBlobCaptureRecord]) -> BlobBackupFence {
+        match test_capture_fence(records) {
+            Ok(fence) => fence,
+            Err(error) => panic!("capture denominator must fence: {error}"),
+        }
+    }
+
+    fn must_digest(fence: &BlobBackupFence) -> String {
+        match fence.canonical_digest() {
+            Ok(digest) => digest,
+            Err(error) => panic!("canonical digest must compute: {error}"),
+        }
+    }
+
+    #[test]
+    fn canonical_digest_moves_with_members() {
+        let one = must_fence(&[must_record(0xA1)]);
+        let other = must_fence(&[must_record(0xB2)]);
+        assert_ne!(must_digest(&one), must_digest(&other));
     }
 }
