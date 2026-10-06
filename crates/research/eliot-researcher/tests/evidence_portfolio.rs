@@ -880,6 +880,87 @@ fn acquisition_dispositions_stay_distinct() {
     assert_eq!(account.digest().len(), 64);
 }
 
+// Issue #1767 W3: the aggregate acquisition-attempt budget binds before the
+// append. Two retained attempts on a bound of two record; the third refuses
+// with `BudgetExhausted` before mutating, so the digest, the chain and the
+// frontier note are exactly what a replay from retained material reproduces,
+// and an already-recorded binding still replays idempotently.
+#[test]
+fn attempt_budget_refuses_before_append_and_preserves_replay() {
+    let members: BTreeSet<String> = ["w3-a"].into_iter().map(str::to_owned).collect();
+    let mut account = CoverageAccount::open_bounded(members.clone(), 2).expect("bounded");
+    for disposition in [SourceDisposition::Unknown, SourceDisposition::Unavailable] {
+        account
+            .record("w3-a", disposition, Some("h-w3".to_owned()))
+            .expect("within-budget record");
+    }
+    account
+        .note_frontier("attempt budget exhausted at w3-a")
+        .expect("frontier");
+    let retained = account.digest();
+    assert!(
+        matches!(
+            account.record("w3-a", SourceDisposition::Stale, Some("h-w3".to_owned())),
+            Err(PortfolioError::BudgetExhausted { .. })
+        ),
+        "the over-budget attempt must refuse before appending"
+    );
+    assert_eq!(
+        account.digest(),
+        retained,
+        "a refused attempt must not mutate retained accounting"
+    );
+    account
+        .record(
+            "w3-a",
+            SourceDisposition::Unavailable,
+            Some("h-w3".to_owned()),
+        )
+        .expect("an already-recorded binding replays idempotently under exhaustion");
+    let mut replay = CoverageAccount::open_bounded(members, 2).expect("replay");
+    for disposition in [SourceDisposition::Unknown, SourceDisposition::Unavailable] {
+        replay
+            .record("w3-a", disposition, Some("h-w3".to_owned()))
+            .expect("replay record");
+    }
+    replay
+        .note_frontier("attempt budget exhausted at w3-a")
+        .expect("replay frontier");
+    assert_eq!(
+        replay.digest(),
+        retained,
+        "replaying the retained bindings reproduces the digest"
+    );
+}
+
+// Issue #1767 W3: `EvidencePortfolio::open` enforces the frozen inquiry's
+// `budgets.attempts` (8 in this fixture) across the whole portfolio: eight
+// ingests record, the ninth refuses with `BudgetExhausted`.
+#[test]
+fn portfolio_ingest_enforces_inquiry_attempt_budget() {
+    let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
+    let mut portfolio = EvidencePortfolio::open(&inquiry).expect("portfolio");
+    let members = ["primary#0", "primary#1", "secondary#0", "negative#0"];
+    for (index, member) in members.iter().cycle().take(8).enumerate() {
+        let mut params = source_params(&format!("budget-{index}"));
+        params.acquisition = SourceDisposition::Unavailable;
+        let attempt = SourceRecord::new(params).expect("attempt record");
+        portfolio
+            .ingest(attempt, member)
+            .expect("within-budget ingest");
+    }
+    let mut params = source_params("budget-over");
+    params.acquisition = SourceDisposition::Unavailable;
+    let over = SourceRecord::new(params).expect("over-budget record");
+    assert!(
+        matches!(
+            portfolio.ingest(over, "primary#0"),
+            Err(PortfolioError::BudgetExhausted { .. })
+        ),
+        "ingest past budgets.attempts must refuse"
+    );
+}
+
 // WORK_UNIT_CASE: 700/8
 #[test]
 fn absence_requires_complete_authoritative_lookup() {
@@ -1803,6 +1884,121 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
     assert!(GOLDEN.contains("weakest_link"));
 }
 
+/// Two examined candidates the frozen denominator never declared.
+fn examined_two() -> Vec<ObservedOutsideScope> {
+    vec![
+        ObservedOutsideScope {
+            handle: "witness-a".to_owned(),
+            disposition: SourceDisposition::Observed,
+            content_digest: DIGEST_A.to_owned(),
+            operation_id: "op-1".to_owned(),
+            admitted_manifest_digest: DIGEST_A.to_owned(),
+        },
+        ObservedOutsideScope {
+            handle: "witness-b".to_owned(),
+            disposition: SourceDisposition::Observed,
+            content_digest: DIGEST_A.to_owned(),
+            operation_id: "op-2".to_owned(),
+            admitted_manifest_digest: DIGEST_A.to_owned(),
+        },
+    ]
+}
+
+#[test]
+fn open_verified_empty_refuses_unexamined() {
+    assert!(matches!(
+        CoverageAccount::open_verified_empty(&[]),
+        Err(PortfolioError::IncompleteDenominator { .. })
+    ));
+    assert!(matches!(
+        CoverageAccount::open(BTreeSet::new()),
+        Err(PortfolioError::IncompleteDenominator { .. })
+    ));
+}
+
+#[test]
+fn open_verified_empty_retains_examined() {
+    let account =
+        CoverageAccount::open_verified_empty(&examined_two()).expect("verified empty account");
+    assert_eq!(account.denominator_size(), 0);
+    assert!(account.is_verified_empty());
+    assert!(account.open_members().is_empty());
+    assert_eq!(account.observed_outside_scope().len(), 2);
+}
+
+// Issue #1767 A5: the science grade binds evaluator linkage through the real
+// requirement selector. Three records with distinct lineage roots, providers,
+// ancestors and assumptions satisfy every axis only when their evaluators are
+// distinct; one shared evaluator holds the EvaluatorFamily axis (and the whole
+// profile) unmet. Grade scoping itself stays with `select_independence_requirement`
+// (I21.2/I21.3): lower grades do not request the axis, so no linkage is
+// demanded of them here.
+fn evaluator_case_records(shared_evaluator: bool) -> BTreeMap<String, SourceRecord> {
+    let mut records = BTreeMap::new();
+    for handle in ["eval-a", "eval-b", "eval-c"] {
+        let mut params = source_params(handle);
+        params.transformed_from = Some(format!("parent-{handle}"));
+        params.evaluator_family = Some(if shared_evaluator {
+            "evaluator-shared".to_owned()
+        } else {
+            format!("evaluator-{handle}")
+        });
+        records.insert(
+            handle.to_owned(),
+            SourceRecord::new(params).expect("evaluator case record"),
+        );
+    }
+    records
+}
+
+fn science_evaluator_profile(
+    records: &BTreeMap<String, SourceRecord>,
+) -> eliot_researcher::inquiry_governance::IndependenceProfile {
+    use eliot_researcher::inquiry_governance::{EvidenceGrade, select_independence_requirement};
+
+    let grade = EvidenceGrade::from_name("SCIENCE_GRADE").expect("science grade");
+    let (dimensions, minimum) = select_independence_requirement(grade);
+    assert!(
+        dimensions.contains(
+            &eliot_researcher::inquiry_governance::IndependenceDimension::EvaluatorFamily
+        ),
+        "the science grade must request the evaluator axis"
+    );
+    let eligible: Vec<String> = records.keys().cloned().collect();
+    eliot_researcher::inquiry_governance::IndependenceProfile::derive(
+        &eligible,
+        records,
+        &dimensions,
+        minimum,
+    )
+}
+
+#[test]
+fn shared_evaluator_does_not_satisfy_science_requirement() {
+    use eliot_researcher::inquiry_governance::IndependenceDimension;
+
+    let records = evaluator_case_records(true);
+    let profile = science_evaluator_profile(&records);
+    assert!(
+        !profile.meets_requirement,
+        "one evaluator behind three records must not satisfy the science requirement"
+    );
+    let evaluator = profile
+        .dimensions
+        .iter()
+        .find(|measurement| measurement.dimension == IndependenceDimension::EvaluatorFamily)
+        .expect("evaluator axis is measured");
+    assert!(
+        !evaluator.meets_requirement,
+        "the shared evaluator axis must stay unmet"
+    );
+    assert_eq!(
+        evaluator.groups,
+        vec!["evaluator-shared".to_owned()],
+        "the shared evaluator collapses to exactly one family"
+    );
+}
+
 #[test]
 fn absence_issuer_nonblank_predicate_refused() {
     let (_, _, manifest, _) = proven_absence();
@@ -1976,6 +2172,16 @@ fn absence_replay_conflicts_on_changed_predicate() {
         err.to_string()
             .contains("no_match_evaluation.predicate_form"),
         "the conflict must name the predicate bytes: {err}"
+    );
+}
+
+#[test]
+fn distinct_evaluators_satisfy_science_requirement() {
+    let records = evaluator_case_records(false);
+    let profile = science_evaluator_profile(&records);
+    assert!(
+        profile.meets_requirement,
+        "distinct evaluators over distinct roots/providers/ancestors/assumptions satisfy science"
     );
 }
 

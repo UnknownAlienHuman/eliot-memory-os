@@ -6021,4 +6021,104 @@ mod tests {
         assert_eq!(decision.candidate_revision, 3);
         assert_eq!(decision.disposition, disposition);
     }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (AUD7).
+    #[test]
+    fn stale_closure_binding_maps_to_blocked_with_typed_cause_owner_and_remedy() {
+        let mut group = fixture("stale");
+        group.admission_evidence.closure_stale = true;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::Blocked {
+                cause,
+                remedy,
+                reason,
+                owner_id,
+            }) => {
+                // The typed cause, not the reason wording, carries the verdict:
+                // the remedy is derived from the cause, so a reworded reason
+                // cannot change what the owner must do. The reason is asserted
+                // non-empty only, never by text.
+                assert_eq!(cause, ImprovementBlockCause::StaleClosure);
+                assert_eq!(remedy, cause.remedy());
+                assert_eq!(owner_id, group.policy.external_owner_id);
+                assert!(!reason.trim().is_empty());
+            }
+            Ok(other) => panic!("a stale closure binding must block, got {other:?}"),
+            Err(error) => panic!("a stale closure binding must block, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (A2).
+    #[test]
+    fn observed_harm_maps_to_rejected_with_typed_cause() {
+        let mut group = fixture("harm");
+        group.admission_evidence.harm_observed = true;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::Rejected {
+                cause,
+                reason,
+                owner_id,
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::HarmObserved);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+                assert!(!reason.trim().is_empty());
+            }
+            Ok(other) => panic!("observed harm must reject, got {other:?}"),
+            Err(error) => panic!("observed harm must reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (A3).
+    #[test]
+    fn pulse_regression_maps_to_regression_rejected_with_typed_cause() {
+        let mut group = fixture("regression");
+        group.admission_evidence.pulse = ImprovementPulseOutcome::Regression;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::RegressionRejected {
+                cause,
+                reason,
+                owner_id,
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::PulseRegression);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+                assert!(!reason.trim().is_empty());
+            }
+            Ok(other) => panic!("a pulse regression must regress-reject, got {other:?}"),
+            Err(error) => panic!("a pulse regression must regress-reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (A4/A6).
+    #[test]
+    fn unknown_outcome_maps_to_reconciliation_obligation_bound_to_candidate() {
+        let mut group = fixture("unknown");
+        group.admission_evidence.outcome_unknown = true;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation }) => {
+                // The obligation is a value bound to the checked records, not a
+                // sentence: it names the exact candidate, experiment and owner
+                // this run checked.
+                assert_eq!(obligation.candidate_id, "cand-2702-unknown");
+                assert_eq!(obligation.experiment_id, group.experiment.experiment_id);
+                assert_eq!(obligation.owner_id, group.policy.external_owner_id);
+                assert!(!obligation.commitment.digest.trim().is_empty());
+            }
+            Ok(other) => panic!("an unknown outcome must require reconciliation, got {other:?}"),
+            Err(error) => panic!("an unknown outcome must require reconciliation, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - only the typed no-executed-evidence refusal may reach
+    /// the gate (AUD3 trigger).
+    #[test]
+    fn unexecuted_evidence_refuses_as_typed_not_executed_before_any_disposition() {
+        let mut group = fixture("unexecuted");
+        group.evidence.execution = ImprovementEvidenceExecution::NotExecuted;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "not-executed",
+            }
+        );
+    }
 }

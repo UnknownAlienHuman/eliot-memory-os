@@ -7651,6 +7651,11 @@ async fn route_and_reconcile_improvement_candidate(
             // `artifact`, carried out of that read rather than opened a second
             // time. The route binds its `meta.learning.closure` fields to it.
             observed_closure: &artifact.observed_closure,
+            // No owner privacy-class vocabulary is reachable from this daemon
+            // (see `improvement_candidate_dispatch` module documentation), so
+            // no classification is supplied: the proposal carries no class and
+            // the pipeline refuses it as `MissingField("privacy_class")`.
+            privacy_class: None,
         },
     );
     // Phase 6 — the external effect this disposition names, read from the effect
