@@ -55,6 +55,12 @@ enum StartMode {
     MismatchedEvidence,
     MismatchedReceipt,
     Unknown,
+    /// Well-formed start fails with `Unavailable`; the executor retains nothing.
+    FailUnavailable,
+    /// Well-formed start fails with a generic error; the executor retains nothing.
+    FailProcess,
+    /// Well-formed start fails, but the executor already retains the operation.
+    FailAfterRetain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +72,7 @@ struct ExecutorState {
     start_mode: StartMode,
     cancel_unknown: bool,
     report_unknown_on_inspect: bool,
+    fail_inspect: bool,
     request: Option<ProcessBindingSnapshot>,
     process: Option<ProcessState>,
 }
@@ -80,6 +87,7 @@ impl Default for ExecutorState {
             start_mode: StartMode::Normal,
             cancel_unknown: false,
             report_unknown_on_inspect: false,
+            fail_inspect: false,
             request: None,
             process: None,
         }
@@ -111,6 +119,19 @@ impl ProcessExecutor for FakeExecutor {
         if state.start_mode == StartMode::Unknown {
             return Err(ProcessExecutionError::UnknownOutcome);
         }
+        // Issue #1701 step 4: the request is well-formed and admitted; only the
+        // P-03 start fails, and the executor retains nothing under the admitted
+        // operation identity, so `inspect` later answers `NotFound`.
+        if state.start_mode == StartMode::FailUnavailable {
+            return Err(ProcessExecutionError::Unavailable(
+                "p-03 executor refused start".to_owned(),
+            ));
+        }
+        if state.start_mode == StartMode::FailProcess {
+            return Err(ProcessExecutionError::EvidenceSink(EvidenceSinkError {
+                message: "p-03 start failed without effect".to_owned(),
+            }));
+        }
 
         let process = validated_process_state(request)?;
         let receipt = ProcessStartReceipt::new(&process)?;
@@ -130,6 +151,13 @@ impl ProcessExecutor for FakeExecutor {
             let other_process = validated_process_state(other)?;
             return Ok(ProcessStartReceipt::new(&other_process)?);
         }
+        // Issue #1701 step 4: the operation is retained under the admitted
+        // identity even though this start call failed, so `inspect` finds it.
+        if state.start_mode == StartMode::FailAfterRetain {
+            return Err(ProcessExecutionError::EvidenceSink(EvidenceSinkError {
+                message: "p-03 start failed after retaining the operation".to_owned(),
+            }));
+        }
         Ok(receipt)
     }
 
@@ -139,6 +167,13 @@ impl ProcessExecutor for FakeExecutor {
     ) -> Result<ProcessExecutionView, ProcessExecutionError> {
         let mut state = self.state.lock().expect("executor lock");
         state.inspections += 1;
+        // Issue #1701 step 4: the owner cannot answer, so no no-effect proof
+        // exists and the caller must fail closed to retention.
+        if state.fail_inspect {
+            return Err(ProcessExecutionError::Unavailable(
+                "p-03 inspect inconclusive".to_owned(),
+            ));
+        }
         if state.report_unknown_on_inspect {
             let process = state
                 .process
@@ -1260,6 +1295,99 @@ fn start_unknown_outcome_is_durable_and_never_ready() {
         state.events[0].payload,
         WorkerEventPayload::UnknownOutcome
     ));
+}
+
+#[test]
+fn failed_start_without_retained_operation_resets_to_created_as_plan_gap() {
+    // Issue #1701 step 4: a well-formed admitted start fails, and `inspect`
+    // proves the executor retained nothing (`NotFound`), so the lifecycle
+    // resets to `Created` with the original `Unavailable` mapping preserved.
+    let (mut core, _, _, replay, _) =
+        fixture_with_executor(FakeExecutor::with_start_mode(StartMode::FailUnavailable));
+    assert!(matches!(
+        block_on(core.demand_start(
+            hello("connection-1", "start-unavailable"),
+            process_request()
+        )),
+        Err(WorkerError::PlanGap { .. })
+    ));
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    assert!(
+        !replay
+            .state
+            .lock()
+            .expect("replay lock")
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, WorkerEventPayload::UnknownOutcome))
+    );
+}
+
+#[test]
+fn failed_start_without_retained_operation_keeps_original_process_error() {
+    // Issue #1701 step 4: same no-effect proof as above, but a generic start
+    // error keeps its original `Process` mapping instead of a plan gap.
+    let (mut core, _, _, replay, _) =
+        fixture_with_executor(FakeExecutor::with_start_mode(StartMode::FailProcess));
+    assert!(matches!(
+        block_on(core.demand_start(hello("connection-1", "start-failed"), process_request())),
+        Err(WorkerError::Process(_))
+    ));
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    assert!(
+        !replay
+            .state
+            .lock()
+            .expect("replay lock")
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, WorkerEventPayload::UnknownOutcome))
+    );
+}
+
+#[test]
+fn failed_start_with_retained_operation_fences_unknown_outcome() {
+    // Issue #1701 step 4: the start call failed but the executor retains the
+    // operation, so the possible effect is retained and overlapping work stays
+    // blocked until the reconcile path resolves the operation.
+    let (mut core, _, _, replay, _) =
+        fixture_with_executor(FakeExecutor::with_start_mode(StartMode::FailAfterRetain));
+    assert_eq!(
+        block_on(core.demand_start(hello("connection-1", "start-retained"), process_request())),
+        Err(WorkerError::UnknownOutcome)
+    );
+    assert_eq!(core.lifecycle(), WorkerLifecycle::UnknownOutcome);
+    assert!(
+        replay
+            .state
+            .lock()
+            .expect("replay lock")
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, WorkerEventPayload::UnknownOutcome))
+    );
+    assert_eq!(
+        block_on(core.demand_start(hello("connection-1", "start-overlap"), process_request())),
+        Err(WorkerError::InvalidLifecycle)
+    );
+}
+
+#[test]
+fn inconclusive_inspect_after_failed_start_fails_closed_to_retention() {
+    // Issue #1701 step 4: the start failed and the owner cannot answer
+    // `inspect`, so no no-effect proof exists and the outcome is retained
+    // exactly like a reported unknown outcome - never reset.
+    let (mut core, executor, _, _, _) =
+        fixture_with_executor(FakeExecutor::with_start_mode(StartMode::FailUnavailable));
+    executor.state.lock().expect("executor lock").fail_inspect = true;
+    assert_eq!(
+        block_on(core.demand_start(
+            hello("connection-1", "start-inconclusive"),
+            process_request()
+        )),
+        Err(WorkerError::UnknownOutcome)
+    );
+    assert_eq!(core.lifecycle(), WorkerLifecycle::UnknownOutcome);
 }
 
 #[test]
