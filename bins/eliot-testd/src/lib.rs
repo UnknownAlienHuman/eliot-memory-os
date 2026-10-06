@@ -2435,10 +2435,15 @@ fn replay_terminal_productive_dispatch(
         ) => {}
         _ => return Err(TestdError::InvalidBinding),
     }
-    if verification_receipt.raw_artifacts.is_empty() {
+    // Issue #456 (D5): post-cutover receipts retain no inline stream
+    // artifacts; admitted typed bundles are the retained evidence. Refuse
+    // only when both are empty.
+    if verification_receipt.raw_artifacts.is_empty()
+        && verification_receipt.typed_evidence.is_empty()
+    {
         return Err(TestdError::Invalid {
             field: "terminal_replay.verification_receipt",
-            reason: "terminal productive job has no retained raw artifacts",
+            reason: "terminal productive job has no retained raw artifacts or typed evidence",
         });
     }
     let snapshot_artifact = job
@@ -3671,7 +3676,8 @@ mod tests {
             Arc::new(probe_store),
             probe_fence,
         ));
-        let executor = super::compose_process_executor(Arc::new(authority), probe_retention);
+        let executor =
+            super::compose_process_executor(Arc::new(authority), probe_retention.clone());
         let sink: Arc<dyn eliot_process::ProcessEvidenceSink> =
             Arc::new(eliot_testd_core::EvidenceCollector::default());
         let started = block_on_drive_test(executor.start(request, sink));
@@ -3682,6 +3688,11 @@ mod tests {
             started,
             Err(eliot_process::ProcessExecutionError::Unavailable(_))
         ));
+        // The retention owns the open store file; release every handle
+        // before the directory is removed.
+        drop(started);
+        drop(executor);
+        drop(probe_retention);
         std::fs::remove_dir_all(&cwd).expect("probe cwd must clean");
     }
 

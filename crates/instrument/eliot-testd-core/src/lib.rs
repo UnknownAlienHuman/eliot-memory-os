@@ -2904,6 +2904,10 @@ impl VerificationReceipt {
                 return Err(TestdError::InvalidBinding);
             }
         }
+        // Issue #456 (D5): normalized entries no longer cover the artifact
+        // set, so receipts without any collapse entry validate. Surviving
+        // entries on rows written by older daemons must still name retained
+        // artifacts exactly once each.
         let mut referenced = BTreeSet::new();
         for evidence in &self.normalized {
             for handle in &evidence.raw_handles {
@@ -2911,9 +2915,6 @@ impl VerificationReceipt {
                     return Err(TestdError::InvalidBinding);
                 }
             }
-        }
-        if artifacts.len() != referenced.len() {
-            return Err(TestdError::InvalidBinding);
         }
         // Typed bundles revalidate structurally only: each bundle rechecks
         // its own record coherence. Cross-job/cross-operation rejection needs
@@ -3177,32 +3178,13 @@ impl EvidenceCollector {
                 .cmp(&right.capture_sequence)
                 .then_with(|| left.handle.cmp(&right.handle))
         });
-        let mut normalized: Vec<NormalizedEvidence> = records
-            .iter()
-            .map(|record| NormalizedEvidence {
-                kind: "process.observation".to_owned(),
-                summary: format!("process lifecycle: {:?}", record.view().lifecycle()),
-                raw_handles: [record.stdout_ref(), record.stderr_ref()]
-                    .into_iter()
-                    .flatten()
-                    .map(str::to_owned)
-                    .collect(),
-                execution,
-            })
-            .collect();
-        for artifact in &raw_artifacts {
-            if !normalized
-                .iter()
-                .any(|evidence| evidence.raw_handles.contains(&artifact.handle))
-            {
-                normalized.push(NormalizedEvidence {
-                    kind: "process.observation".to_owned(),
-                    summary: format!("one-shot worker observed inline stream {}", artifact.handle),
-                    raw_handles: vec![artifact.handle.clone()],
-                    execution,
-                });
-            }
-        }
+        // Issue #456 (D5): production receipts carry no stream-collapse
+        // normalized entries. Transport, persistence, parsing, evaluation,
+        // artifact binding, and freshness stay on the separate typed axes,
+        // and a successful process exit never becomes a verifier result
+        // here. The field remains only so durable rows written by older
+        // daemons still deserialize.
+        let normalized: Vec<NormalizedEvidence> = Vec::new();
         VerificationReceipt {
             job_id: job.job_id.clone(),
             operation_id: job.process.operation_id.clone(),

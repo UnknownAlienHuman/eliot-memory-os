@@ -101,15 +101,6 @@ const SUPERVISION_CANCEL_GRACE_MS: u64 = 5_000;
 /// deterministic rule that produced the disposition.
 const MAX_REASON_CHARS: usize = 512;
 
-/// Prefix for raw-artifact handles synthesized from inline stream previews.
-///
-/// Inline previews have no durable locator; the handle only keys the exact
-/// retained bytes inside this shot's receipt. Resolving `Blob` /
-/// `OmittedPayload` durable locators into handles is future work that changes
-/// no semantics here: unresolvable streams are simply not recorded, and every
-/// recorded artifact keeps exactly one normalized reference either way.
-const INLINE_STREAM_HANDLE_PREFIX: &str = "testd-inline-stream";
-
 /// The governed physical-process contour for one admitted shot.
 ///
 /// The tool child and the terminal source observation are launched by the SAME
@@ -768,6 +759,10 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     } = outcome;
     let finished_at = observation_clock(current_clock_ms());
     let records = collector.snapshot();
+    // Issue #456 (D4/I2/I8): inline stream previews are never recorded as
+    // raw artifacts. Caller-observed preview bytes cannot become receipt
+    // evidence under any handle; the receipt below cites admitted typed
+    // bundles and readback bindings only.
     // Issue #456 (WB3/WB4): admit every emitted record into owner-neutral
     // bundles before the receipt is composed, so both requested streams keep
     // their explicit dispositions. Admission performs no readback and sets no
@@ -826,21 +821,6 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
             )?;
             return Ok(());
         }
-    }
-    if let Err(error) = capture_inline_previews(
-        collector,
-        &claimed.invocation.profile,
-        &records,
-        finished_at,
-    ) {
-        finish_unknown(
-            store,
-            claimed,
-            lease,
-            collector,
-            format!("raw capture failed after execution; outcome rescheduled as unknown: {error}"),
-        )?;
-        return Ok(());
     }
     let (source_observation, observation_fault) =
         observe_terminal_source(observed, contour, &mut execution);
@@ -1099,72 +1079,15 @@ fn observation_reason(view: &ProcessExecutionView) -> &'static str {
     }
 }
 
-/// Captures inline stream previews observed on the evidence sink as raw
-/// artifacts, preserving the exact bytes plus the truncated flag.
+/// Maps one receipt stdout handle back to its emitted record index.
 ///
-/// Raw capture is bytes-first: the digest stored with each artifact is always
-/// over the retained bytes, never over handle text. Streams with no retained
-/// bytes and no truncation carry nothing and are skipped; streams whose bytes
-/// live behind a durable `Blob` / omitted locator (or are withheld by
-/// policy) are left for future handle resolution and change no semantics.
-/// Returns the synthesized handles so the caller can reference each exactly
-/// once from normalized evidence.
-fn capture_inline_previews(
-    collector: &EvidenceCollector,
-    profile: &str,
-    records: &[ProcessEvidence],
-    captured_at: ClockReading,
-) -> Result<Vec<String>, TestdError> {
-    let mut synthetic = Vec::new();
-    for (index, record) in records.iter().enumerate() {
-        for (stream, evidence) in [("stdout", record.stdout()), ("stderr", record.stderr())]
-            .into_iter()
-            .filter_map(|(stream, evidence)| evidence.map(|evidence| (stream, evidence)))
-        {
-            let preview = evidence.preview();
-            let bytes = preview.bytes();
-            if bytes.is_empty() && !preview.is_truncated() {
-                continue;
-            }
-            let handle = format!("{INLINE_STREAM_HANDLE_PREFIX}-{index}-{stream}");
-            let stream_kind = if stream == "stdout" {
-                RawArtifactStream::Stdout
-            } else {
-                RawArtifactStream::Stderr
-            };
-            // Content domains stay disjoint per profile: discovery
-            // stdout is inventory, never run events, so it must never
-            // reach the run-event parser. Literals mirror the nextest
-            // owner's content-type constants without a dependency.
-            let content_type = if stream_kind == RawArtifactStream::Stdout {
-                if profile == eliot_testd_core::TESTD_LIST_PROFILE {
-                    "application/x-nextest-list-json"
-                } else {
-                    "application/x-nextest-libtest-json-plus"
-                }
-            } else {
-                "text/plain"
-            };
-            collector.record_raw_artifact_at(
-                handle.clone(),
-                content_type,
-                bytes.to_vec(),
-                preview.is_truncated(),
-                stream_kind,
-                captured_at,
-            )?;
-            synthetic.push(handle);
-        }
-    }
-    Ok(synthetic)
-}
-
+/// Issue #456 (D4/I8): only quarantined legacy references resolve here.
+/// Inline stream previews are never recorded, so no synthesized handle can
+/// match; legacy text can never become an admitted handle.
 fn process_evidence_index_for_stdout(handle: &str, records: &[ProcessEvidence]) -> Option<usize> {
-    records.iter().enumerate().find_map(|(index, record)| {
-        let direct_handle = record.stdout_ref() == Some(handle);
-        let inline_handle = format!("{INLINE_STREAM_HANDLE_PREFIX}-{index}-stdout") == handle;
-        (direct_handle || inline_handle).then_some(index)
-    })
+    records
+        .iter()
+        .position(|record| record.stdout_ref() == Some(handle))
 }
 
 fn observation_clock(now: u64) -> ClockReading {
@@ -1446,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_bearing_evidence_still_yields_native_synthetic_handle() {
+    fn legacy_bearing_evidence_admits_without_synthetic_handles() {
         let view = admitted_test_view();
         let binding = view.binding().clone();
         let stdout_bytes = b"inline-stdout-bytes".to_vec();
@@ -1484,18 +1407,31 @@ mod tests {
         assert_eq!(evidence.stdout_ref(), None);
         assert_eq!(evidence.stderr_ref(), Some("raw:legacy-stderr"));
 
+        // Issue #456 (D4/I8): previews are never recorded, so the bundle
+        // carries dispositions only: the native stream stays unavailable
+        // without a durable source, and the legacy reference stays
+        // migration-required without ever resolving to a record.
         let collector = EvidenceCollector::default();
-        let synthetic = capture_inline_previews(
-            &collector,
-            eliot_testd_core::TESTD_PRODUCTIVE_PROFILE,
-            std::slice::from_ref(&evidence),
-            observation_clock(current_clock_ms()),
-        )
-        .expect("inline capture succeeds");
-        assert_eq!(synthetic, vec!["testd-inline-stream-0-stdout".to_owned()]);
-        assert!(
-            !synthetic.iter().any(|handle| handle == "raw:legacy-stderr"),
-            "synthetic handles stay on the native path; legacy text never becomes a handle"
+        collector
+            .admit_process_evidence(&evidence)
+            .expect("typed admission succeeds");
+        let bundles = collector.typed_bundles();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(
+            bundles[0].stdout.disposition,
+            eliot_testd_core::TestdStreamDisposition::SourceUnavailable
+        );
+        assert_eq!(
+            bundles[0].stderr.disposition,
+            eliot_testd_core::TestdStreamDisposition::LegacyMigrationRequired
+        );
+        assert_eq!(
+            process_evidence_index_for_stdout(
+                "testd-inline-stream-0-stdout",
+                std::slice::from_ref(&evidence)
+            ),
+            None,
+            "no synthesized preview handle can resolve to a record"
         );
     }
 }
