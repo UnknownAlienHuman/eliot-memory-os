@@ -7141,17 +7141,14 @@ impl HostComposition {
         // fence still fails closed on any revision movement in between.
         drop(store);
 
-        // A refusal here is still PRE-EFFECT for the destination root: nothing
-        // is created by this read, and a publication that committed without a
-        // readable identity leaves the created root preserved, never removed by
-        // path name. The admission above is already retained, so this refusal
-        // does not claim nothing happened — the operation stays admitted and
-        // reconcilable.
+        // The admission above is already durable, so a failed read here must
+        // preserve the operation as uncertain. No root is created by this read;
+        // reconciliation resolves the retained admission before any retry.
         let re_inspected = crate::backup_preparation::OwnerEvidence::inspect(
             &self.registry_host_root,
         )
         .map_err(|_| {
-            IsolatedPreparationFailure::Refused(
+            IsolatedPreparationFailure::EffectUncertain(
                 "the source installation owner evidence could not be re-inspected, so the \
                  currency of the destination cannot be proved before it is created",
             )
