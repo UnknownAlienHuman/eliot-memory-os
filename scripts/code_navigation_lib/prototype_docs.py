@@ -14,7 +14,7 @@ from .common import NavigationError, normalize_repo_path, read_toml, relative_to
 from .handle_destinations import get_resolver, natural_handle_key
 from .package_docs import INDEX_PATH as WORKSPACE_INDEX_PATH
 from .package_docs import PROTOCOL_PATH, family_contract
-from .package_docs import reverse_target_cell, target_cell
+from .package_docs import reverse_target_cell, target_cell, target_relations
 from .registry import build_registry
 
 SCHEMA = "eliot-prototype-doc-index-v1"
@@ -195,6 +195,27 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
                 resolver = get_resolver(root)
             resolver.resolve(handle)
 
+        # Per-target closure (issue #690 P3): every target reconciles its own
+        # inherited AGENTS chain, block selection and governing handles. The
+        # package-level evidence above is reused, never a replacement.
+        for relation in target_relations(package, blocks):
+            target = relation["target"]
+            relative = normalize_repo_path(str(target.get("path", "")))
+            if CONTRACT_PATH not in nearest_agents(root, relation["path"]):
+                raise NavigationError(
+                    "prototype package target does not inherit "
+                    f"{CONTRACT_PATH}: {package_root}/{relative}"
+                )
+            if not relation["blocks"]:
+                raise NavigationError(
+                    "prototype package target matches no logical block: "
+                    f"{package_root}/{relative}"
+                )
+            for handle in relation["handles"]:
+                if resolver is None:
+                    resolver = get_resolver(root)
+                resolver.resolve(handle)
+
 
 def _md_link(label: str, destination: str) -> str:
     return f"[{label}]({destination})"
@@ -216,9 +237,16 @@ def render(root: Path, registry: dict[str, Any]) -> str:
         for block_id in package.get("logical_blocks", [])
     }
     total_targets = sum(len(p.get("targets", [])) for p in packages)
+    # Shared per-target relation (issue #690 P4): forward rows and the reverse
+    # index below are both derived from these records, never from a cartesian
+    # package-blocks x all-targets product.
+    relations_by_package = [
+        (package, target_relations(package, blocks)) for package in packages
+    ]
     all_prototype_handles: set[str] = set()
-    for package in packages:
-        all_prototype_handles.update(_handles(package, blocks))
+    for _package, relations in relations_by_package:
+        for relation in relations:
+            all_prototype_handles.update(relation["handles"])
     sorted_handles = sorted(all_prototype_handles, key=natural_handle_key)
 
     lines = [
@@ -272,14 +300,17 @@ def render(root: Path, registry: dict[str, Any]) -> str:
             "|---|---|---|---|---|---|",
         ]
     )
-    for package in packages:
+    for package, relations in relations_by_package:
         root_path = str(package["root_path"])
         manifest_path = str(package["manifest_path"])
         raw_targets = package.get("targets", [])
         sorted_targets = sorted(raw_targets, key=lambda t: (t.get("kind", ""), t.get("name", ""), t.get("path", "")))
         targets_str = "<br>".join(target_cell(t) for t in sorted_targets)
         blocks_str = "<br>".join(f"`{item}`" for item in package["logical_blocks"])
-        package_handles = _handles(package, blocks)
+        package_handles = sorted(
+            {handle for relation in relations for handle in relation["handles"]},
+            key=natural_handle_key,
+        )
         handle_links = []
         dest_links = []
         for handle in package_handles:
@@ -308,14 +339,21 @@ def render(root: Path, registry: dict[str, Any]) -> str:
         dest_link = _md_link(f"`{rec['direct_destination']}`", rel)
         proto_pkgs = []
         target_list = []
-        for package in packages:
-            if handle in _handles(package, blocks):
+        for package, relations in relations_by_package:
+            related = [relation for relation in relations if handle in relation["handles"]]
+            if related:
                 p_root = str(package["root_path"])
                 p_manifest = str(package["manifest_path"])
                 proto_pkgs.append(_md_link(f"`{p_root}`", f"../../{p_manifest}"))
-                raw_targets = package.get("targets", [])
-                for t in sorted(raw_targets, key=lambda x: (x.get("kind", ""), x.get("name", ""), x.get("path", ""))):
-                    target_list.append(reverse_target_cell(p_root, t))
+                for relation in sorted(
+                    related,
+                    key=lambda item: (
+                        item["target"].get("kind", ""),
+                        item["target"].get("name", ""),
+                        item["target"].get("path", ""),
+                    ),
+                ):
+                    target_list.append(reverse_target_cell(p_root, relation["target"]))
         lines.append(
             f"| {handle_link} | {dest_link} | {'<br>'.join(proto_pkgs)} | {'<br>'.join(target_list)} |"
         )
