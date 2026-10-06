@@ -1498,101 +1498,12 @@ fn infer_authority_operation(
     use eliot_store_api::{NamedMutationOperation, TransitionClass};
     let has = |name: &str| parameters.contains_key(name);
     match transition_class {
-        TransitionClass::TaskControl if has("task_id") && has("event_id") => {
-            Ok(NamedMutationOperation::UpdateTaskState)
-        }
-        // Owner records travel whole under one `record` key; the closed inner
-        // shapes discriminate: swarm revisions carry `owner_kind`, task
-        // acceptance sets carry `task_id`.
-        TransitionClass::TaskControl if has("record") => {
-            let inner_has = |name: &str| {
-                parameters
-                    .get("record")
-                    .and_then(Value::as_object)
-                    .is_some_and(|object| object.contains_key(name))
-            };
-            if inner_has("owner_kind") && inner_has("owner_id") {
-                Ok(NamedMutationOperation::ApplySwarmOwnerRevisions)
-            } else if inner_has("task_id") && inner_has("acceptance_digest") {
-                Ok(NamedMutationOperation::RecordTaskContractAcceptanceSet)
-            } else {
-                Err(StoreError::InvalidReceipt)
-            }
-        }
+        TransitionClass::TaskControl => infer_task_control_operation(parameters),
         TransitionClass::LifecyclePolicy if has("skill_id") => {
             Ok(NamedMutationOperation::ApplyLifecyclePolicy)
         }
-        // The named owner transitions are discriminated first: they are also
-        // `RecoverySchema` and also carry `problem_id`, so without this arm a
-        // committed `ApplyProblemOwnerState` row would be read back under
-        // `ReconcileRecovery`'s name and its verb would be lost.
-        TransitionClass::RecoverySchema if has("transition") => {
-            Ok(NamedMutationOperation::ApplyProblemOwnerState)
-        }
-        TransitionClass::RecoverySchema if has("origin_ref") && has("closure_id") => {
-            Ok(NamedMutationOperation::RecordAuthorityRevocation)
-        }
-        TransitionClass::RecoverySchema if has("attempt_id") && has("receipt_json") => {
-            Ok(NamedMutationOperation::RecordFinishDecision)
-        }
-        TransitionClass::RecoverySchema
-            if has("expected_canonical_revision") && has("snapshot_json") =>
-        {
-            Ok(NamedMutationOperation::RecordFinishEvidence)
-        }
-        TransitionClass::RecoverySchema
-            if has("expected_module_registry_revision") && has("snapshot_json") =>
-        {
-            Ok(NamedMutationOperation::RecordModuleCatalogSnapshot)
-        }
-        TransitionClass::RecoverySchema if has("problem_id") => {
-            Ok(NamedMutationOperation::ReconcileRecovery)
-        }
-        TransitionClass::CaptureCandidate if has("operation_id") && has("idempotency_key") => {
-            Ok(NamedMutationOperation::AppendAuditEvent)
-        }
-        TransitionClass::CaptureCandidate
-            if has("record_kind") && has("handle") && has("record_json") =>
-        {
-            Ok(NamedMutationOperation::RecordLearningRecord)
-        }
-        TransitionClass::CaptureCandidate
-            if has("skill_id") && has("scope_key") && has("record_json") =>
-        {
-            Ok(NamedMutationOperation::RecordCapabilityEvidenceRecord)
-        }
-        // Bank and feedback share one parameter table; the admitted document's
-        // family revision field discriminates (admission already proved the
-        // field matches the committed operation).
-        TransitionClass::CaptureCandidate
-            if has("record_revision")
-                && has("scope_digest")
-                && has("fence_digest")
-                && has("record_json") =>
-        {
-            let document = parameters
-                .get("record_json")
-                .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok());
-            match document {
-                Some(document) if document.contains_key("bank_revision") => {
-                    Ok(NamedMutationOperation::CommitExperienceBank)
-                }
-                Some(document) if document.contains_key("feedback_revision") => {
-                    Ok(NamedMutationOperation::CommitAgentFeedback)
-                }
-                _ => Err(StoreError::InvalidReceipt),
-            }
-        }
-        TransitionClass::CaptureCandidate if has("revision") => {
-            Ok(NamedMutationOperation::ApplyBlackboardItem)
-        }
-        TransitionClass::CaptureCandidate if has("admission") => {
-            Ok(NamedMutationOperation::AdmitMailboxMessage)
-        }
-        TransitionClass::CaptureCandidate if has("subject") => {
-            Ok(NamedMutationOperation::CaptureObservation)
-        }
+        TransitionClass::RecoverySchema => infer_recovery_schema_operation(parameters),
+        TransitionClass::CaptureCandidate => infer_capture_candidate_operation(parameters),
         TransitionClass::Epistemic if has("revision") => {
             Ok(NamedMutationOperation::ApplyEpistemicRevision)
         }
@@ -1613,6 +1524,111 @@ fn infer_authority_operation(
         }
         _ => Err(StoreError::InvalidReceipt),
     }
+}
+
+/// Discriminates the `TaskControl` authority operations by parameter shape.
+fn infer_task_control_operation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
+    use eliot_store_api::NamedMutationOperation;
+    let has = |name: &str| parameters.contains_key(name);
+    if has("task_id") && has("event_id") {
+        return Ok(NamedMutationOperation::UpdateTaskState);
+    }
+    // Owner records travel whole under one `record` key; the closed inner
+    // shapes discriminate: swarm revisions carry `owner_kind`, task
+    // acceptance sets carry `task_id`.
+    if has("record") {
+        let inner_has = |name: &str| {
+            parameters
+                .get("record")
+                .and_then(Value::as_object)
+                .is_some_and(|object| object.contains_key(name))
+        };
+        if inner_has("owner_kind") && inner_has("owner_id") {
+            return Ok(NamedMutationOperation::ApplySwarmOwnerRevisions);
+        }
+        if inner_has("task_id") && inner_has("acceptance_digest") {
+            return Ok(NamedMutationOperation::RecordTaskContractAcceptanceSet);
+        }
+    }
+    Err(StoreError::InvalidReceipt)
+}
+
+/// Discriminates the `RecoverySchema` authority operations by parameter shape.
+fn infer_recovery_schema_operation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
+    use eliot_store_api::NamedMutationOperation;
+    let has = |name: &str| parameters.contains_key(name);
+    // The named owner transitions are discriminated first: they are also
+    // `RecoverySchema` and also carry `problem_id`, so without this arm a
+    // committed `ApplyProblemOwnerState` row would be read back under
+    // `ReconcileRecovery`'s name and its verb would be lost.
+    if has("transition") {
+        return Ok(NamedMutationOperation::ApplyProblemOwnerState);
+    }
+    if has("origin_ref") && has("closure_id") {
+        return Ok(NamedMutationOperation::RecordAuthorityRevocation);
+    }
+    if has("attempt_id") && has("receipt_json") {
+        return Ok(NamedMutationOperation::RecordFinishDecision);
+    }
+    if has("expected_canonical_revision") && has("snapshot_json") {
+        return Ok(NamedMutationOperation::RecordFinishEvidence);
+    }
+    if has("expected_module_registry_revision") && has("snapshot_json") {
+        return Ok(NamedMutationOperation::RecordModuleCatalogSnapshot);
+    }
+    if has("problem_id") {
+        return Ok(NamedMutationOperation::ReconcileRecovery);
+    }
+    Err(StoreError::InvalidReceipt)
+}
+
+/// Discriminates the `CaptureCandidate` authority operations by parameter shape.
+fn infer_capture_candidate_operation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
+    use eliot_store_api::NamedMutationOperation;
+    let has = |name: &str| parameters.contains_key(name);
+    if has("operation_id") && has("idempotency_key") {
+        return Ok(NamedMutationOperation::AppendAuditEvent);
+    }
+    if has("record_kind") && has("handle") && has("record_json") {
+        return Ok(NamedMutationOperation::RecordLearningRecord);
+    }
+    if has("skill_id") && has("scope_key") && has("record_json") {
+        return Ok(NamedMutationOperation::RecordCapabilityEvidenceRecord);
+    }
+    // Bank and feedback share one parameter table; the admitted document's
+    // family revision field discriminates (admission already proved the
+    // field matches the committed operation).
+    if has("record_revision") && has("scope_digest") && has("fence_digest") && has("record_json") {
+        let document = parameters
+            .get("record_json")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok());
+        match document {
+            Some(document) if document.contains_key("bank_revision") => {
+                return Ok(NamedMutationOperation::CommitExperienceBank);
+            }
+            Some(document) if document.contains_key("feedback_revision") => {
+                return Ok(NamedMutationOperation::CommitAgentFeedback);
+            }
+            _ => return Err(StoreError::InvalidReceipt),
+        }
+    }
+    if has("revision") {
+        return Ok(NamedMutationOperation::ApplyBlackboardItem);
+    }
+    if has("admission") {
+        return Ok(NamedMutationOperation::AdmitMailboxMessage);
+    }
+    if has("subject") {
+        return Ok(NamedMutationOperation::CaptureObservation);
+    }
+    Err(StoreError::InvalidReceipt)
 }
 
 struct IndexedAuthority {

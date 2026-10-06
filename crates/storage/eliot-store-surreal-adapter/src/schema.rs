@@ -830,7 +830,7 @@ pub(crate) const TX_CREATE_RECEIPT: &str =
 /// [`TX_COMMIT`]: returns the exact operation identity plus the allocation this
 /// attempt consumed (`commit_sequence`, `next_commit_sequence`,
 /// `next_outbox_sequence`) as one typed result slot owned by the same
-/// transaction. It is `RETURN`, not `LET`: on the pinned provider (SurrealDB
+/// transaction. It is `RETURN`, not `LET`: on the pinned provider (`SurrealDB`
 /// 3.1.4) a `LET` result slot decodes as null, so a `LET` proof can never
 /// satisfy the writer's equality check (issue #10, live commit proof). The
 /// writer validates this slot's operation binding and allocation equality on
