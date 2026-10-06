@@ -184,6 +184,7 @@ fn verified_empty_account_receipts_without_proof() {
         provider_degradation: vec![],
         unknown_coverage: vec![],
         budget_limitation: None,
+        source_assurance_digest: None,
         assessment_time_ms: 1_800_000_000_000,
     }) {
         Ok(receipt) => receipt,
@@ -389,7 +390,7 @@ fn coverage_account_digest_observes_substitution() {
 // none, cited = eligible handles another eligible record cites. Route
 // staleness/skips and page cursors have no admitted input on this path, so no
 // test synthesizes them.
-fn w2_receipt() -> CoverageReceipt {
+fn w2_receipt_with(source_assurance_digest: Option<String>) -> CoverageReceipt {
     use std::collections::BTreeSet;
 
     let profile = receipt_profile();
@@ -427,9 +428,83 @@ fn w2_receipt() -> CoverageReceipt {
         provider_degradation: Vec::new(),
         unknown_coverage: Vec::new(),
         budget_limitation: None,
+        source_assurance_digest,
         assessment_time_ms: 1_800_000_000_000,
     })
     .expect("w2 receipt")
+}
+
+fn w2_receipt() -> CoverageReceipt {
+    w2_receipt_with(None)
+}
+
+// Issue #1767 A7: the assurance summary rides as a digest link, never as a
+// second denominator. A presented link is carried and moves the receipt
+// digest; a malformed link refuses; the live path presents none.
+#[test]
+fn assurance_link_binds_when_presented() {
+    let linked = w2_receipt_with(Some(DIGEST_VE.to_owned()));
+    assert_eq!(
+        linked.source_assurance_digest,
+        Some(DIGEST_VE.to_owned()),
+        "the presented summary link is carried"
+    );
+    assert_ne!(
+        linked.digest,
+        w2_receipt().digest,
+        "a presented link digests differently from its bound absence"
+    );
+}
+
+#[test]
+fn assurance_link_refuses_malformed() {
+    use eliot_researcher::evidence_portfolio::PortfolioError;
+
+    let profile = receipt_profile();
+    let admissibility = vec![w4_admissible(&profile, w4_record("am-a", Vec::new()))];
+    let mut account = CoverageAccount::open(
+        ["am-a"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<String>>(),
+    )
+    .expect("link account");
+    for record in &admissibility {
+        account
+            .observe(
+                &record.record.handle,
+                record.record.acquisition,
+                &record.record.content_digest,
+                &record.record.operation_id,
+                DIGEST_VE,
+            )
+            .expect("link observe");
+    }
+    let refused = CoverageReceipt::compute(CoverageReceiptParams {
+        profile: &profile,
+        requested_scope: "which valve alloy survives the thermal envelope",
+        frozen_scope_digest: DIGEST_VE,
+        account: &account,
+        records: &admissibility,
+        absence_evidence: None,
+        routes_used: Vec::new(),
+        provider_degradation: Vec::new(),
+        unknown_coverage: Vec::new(),
+        budget_limitation: None,
+        source_assurance_digest: Some("not-a-digest".to_owned()),
+        assessment_time_ms: 1_800_000_000_000,
+    });
+    assert!(
+        matches!(
+            refused,
+            Err(
+                eliot_researcher::inquiry_governance::InquiryError::Portfolio(
+                    PortfolioError::BadDigest { .. }
+                )
+            )
+        ),
+        "a malformed summary link must refuse"
+    );
 }
 
 #[test]

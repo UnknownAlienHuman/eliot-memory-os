@@ -3254,6 +3254,15 @@ pub struct CoverageReceipt {
     /// claim stronger than the evidence's own ceiling allows, rather than
     /// re-deriving that ceiling from records it may no longer hold.
     pub absence_proof_ceiling_grade: Option<u8>,
+    /// Digest of the source-assurance summary assessed over this run's frozen
+    /// evidence set, when the route presented one (issue #1767 A7).
+    ///
+    /// This is the link, not the summary: the full denominator stays on this
+    /// receipt, and the assurance result itself stays with its own owner
+    /// (`eliot-dreamer-source-assurance`). `None` is the fail-closed state —
+    /// no summary was presented on this path — and digests explicitly as
+    /// `absent`, so "no summary" is a bound fact rather than an omission.
+    pub source_assurance_digest: Option<String>,
     /// Declared denominator kind.
     pub denominator_kind: DenominatorKind,
     /// Budget limitation that bounded the run, when one applied.
@@ -3264,8 +3273,8 @@ pub struct CoverageReceipt {
 
 /// Named arguments for [`CoverageReceipt::compute`].
 ///
-/// A parameter list here is not cosmetic. The eleven inputs a coverage receipt
-/// consumes are eleven chances to transpose two of them, and the seam argument
+/// A parameter list here is not cosmetic. The twelve inputs a coverage receipt
+/// consumes are twelve chances to transpose two of them, and the seam argument
 /// added by #2893 is the one whose order matters most: an evaluation presented
 /// against the wrong account is exactly the caller-constructed negative this
 /// issue exists to refuse. Named fields make that a compile error instead.
@@ -3291,6 +3300,8 @@ pub struct CoverageReceiptParams<'a> {
     pub unknown_coverage: Vec<String>,
     /// Budget limitation that bounded the run, when one applied.
     pub budget_limitation: Option<String>,
+    /// Digest of the source-assurance summary presented for this run, if any.
+    pub source_assurance_digest: Option<String>,
     /// The run's own assessment instant.
     pub assessment_time_ms: i64,
 }
@@ -3327,8 +3338,12 @@ impl CoverageReceipt {
             provider_degradation,
             unknown_coverage,
             budget_limitation,
+            source_assurance_digest,
             assessment_time_ms,
         } = params;
+        if let Some(link) = &source_assurance_digest {
+            digest(link, "coverage.source_assurance_digest")?;
+        }
         require_scope(requested_scope, "coverage.requested_scope")?;
         require_digest(frozen_scope_digest, "coverage.frozen_scope_digest")?;
         let expected_members = account.denominator_size();
@@ -3439,6 +3454,7 @@ impl CoverageReceipt {
             absence_verdict,
             absence_evidence_digest,
             absence_proof_ceiling_grade,
+            source_assurance_digest,
             denominator_kind,
             budget_limitation,
             digest: String::new(),
@@ -3477,7 +3493,9 @@ impl CoverageReceipt {
         // carried fields, so one name must not cover both field sets.
         // Transitively, `evidence-freeze/*` and `inquiry-terminal-record/*`
         // bind this digest and produce different values for the same run.
-        let mut preimage = String::from("coverage-receipt/v4;");
+        // `coverage-receipt/v4` -> `v5` by #1767 for the same field-set reason:
+        // the source-assurance summary link is now a carried field.
+        let mut preimage = String::from("coverage-receipt/v5;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
         push_field(&mut preimage, "requested_scope", &self.requested_scope);
@@ -3569,6 +3587,12 @@ impl CoverageReceipt {
         match self.absence_proof_ceiling_grade {
             Some(ceiling) => push_field(&mut preimage, "absence_ceiling", &ceiling.to_string()),
             None => push_field(&mut preimage, "absence_ceiling", "unknown"),
+        }
+        // The presented summary link, or its bound absence: a receipt that
+        // presented no summary digests differently from one that did.
+        match &self.source_assurance_digest {
+            Some(link) => push_field(&mut preimage, "source_assurance", link),
+            None => push_field(&mut preimage, "source_assurance", "absent"),
         }
         push_field(
             &mut preimage,
@@ -7000,6 +7024,11 @@ impl InquiryGovernance {
             provider_degradation: degradation.provider_degradation,
             unknown_coverage: degradation.unknown_coverage,
             budget_limitation: degradation.budget_limitation,
+            // A7 (#1767): no source-assurance summary is presented on this
+            // path — the composition that freezes researcher output into an
+            // assurance set is unowned, so the link stays fail-closed `None`
+            // rather than naming a summary nobody assessed.
+            source_assurance_digest: None,
             assessment_time_ms: observation.assessment_time_ms,
         })?;
         let precision = EvidenceSetPrecision::evaluate(
