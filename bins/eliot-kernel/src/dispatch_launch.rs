@@ -2532,35 +2532,80 @@ fn testd_material_bytes(
     Ok(bytes)
 }
 
-/// Writes the native-worker dispatch file carrying the admitted claim plus
-/// the Kernel-issued launch grant.
-///
-/// JSON shape for the native child (`capacity_permit` only when the contour
-/// issued owner capacity for this launch):
-/// ```json
-/// {
-///   "request": NativeWorkerClaimRequest,
-///   "receipt": NativeWorkerClaimReceipt,
-///   "epoch": EpochId,
-///   "generation": 1,
-///   "nonce": "native-worker-dispatch-<hex>",
-///   "grant": DispatchGrant,
-///   "capacity_permit": {"request": CapacityRequest, "binding": CapacityPermitBinding}
-/// }
-/// ```
-/// * `request` — the exact `NativeWorkerClaimRequest` the contour admitted
-///   (existing `eliot-kernel-service` vocabulary; never a parallel type).
-/// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
-///   vocabulary; its `receipt_digest` is the admission identity).
-/// * `epoch`/`generation` — the live authority bound at admission.
-/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
-///   executable-join launch nonce when the join is present; the caller
-///   request already binds it, and the child re-proves binding).
-/// * `grant` — the shared `DispatchGrant` object.
-///
-/// The concrete `ProcessRequest` plus the composed provider ports arrive
-/// only with the execution context the child builds in-process from `grant`
-/// (same broker pattern as Doctor/Testd); validated claim bytes alone never
+/// Builds the five governed action-envelope carriers for one
+/// native-worker dispatch file (issue #1911 contract, unchanged
+/// semantics, extracted so the writer stays within the line bound).
+fn native_worker_action_envelopes(
+    request: &NativeWorkerClaimRequest,
+    receipt: &NativeWorkerClaimReceipt,
+    epoch: &EpochId,
+    grant: &DispatchGrant,
+    nonce: &str,
+) -> Result<Vec<serde_json::Value>, DispatchLaunchError> {
+    // The child-side 1911 contract consumes these exact operation names. The
+    // Kernel is the only owner of the admitted claim/fence/grant projection;
+    // it does not import the worker binary or duplicate its validator.
+    const WORKER_ENVELOPE_OPS: [&str; 5] = [
+        "register",
+        "claim",
+        "reconcile",
+        "start_claimed",
+        "serve_stdio",
+    ];
+    let derivation = native_worker_dispatch_derivation(
+        request.claim_id.as_str(),
+        request.operation_id.as_str(),
+        request.worker_generation,
+        epoch,
+        nonce,
+    )?;
+    WORKER_ENVELOPE_OPS
+        .into_iter()
+        .map(|operation| {
+            let envelope = serde_json::json!({
+                "operation": operation,
+                "intent": format!(
+                    "present the admitted native-worker {operation} operation"
+                ),
+                "scope_ref": request.work_scope_id,
+                "preconditions": format!(
+                    "claim admission, executable join, exact fence, and dispatch grant {} are live",
+                    grant.grant_digest
+                ),
+                "expected_effect": format!(
+                    "one bounded {operation} presentation answered by receipt {}",
+                    receipt.receipt_digest
+                ),
+                "invariants":
+                    "the claim fence and authority epoch remain exact; unknown outcomes reconcile by identity",
+                "known_failures":
+                    "missing, stale, mismatched, expired, or owner-rejected admission",
+                "rollback_or_compensation":
+                    "retain the exact claim and receipt for reconciliation; never replay an unknown effect",
+                "verifier": "unknown:post-effect verifier is owned outside Kernel dispatch",
+                "stop_condition":
+                    "stop on any claim, fence, grant, or owner-verdict mismatch",
+                "state_fence": request.state_fence,
+                "authority_epoch": epoch,
+                "tool_profile": operation,
+                "affected_resources": [format!("native-worker-operation:{operation}")],
+                "applicable_authority": derivation.authority_id,
+            });
+            let envelope_json = serde_json::to_string(&envelope)
+                .map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
+            if envelope_json.is_empty() || envelope_json.len() > 16 * 1024 {
+                return Err(DispatchLaunchError::Io(
+                    "native action envelope exceeds the bounded carrier limit".to_owned(),
+                ));
+            }
+            Ok(serde_json::json!({
+                "operation": operation,
+                "envelope_json": envelope_json,
+            }))
+        })
+        .collect::<Result<Vec<_>, DispatchLaunchError>>()
+}
+
 /// Owner-issued process-launch capacity evidence for one dispatch file
 /// (issue #1679, W11/W4/A7 producer side).
 ///
@@ -2745,6 +2790,35 @@ fn release_retained_native_worker_capacity(
     drop(removed);
 }
 
+/// Writes the native-worker dispatch file carrying the admitted claim plus
+/// the Kernel-issued launch grant.
+///
+/// JSON shape for the native child (`capacity_permit` only when the contour
+/// issued owner capacity for this launch):
+/// ```json
+/// {
+///   "request": NativeWorkerClaimRequest,
+///   "receipt": NativeWorkerClaimReceipt,
+///   "epoch": EpochId,
+///   "generation": 1,
+///   "nonce": "native-worker-dispatch-<hex>",
+///   "grant": DispatchGrant,
+///   "capacity_permit": {"request": CapacityRequest, "binding": CapacityPermitBinding}
+/// }
+/// ```
+/// * `request` — the exact `NativeWorkerClaimRequest` the contour admitted
+///   (existing `eliot-kernel-service` vocabulary; never a parallel type).
+/// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
+///   vocabulary; its `receipt_digest` is the admission identity).
+/// * `epoch`/`generation` — the live authority bound at admission.
+/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
+///   executable-join launch nonce when the join is present; the caller
+///   request already binds it, and the child re-proves binding).
+/// * `grant` — the shared `DispatchGrant` object.
+///
+/// The concrete `ProcessRequest` plus the composed provider ports arrive
+/// only with the execution context the child builds in-process from `grant`
+/// (same broker pattern as Doctor/Testd); validated claim bytes alone never
 /// drive. Binds to the existing `NativeWorkerClaimRecord` durably
 /// kernel-side (the ORS claim table stages/loads it; see
 /// `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`): the
@@ -2759,17 +2833,6 @@ pub fn native_worker_material_bytes(
     grant: &DispatchGrant,
     capacity: Option<NativeWorkerCapacitySection<'_>>,
 ) -> Result<Vec<u8>, DispatchLaunchError> {
-    // The child-side 1911 contract consumes these exact operation names. The
-    // Kernel is the only owner of the admitted claim/fence/grant projection;
-    // it does not import the worker binary or duplicate its validator.
-    const WORKER_ENVELOPE_OPS: [&str; 5] = [
-        "register",
-        "claim",
-        "reconcile",
-        "start_claimed",
-        "serve_stdio",
-    ];
-
     // Bind to the existing claim vocabulary without inventing a parallel
     // one: the lifecycle route owns `native_worker.claim`, and ORS owns the
     // record. Referencing the operation here keeps the dispatch seam on the
@@ -2796,58 +2859,7 @@ pub fn native_worker_material_bytes(
             "native worker launch nonce does not match its owner executable binding".to_owned(),
         ));
     }
-    let derivation = native_worker_dispatch_derivation(
-        request.claim_id.as_str(),
-        request.operation_id.as_str(),
-        request.worker_generation,
-        epoch,
-        nonce,
-    )?;
-    let action_envelopes = WORKER_ENVELOPE_OPS
-        .into_iter()
-        .map(|operation| {
-            let envelope = serde_json::json!({
-                "operation": operation,
-                "intent": format!(
-                    "present the admitted native-worker {operation} operation"
-                ),
-                "scope_ref": request.work_scope_id,
-                "preconditions": format!(
-                    "claim admission, executable join, exact fence, and dispatch grant {} are live",
-                    grant.grant_digest
-                ),
-                "expected_effect": format!(
-                    "one bounded {operation} presentation answered by receipt {}",
-                    receipt.receipt_digest
-                ),
-                "invariants":
-                    "the claim fence and authority epoch remain exact; unknown outcomes reconcile by identity",
-                "known_failures":
-                    "missing, stale, mismatched, expired, or owner-rejected admission",
-                "rollback_or_compensation":
-                    "retain the exact claim and receipt for reconciliation; never replay an unknown effect",
-                "verifier": "unknown:post-effect verifier is owned outside Kernel dispatch",
-                "stop_condition":
-                    "stop on any claim, fence, grant, or owner-verdict mismatch",
-                "state_fence": request.state_fence,
-                "authority_epoch": epoch,
-                "tool_profile": operation,
-                "affected_resources": [format!("native-worker-operation:{operation}")],
-                "applicable_authority": derivation.authority_id,
-            });
-            let envelope_json = serde_json::to_string(&envelope)
-                .map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
-            if envelope_json.is_empty() || envelope_json.len() > 16 * 1024 {
-                return Err(DispatchLaunchError::Io(
-                    "native action envelope exceeds the bounded carrier limit".to_owned(),
-                ));
-            }
-            Ok(serde_json::json!({
-                "operation": operation,
-                "envelope_json": envelope_json,
-            }))
-        })
-        .collect::<Result<Vec<_>, DispatchLaunchError>>()?;
+    let action_envelopes = native_worker_action_envelopes(request, receipt, epoch, grant, nonce)?;
     let mut body = serde_json::json!({
         "request": request,
         "receipt": receipt,
@@ -5903,6 +5915,44 @@ fn retain_unknown_native_worker_launch(
     })
 }
 
+/// Returns the Unreconciled outcome when the retained launch capacity is
+/// stale, or `None` when convergence may proceed (issue #1679 W11/W4/A7,
+/// A8: a stale, released or foreign permit keeps the attempt excluded
+/// until its owner reconciles instead of converging on dead authority).
+fn unreconciled_when_capacity_stale(
+    contour: &'static ComposedDispatchContour,
+    kernel: &KernelComposition,
+    claim_id: &str,
+) -> Result<Option<ReconcileLaunchedOutcome>, DispatchLaunchError> {
+    let (permit_epoch, permit_generation_value) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        (
+            service.authority_epoch(),
+            service
+                .activation_receipt()
+                .map_or(0, |receipt| receipt.generation.value()),
+        )
+    };
+    let permit_generation = Generation::new(permit_generation_value)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let permit_now_ms = i64::try_from(super::unix_ms()).map_err(|_| {
+        DispatchLaunchError::Gate("reconcile clock overflows millisecond clock".to_owned())
+    })?;
+    let permit_boundary =
+        process_capacity_boundary(kernel, &permit_epoch, permit_generation, permit_now_ms)?;
+    match check_retained_native_worker_capacity(contour, claim_id, &permit_boundary) {
+        Ok(PermitCurrency::Current | PermitCurrency::Absent) => Ok(None),
+        Ok(PermitCurrency::Stale(_)) => Ok(Some(ReconcileLaunchedOutcome::Unreconciled {
+            kind: DispatchedWorkerKind::NativeWorker,
+            identity: claim_id.to_owned(),
+        })),
+        Err(error) => Err(error),
+    }
+}
+
 /// Reconciles one launched-but-unreconciled native-worker claim by its
 /// original identity.
 ///
@@ -5985,37 +6035,9 @@ pub fn reconcile_launched_native_worker_attempt(
         .reconcile_native_worker_claim_admission(&receipt, &request)
         .map_err(gate_error)?;
     // Owner-held launch capacity must still be live and current to
-    // converge: a stale, released or foreign permit keeps the attempt
-    // unreconciled (excluded until its owner reconciles) instead of
-    // converging on dead authority (#1679 W11/W4/A7, A8).
-    let (permit_epoch, permit_generation_value) = {
-        let service = kernel
-            .service
-            .lock()
-            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
-        (
-            service.authority_epoch(),
-            service
-                .activation_receipt()
-                .map_or(0, |receipt| receipt.generation.value()),
-        )
-    };
-    let permit_generation = Generation::new(permit_generation_value)
-        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    let permit_now_ms = i64::try_from(super::unix_ms()).map_err(|_| {
-        DispatchLaunchError::Gate("reconcile clock overflows millisecond clock".to_owned())
-    })?;
-    let permit_boundary =
-        process_capacity_boundary(kernel, &permit_epoch, permit_generation, permit_now_ms)?;
-    match check_retained_native_worker_capacity(contour, claim_id, &permit_boundary) {
-        Ok(PermitCurrency::Current | PermitCurrency::Absent) => {}
-        Ok(PermitCurrency::Stale(_)) => {
-            return Ok(ReconcileLaunchedOutcome::Unreconciled {
-                kind: DispatchedWorkerKind::NativeWorker,
-                identity: claim_id.to_owned(),
-            });
-        }
-        Err(error) => return Err(error),
+    // converge (extracted so this function stays within the line bound).
+    if let Some(outcome) = unreconciled_when_capacity_stale(contour, kernel, claim_id)? {
+        return Ok(outcome);
     }
     if binds {
         if retained.phase == LaunchPhase::Launched {
