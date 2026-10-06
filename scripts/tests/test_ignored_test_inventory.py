@@ -2885,6 +2885,51 @@ class TestIgnoredTestInventory(unittest.TestCase):
         row_alt_line = reconcile([s_alt_line], [base_c])[0]
         self.assertNotEqual(base_row.row_digest, row_alt_line.row_digest)
 
+        # Perturb source bytes identity (source_digest is the row's binding to
+        # the observed file bytes): the row digest must invalidate (W33).
+        s_alt_digest = dataclasses.replace(
+            base_s, source_digest="0" * 64,
+        )
+        row_alt_digest = reconcile([s_alt_digest], [base_c])[0]
+        self.assertNotEqual(base_row.row_digest, row_alt_digest.row_digest)
+
+        # Perturb rule identity: the aggregate digest covers header.rule_table,
+        # so a rule version/sha change must invalidate the aggregate (W33).
+        # The preimage construction below is the production one (build_inventory
+        # lines 4006-4007), whose fidelity case 1 proves against the fixture.
+        fixture_inventory = json.loads(
+            (self.fixture_dir / "sample_inventory.json").read_bytes()
+        )
+        fixture_header = fixture_inventory["header"]
+        base_aggregate_input = {
+            "header": {
+                key: value
+                for key, value in fixture_header.items()
+                if key != "aggregate_sha256"
+            },
+            "rows": fixture_inventory["rows"],
+        }
+        self.assertEqual(
+            fixture_header["aggregate_sha256"],
+            hashlib.sha256(_canonical_bytes(base_aggregate_input)).hexdigest(),
+        )
+        for perturbed_rule_table in (
+            {"version": "9.9.9", "sha256": fixture_header["rule_table"]["sha256"]},
+            {"version": fixture_header["rule_table"]["version"], "sha256": "1" * 64},
+        ):
+            perturbed_header = dict(base_aggregate_input["header"])
+            perturbed_header["rule_table"] = perturbed_rule_table
+            perturbed_aggregate = hashlib.sha256(
+                _canonical_bytes(
+                    {"header": perturbed_header, "rows": fixture_inventory["rows"]}
+                )
+            ).hexdigest()
+            self.assertNotEqual(
+                fixture_header["aggregate_sha256"],
+                perturbed_aggregate,
+                f"rule identity change must invalidate aggregate: {perturbed_rule_table}",
+            )
+
     # WORK_UNIT_CASE: 905/25
     def test_path_reparse_escape_and_file_test_output_time_bounds_fail_within_limits(self) -> None:
         """Path/reparse escape and file/test/output/time bounds fail within limits."""
@@ -3642,6 +3687,111 @@ class TestIgnoredTestInventory(unittest.TestCase):
                 ns=(admitted_identity["mtime_ns"], admitted_identity["mtime_ns"]),
             )
 
+    # WORK_UNIT_CASE: 905/25
+    def test_source_and_compiled_count_bounds_refuse_over_limit(self) -> None:
+        """Source/compiled count bounds refuse listings past the limit."""
+        fixture = json.loads((self.fixture_dir / "sample_inventory.json").read_bytes())
+        target_record = fixture["header"]["target_denominator"][0]
+        artifact_record = fixture["header"]["artifact_denominator"][0]
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            package_dir = root / "crates" / "sample-package"
+            src_dir = package_dir / "src"
+            src_dir.mkdir(parents=True)
+            source_path = src_dir / "lib.rs"
+            source_path.write_text("mod alpha;\nmod beta;\n", encoding="utf-8")
+            for name in ("alpha.rs", "beta.rs"):
+                (src_dir / name).write_text(
+                    f'#[test]\n#[ignore = "requires store database"]\nfn test_{Path(name).stem}() {{}}\n',
+                    encoding="utf-8",
+                )
+            target = PackageTarget(
+                package_id=target_record["package_id"],
+                package_name=target_record["package_name"],
+                manifest_dir=package_dir,
+                target_name=target_record["target_name"],
+                target_kind=target_record["target_kind"],
+                src_path=source_path,
+            )
+            # Positive control: the driver yields two source tests by default.
+            control_records: list[dict[str, object]] = []
+            control_tests = discover_source(root, [target], source_denominator_records=control_records)
+            self.assertEqual(len(control_tests), 2)
+            # A listing past a patched small source bound refuses, never truncates.
+            with patch.object(iti, "BOUNDS", dataclasses.replace(BOUNDS, max_source_tests=1)):
+                with self.assertRaises(InventoryError) as cm:
+                    discover_source(root, [target])
+                self.assertEqual(cm.exception.code, "SOURCE_TEST_LIMIT")
+
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            admitted_root = iti._admitted_target_root(troot)
+            troot_source = troot / target_record["src_path"]
+            troot_source.parent.mkdir(parents=True, exist_ok=True)
+            troot_source.write_text("", encoding="utf-8")
+            manifest = troot_source.parent.parent / "Cargo.toml"
+            manifest.write_text("[package]\nname = \"sample-package\"\nversion = \"0.1.0\"\n", encoding="utf-8")
+            executable = admitted_root / artifact_record["executable"]
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_bytes(b"synthetic executable identity")
+            compiled_target = PackageTarget(
+                package_id=target_record["package_id"],
+                package_name=target_record["package_name"],
+                manifest_dir=manifest.parent,
+                target_name=target_record["target_name"],
+                target_kind=target_record["target_kind"],
+                src_path=troot_source,
+                test_enabled=target_record["test_enabled"],
+                doctest_enabled=target_record["doctest_enabled"],
+                bench_enabled=target_record["bench_enabled"],
+                required_features=tuple(target_record["required_features"]),
+                edition="2021",
+            )
+            cargo_stream = "\n".join((
+                json.dumps({
+                    "reason": "compiler-artifact",
+                    "package_id": compiled_target.package_id,
+                    "manifest_path": str(manifest),
+                    "target": {
+                        "kind": [compiled_target.target_kind],
+                        "crate_types": ["lib"],
+                        "name": compiled_target.target_name,
+                        "src_path": str(troot_source),
+                        "edition": "2021",
+                        "doc": True,
+                        "doctest": compiled_target.doctest_enabled,
+                        "test": compiled_target.test_enabled,
+                    },
+                    "profile": artifact_record["profile"],
+                    "features": artifact_record["features"],
+                    "filenames": [str(executable)],
+                    "executable": str(executable),
+                    "fresh": True,
+                }),
+                json.dumps({"reason": "build-finished", "success": True}),
+            )).encode("utf-8") + b"\n"
+            listing = b"test_alpha_ignored: test\ntest_beta_ignored: test\n"
+
+            def listing_runner(
+                run_root: Path, argv: Sequence[str], timeout: int | None = None
+            ) -> CommandResult:
+                if tuple(argv[:2]) == ("cargo", "test"):
+                    return CommandResult(stdout=cargo_stream, stderr=b"")
+                return CommandResult(stdout=listing, stderr=b"")
+
+            # Positive control: two ignored names list cleanly by default.
+            control_compiled = discover_compiled(troot, [compiled_target], runner=listing_runner)
+            self.assertEqual(
+                [item.test_name for item in control_compiled],
+                ["test_alpha_ignored", "test_beta_ignored"],
+            )
+            # A listing past a patched small compiled bound refuses, never truncates.
+            with patch.object(iti, "BOUNDS", dataclasses.replace(BOUNDS, max_compiled_tests=1)):
+                with self.assertRaises(InventoryError) as cm:
+                    discover_compiled(troot, [compiled_target], runner=listing_runner)
+                self.assertEqual(cm.exception.code, "COMPILED_TEST_LIMIT")
+
     # WORK_UNIT_CASE: 905/26
     def test_no_provisioning_ignored_test_execution_workflow_secret_rust_mutation_path(self) -> None:
         """No provisioning, ignored-test execution, workflow/secret/Rust mutation path."""
@@ -3696,6 +3846,45 @@ class TestIgnoredTestInventory(unittest.TestCase):
                     for arg in node.args:
                         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                             self.assertNotIn(".rs", arg.value)
+
+        # The ignored-test listing runs one exact argv: the executable followed
+        # by the locked libtest suffix, with no extra flag admitted (W35).
+        self.assertEqual(iti._LIBTEST_LIST_ARGS, ("--list", "--ignored", "--format", "terse"))
+        list_argv_tuples = [
+            node
+            for node in ast.walk(parsed_ast)
+            if isinstance(node, ast.Tuple)
+            and any(
+                isinstance(elt, ast.Starred)
+                and isinstance(elt.value, ast.Name)
+                and elt.value.id == "_LIBTEST_LIST_ARGS"
+                for elt in node.elts
+            )
+        ]
+        self.assertEqual(len(list_argv_tuples), 1)
+        self.assertEqual(len(list_argv_tuples[0].elts), 2)
+
+        # No file-mutation call targets a workflow path or a secret-bearing
+        # literal: writes go to computed admitted paths only (W35). Secret
+        # _patterns_ (diagnostic redaction) are not write targets and are out
+        # of scope here; only open/write call arguments are collected.
+        write_calls = {"open", "write_text", "write_bytes", "mkdir", "unlink"}
+        for node in ast.walk(parsed_ast):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                call_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                call_name = node.func.attr
+            else:
+                continue
+            if call_name not in write_calls:
+                continue
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    lowered = arg.value.lower()
+                    self.assertNotIn(".github/workflows", lowered)
+                    self.assertNotIn("secret", lowered)
 
     # WORK_UNIT_CASE: 905/27
     def test_supported_cfg_attr_ignore_forms_reconcile_without_evaluating_cfg(self) -> None:
