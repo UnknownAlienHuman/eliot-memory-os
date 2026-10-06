@@ -1339,5 +1339,35 @@ fn closure_lineage_rejects_resealed_overlay_under_unchanged_assessment()
         ),
         Err(LearningContractError::DigestMismatch { .. })
     ));
+    let mut unsealed_overlay = overlay.clone();
+    unsealed_overlay.revision += 1;
+    assert_eq!(unsealed_overlay.frozen_digest(), overlay.frozen_digest());
+    let unsealed_result = handoff.validate_against_assessment_and_delta(
+        &assessment,
+        &delta,
+        &unsealed_overlay,
+        &receipt,
+    );
+    let mut substituted_delta = delta.clone();
+    substituted_delta.attempted_strategy = ArtifactId::new("replacement-strategy")?;
+    substituted_delta.frozen_pre_evaluation_digest = Some(substituted_delta.frozen_digest()?);
+    substituted_delta.seal()?;
+    assert_ne!(substituted_delta.canonical_digest, delta.canonical_digest);
+    let substituted_result = handoff.validate_against_assessment_and_delta(
+        &assessment,
+        &substituted_delta,
+        &overlay,
+        &receipt,
+    );
+    assert!(
+        matches!(
+            unsealed_result,
+            Err(LearningContractError::DigestMismatch { .. })
+        ) && matches!(
+            substituted_result,
+            Err(LearningContractError::DigestMismatch { .. })
+        ),
+        "unsealed overlay: {unsealed_result:?}; resealed source substitution: {substituted_result:?}"
+    );
     Ok(())
 }

@@ -203,10 +203,10 @@ impl ClosureHandoff {
     /// committed activation (id plus receipt digest) joins the chain to the
     /// exact retained receipt, so a same-ID resealed replacement overlay
     /// presented under the unchanged assessment cannot pass: its recomputed
-    /// digest disagrees with the receipt the assessment sealed. Overlay seal
-    /// integrity needs no separate check here: the digest is recomputed
-    /// from content, so seal-consistent tampering still mismatches both
-    /// sealed commitments. A fabricated digest, another material's digest
+    /// digest disagrees with the receipt the assessment sealed. The overlay
+    /// seal is validated before its frozen digest is used, and its admitted
+    /// source digest must match the presented delta. A fabricated digest,
+    /// another material's digest
     /// or a missing binding fails here, not at the external review.
     pub fn validate_against_assessment_and_delta(
         &self,
@@ -216,7 +216,8 @@ impl ClosureHandoff {
         activation: &crate::activation::HarnessActivationReceiptCandidate,
     ) -> Result<(), LearningContractError> {
         self.validate_against_assessment(assessment)?;
-        activation.validate()?;
+        assessment.validate_against_activation(activation)?;
+        overlay.validate()?;
         if assessment.activation_id != activation.activation_id
             || assessment.activation_digest != activation.canonical_digest
             || activation.overlay_id != overlay.overlay_id
@@ -249,7 +250,7 @@ impl ClosureHandoff {
                 field: "closure.delta_lineage",
             });
         }
-        if self.overlay_id != overlay.overlay_id {
+        if self.overlay_id != overlay.overlay_id || self.binding != overlay.binding {
             return Err(LearningContractError::ScopeMismatch {
                 field: "closure.overlay_lineage",
             });
@@ -281,6 +282,19 @@ impl ClosureHandoff {
                     field: "closure.delta_frozen_lineage",
                 });
             }
+        }
+        let (_, admitted_digest) = overlay
+            .admitted_delta_ids
+            .iter()
+            .zip(&overlay.admitted_delta_digests)
+            .find(|(id, _)| *id == &delta.delta_id)
+            .ok_or(LearningContractError::ScopeMismatch {
+                field: "closure.overlay_source",
+            })?;
+        if admitted_digest != &delta.canonical_digest {
+            return Err(LearningContractError::DigestMismatch {
+                field: "closure.overlay_source_digest",
+            });
         }
         Ok(())
     }
