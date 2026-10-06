@@ -29,7 +29,7 @@ SCHEMA: Final = "eliot.integration.ignored-test-inventory.v1"
 # TOOL_VERSION binds the emitted artifact identity: any change to the header,
 # row schema, requirement classes, or classification rules bumps it, so two
 # different tool states never certify indistinguishable artifacts (issue #905 W3).
-TOOL_VERSION: Final = "0.7.0"
+TOOL_VERSION: Final = "0.8.0"
 OUTPUT_ROOT: Final = ".eliot"
 _TARGET_ROOT_PARTS: Final = (".eliot", "integration", "ignored-test-inventory", "target")
 _CARGO_METADATA_ARGV: Final = ("cargo", "metadata", "--locked", "--format-version", "1")
@@ -2146,35 +2146,40 @@ _NEGATION_SUFFIX: Final = re.compile(
 # another explicit provider the rule table does not know ("requires SurrealDB
 # and Redis", "requires store with PostgreSQL"): the extra provider is an
 # unleased dependency (I18.32:3), so the composed set keeps UNKNOWN and
-# reconcile leaves the row UNCLASSIFIED. Every unit of a multi-provider
-# enumeration (conjunction- or comma-separated, first unit included) accounts
-# for each word (match span, glue, or table literal), so all-known phrases
-# ("requires local authenticated SurrealDB", "... store and governor host
-# runtime") are unaffected; single declarations keep matcher-only semantics.
-# "runtime" is a table literal (inside "windows runtime"), while "Redis" in
-# "SurrealDB and Redis" is covered by nothing. Bare articles ("a", "an",
-# "the") are determiners, never providers.
-
-_PROVIDER_UNIT_SPLIT: Final = re.compile(r"\b(?:and|or|with|plus)\b|,")
-_PROVIDER_NON_PROVIDER_WORDS: Final = frozenset({"a", "an", "the"})
-_PROVIDER_GLUE_WORDS: Final = _PROVIDER_NON_PROVIDER_WORDS | frozenset({"requires", "require", "needs", "need"})
+# reconcile leaves the row UNCLASSIFIED. Proper nouns are providers and
+# lowercase words are modifiers: every unit of a multi-provider enumeration
+# (conjunction- or comma-separated, first unit included) accounts for each
+# word (match span, glue, table literal, or lowercase descriptor), so
+# all-known phrases are unaffected; single declarations keep matcher-only
+# semantics. A capitalized leftover ("Redis" beside generic "database") is
+# an explicit unknown name; lowercase leftovers ("local", "running") ride
+# the unit's known anchor as modifiers.
 
 
-def _has_unknown_provider(value: str) -> bool:
+def _has_unknown_provider(raw_text: str) -> bool:
     """An explicit additional provider the rule table does not cover.
 
     Every unit of a multi-provider enumeration (conjunction- or
     comma-separated, including the first) must account for each of its words:
-    inside a known-phrase match span, verb/determiner glue, or a literal word
-    of the rule table itself. A leftover word (e.g. "redis" beside generic
-    "database") is an unleased dependency (I18.32:3). Single declarations keep
-    matcher-only semantics, so all-known phrases are unaffected.
+    inside a known-phrase match span, verb/determiner glue, a literal word of
+    the rule table itself, or a lowercase descriptor of the unit's known
+    anchor. A capitalized leftover word (e.g. "Redis" beside generic
+    "database") names an explicit dependency the table does not know: proper
+    nouns are providers, lowercase words are modifiers. Single declarations
+    keep matcher-only semantics, so all-known phrases are unaffected.
     """
+    value = raw_text.casefold()
     units = [unit.strip() for unit in _PROVIDER_UNIT_SPLIT.split(value)]
     units = [unit for unit in units if unit]
     if len(units) < 2:
         return False
-    for unit in units:
+    raw_units = [unit.strip() for unit in _PROVIDER_UNIT_SPLIT_CI.split(raw_text)]
+    raw_units = [unit for unit in raw_units if unit]
+    if len(raw_units) != len(units):
+        return True
+    for unit, raw_unit in zip(units, raw_units):
+        if len(unit) != len(raw_unit):
+            return True
         covered: set[int] = set()
         for matcher in _REQUIREMENT_MATCHERS:
             for match in matcher.finditer(unit):
@@ -2182,19 +2187,36 @@ def _has_unknown_provider(value: str) -> bool:
         for token in re.finditer(r"\S+", unit):
             if set(range(token.start(), token.end())) <= covered:
                 continue
-            if token.group(0) in _PROVIDER_GLUE_WORDS:
+            raw_word = raw_unit[token.start():token.end()]
+            key = raw_word.strip(_WORD_STRIP_CHARS).casefold()
+            if not key:
                 continue
-            if token.group(0) in _TABLE_LITERAL_WORDS:
+            if key in _PROVIDER_GLUE_WORDS or key in _TABLE_LITERAL_WORDS:
+                continue
+            if raw_word == raw_word.lower():
                 continue
             return True
     return False
+
+
+_PROVIDER_UNIT_SPLIT: Final = re.compile(r"\b(?:and|or|with|plus)\b|,")
+_PROVIDER_NON_PROVIDER_WORDS: Final = frozenset({"a", "an", "the"})
+_PROVIDER_GLUE_WORDS: Final = _PROVIDER_NON_PROVIDER_WORDS | frozenset({"requires", "require", "needs", "need"})
+# Case-insensitive twin of the unit splitter: the same separators applied to
+# the raw reason, so capitalized (proper-noun) words keep their case for the
+# explicit-provider test below. Derived from the bound pattern, not new rules.
+_PROVIDER_UNIT_SPLIT_CI = re.compile(_PROVIDER_UNIT_SPLIT.pattern, re.IGNORECASE)
+# Leading/trailing punctuation stripped before glue/literal comparison, so a
+# "requires:" verb or '"store",' token still reads as its word.
+_WORD_STRIP_CHARS: Final = ".,:;!?()[]\"'"
+
 
 
 # Versioned finite rule-table identity (issue #905: "versioned finite rule
 # table"). RULE_TABLE_VERSION is the human identity; RULE_TABLE_SHA256 binds the
 # exact pattern literals, so any rule edit changes the emitted header and
 # aggregate digest even when no row's composed requirement set changes.
-RULE_TABLE_VERSION: Final = "1.4.0"
+RULE_TABLE_VERSION: Final = "1.5.0"
 RULE_TABLE_SHA256: Final = _sha256(
     _canonical_bytes(
         {
@@ -2212,6 +2234,7 @@ RULE_TABLE_SHA256: Final = _sha256(
                 "conjunction": _PROVIDER_UNIT_SPLIT.pattern,
                 "non_provider_words": sorted(_PROVIDER_NON_PROVIDER_WORDS),
                 "glue_words": sorted(_PROVIDER_GLUE_WORDS),
+                "word_strip": _WORD_STRIP_CHARS,
             },
         }
     )
@@ -2246,7 +2269,7 @@ def _requirements(text: str) -> tuple[str, ...]:
         result.add(Requirement.EXTERNAL_CREDENTIALED_MANUAL_ONLY)
     if not result:
         result.add(Requirement.UNKNOWN)
-    elif _has_unknown_provider(value):
+    elif _has_unknown_provider(text):
         result.add(Requirement.UNKNOWN)
     return tuple(sorted(item.value for item in result))
 

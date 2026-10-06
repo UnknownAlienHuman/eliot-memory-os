@@ -187,7 +187,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
     def test_closed_descriptor_schema_round_trip(self) -> None:
         """Closed descriptor/schema round trip."""
         self.assertEqual(SCHEMA, "eliot.integration.ignored-test-inventory.v1")
-        self.assertEqual(TOOL_VERSION, "0.7.0")
+        self.assertEqual(TOOL_VERSION, "0.8.0")
 
         fixture_path = self.fixture_dir / "sample_inventory.json"
         self.assertTrue(fixture_path.is_file(), f"missing fixture: {fixture_path}")
