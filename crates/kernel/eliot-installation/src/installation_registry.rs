@@ -2143,11 +2143,21 @@ pub(super) fn validate_installation_host_root(path: &Path) -> Result<(), Install
             reason: "retained root must be an installation Host root".to_owned(),
         });
     };
-    if !valid_installation_key(key) || !identity.ends_with(&["eliot", "installations", key, "host"])
-    {
+    // Both profiled shapes are admitted here: `SystemService` refines
+    // `<anchor>\Eliot` directly while `UserMode` refines the I3.1
+    // durable-data sibling (`<anchor>\Eliot\data`). Profile separation stays
+    // in the lease family that opened the root (a `SystemService` contour
+    // cannot arrive on a current-user lease and vice versa); this check only
+    // proves "an installation Host root with a valid key", never which
+    // profile admitted it.
+    let system_shape = identity.ends_with(&["eliot", "installations", key, "host"]);
+    let user_shape = identity.ends_with(&["eliot", "data", "installations", key, "host"]);
+    if !valid_installation_key(key) || !(system_shape || user_shape) {
         return Err(InstallationError::InvalidField {
             field: "installation_registry.host_root".to_owned(),
-            reason: "retained root must end in Eliot/installations/<sha256-key>/host".to_owned(),
+            reason: "retained root must end in Eliot/installations/<sha256-key>/host \
+                     (system_service) or Eliot/data/installations/<sha256-key>/host (user_mode)"
+                .to_owned(),
         });
     }
     Ok(())
