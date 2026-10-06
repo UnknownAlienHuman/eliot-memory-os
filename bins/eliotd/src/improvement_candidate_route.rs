@@ -546,7 +546,8 @@ mod tests {
         IMPROVEMENT_PROPOSAL_ENCODING_VERSION, ImprovementDiscriminatorProjection,
     };
     use eliot_maintenance::{
-        IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PIPELINE_WIRE_REVISION, IMPROVEMENT_PROOF_CEILING,
+        IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_LEGACY_DIGEST_ALGORITHM,
+        IMPROVEMENT_PIPELINE_WIRE_REVISION, IMPROVEMENT_PROOF_CEILING,
         IMPROVEMENT_REQUESTED_EFFECT, IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementBlockCause,
         ImprovementEvidenceExecution, ImprovementMaterialEquality, ImprovementPulseOutcome,
         ImprovementRejectCause, KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT, OP_PROPOSE,
@@ -1263,6 +1264,40 @@ mod tests {
                 relation: "retained-unknown-effect: candidate-identity-mismatch"
             })
         );
+    }
+
+    /// Norm: `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md:76`.
+    /// A7: the daemon consumes the handoff under the identity this build
+    /// checks. The genuinely routed handoff passes; a copy drifted to a stale
+    /// wire revision or a legacy algorithm refuses through the same forwarder
+    /// `check_handoff_consumable` reads, with no substitute digest.
+    #[test]
+    fn daemon_consumer_passes_routed_handoff_while_drift_refuses() {
+        let group = joined_group("a");
+        let handoff = match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::CanaryAdmitted { handoff }) => handoff,
+            other => panic!("must admit, got {other:?}"),
+        };
+        assert_eq!(
+            check_improvement_handoff_identity(&handoff, &group.experiment),
+            Ok(())
+        );
+        // The drift starts from the genuinely produced record and changes one
+        // identity field, so the refusal below proves the consumer reads the
+        // record rather than trusting it.
+        let mut stale_wire = (*handoff).clone();
+        stale_wire.wire_revision = IMPROVEMENT_PIPELINE_WIRE_REVISION - 1;
+        assert!(matches!(
+            check_improvement_handoff_identity(&stale_wire, &group.experiment),
+            Err(PipelineError::UncheckedWireRevision(_))
+        ));
+        let mut legacy_algorithm = (*handoff).clone();
+        legacy_algorithm.proposal_commitment.algorithm =
+            IMPROVEMENT_LEGACY_DIGEST_ALGORITHM.to_string();
+        assert!(matches!(
+            check_improvement_handoff_identity(&legacy_algorithm, &group.experiment),
+            Err(PipelineError::UncheckedRecordIdentity(_))
+        ));
     }
 
     /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
