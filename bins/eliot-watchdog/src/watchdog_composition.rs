@@ -227,6 +227,29 @@ fn retain_published_shared_manifest(
     port.retain_shared_coverage_manifest(manifest).is_ok()
 }
 
+/// Retains one tick's gated downstream verdicts in the owner spool for
+/// downstream consumers (#1755 W7).
+///
+/// The verdicts the gate just decided are snapshotted under the consulted
+/// profile revision and retained through the owner backup port. Returns
+/// `false` when no owner spool is bound or the retain failed: the tick
+/// traces the miss, and an omission never clears a previously retained row,
+/// so the reader always sees a complete retained row or nothing.
+fn retain_gated_downstream_claims(
+    port: Option<&WatchdogBackupPort>,
+    profile_revision: Option<String>,
+    claims: &[crate::observation_coverage::DownstreamChannelClaim],
+) -> bool {
+    let Some(port) = port else {
+        return false;
+    };
+    let gated = crate::watchdog_spool::RetainedGatedDownstreamClaims::gated(
+        profile_revision,
+        claims,
+    );
+    port.retain_gated_downstream_claims(&gated).is_ok()
+}
+
 /// The actual manifest's own interval identity: the declared owner-clock
 /// bounds under the sensor map revision they were derived under.
 ///
@@ -578,10 +601,11 @@ impl WatchdogComposition {
                             // claim downstream (#1756/#1758), and a port
                             // that resolved no profile disables every
                             // claim rather than substituting one.
+                            let active_profile = kernel.active_coverage_profile();
                             let gated_claims =
                                 crate::observation_coverage::gate_downstream_claims(
                                     &closed,
-                                    kernel.active_coverage_profile().as_ref(),
+                                    active_profile.as_ref(),
                                 );
                             tracing::debug!(
                                 event = "watchdog.downstream_claims_gated",
@@ -598,6 +622,29 @@ impl WatchdogComposition {
                                     .join(","),
                                 "downstream absence/compliance claims gated on the active coverage profile for this interval"
                             );
+                            // The typed verdicts reach the owner spool on this
+                            // tick (#1755 W7); the log keeps the summary only.
+                            // A retain miss is warned: verdicts that were
+                            // decided but not retained must be visible, and
+                            // the next gated interval replaces the row anyway.
+                            let claims_retained = retain_gated_downstream_claims(
+                                kernel.spool_backup_port().as_deref(),
+                                active_profile.map(|profile| profile.profile_revision.clone()),
+                                &gated_claims,
+                            );
+                            if claims_retained {
+                                tracing::debug!(
+                                    event = "watchdog.gated_claims_retained",
+                                    observation = "retained",
+                                    "gated downstream claims retained for this interval"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event = "watchdog.gated_claims_retain_missed",
+                                    observation = "unretained",
+                                    "gated downstream claims decided but not retained in the owner spool"
+                                );
+                            }
                             // The payload reaches the owner spool on this
                             // tick (#1755 W6); the log keeps the summary
                             // only. A retain miss is warned: evidence that
@@ -1836,6 +1883,26 @@ impl WatchdogBackupPort {
         manifest: &eliot_evaluation_contracts::ObservationCoverageManifest,
     ) -> Result<(), SpoolError> {
         self.spool.retain_shared_coverage_manifest(manifest)
+    }
+
+    /// Retains the newest gated downstream verdicts (#1755 W7).
+    ///
+    /// Thin delegation to
+    /// [`WatchdogSpool::retain_gated_downstream_claims`](crate::watchdog_spool::WatchdogSpool::retain_gated_downstream_claims):
+    /// the same owner spool the manifest row reaches, so the typed
+    /// profile/sensor/subject/generation/interval handoff reaches durable
+    /// owner evidence on the supervision tick for downstream consumers
+    /// (#1756/#1758) instead of only a debug-log summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the verdicts do not validate or the row
+    /// cannot be committed.
+    pub(crate) fn retain_gated_downstream_claims(
+        &self,
+        gated: &crate::watchdog_spool::RetainedGatedDownstreamClaims,
+    ) -> Result<(), SpoolError> {
+        self.spool.retain_gated_downstream_claims(gated)
     }
 
     /// Binds one capture request against the owner's retained identity.

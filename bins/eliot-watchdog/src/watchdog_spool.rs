@@ -159,6 +159,100 @@ pub(crate) const SPOOL_JOURNAL_CURSOR_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_watchdog_journal_cursor_v1");
 /// Single-key row of the latest shared coverage manifest.
 pub(crate) const SPOOL_COVERAGE_MANIFEST_KEY: u64 = 0;
+/// Single-key table of the latest gated downstream claims, separate from the
+/// manifest table so one row never overwrites the other.
+pub(crate) const SPOOL_GATED_CLAIMS_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eliot_watchdog_gated_claims_v1");
+/// Single-key row of the latest gated downstream claims.
+pub(crate) const SPOOL_GATED_CLAIMS_KEY: u64 = 0;
+
+/// One channel's gated downstream verdict in owned spool form (#1755 W7).
+///
+/// Mirrors [`DownstreamChannelClaim`](crate::observation_coverage::DownstreamChannelClaim)
+/// field for field with owned strings: the live claim carries a `&'static
+/// str` reason and a value interval, neither of which deserializes, so the
+/// retained row is the owned snapshot downstream (#1756/#1758) reads.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct RetainedGatedChannelClaim {
+    /// I8.2 channel wire name.
+    pub channel: String,
+    /// Revision of the active profile consulted, when one was supplied.
+    pub profile_revision: Option<String>,
+    /// Identity of the sensor the profile named for this channel, if any.
+    pub sensor_identity: Option<String>,
+    /// Subject the named sensor observes, if one was named.
+    pub observed_subject: Option<String>,
+    /// Generation the naming is valid for, if one was named.
+    pub observed_generation: Option<String>,
+    /// Owner-clock start of the declared interval the claim is about.
+    pub interval_start_ms: u64,
+    /// Owner-clock end of the declared interval the claim is about.
+    pub interval_end_ms: u64,
+    /// Whether downstream may treat this channel as competently covered.
+    pub claim_allowed: bool,
+    /// Bounded reason code for the verdict.
+    pub reason: String,
+}
+
+/// The latest interval's gated downstream verdicts for downstream consumers.
+///
+/// One row per interval, replaced whole: a reader never sees a half-written
+/// interval, and an omission never clears the previously retained row.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct RetainedGatedDownstreamClaims {
+    /// Revision of the active profile the verdicts were gated on, when one
+    /// was supplied.
+    pub profile_revision: Option<String>,
+    /// One owned verdict per I8.2 channel, in map order.
+    pub claims: Vec<RetainedGatedChannelClaim>,
+}
+
+impl RetainedGatedDownstreamClaims {
+    /// Snapshots one tick's gated verdicts under the consulted profile
+    /// revision for the owner spool.
+    pub(crate) fn gated(
+        profile_revision: Option<String>,
+        claims: &[crate::observation_coverage::DownstreamChannelClaim],
+    ) -> Self {
+        Self {
+            profile_revision,
+            claims: claims
+                .iter()
+                .map(|claim| RetainedGatedChannelClaim {
+                    channel: claim.channel.as_str().to_owned(),
+                    profile_revision: claim.profile_revision.clone(),
+                    sensor_identity: claim.sensor_identity.clone(),
+                    observed_subject: claim.observed_subject.clone(),
+                    observed_generation: claim.observed_generation.clone(),
+                    interval_start_ms: claim.interval.start_ms,
+                    interval_end_ms: claim.interval.end_ms,
+                    claim_allowed: claim.claim_allowed,
+                    reason: claim.reason.to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// True when the row carries one complete interval's verdicts: at least
+    /// one claim, every channel and reason named, every interval ordered.
+    fn validate(&self) -> Result<(), String> {
+        if self.claims.is_empty() {
+            return Err("gated claims carry no channel verdict".to_owned());
+        }
+        for claim in &self.claims {
+            if claim.channel.trim().is_empty() {
+                return Err("gated claim names no channel".to_owned());
+            }
+            if claim.reason.trim().is_empty() {
+                return Err("gated claim names no reason".to_owned());
+            }
+            if claim.interval_end_ms < claim.interval_start_ms {
+                return Err("gated claim interval is not ordered".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
 /// Maximum accepted length for one persisted cursor identity string.
 ///
 /// Cursor identities are short installer-bound names such as
@@ -1282,6 +1376,85 @@ impl WatchdogSpool {
             ))
         })?;
         Ok(Some(manifest))
+    }
+
+    /// Retains the latest interval's gated downstream claims (#1755 W7).
+    ///
+    /// The row is validated before anything is written and replaced whole on
+    /// success: the reader always sees one complete interval's verdicts or
+    /// nothing. A retain miss never clears a previously retained row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the verdicts do not validate, cannot be
+    /// serialized, or the row cannot be committed.
+    pub(crate) fn retain_gated_downstream_claims(
+        &self,
+        gated: &RetainedGatedDownstreamClaims,
+    ) -> Result<(), SpoolError> {
+        gated.validate().map_err(|reason| {
+            SpoolError::Corrupt(format!("refused to retain invalid gated claims: {reason}"))
+        })?;
+        let bytes = serde_json::to_vec(gated)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_GATED_CLAIMS_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(SPOOL_GATED_CLAIMS_KEY, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reads the latest retained gated downstream claims (#1755 W7).
+    ///
+    /// Production readback for downstream consumers (#1756/#1758): the tick
+    /// retains one row per interval and this returns it — the typed
+    /// profile/sensor/subject/generation/interval handoff the gate decided.
+    ///
+    /// `Ok(None)` when no interval has retained one yet. A stored row that no
+    /// longer parses or validates is refused as corrupt rather than served as
+    /// evidence: fail closed, never best-effort verdicts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the database cannot be read or the stored
+    /// row is corrupt.
+    pub fn read_gated_downstream_claims(
+        &self,
+    ) -> Result<Option<RetainedGatedDownstreamClaims>, SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_GATED_CLAIMS_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let row = table
+            .get(SPOOL_GATED_CLAIMS_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let gated: RetainedGatedDownstreamClaims =
+            serde_json::from_slice(row.value()).map_err(|error| {
+                SpoolError::Corrupt(format!("stored gated claims are not valid JSON: {error}"))
+            })?;
+        gated.validate().map_err(|reason| {
+            SpoolError::Corrupt(format!("stored gated claims do not validate: {reason}"))
+        })?;
+        Ok(Some(gated))
     }
 
     /// Retains the journal read position for one volume (#1755 W3).
