@@ -1,7 +1,7 @@
 use eliot_engine::{
     AdapterSupervisor, ExchangeEnvelopeService, HealthService, LifecycleService, LogService,
-    ModuleRegistryService, ServiceSupervisor, StaticRuntimeService, default_runtime_services,
-    shutdown_deadline_after,
+    ModuleRegistryService, ServiceSupervisor, SingleInstanceObservations, StaticRuntimeService,
+    default_runtime_services, shutdown_deadline_after,
 };
 use eliot_types::{
     AgentSessionId, AuthorityHeader, EliotExchangeEnvelope, EndpointDirection, ExchangeKind,
@@ -81,6 +81,81 @@ fn daemon_single_instance_guard() -> TestResult {
 
     assert!(second.is_err());
     Ok(())
+}
+
+/// Forced-death recovery reclaims a dead owner's lock and PID and is confined
+/// to its own runtime root: a stale lock/PID pair naming a provably dead PID
+/// is removed by one bounded recovery, a later acquire succeeds, and a second
+/// root's stale objects are untouched. Windows-only: liveness recovery is a
+/// Windows-runtime concern and other platforms refuse with `UnsupportedPlatform`.
+#[cfg(windows)]
+#[test]
+fn stale_recovery_reclaims_dead_owner_and_is_root_isolated() -> TestResult {
+    let root_a = test_root("daemon-stale-recovery-a")?;
+    let root_b = test_root("daemon-stale-recovery-b")?;
+    let dead_a = spawn_dead_pid()?;
+    let dead_b = spawn_dead_pid()?;
+    seed_stale_owner(&root_a, dead_a)?;
+    seed_stale_owner(&root_b, dead_b)?;
+
+    let lifecycle_a = LifecycleService::new(&root_a);
+    assert!(
+        lifecycle_a.try_recover_stale_single_instance(&SingleInstanceObservations::none())?,
+        "dead-owner lock must be reclaimed"
+    );
+    assert!(
+        !root_a.join("runtime").join("daemon.lock").exists(),
+        "reclaimed lock must be gone"
+    );
+    assert!(
+        !root_a.join("runtime").join("daemon.pid").exists(),
+        "reclaimed PID must be gone"
+    );
+
+    // Root B is independent: its stale objects survive A's recovery byte-for-byte.
+    assert_eq!(
+        fs::read(root_b.join("runtime").join("daemon.lock"))?,
+        dead_b.to_string().into_bytes()
+    );
+    assert_eq!(
+        fs::read(root_b.join("runtime").join("daemon.pid"))?,
+        dead_b.to_string().into_bytes()
+    );
+
+    // The reclaimed root accepts a new owner.
+    let _lock = LifecycleService::new(&root_a).acquire_single_instance()?;
+    Ok(())
+}
+
+/// Plants a stale single-instance claim: lock bytes and PID bytes naming a
+/// dead owner PID, with no live handles behind them.
+#[cfg(windows)]
+fn seed_stale_owner(root: &Path, dead_pid: u32) -> TestResult {
+    let runtime_dir = root.join("runtime");
+    fs::create_dir_all(&runtime_dir)?;
+    fs::write(runtime_dir.join("daemon.lock"), dead_pid.to_string())?;
+    fs::write(runtime_dir.join("daemon.pid"), dead_pid.to_string())?;
+    Ok(())
+}
+
+/// Returns the PID of a process that has already exited, so the liveness
+/// probe observes death. PID reuse between exit and probe is the only
+/// residual, and it fails closed (live owner refuses recovery).
+#[cfg(windows)]
+fn spawn_dead_pid() -> TestResult<u32> {
+    // Operation: this TEST-ONLY fixture spawns `cmd /C exit 0` to observe a
+    // real dead PID through the production liveness probe. Removal condition:
+    // deleted with this acceptance proof, or as soon as the harness offers a
+    // dead-PID fixture, at which point this raw spawn goes away.
+    #[allow(clippy::disallowed_methods)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "exit", "0"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let pid = child.id();
+    child.wait()?;
+    Ok(pid)
 }
 
 #[tokio::test]
