@@ -13788,6 +13788,9 @@ mod journal_tests;
 mod backup_dispatch_success_tests;
 
 #[cfg(all(test, windows))]
+mod runtime_control_dispatch_tests;
+
+#[cfg(all(test, windows))]
 mod tests;
 
 impl From<io::Error> for HostError {
