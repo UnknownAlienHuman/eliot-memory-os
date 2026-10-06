@@ -1,4 +1,4 @@
-//! Typed BlobStore capacity-exhaustion contract for ELIOT issue #864.
+//! Typed `BlobStore` capacity-exhaustion contract for ELIOT issue #864.
 //!
 //! Declared denominator: cases 2..9 of the 22-case matrix live in this suite;
 //! cases 1 and 10..22 live in `eliot-blob/tests/storage_exhausted.rs`. One
@@ -158,13 +158,10 @@ fn minimal_capacity_error_binds_identity_and_preserves_cas_outcomes() {
         recovery: BlobCapacityRecovery::ReconcileSameOperationThenRevalidate,
     };
     assert!(cas_failure.validate().is_ok());
-    assert_eq!(
-        cas_failure
-            .cas_request
-            .as_deref()
-            .expect("cas request retained"),
-        &request
-    );
+    let Some(retained) = cas_failure.cas_request.as_deref() else {
+        panic!("cas request retained");
+    };
+    assert_eq!(retained, &request);
 
     // Accepted #946 outcomes still decode to CasFailure, never to capacity.
     let not_attempted = match (BlobCasOutcome::NotAttempted {
@@ -278,7 +275,7 @@ fn missing_or_empty_operation_or_storage_identity_is_rejected() {
 }
 
 /// Source: `BlobCapacityCause::WindowsErrorDiskFull` + `validate_capacity_cause`.
-/// Discovery: ERROR_DISK_FULL code 112 in its Windows namespace.
+/// Discovery: `ERROR_DISK_FULL` code 112 in its Windows namespace.
 /// Executed-pass: code 112 validates; any other code under this variant is
 /// rejected; the platform namespace is retained in the debug shape.
 // WORK_UNIT_CASE: 864/4
@@ -318,8 +315,8 @@ fn windows_error_disk_full_mapping_keeps_platform_namespace() {
 }
 
 /// Source: `BlobCapacityCause::WindowsErrorHandleDiskFull` + validator.
-/// Discovery: ERROR_HANDLE_DISK_FULL code 39 in its Windows namespace.
-/// Executed-pass: code 39 validates; ERROR_DISK_FULL/ENOSPC codes under this
+/// Discovery: `ERROR_HANDLE_DISK_FULL` code 39 in its Windows namespace.
+/// Executed-pass: code 39 validates; `ERROR_DISK_FULL`/`ENOSPC` codes under this
 /// variant are rejected.
 // WORK_UNIT_CASE: 864/5
 #[test]
@@ -465,7 +462,7 @@ fn pinned_storage_full_mapping_invents_no_unavailable_variant() {
 // WORK_UNIT_CASE: 864/8
 #[test]
 fn unrelated_kinds_and_quota_semantics_stay_distinct() {
-    fn cause_name(cause: &BlobCapacityCause) -> &'static str {
+    fn cause_name(cause: BlobCapacityCause) -> &'static str {
         match cause {
             BlobCapacityCause::IoStorageFull => "IO_STORAGE_FULL",
             BlobCapacityCause::PosixEnospc { .. } => "POSIX_ENOSPC",
@@ -476,19 +473,19 @@ fn unrelated_kinds_and_quota_semantics_stay_distinct() {
         }
     }
     assert_eq!(
-        cause_name(&BlobCapacityCause::IoStorageFull),
+        cause_name(BlobCapacityCause::IoStorageFull),
         "IO_STORAGE_FULL"
     );
     assert_eq!(
-        cause_name(&BlobCapacityCause::PosixEnospc { code: 28 }),
+        cause_name(BlobCapacityCause::PosixEnospc { code: 28 }),
         "POSIX_ENOSPC"
     );
     assert_eq!(
-        cause_name(&BlobCapacityCause::WindowsErrorDiskFull { code: 112 }),
+        cause_name(BlobCapacityCause::WindowsErrorDiskFull { code: 112 }),
         "WINDOWS_ERROR_DISK_FULL"
     );
     assert_eq!(
-        cause_name(&BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 }),
+        cause_name(BlobCapacityCause::WindowsErrorHandleDiskFull { code: 39 }),
         "WINDOWS_ERROR_HANDLE_DISK_FULL"
     );
     // A quota/policy denial travels as authority/contract state, never as a

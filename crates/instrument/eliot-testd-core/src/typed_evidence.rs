@@ -2072,6 +2072,136 @@ fn disposition_for_readback_error(error: &TestdEvidenceError) -> TestdStreamDisp
     }
 }
 
+/// Durable typed-evidence restart record (issue #456, WD1).
+///
+/// The daemon persists this record with the durable job row when typed
+/// bundles are admitted, before any readback runs. After a restart the
+/// daemon reopens the persisted bytes with [`reopen`](Self::reopen) and
+/// reconciles them with [`reconcile`](Self::reconcile): every identity is
+/// revalidated from the durable row, so reconstruction needs no operation
+/// memory. Source bytes are never persisted here, only bindings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedEvidenceRestartRecord {
+    /// Durable job identity the bundles were admitted for.
+    pub job_id: String,
+    /// Instrument invocation identity the bundles were admitted for.
+    pub invocation_id: String,
+    /// State Fence the post-restart readback must satisfy.
+    pub fence: StateFence,
+    /// Admitted bundles, bindings only.
+    pub bundles: Vec<TestdProcessEvidenceBundle>,
+}
+
+impl TypedEvidenceRestartRecord {
+    /// Captures admitted bundles with the durable job/attempt identities.
+    ///
+    /// Every bundle must validate and must name `job_id` in its process
+    /// binding; a foreign bundle is refused rather than re-keyed.
+    pub fn capture(
+        job_id: &str,
+        invocation_id: &str,
+        fence: &StateFence,
+        bundles: Vec<TestdProcessEvidenceBundle>,
+    ) -> Result<Self, TestdEvidenceError> {
+        let record = Self {
+            job_id: job_id.to_owned(),
+            invocation_id: invocation_id.to_owned(),
+            fence: fence.clone(),
+            bundles,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Reopens a persisted record after a daemon restart.
+    ///
+    /// Deserialization plus [`validate`](Self::validate) replays the full
+    /// admission gate over the durable bytes: malformed JSON, a blank
+    /// identity, an incoherent bundle, or a bundle bound to another job is
+    /// refused, never repaired.
+    pub fn reopen(serialized: &str) -> Result<Self, TestdEvidenceError> {
+        let record: Self =
+            serde_json::from_str(serialized).map_err(|_| TestdEvidenceError::BindingMismatch {
+                reason: "the persisted restart record is not valid JSON",
+            })?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Revalidates every durable identity without touching any source.
+    fn validate(&self) -> Result<(), TestdEvidenceError> {
+        validate_reference("job_id", Some(self.job_id.as_str())).map_err(|_| {
+            TestdEvidenceError::BindingMismatch {
+                reason: "the restart record job identity is blank or malformed",
+            }
+        })?;
+        validate_reference("invocation_id", Some(self.invocation_id.as_str())).map_err(|_| {
+            TestdEvidenceError::BindingMismatch {
+                reason: "the restart record invocation identity is blank or malformed",
+            }
+        })?;
+        self.fence
+            .validate()
+            .map_err(|_| TestdEvidenceError::BindingMismatch {
+                reason: "the restart record fence carries no resource generation",
+            })?;
+        for bundle in &self.bundles {
+            bundle.validate()?;
+            if bundle.binding.job_id().as_str() != self.job_id {
+                return Err(TestdEvidenceError::BindingMismatch {
+                    reason: "a restart record bundle names another job",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the readback context from durable identities only.
+    ///
+    /// The job/attempt/fence come from this persisted record, never from
+    /// operation memory or evidence bytes; a zero deadline is refused.
+    pub fn context(
+        &self,
+        max_bytes: u64,
+        deadline_ms: u64,
+    ) -> Result<TestdReadbackContext, TestdEvidenceError> {
+        if deadline_ms == 0 {
+            return Err(TestdEvidenceError::ReadbackRequestInvalid {
+                field: "deadline_ms",
+                reason: "the provider deadline must be non-zero",
+            });
+        }
+        Ok(TestdReadbackContext {
+            job_id: self.job_id.clone(),
+            invocation_id: self.invocation_id.clone(),
+            fence: self.fence.clone(),
+            max_bytes,
+            deadline_ms,
+        })
+    }
+
+    /// Reconciles every persisted bundle through the port after a restart.
+    ///
+    /// Pending, already-complete (re-expansion for restart re-parse), and
+    /// unknown-outcome (reconcile by the same session identity) slots resolve
+    /// through the port; every other disposition is refused without a port
+    /// call. Resolution never fails wholesale.
+    pub fn reconcile(
+        &mut self,
+        port: &dyn ProcessStreamSourceReadbackPort,
+        max_bytes: u64,
+        deadline_ms: u64,
+    ) -> Result<Vec<Vec<TestdStreamResolution>>, TestdEvidenceError> {
+        let context = self.context(max_bytes, deadline_ms)?;
+        Ok(self
+            .bundles
+            .iter_mut()
+            .map(|bundle| bundle.resolve_pending(port, &context))
+            .collect())
+    }
+}
+
 /// Validates one retained reference: non-blank, control-free, bounded.
 fn validate_reference(field: &'static str, value: Option<&str>) -> Result<(), TestdEvidenceError> {
     match value {
