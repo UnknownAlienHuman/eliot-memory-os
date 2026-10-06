@@ -460,7 +460,9 @@ impl RuntimeStateRoots {
     }
 
     /// Derives the exact owner-declared root that contains EVERY installation
-    /// of this profile (`<profile_root>\installations`).
+    /// of this profile (`<profile_root>\installations` for `system_service`,
+    /// `<profile_root>\data\installations` for `user_mode` — the parent of
+    /// every `derive_profiled` installation root of that profile).
     ///
     /// This is the owner's own declaration of where installations live, derived
     /// from the same already-validated profile anchor as every other declared
@@ -490,12 +492,21 @@ impl RuntimeStateRoots {
             ));
         }
         let profile_root = self.installer_profile_root()?;
-        PlatformHandle::new(joined_windows_path(profile_root.as_str(), "installations")).map_err(
-            |error| InstallationError::InvalidField {
+        // The shared installations area sits directly below the profile root
+        // for `system_service` but below the I3.1 durable-data sibling for
+        // `user_mode` — the same `data` infix `derive_profiled` produces, so
+        // this stays the parent of every derived installation root instead
+        // of naming a directory no UserMode installation lives under.
+        let leaf = match self.profile {
+            InstallationProfile::UserMode => "data\\installations",
+            _ => "installations",
+        };
+        PlatformHandle::new(joined_windows_path(profile_root.as_str(), leaf)).map_err(|error| {
+            InstallationError::InvalidField {
                 field: "runtime_state_roots.installations_root".to_owned(),
                 reason: error.to_string(),
-            },
-        )
+            }
+        })
     }
 
     pub(super) fn expected_staging_root(
@@ -721,11 +732,20 @@ impl RuntimeStateRoots {
                     ));
                 };
                 validate_installation_key(key)?;
-                if installation.components.len() < 3
-                    || !installation.ends_with(&["eliot", "installations", key])
-                {
+                // `SystemService` refines `<anchor>\Eliot` into per-installation
+                // trees directly; `UserMode` refines the I3.1 durable-data
+                // sibling (`<anchor>\Eliot\data`), so its fixed suffix carries
+                // the `data` infix the derivation produces — a UserMode root
+                // without it is a SystemService-shaped path under the wrong
+                // anchor, never a UserMode installation.
+                let suffix: &[&str] = match self.profile {
+                    InstallationProfile::SystemService => &["eliot", "installations", key],
+                    _ => &["eliot", "data", "installations", key],
+                };
+                if installation.components.len() < 3 || !installation.ends_with(suffix) {
                     return Err(InstallationError::ProfileViolation(
-                        "profiled installation root must end in Eliot/installations/<key>"
+                        "profiled installation root must end in Eliot/installations/<key> \
+                         (system_service) or Eliot/data/installations/<key> (user_mode)"
                             .to_owned(),
                     ));
                 }
