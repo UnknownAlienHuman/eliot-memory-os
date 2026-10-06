@@ -2002,17 +2002,74 @@ fn live_delivery_outstanding(
     triple(&served).is_none_or(|settled| settled != (operation_id, claim_id, generation))
 }
 
+/// Decides the owner disposition of one expired live set (issue #2786
+/// W5/W6): expiry closes new execution, never custody. A live child claim
+/// without a settled served result is `BlockScopeUnknownOutcome`; a
+/// served result settling this exact delivery is acknowledged terminal
+/// execution (`FinishExactAuthorizedOperation`); a marker-less set whose
+/// generation slot still names it with byte-identical bytes is proven
+/// never-issued — the child writes `InFlight` before any guest effect,
+/// so no marker means no effect, and the expired grant means no future
+/// execution (`CancelProvenNoEffect`). Anything else is unknown and stays
+/// blocked: a crash after claim is unresolved until owner evidence
+/// settles it, never reopened because the holder disappeared.
+fn disposition_for_expired_live(
+    install_dir: &std::path::Path,
+    live_identity: &WasmDeliveryIdentity,
+) -> WasmDeliveryDispositionRecord {
+    if live_delivery_outstanding(
+        install_dir,
+        &live_identity.operation_id,
+        &live_identity.claim_id,
+        live_identity.generation,
+    ) {
+        return WasmDeliveryDispositionRecord {
+            identity: live_identity.clone(),
+            disposition: WasmDeliveryDisposition::BlockScopeUnknownOutcome,
+            recovery_reference:
+                "live delivery has an inflight claim without a settled served result".to_owned(),
+            acknowledged_terminal: false,
+        };
+    }
+    if served_result_settles(install_dir, live_identity) {
+        return WasmDeliveryDispositionRecord {
+            identity: live_identity.clone(),
+            disposition: WasmDeliveryDisposition::FinishExactAuthorizedOperation,
+            recovery_reference: live_identity.slot_name(),
+            acknowledged_terminal: true,
+        };
+    }
+    if delivery_slot_intact(&slots_dir(install_dir), live_identity) {
+        return WasmDeliveryDispositionRecord {
+            recovery_reference: live_identity.slot_name(),
+            acknowledged_terminal: false,
+            disposition: WasmDeliveryDisposition::CancelProvenNoEffect,
+            identity: live_identity.clone(),
+        };
+    }
+    WasmDeliveryDispositionRecord {
+        identity: live_identity.clone(),
+        disposition: WasmDeliveryDisposition::BlockScopeUnknownOutcome,
+        recovery_reference: format!(
+            "expired delivery has no owner retirement evidence; slot {} absent or mismatched",
+            live_identity.slot_name()
+        ),
+        acknowledged_terminal: false,
+    }
+}
+
 /// Retires an expired live set under its exact presented identity, or
 /// refuses the replacement with typed bounded backpressure (#2786 step
 /// 4). Supported expiry without a wall clock: a live set whose grant
 /// expired before the new admission opened can no longer execute, so the
 /// owner reclaims exactly that set and the replacement publishes fresh.
-/// Expiry alone never frees a set that may still execute: a live child
-/// claim without a settled served result backpressures with the exact
-/// recovery reference instead of being reclaimed underfoot (issue #2786
-/// W4). Anything still live backpressures with the exact retry condition,
-/// and a partially reclaimed set fails closed instead of publishing over
-/// unknown bytes.
+/// Expiry alone never frees a set: physical reclamation proceeds only
+/// under an eligible owner disposition record (issue #2786 W5) — proven
+/// no-effect retirement or acknowledged terminal execution — while an
+/// unresolved set backpressures with the exact recovery reference instead
+/// of being reclaimed underfoot. Anything still live backpressures with
+/// the exact retry condition, and a partially reclaimed set fails closed
+/// instead of publishing over unknown bytes.
 fn retire_or_backpressure_live(
     live: &WasmDispatchMaterial,
     live_envelope: &[u8],
@@ -2027,19 +2084,9 @@ fn retire_or_backpressure_live(
         1,
     )?;
     if live_identity.expires_at <= claim_admitted_at_unix_ms {
-        if live_delivery_outstanding(
-            install_dir,
-            &live_identity.operation_id,
-            &live_identity.claim_id,
-            live_identity.generation,
-        ) {
-            return Err(WasmDispatchError::Backpressure(WasmDeliveryBackpressure {
-                live_generation: live_identity.generation,
-                live_operation_id: live_identity.operation_id.clone(),
-                live_expires_at: live_identity.expires_at,
-                retry_condition:
-                    "live delivery has an inflight claim without a settled served result".to_owned(),
-            }));
+        let record = disposition_for_expired_live(install_dir, &live_identity);
+        if !record.eligible_for_reclaim() {
+            return Err(WasmDispatchError::Backpressure(record.to_backpressure()));
         }
         let reclamation = reclaim_fixed_delivery(install_dir, &live_identity)?;
         if !reclamation.fully_reclaimed() {
@@ -2090,9 +2137,22 @@ fn stage_and_expose_delivery(
     )
 }
 
+/// Retained-slot prune report: how many surplus slots were removed and
+/// how many `Failed` evidence slots were retained instead of deleted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotPruneReport {
+    /// Surplus slots removed.
+    pub removed: usize,
+    /// `Failed` evidence slots kept under the prune budget.
+    pub retained_failed: usize,
+}
+
 /// Prunes retained slots beyond [`MAX_DELIVERY_SLOTS`]: oldest first
 /// (slot names sort by generation), keeping the current slot and any
-/// slot whose Ready identity still owns the fixed names. A completion,
+/// slot whose Ready identity still owns the fixed names. Slots carrying
+/// a `Failed` marker are recovery evidence (issue #2786 W6/A4) and are
+/// never deleted here — neither are the caller-consumed reconciled
+/// slots named in `protected`. A completion,
 /// failure, cancellation, publication error, or failed drain never
 /// removes another generation: each removal names one exact non-live
 /// slot path. Best-effort and bounded; failures stay as disk residual
@@ -2108,9 +2168,14 @@ fn prune_delivery_slots(
     slots: &std::path::Path,
     live_envelope_digest: Option<&str>,
     current_slot_name: &str,
-) {
+    protected: &[String],
+) -> SlotPruneReport {
+    let mut report = SlotPruneReport {
+        removed: 0,
+        retained_failed: 0,
+    };
     let Ok(entries) = std::fs::read_dir(slots) else {
-        return;
+        return report;
     };
     let mut names: Vec<String> = entries
         .flatten()
@@ -2118,36 +2183,42 @@ fn prune_delivery_slots(
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
         .collect();
     if names.len() <= MAX_DELIVERY_SLOTS {
-        return;
+        return report;
     }
     names.sort();
     let surplus = names.len().saturating_sub(MAX_DELIVERY_SLOTS);
-    let mut removed = 0_usize;
     for name in names {
-        if removed >= surplus {
+        if report.removed >= surplus {
             break;
         }
-        if name == current_slot_name {
+        if name == current_slot_name || protected.contains(&name) {
             continue;
         }
         let slot = slots.join(&name);
         let Some(state) = read_slot_state(&slot) else {
             continue;
         };
+        if matches!(state, WasmPublicationState::Failed { .. }) {
+            report.retained_failed = report.retained_failed.saturating_add(1);
+            continue;
+        }
         if live_envelope_digest.is_some_and(|live| state.identity().envelope_digest == live) {
             continue;
         }
         if std::fs::remove_dir_all(&slot).is_ok() {
-            removed = removed.saturating_add(1);
+            report.removed = report.removed.saturating_add(1);
         }
     }
+    report
 }
 
 /// Reconciles retained Ready slots against their staged bytes (issue
 /// #2786 A4): a Ready slot whose immutable set no longer re-hashes to
 /// its recorded identity digests is transitioned to an explicit Failed
 /// publication (`delivery-material-missing`) instead of reporting a
-/// complete set. Skips the slot being published and any slot backing
+/// complete set, and the transition is CONSUMED here as an owner
+/// disposition record — the caller protects the consumed evidence from
+/// pruning. Skips the slot being published and any slot backing
 /// the live fixed set; those have their own replay/reclaim paths. The
 /// sweep is bounded local I/O under the publish serial guard — no guest
 /// execution, no RPC — and a concurrent publisher's fresh slot either
@@ -2158,9 +2229,10 @@ fn reconcile_ready_slots(
     slots: &std::path::Path,
     live_envelope_digest: Option<&str>,
     current_slot_name: &str,
-) {
+) -> Vec<WasmDeliveryDispositionRecord> {
+    let mut consumed = Vec::new();
     let Ok(entries) = std::fs::read_dir(slots) else {
-        return;
+        return consumed;
     };
     for entry in entries.flatten().take(MAX_SLOT_SCAN_ENTRIES) {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -2178,7 +2250,14 @@ fn reconcile_ready_slots(
             continue;
         }
         mark_slot_failed(&slot, &identity, "delivery-material-missing");
+        consumed.push(WasmDeliveryDispositionRecord {
+            recovery_reference: name,
+            acknowledged_terminal: false,
+            disposition: WasmDeliveryDisposition::BlockScopeUnknownOutcome,
+            identity,
+        });
     }
+    consumed
 }
 
 /// Whether a slot's staged immutable set still re-hashes to the
@@ -2258,20 +2337,6 @@ fn stage_delivery_slot(
     staged
 }
 
-/// Whether the fixed payloads currently exposed re-hash to the identity
-/// digests: both files must exist with byte-exact bodies. A live
-/// envelope alone proves nothing — reclaim removes payloads first, so a
-/// crash leaves the envelope identity over missing payloads.
-fn fixed_payloads_match(install_dir: &std::path::Path, identity: &WasmDeliveryIdentity) -> bool {
-    let artifact_ok = std::fs::read(install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))
-        .ok()
-        .is_some_and(|bytes| sha256_hex(&bytes) == identity.artifact_digest);
-    let input_ok = std::fs::read(install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))
-        .ok()
-        .is_some_and(|bytes| sha256_hex(&bytes) == identity.input_digest);
-    artifact_ok && input_ok
-}
-
 /// Re-exposes the fixed-name set from the generation slot after a
 /// same-delivery replay found the live payloads missing or replaced:
 /// the slot's payload and envelope copies are re-hashed against the
@@ -2344,6 +2409,209 @@ fn mark_slot_failed(slot: &std::path::Path, identity: &WasmDeliveryIdentity, rea
     }
 }
 
+/// Owner-side delivery disposition (issue #2786 W5/W6/W7/A4): exactly the
+/// fixed old-operation dispositions of `docs/architecture/I14-14-module-hot-replacement.md:33`
+/// — no other disposition exists for a delivery the owner retires, replays,
+/// or holds. The record below carries one of these per delivery.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum WasmDeliveryDisposition {
+    /// Read/stream may finish while its input fence remains valid.
+    DrainRead,
+    /// Only the already admitted operation may finish.
+    FinishExactAuthorizedOperation,
+    /// Candidate resumes from a compatible checkpoint.
+    CheckpointTransfer,
+    /// Cancellation accepted only with proven no-effect retirement.
+    CancelProvenNoEffect,
+    /// Outcome unresolved; conflicting effects stay blocked.
+    BlockScopeUnknownOutcome,
+}
+
+impl WasmDeliveryDisposition {
+    /// Stable norm code for this disposition.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::DrainRead => "drain_read",
+            Self::FinishExactAuthorizedOperation => "finish_exact_authorized_operation",
+            Self::CheckpointTransfer => "checkpoint_transfer",
+            Self::CancelProvenNoEffect => "cancel_proven_no_effect",
+            Self::BlockScopeUnknownOutcome => "block_scope_unknown_outcome",
+        }
+    }
+}
+
+/// Owner-side disposition record for one delivery (issue #2786 W5/W6):
+/// the durable owner evidence that a physical reclamation was authorized.
+/// Reclamation is eligible only for proven no-effect retirement or for an
+/// exactly finished operation whose terminal result the owner acknowledged;
+/// every other disposition backpressures with the exact recovery reference.
+/// The child-side `InFlight`/served markers are inputs to this decision,
+/// never the decision itself.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WasmDeliveryDispositionRecord {
+    /// Retired delivery identity.
+    pub identity: WasmDeliveryIdentity,
+    /// Fixed owner disposition for this delivery.
+    pub disposition: WasmDeliveryDisposition,
+    /// Exact recovery reference (slot name or settled-result locator).
+    pub recovery_reference: String,
+    /// Whether the owner durably acknowledged the terminal result.
+    pub acknowledged_terminal: bool,
+}
+
+impl WasmDeliveryDispositionRecord {
+    /// Stable norm code of the carried disposition.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        self.disposition.code()
+    }
+
+    /// Whether physical reclamation may proceed under this record.
+    #[must_use]
+    pub fn eligible_for_reclaim(&self) -> bool {
+        match self.disposition {
+            WasmDeliveryDisposition::CancelProvenNoEffect => true,
+            WasmDeliveryDisposition::FinishExactAuthorizedOperation => self.acknowledged_terminal,
+            WasmDeliveryDisposition::DrainRead
+            | WasmDeliveryDisposition::CheckpointTransfer
+            | WasmDeliveryDisposition::BlockScopeUnknownOutcome => false,
+        }
+    }
+
+    /// Typed bounded backpressure carrying the exact recovery reference.
+    #[must_use]
+    pub fn to_backpressure(&self) -> WasmDeliveryBackpressure {
+        WasmDeliveryBackpressure {
+            live_generation: self.identity.generation,
+            live_operation_id: self.identity.operation_id.clone(),
+            live_expires_at: self.identity.expires_at,
+            retry_condition: format!("{}:{}", self.code(), self.recovery_reference),
+        }
+    }
+}
+
+/// Closed launch-claim outcome (issue #2786 W5): the owner-side exclusive
+/// claim decision of audit 5868578172 section 3. Only `Acquired` arms a
+/// launch; every other outcome reconciles, retains, or denies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasmLaunchClaimOutcome {
+    /// Fresh claim, nothing outstanding: the caller may arm the launch.
+    Acquired,
+    /// Same identity already claimed with no settled result: reconcile,
+    /// never double-arm.
+    ExistingInFlight,
+    /// Exact spent delivery replayed: return the retained set, re-arm nothing.
+    RetainedResult,
+    /// A different commitment under a spent or bound claim: deny.
+    Conflict,
+    /// Nothing published and no retained slot adopts it: deny.
+    Unavailable,
+}
+
+impl WasmLaunchClaimOutcome {
+    /// Stable code for this outcome.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Acquired => "LAUNCH_CLAIM_ACQUIRED",
+            Self::ExistingInFlight => "LAUNCH_CLAIM_EXISTING_INFLIGHT",
+            Self::RetainedResult => "LAUNCH_CLAIM_RETAINED_RESULT",
+            Self::Conflict => "LAUNCH_CLAIM_CONFLICT",
+            Self::Unavailable => "LAUNCH_CLAIM_UNAVAILABLE",
+        }
+    }
+}
+
+/// Classifies one launch claim against the retained join table without
+/// mutating it (issue #2786 W5): the symmetric owner-side guard to the
+/// consuming [`admit`](WasmJoinTable::admit). A consumed record replays
+/// only under its exact envelope binding (`RetainedResult`); any other
+/// commitment under a spent claim is `Conflict`, so a second contender
+/// can never revive spent authority. A table miss after a process restart
+/// re-binds through the retained Ready slot (`Acquired` adoption, issue
+/// #2786 W7); a genuine miss is `Unavailable`. Fresh claims report
+/// `ExistingInFlight` while the child holds the matching claim so the
+/// caller reconciles instead of double-arming.
+#[must_use]
+pub fn claim_wasm_dispatch_launch(
+    joins: &WasmJoinTable,
+    join: &WasmJoinGate,
+    delivery: &WasmDeliveryIdentity,
+    install_dir: &std::path::Path,
+    now_ms: u64,
+) -> WasmLaunchClaimOutcome {
+    let key = (join.claim_id.clone(), join.operation_id.clone());
+    let Some(record) = joins.records.get(&key) else {
+        if delivery_slot_intact(&slots_dir(install_dir), delivery) {
+            return WasmLaunchClaimOutcome::Acquired;
+        }
+        return WasmLaunchClaimOutcome::Unavailable;
+    };
+    if record.consumed {
+        if record.invocation_digest == join.invocation_digest
+            && record.envelope_digest.as_deref() == Some(delivery.envelope_digest.as_str())
+        {
+            return WasmLaunchClaimOutcome::RetainedResult;
+        }
+        return WasmLaunchClaimOutcome::Conflict;
+    }
+    if record.expires_at <= now_ms {
+        return WasmLaunchClaimOutcome::Unavailable;
+    }
+    if live_delivery_outstanding(
+        install_dir,
+        &delivery.operation_id,
+        &delivery.claim_id,
+        delivery.generation,
+    ) {
+        return WasmLaunchClaimOutcome::ExistingInFlight;
+    }
+    WasmLaunchClaimOutcome::Acquired
+}
+
+/// Whether the served-result record settles this exact delivery (issue
+/// #2786 W6): the triple must name this operation, claim, and generation.
+/// A settled result is the durable owner acknowledgement of the terminal
+/// outcome; anything else leaves the delivery unresolved.
+fn served_result_settles(install_dir: &std::path::Path, identity: &WasmDeliveryIdentity) -> bool {
+    let Ok(served_bytes) = std::fs::read(install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME))
+    else {
+        return false;
+    };
+    let Ok(served) = serde_json::from_slice::<serde_json::Value>(&served_bytes) else {
+        return false;
+    };
+    let settled = (
+        served
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str),
+        served.get("claim_id").and_then(serde_json::Value::as_str),
+        served.get("generation").and_then(serde_json::Value::as_u64),
+    );
+    settled
+        == (
+            Some(identity.operation_id.as_str()),
+            Some(identity.claim_id.as_str()),
+            Some(identity.generation),
+        )
+}
+
+/// Whether the generation slot still names this exact delivery with
+/// byte-identical staged bytes (issue #2786 W5): a Ready marker under the
+/// same delivery plus re-hashed payloads. Only then is a marker-less
+/// expired set proven never-issued; a missing or damaged slot reads as
+/// unknown, never as permission to reclaim.
+fn delivery_slot_intact(slots: &std::path::Path, identity: &WasmDeliveryIdentity) -> bool {
+    let slot = slots.join(identity.slot_name());
+    match read_slot_state(&slot) {
+        Some(WasmPublicationState::Ready { identity: ready }) if ready.same_delivery(identity) => {
+            slot_payloads_match(&slot, identity)
+        }
+        _ => false,
+    }
+}
+
 /// Publishes one dispatch bundle from retained actual owner state plus the
 /// installation-approved host binding: validates every record, binds the
 /// registry digest into the grant and the envelope, re-hashes the staged
@@ -2376,6 +2644,90 @@ fn mark_slot_failed(slot: &std::path::Path, identity: &WasmDeliveryIdentity, rea
 /// byte bindings, or the file staging fails closed, or
 /// [`WasmDispatchError::Backpressure`] when another live delivery owns
 /// the fixed names.
+/// Custody state of one fixed-name root file (issue #2786 W7): a present
+/// file carries its owner-measured digest, a missing file is explicit
+/// absence, and an unreadable file is explicit unavailability — never an
+/// empty authoritative set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WasmRootFileState {
+    /// File present with its SHA-256 hex digest.
+    Present {
+        /// Owner-measured digest of the file bytes.
+        digest: String,
+    },
+    /// File absent (`NotFound`).
+    Missing,
+    /// File could not be read; discovery carries this, never absence.
+    Unreadable,
+}
+
+/// Custody accounting of the fixed-name delivery set in the install root
+/// (issue #2786 W7): restart discovers owner state through this,
+/// never through arbitrary files alone. Pure observation — it deletes
+/// nothing and stages nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmRootFileAccounting {
+    /// Guest artifact file state.
+    pub artifact: WasmRootFileState,
+    /// Guest input file state.
+    pub input: WasmRootFileState,
+    /// Material envelope file state.
+    pub material: WasmRootFileState,
+}
+
+impl WasmRootFileAccounting {
+    /// Whether every fixed name was accounted without a read failure:
+    /// callers fail closed on `false` instead of deciding over unknown bytes.
+    #[must_use]
+    pub fn readable(&self) -> bool {
+        !matches!(self.artifact, WasmRootFileState::Unreadable)
+            && !matches!(self.input, WasmRootFileState::Unreadable)
+            && !matches!(self.material, WasmRootFileState::Unreadable)
+    }
+
+    /// Whether the exposed payloads re-hash to the presented identity
+    /// digests: both files must be present with byte-exact bodies. A live
+    /// envelope alone proves nothing.
+    #[must_use]
+    pub fn payloads_match(&self, identity: &WasmDeliveryIdentity) -> bool {
+        matches!(&self.artifact, WasmRootFileState::Present { digest } if digest == &identity.artifact_digest)
+            && matches!(&self.input, WasmRootFileState::Present { digest } if digest == &identity.input_digest)
+    }
+}
+
+/// Accounts one fixed-name root file: presence carries the digest,
+/// absence is `Missing`, any other read failure is `Unreadable`.
+fn account_root_file(path: &std::path::Path) -> WasmRootFileState {
+    match std::fs::read(path) {
+        Ok(bytes) => WasmRootFileState::Present {
+            digest: sha256_hex(&bytes),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => WasmRootFileState::Missing,
+        Err(_) => WasmRootFileState::Unreadable,
+    }
+}
+
+/// Accounts the fixed-name delivery set in the install root (issue #2786
+/// W7): artifact, input, and envelope each accounted exactly once.
+/// Bounded local I/O, no guest execution, no mutation.
+#[must_use]
+pub fn account_delivery_root_files(install_dir: &std::path::Path) -> WasmRootFileAccounting {
+    WasmRootFileAccounting {
+        artifact: account_root_file(&install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME)),
+        input: account_root_file(&install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME)),
+        material: account_root_file(&install_dir.join(WASM_HOST_MATERIAL_FILE_NAME)),
+    }
+}
+
+/// Whether the slot budget still has room: at most [`MAX_DELIVERY_SLOTS`]
+/// slot directories may be retained. Bounded scan, early stop.
+fn slot_count_exceeds(slots: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(slots) else {
+        return false;
+    };
+    entries.flatten().take(MAX_DELIVERY_SLOTS + 2).count() > MAX_DELIVERY_SLOTS
+}
+
 /// Claim-shape validation for [`publish_wasm_dispatch_bundle`]: non-blank
 /// host path and digest, non-empty size-bounded guest bytes bound to the
 /// claim digests. Pure check, no staging side effect.
@@ -2404,6 +2756,97 @@ fn validate_publish_claim(
     Ok(())
 }
 
+/// Adopts the retained publication revision when the slot still names
+/// this delivery with byte-identical bytes (audit 5868578172 exit):
+/// exact replay keeps its admitted revision instead of minting
+/// revision-plus-one for the identical set.
+fn adopt_retained_revision(slot: &std::path::Path, identity: &mut WasmDeliveryIdentity) {
+    if let Some(WasmPublicationState::Ready { identity: retained }) = read_slot_state(slot)
+        && retained.same_delivery(identity)
+        && slot_payloads_match(slot, identity)
+    {
+        identity.publication_revision = retained.publication_revision;
+    }
+}
+
+/// Re-verifies the retained exposure of a same-delivery replay (issue
+/// #2786 W7): the slot record is staged idempotently, the fixed set is
+/// accounted, unreadable roots fail closed without touching slot
+/// markers, and drifted payloads heal from the slot — never a re-armed
+/// Ready over missing payloads.
+fn verify_retained_exposure(
+    install_dir: &std::path::Path,
+    slot: &std::path::Path,
+    identity: &WasmDeliveryIdentity,
+    envelope: &[u8],
+    claim: &WasmOwnerClaim,
+) -> Result<(), WasmDispatchError> {
+    stage_delivery_slot(slot, identity, envelope, claim)?;
+    let accounting = account_delivery_root_files(install_dir);
+    if !accounting.readable() {
+        return Err(invalid("delivery-root-unreadable"));
+    }
+    if accounting.payloads_match(identity) {
+        return Ok(());
+    }
+    if let Err(error) = reexpose_fixed_delivery_from_slot(install_dir, slot, identity) {
+        mark_slot_failed(slot, identity, &error.to_string());
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Denies a different commitment under a spent claim before any staging
+/// side effect (issue #2786 W5): spent authority can never be revived, so
+/// a failed publication stages no bytes for a delivery that cannot arm.
+fn deny_spent_revival(
+    joins: &WasmJoinTable,
+    join: &WasmJoinGate,
+    identity: &WasmDeliveryIdentity,
+    install_dir: &std::path::Path,
+    admitted_at_unix_ms: u64,
+) -> Result<(), WasmDispatchError> {
+    let outcome =
+        claim_wasm_dispatch_launch(joins, join, identity, install_dir, admitted_at_unix_ms);
+    if outcome == WasmLaunchClaimOutcome::Conflict {
+        return Err(invalid(outcome.code()));
+    }
+    Ok(())
+}
+
+/// Reconciles retained publications and enforces the slot budget (issue
+/// #2786 A4/W6/AUD5): Ready-without-material becomes an explicit Failed
+/// publication whose evidence slots are protected from pruning; `Failed`
+/// evidence is never deleted for budget, and a budget held by protected
+/// deliveries backpressures before anything stages.
+fn reconcile_and_prune_slots(
+    install_dir: &std::path::Path,
+    slots: &std::path::Path,
+    slot_name: &str,
+    identity: &WasmDeliveryIdentity,
+) -> Result<(), WasmDispatchError> {
+    let swept_live_digest = read_live_material(install_dir)
+        .ok()
+        .flatten()
+        .and_then(|live| material_bytes(&live).ok())
+        .map(|envelope| sha256_hex(&envelope));
+    let consumed = reconcile_ready_slots(slots, swept_live_digest.as_deref(), slot_name);
+    let protected: Vec<String> = consumed
+        .iter()
+        .map(|record| record.identity.slot_name())
+        .collect();
+    let report = prune_delivery_slots(slots, swept_live_digest.as_deref(), slot_name, &protected);
+    if report.retained_failed > 0 && slot_count_exceeds(slots) {
+        return Err(WasmDispatchError::Backpressure(WasmDeliveryBackpressure {
+            live_generation: identity.generation,
+            live_operation_id: identity.operation_id.clone(),
+            live_expires_at: identity.expires_at,
+            retry_condition: "slot budget held by failed-publication evidence".to_owned(),
+        }));
+    }
+    Ok(())
+}
+
 /// Publish a validated owner claim as the live wasm dispatch bundle.
 pub fn publish_wasm_dispatch_bundle(
     host_executable_path: &str,
@@ -2412,16 +2855,11 @@ pub fn publish_wasm_dispatch_bundle(
     claim: &WasmOwnerClaim,
     joins: &mut WasmJoinTable,
 ) -> Result<WasmPublishedBundle, WasmDispatchError> {
-    // The one install guard (issue #2786 A1/AUD1): concurrent same-process
-    // publishers (daemon `JoinSet` threads) serialize here across the whole
-    // stage/expose/prune sequence, so two replacements can never interleave
-    // on the shared fixed names. The guard covers only bounded local file
-    // I/O — validation, staging, exposure, pruning — never guest execution
-    // (this function spawns nothing) and never crosses an await (it is
-    // synchronous). Cross-process pairs need no lock: the child drive is
-    // single-threaded, the child never writes slots, the owner never writes
-    // markers, and every shared-name mutation on either side is an atomic
-    // rename with re-verification.
+    // The one install guard (issue #2786 A1/AUD1): same-process publishers
+    // serialize here across stage/expose/prune — bounded local file I/O
+    // only, never guest execution, never across an await. Cross-process
+    // pairs need no lock: every shared-name mutation is an atomic rename
+    // with re-verification.
     let _serial = PUBLISH_SERIAL_GUARD
         .lock()
         .map_err(|_| invalid("delivery-guard"))?;
@@ -2456,7 +2894,7 @@ pub fn publish_wasm_dispatch_bundle(
     let slots = slots_dir(install_dir);
     std::fs::create_dir_all(&slots).map_err(|_| invalid("delivery-io"))?;
     let revision = slot_revision_for(&slots, claim.generation);
-    let identity = WasmDeliveryIdentity::from_material(
+    let mut identity = WasmDeliveryIdentity::from_material(
         &material,
         &envelope_digest,
         host_artifact_digest,
@@ -2464,6 +2902,7 @@ pub fn publish_wasm_dispatch_bundle(
     )?;
     let slot_name = identity.slot_name();
     let slot = slots.join(&slot_name);
+    adopt_retained_revision(&slot, &mut identity);
     // Replacement serialization: a running claimed A and a concurrently
     // published B never share mutable bytes or cleanup authority. Only
     // an identified live set gates here; an unidentifiable leftover
@@ -2474,19 +2913,26 @@ pub fn publish_wasm_dispatch_bundle(
             // Same-delivery replay: the retained set stands. A legacy v1
             // set without a slot is adopted by staging its immutable
             // record; the join re-arms under the same identity, and no
-            // spent permit is inherited. The fixed payloads are
-            // re-verified before re-arming: a crash inside reclaim
-            // removes payloads first and the envelope last, so a live
-            // envelope over missing payloads heals from the slot —
-            // never a re-armed Ready over missing payloads.
-            stage_delivery_slot(&slot, &identity, &envelope, claim)?;
-            if !fixed_payloads_match(install_dir, &identity)
-                && let Err(error) = reexpose_fixed_delivery_from_slot(install_dir, &slot, &identity)
-            {
-                mark_slot_failed(&slot, &identity, &error.to_string());
-                return Err(error);
+            // spent permit is inherited.
+            verify_retained_exposure(install_dir, &slot, &identity, &envelope, claim)?;
+            // Exclusive launch claim (issue #2786 W5): an exact replay of
+            // a spent delivery returns the retained set without re-arming
+            // anything; a different commitment under the spent claim is
+            // denied, so spent authority can never be revived. A legacy
+            // set with no retained slot adopts through registration.
+            let outcome = claim_wasm_dispatch_launch(
+                joins,
+                &join,
+                &identity,
+                install_dir,
+                claim.admitted_at_unix_ms,
+            );
+            if outcome == WasmLaunchClaimOutcome::Conflict {
+                return Err(invalid(outcome.code()));
             }
-            joins.register_delivery(&join, &identity);
+            if outcome != WasmLaunchClaimOutcome::RetainedResult {
+                joins.register_delivery(&join, &identity);
+            }
             return Ok(WasmPublishedBundle {
                 material,
                 join,
@@ -2504,18 +2950,17 @@ pub fn publish_wasm_dispatch_bundle(
             install_dir,
         )?;
     }
-    // Owner-side reconciliation (issue #2786 A4): a Ready publication
-    // whose material disappeared is transitioned to an explicit
-    // recoverable Failed publication before the new set stages, so Join
-    // Ready can never outlive missing material. At this point the old
-    // live set is either absent or owner-reclaimed above; the live skip
-    // is re-read defensively.
-    let swept_live_digest = read_live_material(install_dir)
-        .ok()
-        .flatten()
-        .and_then(|live| material_bytes(&live).ok())
-        .map(|envelope| sha256_hex(&envelope));
-    reconcile_ready_slots(&slots, swept_live_digest.as_deref(), &slot_name);
+    reconcile_and_prune_slots(install_dir, &slots, &slot_name, &identity)?;
+    // Exclusive launch claim before any staging side effect (issue #2786
+    // W5): a different commitment under a spent claim is denied here, so
+    // a failed publication stages no bytes for a delivery that cannot arm.
+    deny_spent_revival(
+        joins,
+        &join,
+        &identity,
+        install_dir,
+        claim.admitted_at_unix_ms,
+    )?;
     // Immutable generation staging first: a publication error here never
     // touches the fixed names, so it cannot delete another generation.
     // Fixed-name exposure follows, payloads first and envelope last, each
@@ -2527,7 +2972,6 @@ pub fn publish_wasm_dispatch_bundle(
     // Join Ready cannot outlive missing material without an explicit
     // recoverable failed publication.
     joins.register_delivery(&join, &identity);
-    prune_delivery_slots(&slots, Some(&envelope_digest), &slot_name);
     Ok(WasmPublishedBundle {
         material,
         join,
@@ -2880,7 +3324,8 @@ mod tests {
         }
         std::fs::create_dir_all(dir.join("00000000000000000007-residue"))
             .expect("residue dir writable");
-        prune_delivery_slots(&dir, None, "00000000000000000007-0000000000000009");
+        let report = prune_delivery_slots(&dir, None, "00000000000000000007-0000000000000009", &[]);
+        assert_eq!(report.retained_failed, 0);
         assert!(!dir.join("00000000000000000007-0000000000000001").exists());
         assert!(dir.join("00000000000000000007-0000000000000009").exists());
         assert!(dir.join("00000000000000000007-residue").exists());
@@ -2896,7 +3341,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("slots dir writable");
         marked_slot(&dir, "00000000000000000007-aaaaaaaaaaaaaaaa", 1);
-        reconcile_ready_slots(&dir, None, "00000000000000000007-bbbbbbbbbbbbbbbb");
+        let consumed = reconcile_ready_slots(&dir, None, "00000000000000000007-bbbbbbbbbbbbbbbb");
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(
+            consumed[0].recovery_reference,
+            "00000000000000000007-aaaaaaaaaaaaaaaa"
+        );
+        assert!(!consumed[0].eligible_for_reclaim());
         let slot = dir.join("00000000000000000007-aaaaaaaaaaaaaaaa");
         assert!(!slot.join(WASM_DELIVERY_READY_FILE_NAME).exists());
         let state = read_slot_state(&slot);
@@ -2917,11 +3368,12 @@ mod tests {
         marked_slot(&dir, "00000000000000000007-aaaaaaaaaaaaaaaa", 1);
         marked_slot(&dir, "00000000000000000007-bbbbbbbbbbbbbbbb", 2);
         let live = "e".repeat(64);
-        reconcile_ready_slots(
+        let consumed = reconcile_ready_slots(
             &dir,
             Some(live.as_str()),
             "00000000000000000007-aaaaaaaaaaaaaaaa",
         );
+        assert!(consumed.is_empty());
         for name in [
             "00000000000000000007-aaaaaaaaaaaaaaaa",
             "00000000000000000007-bbbbbbbbbbbbbbbb",
@@ -3013,11 +3465,13 @@ mod tests {
                 revision,
             );
         }
-        prune_delivery_slots(
+        let report = prune_delivery_slots(
             &dir,
             Some(&"e".repeat(64)),
             "00000000000000000007-0000000000000009",
+            &[],
         );
+        assert_eq!(report.retained_failed, 0);
         for revision in 1..=9u64 {
             assert!(
                 dir.join(format!("00000000000000000007-{revision:016x}"))
@@ -3155,6 +3609,555 @@ mod tests {
             )
             .is_ok()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The disposition record is the reclaim authorization (issue #2786
+    /// W5/W6): proven no-effect retirement and acknowledged terminal
+    /// execution are eligible; every other disposition backpressures with
+    /// the exact recovery reference.
+    #[test]
+    fn disposition_record_gates_reclaim_eligibility() {
+        let identity = revision_identity(3);
+        let eligible = WasmDeliveryDispositionRecord {
+            identity: identity.clone(),
+            disposition: WasmDeliveryDisposition::CancelProvenNoEffect,
+            recovery_reference: "slot-ref".to_owned(),
+            acknowledged_terminal: false,
+        };
+        assert!(eligible.eligible_for_reclaim());
+        let acknowledged = WasmDeliveryDispositionRecord {
+            identity: identity.clone(),
+            disposition: WasmDeliveryDisposition::FinishExactAuthorizedOperation,
+            recovery_reference: "slot-ref".to_owned(),
+            acknowledged_terminal: true,
+        };
+        assert!(acknowledged.eligible_for_reclaim());
+        for disposition in [
+            WasmDeliveryDisposition::FinishExactAuthorizedOperation,
+            WasmDeliveryDisposition::DrainRead,
+            WasmDeliveryDisposition::CheckpointTransfer,
+            WasmDeliveryDisposition::BlockScopeUnknownOutcome,
+        ] {
+            let record = WasmDeliveryDispositionRecord {
+                identity: identity.clone(),
+                disposition,
+                recovery_reference: "slot-ref".to_owned(),
+                acknowledged_terminal: false,
+            };
+            assert!(!record.eligible_for_reclaim());
+            let backpressure = record.to_backpressure();
+            assert_eq!(backpressure.live_operation_id, "o");
+            assert!(backpressure.retry_condition.contains("slot-ref"));
+        }
+        assert_eq!(
+            WasmDeliveryDisposition::CancelProvenNoEffect.code(),
+            "cancel_proven_no_effect"
+        );
+    }
+
+    /// The full launch-claim taxonomy against one retained record (issue
+    /// #2786 W5): fresh claims acquire, held claims reconcile, spent
+    /// claims retain on exact replay and conflict otherwise, and misses
+    /// adopt through the retained slot or deny.
+    #[test]
+    fn launch_claim_outcome_taxonomy() {
+        let dir = stage_dir("eliot-2786-claim-taxonomy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim = test_claim();
+        claim.artifact_bytes = b"taxonomy-artifact".to_vec();
+        claim.input_bytes = b"taxonomy-input".to_vec();
+        claim.guest.artifact_digest = sha256_hex(b"taxonomy-artifact");
+        claim.guest.input_digest = sha256_hex(b"taxonomy-input");
+        let bundle = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim,
+            &mut joins,
+        )
+        .expect("bundle publishes");
+        // Fresh record, nothing held: acquire.
+        assert_eq!(
+            claim_wasm_dispatch_launch(
+                &joins,
+                &bundle.join,
+                &bundle.delivery,
+                &dir,
+                4_000_000_030_000
+            ),
+            WasmLaunchClaimOutcome::Acquired
+        );
+        // Same identity held by the child: reconcile, never double-arm.
+        write_json(
+            &dir,
+            WASM_HOST_INFLIGHT_FILE_NAME,
+            &serde_json::json!({"operation_id": "operation-bundle-001",
+                "claim_id": "claim-bundle-001", "generation": 7, "grant_digest": "d"}),
+        );
+        assert_eq!(
+            claim_wasm_dispatch_launch(
+                &joins,
+                &bundle.join,
+                &bundle.delivery,
+                &dir,
+                4_000_000_030_000
+            ),
+            WasmLaunchClaimOutcome::ExistingInFlight
+        );
+        let _ = std::fs::remove_file(dir.join(WASM_HOST_INFLIGHT_FILE_NAME));
+        // Spent record, exact replay: retained, never re-armed.
+        joins
+            .admit(
+                &claim.claim_id,
+                &claim.operation_id,
+                &bundle.join.invocation_digest,
+                4_000_000_030_000,
+            )
+            .expect("admission consumes");
+        assert_eq!(
+            claim_wasm_dispatch_launch(
+                &joins,
+                &bundle.join,
+                &bundle.delivery,
+                &dir,
+                4_000_000_030_000
+            ),
+            WasmLaunchClaimOutcome::RetainedResult
+        );
+        // Spent record, different envelope: conflict, never revived.
+        let mut rebound = bundle.delivery.clone();
+        rebound.envelope_digest = "f".repeat(64);
+        assert_eq!(
+            claim_wasm_dispatch_launch(&joins, &bundle.join, &rebound, &dir, 4_000_000_030_000),
+            WasmLaunchClaimOutcome::Conflict
+        );
+        // Fresh record past the grant window: unavailable.
+        let mut joins_b = WasmJoinTable::default();
+        joins_b.register_delivery(&bundle.join, &bundle.delivery);
+        assert_eq!(
+            claim_wasm_dispatch_launch(
+                &joins_b,
+                &bundle.join,
+                &bundle.delivery,
+                &dir,
+                4_000_000_090_000
+            ),
+            WasmLaunchClaimOutcome::Unavailable
+        );
+        // Table miss with a retained Ready slot: restart adoption.
+        assert_eq!(
+            claim_wasm_dispatch_launch(
+                &WasmJoinTable::default(),
+                &bundle.join,
+                &bundle.delivery,
+                &dir,
+                4_000_000_030_000
+            ),
+            WasmLaunchClaimOutcome::Acquired
+        );
+        // Table miss with no retained slot: unavailable.
+        let mut foreign = bundle.delivery.clone();
+        foreign.envelope_digest = "e".repeat(64);
+        assert_eq!(
+            claim_wasm_dispatch_launch(
+                &WasmJoinTable::default(),
+                &bundle.join,
+                &foreign,
+                &dir,
+                4_000_000_030_000
+            ),
+            WasmLaunchClaimOutcome::Unavailable
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spent authority cannot be revived (issue #2786 W5/A4): after the
+    /// join is consumed, a different commitment under the same claim is
+    /// denied before staging, while an exact replay returns the retained
+    /// set with the spent record untouched.
+    #[test]
+    fn claim_denies_spent_revival_and_retains_exact_replay() {
+        let dir = stage_dir("eliot-2786-spent-revival");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim_a = test_claim();
+        claim_a.artifact_bytes = b"revival-artifact-a".to_vec();
+        claim_a.input_bytes = b"revival-input-a".to_vec();
+        claim_a.guest.artifact_digest = sha256_hex(b"revival-artifact-a");
+        claim_a.guest.input_digest = sha256_hex(b"revival-input-a");
+        let bundle_a = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_a,
+            &mut joins,
+        )
+        .expect("bundle A publishes");
+        joins
+            .admit(
+                &claim_a.claim_id,
+                &claim_a.operation_id,
+                &bundle_a.join.invocation_digest,
+                4_000_000_030_000,
+            )
+            .expect("admission consumes A");
+        // A different commitment under the spent claim is denied.
+        let mut claim_prime = test_claim();
+        claim_prime.artifact_bytes = b"revival-artifact-prime".to_vec();
+        claim_prime.input_bytes = b"revival-input-prime".to_vec();
+        claim_prime.guest.artifact_digest = sha256_hex(b"revival-artifact-prime");
+        claim_prime.guest.input_digest = sha256_hex(b"revival-input-prime");
+        claim_prime.admitted_at_unix_ms = 4_000_000_060_001;
+        assert!(matches!(
+            publish_wasm_dispatch_bundle(
+                "C:\\Kernel\\eliot-wasm-host.exe",
+                &"d".repeat(64),
+                &dir,
+                &claim_prime,
+                &mut joins
+            ),
+            Err(WasmDispatchError::InvalidMaterial(reason))
+            if reason == "LAUNCH_CLAIM_CONFLICT"
+        ));
+        // An exact replay of the spent delivery returns the retained set
+        // with the spent record untouched: no second arm.
+        let replay = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_a,
+            &mut joins,
+        )
+        .expect("exact replay returns the retained set");
+        assert_eq!(replay.delivery, bundle_a.delivery);
+        assert_eq!(
+            joins.admit(
+                &claim_a.claim_id,
+                &claim_a.operation_id,
+                &bundle_a.join.invocation_digest,
+                4_000_000_030_000
+            ),
+            Err(JoinDeny::Replayed)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restart re-binds through the retained slot (issue #2786 W7): with
+    /// an empty in-memory table, an exact republish of the live delivery
+    /// adopts the retained Ready slot and succeeds.
+    #[test]
+    fn claim_adopts_retained_slot_after_restart() {
+        let dir = stage_dir("eliot-2786-restart-adopt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim = test_claim();
+        claim.artifact_bytes = b"adopt-artifact".to_vec();
+        claim.input_bytes = b"adopt-input".to_vec();
+        claim.guest.artifact_digest = sha256_hex(b"adopt-artifact");
+        claim.guest.input_digest = sha256_hex(b"adopt-input");
+        let bundle = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim,
+            &mut joins,
+        )
+        .expect("bundle publishes");
+        let mut fresh_joins = WasmJoinTable::default();
+        let adopted = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim,
+            &mut fresh_joins,
+        )
+        .expect("restart republish adopts the retained slot");
+        assert_eq!(adopted.delivery, bundle.delivery);
+        assert_eq!(fresh_joins.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Never-issued expiry retires by record (issue #2786 W5): an expired
+    /// live set with no child claim and an intact slot reclaims under
+    /// `CancelProvenNoEffect`, and the replacement publishes fresh.
+    #[test]
+    fn expired_never_issued_reclaims_by_retirement_record() {
+        let dir = stage_dir("eliot-2786-expiry-never-issued");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim_a = test_claim();
+        claim_a.artifact_bytes = b"never-issued-a".to_vec();
+        claim_a.input_bytes = b"never-issued-input-a".to_vec();
+        claim_a.guest.artifact_digest = sha256_hex(b"never-issued-a");
+        claim_a.guest.input_digest = sha256_hex(b"never-issued-input-a");
+        publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_a,
+            &mut joins,
+        )
+        .expect("bundle A publishes");
+        let mut claim_b = test_claim();
+        claim_b.claim_id = "claim-bundle-002".to_owned();
+        claim_b.operation_id = "operation-bundle-002".to_owned();
+        claim_b.artifact_bytes = b"never-issued-b".to_vec();
+        claim_b.input_bytes = b"never-issued-input-b".to_vec();
+        claim_b.guest.artifact_digest = sha256_hex(b"never-issued-b");
+        claim_b.guest.input_digest = sha256_hex(b"never-issued-input-b");
+        claim_b.admitted_at_unix_ms = 4_000_000_060_001;
+        let bundle_b = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_b,
+            &mut joins,
+        )
+        .expect("never-issued expiry retires and B publishes");
+        let artifact =
+            std::fs::read(dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME)).expect("artifact readable");
+        assert_eq!(sha256_hex(&artifact), bundle_b.delivery.artifact_digest);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unknown expiry stays blocked (issue #2786 W5): an expired live set
+    /// with no child claim and no intact slot backpressures with the
+    /// owner-retirement reference, and its bytes stay staged.
+    #[test]
+    fn expired_unresolved_without_slot_backpressures() {
+        let dir = stage_dir("eliot-2786-expiry-unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim_a = test_claim();
+        claim_a.artifact_bytes = b"unknown-a".to_vec();
+        claim_a.input_bytes = b"unknown-input-a".to_vec();
+        claim_a.guest.artifact_digest = sha256_hex(b"unknown-a");
+        claim_a.guest.input_digest = sha256_hex(b"unknown-input-a");
+        let bundle_a = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_a,
+            &mut joins,
+        )
+        .expect("bundle A publishes");
+        let _ = std::fs::remove_dir_all(
+            dir.join(WASM_DELIVERY_SLOT_DIR_NAME)
+                .join(bundle_a.delivery.slot_name()),
+        );
+        let mut claim_b = test_claim();
+        claim_b.claim_id = "claim-bundle-002".to_owned();
+        claim_b.operation_id = "operation-bundle-002".to_owned();
+        claim_b.artifact_bytes = b"unknown-b".to_vec();
+        claim_b.input_bytes = b"unknown-input-b".to_vec();
+        claim_b.guest.artifact_digest = sha256_hex(b"unknown-b");
+        claim_b.guest.input_digest = sha256_hex(b"unknown-input-b");
+        claim_b.admitted_at_unix_ms = 4_000_000_060_001;
+        match publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_b,
+            &mut joins,
+        ) {
+            Err(WasmDispatchError::Backpressure(backpressure)) => {
+                assert_eq!(backpressure.live_operation_id, "operation-bundle-001");
+                assert!(
+                    backpressure
+                        .retry_condition
+                        .contains("no owner retirement evidence")
+                );
+            }
+            Err(error) => panic!("expected unknown-expiry backpressure, got {error:?}"),
+            Ok(_) => panic!("expected unknown-expiry backpressure, got a published bundle"),
+        }
+        assert!(dir.join(WASM_HOST_MATERIAL_FILE_NAME).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn failed_slot(slots: &std::path::Path, name: &str, revision: u64) {
+        let slot = slots.join(name);
+        std::fs::create_dir_all(&slot).expect("slot dir writable");
+        std::fs::write(
+            slot.join(WASM_DELIVERY_FAILED_FILE_NAME),
+            serde_json::to_vec(&WasmPublicationState::Failed {
+                identity: revision_identity(revision),
+                reason: "delivery-material-missing".to_owned(),
+            })
+            .expect("marker serializes"),
+        )
+        .expect("marker writable");
+    }
+
+    /// Pruning never deletes `Failed` recovery evidence (issue #2786
+    /// W6/A4): over budget, failed slots are retained and reported while
+    /// the current slot is untouched.
+    #[test]
+    fn prune_protects_failed_evidence_and_reports() {
+        let dir = stage_dir("eliot-2786-prune-failed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slots dir writable");
+        for revision in 1..=9u64 {
+            failed_slot(
+                &dir,
+                &format!("00000000000000000007-{revision:016x}"),
+                revision,
+            );
+        }
+        let report = prune_delivery_slots(&dir, None, "00000000000000000007-0000000000000009", &[]);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.retained_failed, 8);
+        for revision in 1..=9u64 {
+            assert!(
+                dir.join(format!("00000000000000000007-{revision:016x}"))
+                    .exists()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A budget held by failed evidence backpressures cleanly (issue #2786
+    /// W6/AUD5): with nine retained `Failed` slots the replacement is
+    /// denied before staging, so no fixed name is touched.
+    #[test]
+    fn failed_evidence_budget_backpressures_publish() {
+        let dir = stage_dir("eliot-2786-budget-evidence");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let slots = dir.join(WASM_DELIVERY_SLOT_DIR_NAME);
+        std::fs::create_dir_all(&slots).expect("slots dir writable");
+        for revision in 1..=9u64 {
+            failed_slot(
+                &slots,
+                &format!("00000000000000000007-{revision:016x}"),
+                revision,
+            );
+        }
+        let mut joins = WasmJoinTable::default();
+        let mut claim = test_claim();
+        claim.artifact_bytes = b"budget-artifact".to_vec();
+        claim.input_bytes = b"budget-input".to_vec();
+        claim.guest.artifact_digest = sha256_hex(b"budget-artifact");
+        claim.guest.input_digest = sha256_hex(b"budget-input");
+        match publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim,
+            &mut joins,
+        ) {
+            Err(WasmDispatchError::Backpressure(backpressure)) => {
+                assert!(
+                    backpressure
+                        .retry_condition
+                        .contains("failed-publication evidence")
+                );
+            }
+            Err(error) => panic!("expected evidence-budget backpressure, got {error:?}"),
+            Ok(_) => panic!("expected evidence-budget backpressure, got a published bundle"),
+        }
+        assert!(!dir.join(WASM_HOST_MATERIAL_FILE_NAME).exists());
+        assert!(joins.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Root accounting pins the fixed set (issue #2786 W7): a staged
+    /// delivery accounts every file present with its exact digest, and a
+    /// removed payload reads as explicit `Missing`, never as a match.
+    #[test]
+    fn account_delivery_root_files_pins_fixed_set() {
+        let dir = stage_dir("eliot-2786-root-account");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim = test_claim();
+        claim.artifact_bytes = b"account-artifact".to_vec();
+        claim.input_bytes = b"account-input".to_vec();
+        claim.guest.artifact_digest = sha256_hex(b"account-artifact");
+        claim.guest.input_digest = sha256_hex(b"account-input");
+        let bundle = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim,
+            &mut joins,
+        )
+        .expect("bundle publishes");
+        let accounting = account_delivery_root_files(&dir);
+        assert!(accounting.readable());
+        assert!(accounting.payloads_match(&bundle.delivery));
+        assert!(matches!(
+            &accounting.material,
+            WasmRootFileState::Present { .. }
+        ));
+        let _ = std::fs::remove_file(dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME));
+        let accounting = account_delivery_root_files(&dir);
+        assert!(accounting.readable());
+        assert!(!accounting.payloads_match(&bundle.delivery));
+        assert!(matches!(&accounting.input, WasmRootFileState::Missing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Join Ready never outlives missing material at publish level (issue
+    /// #2786 A4): a Ready publication whose bytes and fixed set are gone
+    /// is transitioned to an explicit `Failed` publication while the new
+    /// delivery publishes fresh.
+    #[test]
+    fn ready_with_missing_material_fails_over_cleanly() {
+        let dir = stage_dir("eliot-2786-failover-clean");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stage dir writable");
+        let mut joins = WasmJoinTable::default();
+        let mut claim_a = test_claim();
+        claim_a.artifact_bytes = b"failover-a".to_vec();
+        claim_a.input_bytes = b"failover-input-a".to_vec();
+        claim_a.guest.artifact_digest = sha256_hex(b"failover-a");
+        claim_a.guest.input_digest = sha256_hex(b"failover-input-a");
+        let bundle_a = publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_a,
+            &mut joins,
+        )
+        .expect("bundle A publishes");
+        let slots = dir.join(WASM_DELIVERY_SLOT_DIR_NAME);
+        let slot_a = slots.join(bundle_a.delivery.slot_name());
+        for file in [
+            WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+            WASM_HOST_GUEST_INPUT_FILE_NAME,
+            WASM_HOST_MATERIAL_FILE_NAME,
+        ] {
+            let _ = std::fs::remove_file(slot_a.join(file));
+            let _ = std::fs::remove_file(dir.join(file));
+        }
+        let mut claim_b = test_claim();
+        claim_b.claim_id = "claim-bundle-002".to_owned();
+        claim_b.operation_id = "operation-bundle-002".to_owned();
+        claim_b.artifact_bytes = b"failover-b".to_vec();
+        claim_b.input_bytes = b"failover-input-b".to_vec();
+        claim_b.guest.artifact_digest = sha256_hex(b"failover-b");
+        claim_b.guest.input_digest = sha256_hex(b"failover-input-b");
+        publish_wasm_dispatch_bundle(
+            "C:\\Kernel\\eliot-wasm-host.exe",
+            &"d".repeat(64),
+            &dir,
+            &claim_b,
+            &mut joins,
+        )
+        .expect("B publishes while A fails over");
+        let state = read_slot_state(&slot_a);
+        assert!(matches!(state, Some(WasmPublicationState::Failed { .. })));
+        if let Some(WasmPublicationState::Failed { reason, .. }) = state {
+            assert_eq!(reason, "delivery-material-missing");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
