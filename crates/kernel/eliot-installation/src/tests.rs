@@ -6284,7 +6284,7 @@ fn system_service_installation_roots_validate_below_durable_data() {
 /// strictly below the I3.1 durable-data sibling (`<anchor>\Eliot\data`),
 /// and refuses a durable root off the anchor (issue #958-continue: the join
 /// arm compared the durable root against the profile root — which
-/// `<anchor>\Eliot\data` can never contain — refusing every UserMode binding
+/// `<anchor>\Eliot\data` can never contain — refusing every `UserMode` binding
 /// including production; the derivation, the sibling layout and
 /// `RuntimeStateRoots::validate` all require the
 /// `Eliot\data\installations\<key>` shape, so the join compares the
@@ -8952,7 +8952,7 @@ fn installation_registry_host_root_shape_is_exact_and_non_reparse_lexical() {
 /// A `UserMode` installation Host root (`<anchor>\Eliot\data\installations\
 /// <key>\host`) is an installation Host root (issue #958-continue: the
 /// shape check admitted only the `SystemService` suffix, so the
-/// current-user registry open refused every UserMode root before any
+/// current-user registry open refused every `UserMode` root before any
 /// authority check ran).
 #[test]
 fn installation_registry_user_mode_host_root_shape_accepted() {
