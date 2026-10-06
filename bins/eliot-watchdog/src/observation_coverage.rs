@@ -437,12 +437,15 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::PathChange],
         mechanism: SensorMechanism::JournalReplay,
         privilege_profile: PlatformPrivilegeProfile::HostAdministrator,
-        coverage_limitation: "No journal source, cursor, page, or replay exists in this owner, so \
-             file-change coverage is blind and the replay half of I8.2's coverage vocabulary is \
-             unreachable.",
+        coverage_limitation: "The journal surface (`eliot-platform-windows::usn_journal`), the \
+             spool-retained cursor and the replay adapter exist, but the tick passes no \
+             registered-scope volume, so no window is ever recorded and file-change coverage \
+             stays blind.",
         wiring: ChannelWiring::MissingAdapter {
-            reason: "`git grep -rn 'USN\\|UsnJournal\\|usn_journal' -- crates/ bins/` returns no \
-                 match: no USN symbol exists anywhere in the workspace, let alone a Watchdog caller",
+            reason: "`journal_replay_observation::observe_journal_replay` has no production caller: \
+                 the tick holds no registered-scope roots to pass (see `RegisteredScope`), so the \
+                 adapter, the platform page read and the spool cursor it stands on are proved by \
+                 unit tests only",
         },
     },
     ChannelCapability {

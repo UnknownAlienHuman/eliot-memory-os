@@ -71,6 +71,7 @@ pub mod host_recovery;
 #[cfg(test)]
 mod import_positive_tests;
 mod independent_sensor;
+mod journal_replay_observation;
 mod observation_attribution;
 mod observation_coverage;
 mod runtime_manifest_selection;
