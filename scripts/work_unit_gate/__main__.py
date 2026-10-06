@@ -94,16 +94,18 @@ except ImportError:  # fallback for direct file loading (delegate context)
     from scripts.work_unit_gate import case_binding  # type: ignore[no-redef]
     from scripts.work_unit_gate import doc_read_evidence  # type: ignore[no-redef]
 
-# Frozen leaf-router byte identities (from test_work_unit_gate_cohort at base;
-# Windows CRLF checkout). Used only for the shared-repo freeze check, never
-# for temp fixture roots (missing routers are skipped, not failed, so tiny
-# bootstrap repositories without routers still verify).
+# Frozen leaf-router byte identities (#852 refresh, retained on the #837 merge;
+# Windows CRLF checkout; verified byte-identical to the on-disk routers at the
+# merge base). Used only for the shared-repo freeze check, never for temp
+# fixture roots (missing routers are skipped, not failed, so tiny bootstrap
+# repositories without routers still verify).
 FROZEN_LEAF_ROUTER_SHA256 = {
     "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
-    "scripts/docs_router_core.py": "455aec470ab6f3f8bf7e64578d264ca0877a06cfec411d9aa415ffa62ae4a06a",
+    "scripts/docs_router_core.py": "19532a3505c6c94ccb3f4868ffa2d62fa0f666a6389c1166407937c15eb7ff9c",
     "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
     "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
 }
+
 
 PROOF_CHOICES = ("catalogue-only", "selected", "full-project")
 
@@ -174,6 +176,8 @@ def _git_succeeds(root: Path, arguments: list[str]) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return completed.returncode == 0
+
+
 
 
 def _accepted_commit(root: Path, issue: int) -> str | None:
@@ -781,11 +785,125 @@ def _typed_from_decoded(data: dict):  # type: ignore[no-untyped-def]
     return c.WorkUnitDescriptor.from_mapping(converted)
 
 
+def _run_generate_cohort_lock(argv: list[str]) -> int:
+    """Explicit owner-side cohort-lock generation (outside read-only validation).
+
+    Reads a controller-supplied snapshot JSON file, decodes the observed
+    numeric descriptors under --root, renders deterministic lock bytes via
+    cohort.generate_cohort_lock, writes --out, then read-back-validates the
+    emitted lock and checks its numeric class against discovery. Validation
+    paths stay read-only: nothing here runs during catalogue-only, selected
+    or full-project proofs. Existing proof kinds, selectors and exits are
+    untouched (dispatched before parsing, like doc-read-evidence).
+    """
+    parser = argparse.ArgumentParser(
+        prog="verify-work-unit.py generate-cohort-lock",
+        description="Generate a cohort aggregate lock from a controller snapshot.")
+    parser.add_argument("--snapshot", required=True, help="Controller-supplied snapshot JSON file.")
+    parser.add_argument("--out", required=True, help="Output lock TOML path.")
+    parser.add_argument("--root", default=".", help="Repository root carrying .github/work-units.")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    gen = parser.parse_args(argv)
+    root, err = _resolve_root(gen.root)
+    if err is not None:
+        return err
+    assert root is not None
+    try:
+        snapshot_raw = Path(gen.snapshot).read_bytes()
+    except OSError:
+        _emit_error("error: --snapshot file unavailable; rejected before execution")
+        return 2
+    if len(snapshot_raw) > 1048576:
+        _emit_error("error: --snapshot file too large; rejected before execution")
+        return 2
+
+    def _gen_fail(detail: str) -> int:
+        if gen.json:
+            _emit(json.dumps({"exit": 1, "terminal": "INCOMPLETE", "completion": "NOT_VERIFIED",
+                              "terminal_detail": detail}, sort_keys=True))
+        else:
+            _emit(f"generate-cohort-lock INCOMPLETE: {detail}")
+        return 1
+
+    try:
+        snapshot = json.loads(snapshot_raw.decode("utf-8"))
+    except Exception:
+        return _gen_fail("snapshot is not valid JSON")
+    if type(snapshot) is not dict:
+        return _gen_fail("snapshot is not a JSON object")
+    discovered = _discover_descriptor_files(root)
+    typed_by_issue: dict[int, object] = {}
+    for num, path in discovered:
+        try:
+            raw_desc = path.read_bytes()
+        except OSError:
+            return _gen_fail(f"missing selected implementation: {num}")
+        try:
+            data = descriptor_runner.decode_descriptor(raw_desc, f".github/work-units/{num}.toml")
+        except descriptor_runner.RunnerInputError as exc:
+            return _gen_fail(f"descriptor contract failure: {_redact(exc)}")
+        except c.ContractViolation:
+            return _gen_fail("descriptor contract failure: binding mismatch")
+        except Exception:
+            return _gen_fail("descriptor internal failure")
+        try:
+            typed = _typed_from_decoded(data)
+        except c.ContractViolation:
+            return _gen_fail("catalogue contract failure: descriptor rejected")
+        except Exception:
+            return _gen_fail("catalogue internal failure")
+        if type(typed) is not c.WorkUnitDescriptor:
+            return _gen_fail("catalogue internal failure: malformed descriptor")
+        typed_by_issue[num] = typed
+    try:
+        lock_bytes = cohort.generate_cohort_lock(snapshot, typed_by_issue)
+    except cohort.CohortError as exc:
+        problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
+        return _gen_fail(f"snapshot rejected: {_redact(problem)}")
+    except c.ContractViolation:
+        return _gen_fail("snapshot contract failure")
+    except Exception:
+        _emit_error("error: generation internal failure")
+        return 2
+    out_path = Path(gen.out)
+    try:
+        if out_path.parent != Path(".") and not out_path.parent.is_dir():
+            return _gen_fail("output directory missing")
+        out_path.write_bytes(lock_bytes)
+    except OSError:
+        return _gen_fail("generated lock unwritable")
+    try:
+        lock = cohort.read_cohort_lock(out_path)
+    except cohort.CohortError as exc:
+        problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
+        return _gen_fail(f"generated lock unreadable: {_redact(problem)}")
+    try:
+        observed_class = sorted(num for num, _ in
+                                cohort.discover_numeric_descriptor_files(root / ".github" / "work-units"))
+    except cohort.CohortError as exc:
+        problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
+        return _gen_fail(f"discovery unavailable: {_redact(problem)}")
+    if observed_class != list(lock.aggregate.numeric_descriptors):
+        return _gen_fail("generated lock numeric class does not match discovery")
+    summary = {"exit": 0, "terminal": "PASS", "completion": "VERIFIED",
+               "terminal_detail": "cohort lock generated and validated",
+               "digest": lock.aggregate.sha256, "rows": len(lock.rows),
+               "numeric_descriptors": observed_class}
+    if gen.json:
+        _emit(json.dumps(summary, sort_keys=True))
+    else:
+        _emit(f"generate-cohort-lock PASS: digest={lock.aggregate.sha256} "
+              f"rows={len(lock.rows)} numeric={observed_class}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     # #2965 merge-boundary subcommand. Dispatched before any other parsing so
     # the existing work-unit/legacy CLI contract below is byte-for-byte
     # unchanged: no other option, selector, proof kind or exit code is touched.
+    if args_list[:1] == ["generate-cohort-lock"]:
+        return _run_generate_cohort_lock(args_list[1:])
     if args_list[:1] == ["doc-read-evidence"]:
         return doc_read_evidence.main(args_list[1:])
     dup = _reject_duplicates(args_list)
@@ -923,6 +1041,115 @@ def main(argv: list[str] | None = None) -> int:
             _emit(_render_human(result))
         return int(result["exit"])
 
+    class _AdmissionHalt(Exception):
+        """Carries a fail_result shape out of the admission helper. (probe)"""
+
+        def __init__(self, terminal_detail: str, exit_code: int,
+                     missing: list | None = None, failed: list | None = None):
+            super().__init__(terminal_detail)
+            self.terminal_detail = terminal_detail
+            self.exit_code = exit_code
+            self.missing = missing or []
+            self.failed = failed or []
+
+    def _admit_row_receipt(num: int, issue_id: object, unit: object) -> object:
+        """Admit one authoritative assignment receipt into memo_assignment.
+
+        The single acquisition implementation for selected and full-project
+        paths: builds the source request from the caller-supplied (already
+        typed) issue/unit identity, reads the live or explicitly admitted
+        offline source with no fallback, and stores the typed document.
+        Missing required evidence halts incomplete; it is never fabricated.
+        """
+        try:
+            request = assignment_source.SourceRequest(issue=issue_id, unit=unit,
+                                                      source_use=c.AssignmentSourceUse.ACTIVE_ASSIGNMENT)
+        except assignment_source.SourceError:
+            raise _AdmissionHalt("configuration failure: source request", 2)
+        except c.ContractViolation:
+            raise _AdmissionHalt("contract failure: source request", 1,
+                                 failed=[f"issue-{num}"])
+        except Exception:
+            raise _AdmissionHalt("internal failure: source request", 2)
+        offline_cfg = None
+        if mode is c.SourceAuthority.EXPLICIT_OFFLINE_SNAPSHOT:
+            assert offline_path is not None
+            try:
+                import json as _json
+
+                sidecar = offline_path.with_name(offline_path.name + ".admission.json")
+                try:
+                    admission_raw = sidecar.read_bytes()
+                except OSError:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                if len(admission_raw) > 65536:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                try:
+                    admission = _json.loads(admission_raw.decode("utf-8"))
+                except Exception:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                if type(admission) is not dict:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                snap_sha = admission.get("snapshot_sha256")
+                prod_raw = admission.get("producer")
+                cap_raw = admission.get("capture_receipt_sha256")
+                fresh_raw = admission.get("freshness_policy_sha256")
+                max_age_raw = admission.get("max_age_seconds", 86400)
+                if not (isinstance(snap_sha, str) and isinstance(prod_raw, str)
+                        and isinstance(cap_raw, str) and isinstance(fresh_raw, str)):
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                if type(max_age_raw) is not int or not 1 <= max_age_raw <= 86400:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+                try:
+                    producer = c.WorkUnitIdentity(prod_raw)
+                except c.ContractViolation:
+                    raise _AdmissionHalt("offline failure: producer invalid", 1,
+                                         failed=[f"issue-{num}"])
+                try:
+                    offline_cfg = assignment_source.TrustedOfflineCapture(
+                        request=request, path=offline_path, snapshot_sha256=snap_sha,
+                        producer=producer, capture_receipt_sha256=cap_raw,
+                        freshness_policy_sha256=fresh_raw, max_age_seconds=max_age_raw)
+                except assignment_source.SourceError:
+                    raise _AdmissionHalt("offline failure: capture not admitted", 1,
+                                         failed=[f"issue-{num}"])
+            except assignment_source.SourceError as exc:
+                raise _AdmissionHalt(f"offline failure: {_redact(exc.code.value)}", 1,
+                                     failed=[f"issue-{num}"])
+            except _AdmissionHalt:
+                raise
+            except Exception:
+                raise _AdmissionHalt("offline failure: snapshot unavailable", 1,
+                                     failed=[f"issue-{num}"])
+        try:
+            source = assignment_source.AssignmentSource(request, offline=offline_cfg)
+        except assignment_source.SourceError:
+            raise _AdmissionHalt("configuration failure: assignment source", 2)
+        except Exception:
+            raise _AdmissionHalt("internal failure: assignment source", 2)
+        if type(source) is not assignment_source.AssignmentSource:
+            raise _AdmissionHalt("malformed child return: assignment source", 2)
+        try:
+            doc = source.read(mode)
+        except assignment_source.SourceError as exc:
+            code = exc.code.value if hasattr(exc, "code") else "SOURCE_UNAVAILABLE"
+            raise _AdmissionHalt(f"assignment failure: {_redact(code)}", 1,
+                                 failed=[f"issue-{num}"])
+        except c.ContractViolation:
+            raise _AdmissionHalt("assignment contract failure", 1, failed=[f"issue-{num}"])
+        except Exception:
+            raise _AdmissionHalt("assignment internal failure", 2)
+        if type(doc) is not assignment_source.AssignmentDocument:
+            raise _AdmissionHalt("malformed child return: assignment document", 2)
+        memo_assignment[num] = doc
+        return doc
+
     try:
         # Catalogue-only: no runner, no assignment, catalogue integrity only.
         if proof == "catalogue-only":
@@ -992,7 +1219,9 @@ def main(argv: list[str] | None = None) -> int:
                         lock_path, root / ".github" / "work-units", typed_by_issue,
                         expected_base_commit=_observed_base_commit(root),
                         expected_repository=_expected_repository(typed_descs),
-                        assignment_receipts=_assignment_receipts(memo_assignment))
+                        assignment_receipts=_assignment_receipts(memo_assignment),
+                        integration_owners=cohort.derive_integration_owners((), {}),
+                        package_sharing=())
                 except cohort.CohortError as exc:
                     return finish(fail_result(f"catalogue aggregate lock invalid: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
                                               ceiling="catalogue-integrity-only", scope="selected",
@@ -1030,7 +1259,15 @@ def main(argv: list[str] | None = None) -> int:
                                             disposition=c.CatalogueDisposition.ASSIGNED,
                                             descriptor=d, prerequisites=()) for d in sorted(typed_descs, key=lambda d: d.issue))
                 expected = tuple(sorted({r.issue for r in rows}))
-                catalogue = cohort.materialize_catalogue(rows, expected)
+                # No lock ships row dispositions here: every row is ASSIGNED
+                # with no prerequisites, so sharing derives from the observed
+                # descriptors alone; the owner profile is empty (catalogue-only
+                # admits no source mode, hence no relations) and fail-closed.
+                no_lock_owners = cohort.derive_integration_owners((), {})
+                no_lock_sharing = cohort.derive_package_sharing(list(typed_descs), {}, no_lock_owners)
+                catalogue = cohort.materialize_catalogue(
+                    rows, expected, integration_owners=no_lock_owners,
+                    package_sharing=no_lock_sharing)
             except cohort.CohortError as exc:
                 return finish(fail_result(f"catalogue structural failure: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
                                           ceiling="catalogue-integrity-only", scope="selected",
@@ -1371,7 +1608,53 @@ def main(argv: list[str] | None = None) -> int:
                 row for number, row in sorted(locked.items())
                 if number not in synthesized)
             expected_all = tuple(sorted({r.issue for r in rows_all}))
-            catalogue_full = cohort.materialize_catalogue(rows_all, expected_all)
+            # Authority handoff (AUD1/AUD3/AUD4): the admitted assignment
+            # documents are the only owner-role source. The profile projects
+            # admitted integrated-by relations (never spelling); sharing edges
+            # derive from accepted scopes, prereq edges and that profile.
+            admitted_docs = [doc for doc in memo_assignment.values()
+                             if type(doc) is assignment_source.AssignmentDocument]
+            full_profile = cohort.derive_integration_owners(
+                [doc.relation for doc in admitted_docs if doc.relation is not None],
+                {doc.receipt.issue: doc.receipt.unit for doc in admitted_docs})
+            # Every ASSIGNED denominator row needs its admitted receipt before
+            # validation; a row without one stays incomplete, never valid.
+            try:
+                for row in rows_all:
+                    if (row.disposition is c.CatalogueDisposition.ASSIGNED
+                            and row.issue.number not in memo_assignment):
+                        _admit_row_receipt(row.issue.number, row.issue, row.unit)
+            except _AdmissionHalt as halt:
+                return finish(fail_result(halt.terminal_detail, halt.exit_code,
+                                          missing=halt.missing, failed=halt.failed))
+            # Currency plus assignment rebinding over the retained lock
+            # (absent lock: locked is {} and there is nothing retained).
+            if locked:
+                try:
+                    full_lock = cohort.read_cohort_lock(lock_path)
+                    cohort.verify_lock_currency(
+                        full_lock,
+                        expected_base_commit=_observed_base_commit(root),
+                        expected_repository=_expected_repository(all_typed))
+                    cohort.verify_assignment_binding(
+                        full_lock,
+                        {d.issue.number: d for d in all_typed},
+                        _assignment_receipts(memo_assignment))
+                except cohort.CohortError as exc:
+                    return finish(fail_result(
+                        f"catalogue aggregate lock invalid: {_redact(exc.problem.value)}", 1,
+                        failed=["catalogue-lock"]))
+                except c.ContractViolation:
+                    return finish(fail_result("catalogue contract failure", 1, failed=["catalogue"]))
+                except Exception:
+                    return finish(fail_result("catalogue internal failure", 2))
+            full_prereqs = {r.issue.number: set(p.number for p in r.prerequisites) for r in rows_all}
+            full_sharing = cohort.derive_package_sharing(
+                [r.descriptor for r in rows_all if r.descriptor is not None],
+                full_prereqs, full_profile)
+            catalogue_full = cohort.materialize_catalogue(
+                rows_all, expected_all, integration_owners=full_profile,
+                package_sharing=full_sharing)
         except cohort.CohortError as exc:
             problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
             return finish(fail_result(f"catalogue structural failure: {_redact(problem)}", 1,
@@ -1439,14 +1722,15 @@ def main(argv: list[str] | None = None) -> int:
         # Bootstrap guard: never recursively execute own completion gate.
         # This layer only invokes #850 fixed runners via frozen builders with
         # descriptor-owned inputs; it never spawns verify-work-unit.py nor
-        # work_unit_gate.__main__ as a child. Selection of issue 837 itself
-        # still uses fixed fixtures/tiny repos, not a nested gate attempt.
+        # work_unit_gate.__main__ as a child. A descriptor whose TEST roots name
+        # this gate would execute the gate as its own prerequisite, so such a
+        # selection is rejected here instead of failing confusingly downstream;
+        # source roots are snapshot-only inputs that are never executed, so they
+        # stay allowed.
         for d in plan.descriptors:
-            for test_root in tuple(d.test_roots) + tuple(d.source_roots):
-                val = test_root.value
-                if val in ("scripts/verify-work-unit.py", "scripts/work_unit_gate/__main__.py"):
-                    # Not a failure by itself; runner inputs remain fixed builders.
-                    pass
+            for test_root in tuple(d.test_roots):
+                if test_root.value in ("scripts/verify-work-unit.py", "scripts/work_unit_gate/__main__.py"):
+                    return finish(fail_result(f"recursive gate selection: issue-{d.issue.number}", 1, failed=[f"issue-{d.issue.number}"]))
 
         # Attempt-path existence + leaf-router freeze (pure, no mutation).
         for d in plan.descriptors:
@@ -1458,7 +1742,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 return finish(fail_result("internal failure: attempt paths", 2))
             try:
-                cohort.validate_descriptor_scope(d)
+                cohort.validate_descriptor_scope(d, integration_owners=full_profile)
             except cohort.CohortError:
                 return finish(fail_result(f"contract failure: descriptor scope issue-{d.issue.number}", 1,
                                           failed=[f"issue-{d.issue.number}"]))
@@ -1481,6 +1765,14 @@ def main(argv: list[str] | None = None) -> int:
         evidence_rows: list = []
         for d in plan.descriptors:
             num = d.issue.number
+            # Owned-tree process accounting: every owned child below is
+            # spawned and synchronously reaped at its own site (any spawn
+            # failure, timeout or overflow early-returns), so the counters
+            # turn that control-flow fact into a checked invariant: a future
+            # non-reaped spawn surfaces as active > 0 (non-green), never a
+            # silent pass.
+            owned_spawned = 0
+            owned_reaped = 0
             doc = memo_assignment.get(num)
             if type(doc) is not assignment_source.AssignmentDocument:
                 return finish(fail_result("missing required receipt: assignment", 1, missing=[f"issue-{num}"]))
@@ -1532,7 +1824,7 @@ def main(argv: list[str] | None = None) -> int:
                     if d.package is not None:
                         try:
                             try:
-                                ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
+                                ws_doc = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8")) if (root / "Cargo.toml").is_file() else {}
                             except Exception:
                                 ws_doc = {}
                             members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
@@ -1634,6 +1926,8 @@ def main(argv: list[str] | None = None) -> int:
                         bproc = subprocess.run([str(a) for a in build_argv], capture_output=True,
                                                timeout=wall_s, env=env, cwd=str(root))
                         build_raw = bproc.stdout or b""
+                        owned_spawned += 1
+                        owned_reaped += 1
                     except subprocess.TimeoutExpired:
                         return finish(fail_result(f"execution timeout: issue-{num}", 1, failed=[f"issue-{num}"]))
                     except OSError:
@@ -1679,6 +1973,8 @@ def main(argv: list[str] | None = None) -> int:
                         proc = subprocess.run([str(a) for a in disc_argv], capture_output=True, timeout=wall_s,
                                               env=env, cwd=str(root))
                         disc_out = proc.stdout or b""
+                        owned_spawned += 1
+                        owned_reaped += 1
                         disc_code = int(proc.returncode)
                     except subprocess.TimeoutExpired:
                         return finish(fail_result(f"execution timeout: issue-{num}", 1, failed=[f"issue-{num}"]))
@@ -1723,6 +2019,8 @@ def main(argv: list[str] | None = None) -> int:
                             tproc = subprocess.run([str(a) for a in test_argv], capture_output=True,
                                                    timeout=wall_s, env=env, cwd=str(root))
                             tout, tcode = tproc.stdout or b"", int(tproc.returncode)
+                            owned_spawned += 1
+                            owned_reaped += 1
                         except subprocess.TimeoutExpired:
                             try:
                                 erec = descriptor_runner.compose_execution_record(
@@ -1816,19 +2114,33 @@ def main(argv: list[str] | None = None) -> int:
                     # Real contained execution via frozen child protocol.
                     discovery_doc = _run_python_child(root, module, suite_rel, source_sha,
                                                       int(transport["max_tests"]), float(transport["wall_s"]),
-                                                      child_env, "discover", None)
+                                                      child_env, "discover", None,
+                                                      int(transport["output_bytes"]))
                     if discovery_doc is None:
                         return finish(fail_result(f"discovery failure: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    owned_spawned += 1
+                    owned_reaped += 1
                     if type(discovery_doc) is not dict or not discovery_doc.get("tests"):
                         return finish(fail_result(f"discovery without execution cannot pass: issue-{num}", 1,
                                                   failed=[f"issue-{num}"]))
                     exec_doc = _run_python_child(root, module, suite_rel, source_sha,
                                                  int(transport["max_tests"]), float(transport["wall_s"]),
-                                                 child_env, "execute", discovery_doc.get("tests"))
+                                                 child_env, "execute", discovery_doc.get("tests"),
+                                                 int(transport["output_bytes"]))
                     if exec_doc is None:
                         return finish(fail_result(f"execution incomplete: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    owned_spawned += 1
+                    owned_reaped += 1
                     # Compose typed discovery/execution bindings (once per test).
-                    for entry in discovery_doc.get("tests", []):
+                    # Exact selected denominator: extra discovery is a
+                    # mismatch failure before any execution, never a silent
+                    # clip and never execute-then-fail (mirrors the rust
+                    # mismatch rule once test binaries are produced).
+                    discovered_ids = discovery_doc.get("tests", [])
+                    if len(discovered_ids) > d.matrix_cases:
+                        return finish(fail_result(f"discovery denominator mismatch: issue-{num} (discovered {len(discovered_ids)}, matrix {d.matrix_cases})", 1,
+                                                  failed=[f"issue-{num}"]))
+                    for entry in discovered_ids:
                         tid = entry.get("id")
                         line = entry.get("line", 1)
                         try:
@@ -1892,11 +2204,25 @@ def main(argv: list[str] | None = None) -> int:
             # observed disposition), never the descriptor's verification
             # phase label (those pairs are disjoint grammars).
             try:
-                _cleanup = descriptor_runner.cleanup_verdict(cleanup="clean", active_processes=0, truncated=False)
+                # Derived owned-tree observation, not literals: no timeout
+                # path reaches here (every TimeoutExpired handler above
+                # returns first); no bound was exceeded (every out_cap
+                # check above, including the child protocol bound, returns
+                # first); active owned processes = spawned - reaped.
+                _cleanup = descriptor_runner.cleanup_verdict(
+                    cleanup="clean",
+                    active_processes=(owned_spawned - owned_reaped),
+                    truncated=False)
                 exec_outcome = "pass" if executions and all(
                     getattr(e, "disposition", None) is c.ExecutionDisposition.EXECUTED_PASS
                     for e in executions) else "error"
                 _phase = descriptor_runner.phase_verdict("execute", exec_outcome)
+                if _cleanup != "green":
+                    return finish(fail_result(f"cleanup not observed clean: issue-{num}", 1,
+                                              failed=[f"issue-{num}"]))
+                if _phase != "green":
+                    return finish(fail_result(f"phase verdict not green: issue-{num}", 1,
+                                              failed=[f"issue-{num}"]))
             except descriptor_runner.RunnerInputError:
                 return finish(fail_result(f"phase verdict failure: issue-{num}", 1,
                                           failed=[f"issue-{num}"]))
@@ -2068,11 +2394,15 @@ def main(argv: list[str] | None = None) -> int:
                                       ceiling="selected-verification-only",
                                       scope=("full-project" if proof == "full-project" else "selected")))
         sel_sorted = sorted(d.issue.number for d in plan.descriptors)
+        if proof == "full-project": return finish(fail_result("full-project ceiling unavailable: refusing success under a selected-only ceiling", 1, failed=[f"issue-{n}" for n in sel_sorted], ceiling="selected-verification-only", scope="full-project"))
         counts_ok = {"matrix_cases": int(cohort_receipt.expected_matrix_cases), "missing": 0,
                      "blocked": 0, "failed": 0, "passed": len(evidence_rows)}
         identities_ok = [f"issue-{n}" for n in sel_sorted] + [f"cohort:{aggregate[:12]}"]
         ceiling_ok = "selected-verification-only"
-        digest_ok = _result_digest(proof, sel_sorted, counts_ok, ceiling_ok)
+        # CCV7: the success digest is the cohort aggregate, which binds the
+        # load-bearing set (catalogue, selection, descriptors, source
+        # snapshots, receipts, discovered tests, execution records).
+        digest_ok = aggregate
         result_ok = {
             "proof": proof, "selection": sel_sorted,
             "selection_label": ",".join(str(n) for n in sel_sorted),
@@ -2153,12 +2483,14 @@ def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ig
     if not isinstance(name, str):
         raise descriptor_runner.RunnerInputError("PACKAGE_NOT_FOUND")
     try:
-        ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
+        ws_doc = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8")) if (root / "Cargo.toml").is_file() else {}
     except Exception:
         ws_doc = {}
-    members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
+    # Closed single-file observation (no search): the root manifest exclude
+    # list only. Member search has no admitted port, so workspace_members
+    # stays [] by construction and real members stay UNAVAILABLE
+    # fail-closed; the discarded local members read is removed, not kept.
     exclude = ws_doc.get("workspace", {}).get("exclude", []) if isinstance(ws_doc, dict) else []
-    _ = members
     entries = []
     for artifact in artifacts:
         if not isinstance(artifact, dict) or artifact.get("package") != name:
@@ -2180,7 +2512,8 @@ def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ig
 
 
 def _run_python_child(root: Path, module: str, suite_rel: str, source_sha: str,  # type: ignore[no-untyped-def]
-                      max_tests: int, wall_s: float, env: dict, phase: str, expected: object | None):
+                      max_tests: int, wall_s: float, env: dict, phase: str, expected: object | None,
+                      output_cap: int):
     """Run the frozen python child once per phase via frozen builders only.
 
     Returns the parsed protocol dict via parse_python_protocol, or None on any
@@ -2285,6 +2618,11 @@ def _run_python_child(root: Path, module: str, suite_rel: str, source_sha: str, 
                     body = proto.read_bytes() if proto.exists() else b""
                 except Exception:
                     return None
+        # Descriptor output bound enforced on observed child protocol bytes
+        # (mirrors the build_raw/disc_out out_cap checks); oversize body is
+        # bounded non-success, the caller already fails it closed (exit 1).
+        if len(body) > output_cap:
+            return None
         if not body:
             return None
         try:
