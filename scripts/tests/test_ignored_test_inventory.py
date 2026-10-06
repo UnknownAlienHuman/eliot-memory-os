@@ -3716,10 +3716,45 @@ class TestIgnoredTestInventory(unittest.TestCase):
         simple = by_name["test_cfg_attr_simple"]
         self.assertEqual(simple.reason, "requires windows runtime named pipe")
         self.assertEqual(simple.requirements, (Requirement.RUNTIME.value,))
+        # cfg predicate is preserved verbatim as evidence, never evaluated:
+        # the `windows` gate stays unevaluated even off-Windows.
+        self.assertEqual(
+            simple.cfg_evidence,
+            ('#[cfg_attr(windows, ignore = "requires windows runtime named pipe")]',),
+        )
 
         complex_t = by_name["test_cfg_attr_complex"]
         self.assertEqual(complex_t.reason, "requires store database")
         self.assertEqual(complex_t.requirements, (Requirement.STORE.value,))
+        self.assertEqual(
+            complex_t.cfg_evidence,
+            ('#[cfg_attr(all(target_os = "linux", feature = "custom_db"), ignore = "requires store database")]',),
+        )
+
+        # Both scanned forms reconcile to CLASSIFIED against their compiled
+        # pair with the evidence carried into the row (issue #905 W36).
+        compiled_pair = [
+            CompiledTest(
+                package_id=item.package_id,
+                package_name=item.package_name,
+                target_name=item.target_name,
+                target_kind=item.target_kind,
+                executable="target/debug/deps/lib",
+                executable_digest="ed",
+                test_name=item.test_name,
+            )
+            for item in (simple, complex_t)
+        ]
+        rows = reconcile([simple, complex_t], compiled_pair)
+        self.assertEqual(len(rows), 2)
+        by_test_name = {item.test_name: item for item in (simple, complex_t)}
+        for row in rows:
+            item = by_test_name[row.test_name]
+            self.assertEqual(row.state, RowState.CLASSIFIED.value)
+            self.assertEqual(row.remediation_owner, "declared-environment-owner")
+            self.assertEqual(row.requirements, item.requirements)
+            self.assertEqual(row.cfg_evidence, item.cfg_evidence)
+            self.assertEqual(row.ignore_reason, item.reason)
 
     # WORK_UNIT_CASE: 905/28
     def test_exact_repository_owned_disabled_test_entries_and_composed_requirements(self) -> None:
@@ -3733,10 +3768,19 @@ class TestIgnoredTestInventory(unittest.TestCase):
 
         #[test_disabled = "requires kernel host"]
         fn test_disabled_alt() {}
+
+        #[disabled_test = "requires SurrealDB and Redis"]
+        fn test_disabled_unknown_provider() {}
+
+        #[disable_test = "requires store database"]
+        fn test_near_miss_singular() {}
         """
         tests = _scan_snippet(code)
-        self.assertEqual(len(tests), 3)
+        # The near-miss marker `disable_test` is not a repository-owned entry:
+        # only the three supported spellings plus the unknown-provider form scan.
+        self.assertEqual(len(tests), 4)
         by_name = {t.test_name: t for t in tests}
+        self.assertNotIn("test_near_miss_singular", by_name)
 
         composed = by_name["test_disabled_composed"]
         self.assertEqual(composed.requirements, (Requirement.RUNTIME.value, Requirement.STORE.value))
@@ -3758,6 +3802,27 @@ class TestIgnoredTestInventory(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].state, RowState.CLASSIFIED.value)
         self.assertEqual(rows[0].requirements, (Requirement.RUNTIME.value, Requirement.STORE.value))
+
+        # Unknown provider behind a supported marker keeps UNKNOWN and stays
+        # UNCLASSIFIED even with a compiled pair (issue #905 W37; P1 guard).
+        unknown_item = by_name["test_disabled_unknown_provider"]
+        self.assertEqual(
+            unknown_item.requirements,
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        unknown_compiled = CompiledTest(
+            package_id=unknown_item.package_id,
+            package_name=unknown_item.package_name,
+            target_name=unknown_item.target_name,
+            target_kind=unknown_item.target_kind,
+            executable="target/debug/deps/lib",
+            executable_digest="ed",
+            test_name=unknown_item.test_name,
+        )
+        unknown_rows = reconcile([unknown_item], [unknown_compiled])
+        self.assertEqual(len(unknown_rows), 1)
+        self.assertEqual(unknown_rows[0].state, RowState.UNCLASSIFIED.value)
+        self.assertEqual(unknown_rows[0].remediation_owner, "test-declaration-owner")
 
 
 if __name__ == "__main__":
