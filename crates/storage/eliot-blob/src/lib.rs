@@ -45,10 +45,12 @@ pub use eliot_blob_api::{
 };
 pub mod backup_io;
 pub use backup_io::{
-    BACKUP_MAX_PLAINTEXT_BYTES, CaptureOutcome, CapturePorts, ConsumerEvidencePack, ExportedPage,
-    PageInterrupt, PlaintextFetch, RestoreBinding, SealedMember, SealedStage, bind_restore_set,
-    complete_export, export_page, open_member, run_capture, seal_associated_data, seal_member,
-    seal_nonce_context, verify_capture_record, verify_destination_scope,
+    BACKUP_MAX_PLAINTEXT_BYTES, BackupCleanupPort, BackupMemberState, BackupPlaintextSource,
+    BackupSealedSink, CaptureOutcome, CapturePorts, ConsumerEvidencePack, DispositionCleanup,
+    DispositionDurability, DispositionValidation, ExportedPage, MemberDisposition, PageInterrupt,
+    ResidencyDisposition, RestoreBinding, SealedMember, bind_restore_set, complete_export,
+    export_page, open_member, run_capture, seal_associated_data, seal_member, seal_nonce_context,
+    verify_capture_record, verify_destination_scope,
 };
 pub mod demand;
 pub mod key_ports;
