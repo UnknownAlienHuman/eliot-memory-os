@@ -4045,6 +4045,59 @@ class TestIgnoredTestInventory(unittest.TestCase):
         self.assertEqual(unknown_rows[0].state, RowState.UNCLASSIFIED.value)
         self.assertEqual(unknown_rows[0].remediation_owner, "test-declaration-owner")
 
+    # WORK_UNIT_CASE: 905/W3
+    def test_item_and_attribute_spans_exact_and_digest_covered(self) -> None:
+        """Scanned rows carry exact fn-name and attribute spans, covered by the row digest."""
+        source_path = self.fixture_dir / "sample_test_source.rs"
+        text = source_path.read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[2]
+        target = PackageTarget(
+            package_id="sample-package 0.1.0 (path+file:///crates/sample-package)",
+            package_name="sample-package",
+            manifest_dir=root,
+            target_name="sample_package",
+            target_kind="lib",
+            src_path=root / "crates/sample-package/src/lib.rs",
+        )
+        tests = _scan_file(root, target, source_path)
+        item = next(t for t in tests if t.test_name == "test_sync_ignored")
+        # Byte offsets into sample_test_source.rs: attributes occupy lines
+        # 3-4 (`#[test]` at 66 through the closing `]` at 132) and the fn
+        # name sits on line 5 (136-153). Values verified against the file.
+        self.assertEqual(item.fn_span, (136, 153))
+        self.assertEqual(item.attribute_span, (66, 132))
+        self.assertEqual(item.line, 5)
+        self.assertEqual(text[item.fn_span[0]:item.fn_span[1]], "test_sync_ignored")
+        self.assertEqual(
+            text[item.attribute_span[0]:item.attribute_span[1]],
+            '#[test]\n#[ignore = "requires local authenticated SurrealDB store"]',
+        )
+        # The checked-in sample row carries the same spans (no drift).
+        fixture = json.loads((self.fixture_dir / "sample_inventory.json").read_bytes())
+        self.assertEqual(len(fixture['rows']), 1)
+        fixture_row = fixture['rows'][0]
+        self.assertEqual(fixture_row['test_name'], 'test_sync_ignored')
+        self.assertEqual(tuple(fixture_row['fn_span']), item.fn_span)
+        self.assertEqual(tuple(fixture_row['attribute_span']), item.attribute_span)
+        # Spans ride the row payload and are covered by the row digest.
+        rows = reconcile([item], [])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.state, RowState.SOURCE_ONLY.value)
+        self.assertEqual(row.fn_span, (136, 153))
+        self.assertEqual(row.attribute_span, (66, 132))
+        payload = dataclasses.asdict(row)
+        self.assertEqual(payload['fn_span'], (136, 153))
+        self.assertEqual(payload['attribute_span'], (66, 132))
+        expected_digest = hashlib.sha256(
+            _canonical_bytes({k: v for k, v in payload.items() if k != 'row_digest'})
+        ).hexdigest()
+        self.assertEqual(row.row_digest, expected_digest)
+        perturbed_fn = dataclasses.replace(item, fn_span=(0, 0))
+        perturbed_attr = dataclasses.replace(item, attribute_span=None)
+        self.assertNotEqual(reconcile([perturbed_fn], [])[0].row_digest, row.row_digest)
+        self.assertNotEqual(reconcile([perturbed_attr], [])[0].row_digest, row.row_digest)
+
 
 if __name__ == "__main__":
     unittest.main()

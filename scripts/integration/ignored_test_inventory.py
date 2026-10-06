@@ -120,6 +120,10 @@ class SourceTest:
     # Declared isolation/serialization/reset/timeout tokens (issue #905 row
     # contract). Last with a default so existing constructions stay valid.
     isolation: tuple[str, ...] = ()
+    # Exact offsets into the scanned source text (issue #905 W3): the test
+    # fn name token and first-attribute start to last-attribute end.
+    fn_span: tuple[int, int] | None = None
+    attribute_span: tuple[int, int] | None = None
 
     def identity(self) -> tuple[str, str, str, str]:
         return (self.package_id, self.target_kind, self.target_name, self.test_name)
@@ -162,6 +166,10 @@ class InventoryRow:
     # Declared isolation/serialization/reset/timeout tokens, digest-covered via
     # the _row payload (issue #905 row contract). Default keeps the field additive.
     isolation: tuple[str, ...] = ()
+    # Exact offsets into the scanned source text (issue #905 W3): the test
+    # fn name token and first-attribute start to last-attribute end.
+    fn_span: tuple[int, int] | None = None
+    attribute_span: tuple[int, int] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1917,6 +1925,7 @@ def _scan_file(
     module_stack: list[tuple[str, int, tuple[str, ...]]] = [(part, 0, ()) for part in seed_module_path]
     brace_depth = 0
     pending_attributes: list[str] = []
+    pending_spans: list[tuple[int, int]] = []
     pending_module: str | None = None
     results: list[SourceTest] = []
     index = 0
@@ -1941,6 +1950,7 @@ def _scan_file(
             if end - start > BOUNDS.max_attribute_bytes:
                 raise InventoryError("ATTRIBUTE_TOO_LARGE", _redact_detail(f"attribute exceeds bound in {path}"))
             pending_attributes.append(text[start:end])
+            pending_spans.append((start, end))
             index = cursor + 1
             continue
         if token.value == "mod" and index + 1 < len(tokens) and tokens[index + 1].kind == "ident":
@@ -2006,9 +2016,12 @@ def _scan_file(
                         requirements=requirements,
                         source_digest=_sha256(_canonical_bytes(source_identity)),
                         isolation=isolation,
+                        fn_span=(name_token.start, name_token.end),
+                        attribute_span=(pending_spans[0][0], pending_spans[-1][1]) if pending_spans else None,
                     )
                 )
             pending_attributes.clear()
+            pending_spans.clear()
         elif token.value == "{":
             brace_depth += 1
             if pending_module is not None:
@@ -2017,14 +2030,17 @@ def _scan_file(
                 module_stack.append((pending_module, brace_depth, inline_cfg))
                 pending_module = None
             pending_attributes.clear()
+            pending_spans.clear()
         elif token.value == "}":
             while module_stack and module_stack[-1][1] == brace_depth:
                 module_stack.pop()
             brace_depth = max(0, brace_depth - 1)
             pending_attributes.clear()
+            pending_spans.clear()
             pending_module = None
         elif token.value == ";":
             pending_attributes.clear()
+            pending_spans.clear()
             pending_module = None
         elif token.kind == "ident" and token.value not in {"pub", "async", "unsafe", "const", "extern", "crate", "self", "super"}:
             if token.value not in {"fn", "mod"} and pending_module is None:
@@ -2032,6 +2048,7 @@ def _scan_file(
                 # but discard them when another item begins.
                 if token.value in {"struct", "enum", "trait", "impl", "type", "static", "use", "macro_rules"}:
                     pending_attributes.clear()
+                    pending_spans.clear()
         index += 1
     return results
 
@@ -3698,6 +3715,8 @@ def _row(source: SourceTest | None, compiled: CompiledTest | None, state: RowSta
         "cfg_evidence": source.cfg_evidence if source else (),
         "requirements": source.requirements if source else (Requirement.UNKNOWN.value,),
         "isolation": source.isolation if source else (),
+        "fn_span": source.fn_span if source else None,
+        "attribute_span": source.attribute_span if source else None,
         "executable": compiled.executable if compiled else None,
         "executable_digest": compiled.executable_digest if compiled else None,
         "remediation_owner": owner,
