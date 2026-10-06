@@ -315,7 +315,10 @@ impl KernelComposition {
     /// A worker generation presenting under a fence incompatible with its
     /// session is stale or foreign: it fences the session and is never
     /// granted authority, admission, or a receipt.
-    fn require_session_fence(
+    ///
+    /// Shared with the sibling capacity-verify route, which gates the
+    /// same fence before serving the owner lookup.
+    pub(crate) fn require_session_fence(
         session: &Session,
         identity_value: &serde_json::Value,
     ) -> Result<(), TransportError> {

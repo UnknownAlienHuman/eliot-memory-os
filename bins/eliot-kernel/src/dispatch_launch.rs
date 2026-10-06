@@ -105,7 +105,9 @@ use eliot_contracts::{
     ArtifactId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_ipc::ProcessBinding;
-use eliot_kernel_core::{ProcessOwnerBoundary, ProcessPermit, ProcessTreeReserve};
+use eliot_kernel_core::{
+    ProcessOwnerBoundary, ProcessPermit, ProcessPermitWireVerdict, ProcessTreeReserve,
+};
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
@@ -830,12 +832,15 @@ pub(crate) struct NativeWorkerProcessStartBinding {
 ///
 /// The non-clone [`ProcessPermit`] handle is the held slot itself: it stays
 /// in this map from issuance at prepare time until exactly one terminal
-/// transition removes it (prepare/write failure, terminal release, or
-/// reconcile convergence), so the owner exclusion survives unknown spawn
-/// outcomes. The request/binding pair beside it is what the dispatch file
-/// carries and what every later boundary re-verifies. Removing the entry
-/// drops the handle, and the handle's drop backstop releases the slot, so
-/// removal is the single release path: exactly-once by map semantics.
+/// transition removes it (prepare/write failure or evidenced terminal
+/// release through `release_launched_attempt`), so the owner exclusion
+/// survives unknown spawn outcomes and nonterminal reconcile passes.
+/// Reconcile convergence alone never removes it: admission readback is not
+/// a terminal effect disposition. The request/binding pair beside it is
+/// what the dispatch file carries and what every later boundary
+/// re-verifies. Removing the entry drops the handle, and the handle's
+/// drop backstop releases the slot, so removal is the single release
+/// path: exactly-once by map semantics.
 struct RetainedProcessPermit {
     /// Live held slot; dropped (released) by the single terminal remover.
     permit: ProcessPermit,
@@ -2626,8 +2631,16 @@ enum PermitCurrency {
     Current,
     /// The retained handle no longer verifies; carries the refusal.
     Stale(String),
-    /// No permit is retained for the identity (prepared while uncomposed).
-    Absent,
+    /// The reserve is composed but holds nothing under the identity: the
+    /// holding was released or never acquired while configured. Launch
+    /// boundaries fail closed here (reconcile owns recovery) and the
+    /// recovery boundary stays unreconciled; this is never confused with
+    /// deliberately uncomposed capacity below.
+    NotHeld,
+    /// No capacity reserve is composed on this contour: capacity was
+    /// deliberately left uncomposed, so there is nothing to be current.
+    /// Launch boundaries proceed exactly as before composition existed.
+    Uncomposed,
 }
 
 /// Resolves the live process-capacity boundary for one issuance or lookup
@@ -2751,8 +2764,11 @@ fn check_retained_native_worker_capacity(
         .process_capacity
         .lock()
         .map_err(|_| DispatchLaunchError::Gate("process capacity lock poisoned".to_owned()))?;
+    if state.reserve.is_none() {
+        return Ok(PermitCurrency::Uncomposed);
+    }
     let Some(retained) = state.held.get(&retained_permit_key(claim_id)) else {
-        return Ok(PermitCurrency::Absent);
+        return Ok(PermitCurrency::NotHeld);
     };
     let Some(reserve) = state.reserve.as_ref() else {
         return Err(DispatchLaunchError::Inconsistent(
@@ -2788,6 +2804,219 @@ fn release_retained_native_worker_capacity(
         .ok()
         .flatten();
     drop(removed);
+}
+
+/// Maximum length of one capacity-verify claim text field, in UTF-8
+/// bytes. Mirrors the sibling native-worker route claim-text bound.
+const MAX_CAPACITY_VERIFY_TEXT_LEN: usize = 1_024;
+
+/// One `native_worker.capacity_verify` presentation: the claim projection
+/// plus the exact retained pair the owner must check its live holding
+/// against (issue #1679, W11 provider side; wire shape defined by the
+/// #1701 consumer `capacity_verify_payload`).
+struct CapacityVerifyPresentation {
+    /// Claim identity keying the retained holding.
+    claim_id: String,
+    /// Claiming registration the retained request must name.
+    registration_id: String,
+    /// Claim worker generation the retained request must carry.
+    worker_generation: u64,
+    /// Claim authority sequence the retained request must carry.
+    authority_epoch: u64,
+    /// Presented capacity request; must equal the retained request.
+    request: CapacityRequest,
+    /// Presented binding; must equal the retained issuance record.
+    binding: CapacityPermitBinding,
+}
+
+/// Reads one bounded claim text field from a capacity-verify payload.
+fn capacity_verify_text(
+    payload: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, DispatchLaunchError> {
+    let text = payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty() && !text.chars().any(char::is_control))
+        .filter(|text| text.len() <= MAX_CAPACITY_VERIFY_TEXT_LEN)
+        .ok_or_else(|| {
+            DispatchLaunchError::InvalidMaterial(format!(
+                "capacity verify presentation rejects field {field}"
+            ))
+        })?;
+    Ok(text.to_owned())
+}
+
+/// Reads one numeric-or-numeric-string scalar from a capacity-verify payload.
+fn capacity_verify_u64(
+    payload: &serde_json::Value,
+    field: &'static str,
+) -> Result<u64, DispatchLaunchError> {
+    if let Some(number) = payload.get(field).and_then(serde_json::Value::as_u64) {
+        return Ok(number);
+    }
+    if let Some(text) = payload.get(field).and_then(serde_json::Value::as_str)
+        && let Ok(number) = text.parse::<u64>()
+    {
+        return Ok(number);
+    }
+    Err(DispatchLaunchError::InvalidMaterial(format!(
+        "capacity verify presentation rejects field {field}"
+    )))
+}
+
+/// Parses one capacity-verify presentation: the flat claim projection plus
+/// the typed pair. Anything malformed fails closed before any lookup; the
+/// claim `state_fence` and `binding_digest` echoes are not consulted here
+/// (the session fence is already gated at the frame boundary, and the
+/// claim binding digest has no counterpart in the capacity holding).
+fn parse_capacity_verify_presentation(
+    payload: &serde_json::Value,
+) -> Result<CapacityVerifyPresentation, DispatchLaunchError> {
+    let claim_id = capacity_verify_text(payload, "claim_id")?;
+    let registration_id = capacity_verify_text(payload, "registration_id")?;
+    let worker_generation = capacity_verify_u64(payload, "worker_generation")?;
+    let authority_epoch = capacity_verify_u64(payload, "authority_epoch")?;
+    let permit = payload
+        .get("permit")
+        .filter(|permit| permit.is_object())
+        .ok_or_else(|| {
+            DispatchLaunchError::InvalidMaterial(
+                "capacity verify presentation carries no permit".to_owned(),
+            )
+        })?;
+    let request: CapacityRequest = serde_json::from_value(
+        permit
+            .get("request")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|_| {
+        DispatchLaunchError::InvalidMaterial(
+            "capacity verify permit request is not typed".to_owned(),
+        )
+    })?;
+    let binding: CapacityPermitBinding = serde_json::from_value(
+        permit
+            .get("binding")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|_| {
+        DispatchLaunchError::InvalidMaterial(
+            "capacity verify permit binding is not typed".to_owned(),
+        )
+    })?;
+    request.validate().map_err(|error| {
+        DispatchLaunchError::InvalidMaterial(format!("presented capacity request refused: {error}"))
+    })?;
+    binding.validate().map_err(|error| {
+        DispatchLaunchError::InvalidMaterial(format!("presented capacity binding refused: {error}"))
+    })?;
+    Ok(CapacityVerifyPresentation {
+        claim_id,
+        registration_id,
+        worker_generation,
+        authority_epoch,
+        request,
+        binding,
+    })
+}
+
+/// Builds one capacity-verify answer in the exact shape the #1701
+/// consumer maps (`kind`, `claim_id`, `permit_id`, `operation_id`,
+/// `verdict`, plus the presented binding echo the consumer re-checks on
+/// `verified`).
+fn capacity_verify_answer(
+    presentation: &CapacityVerifyPresentation,
+    verdict: &str,
+) -> Result<serde_json::Value, DispatchLaunchError> {
+    let bottleneck = serde_json::to_value(presentation.binding.bottleneck)
+        .map_err(|_| DispatchLaunchError::Gate("capacity bottleneck is not JSON".to_owned()))?;
+    Ok(serde_json::json!({
+        "kind": "native_worker_capacity_verified",
+        "claim_id": presentation.claim_id,
+        "permit_id": presentation.binding.permit_id,
+        "operation_id": presentation.binding.operation_id,
+        "verdict": verdict,
+        "capacity_owner_ref": presentation.binding.capacity_owner_ref,
+        "owner_generation": presentation.binding.capacity_owner_generation_ref.value(),
+        "profile_id": presentation.binding.profile_id,
+        "profile_revision": presentation.binding.profile_revision,
+        "authority_epoch": presentation.binding.authority_epoch_ref.sequence.get(),
+        "bottleneck": bottleneck,
+    }))
+}
+
+/// Answers one `native_worker.capacity_verify` query against the exact
+/// retained holding (issue #1679, W11 provider side).
+///
+/// The presented claim projection must name the retained request
+/// (registration, worker generation, authority sequence) and the
+/// presented pair must equal the retained request and issuance record;
+/// anything else answers `conflict`. The retained triple is then checked
+/// against the live boundary resolved here (live activation generation,
+/// live Authority Epoch, current compiled profile — never caller bytes),
+/// and the owner verdict is echoed with the presented binding fields. No
+/// holding under the claim identity answers `not_held`; an uncomposed
+/// contour fails closed without an answer.
+pub(crate) fn answer_native_worker_capacity_verify(
+    kernel: &KernelComposition,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, DispatchLaunchError> {
+    let presentation = parse_capacity_verify_presentation(payload)?;
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "native-worker capacity verify needs its dispatch contour",
+        ))?;
+    let state = contour
+        .process_capacity
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("process capacity lock poisoned".to_owned()))?;
+    let held = state.held.get(&retained_permit_key(&presentation.claim_id));
+    let Some(retained) = held else {
+        return capacity_verify_answer(&presentation, "not_held");
+    };
+    if presentation.request != retained.request
+        || presentation.binding != retained.binding
+        || presentation.registration_id != retained.request.requesting_owner_ref
+        || presentation.worker_generation != retained.request.requesting_generation_ref.value()
+        || presentation.authority_epoch != retained.request.authority_epoch_ref.sequence.get()
+    {
+        return capacity_verify_answer(
+            &presentation,
+            ProcessPermitWireVerdict::Conflict.as_verdict_str(),
+        );
+    }
+    let reserve = state.reserve.as_ref().ok_or(DispatchLaunchError::Gate(
+        "retained process permit without its issuing reserve".to_owned(),
+    ))?;
+    let (live_epoch, live_generation_value) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        (
+            service.authority_epoch(),
+            service
+                .activation_receipt()
+                .map_or(0, |receipt| receipt.generation.value()),
+        )
+    };
+    let live_generation = Generation::new(live_generation_value)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let now_ms = i64::try_from(super::unix_ms()).map_err(|_| {
+        DispatchLaunchError::Gate("verify clock overflows millisecond clock".to_owned())
+    })?;
+    let boundary = process_capacity_boundary(kernel, &live_epoch, live_generation, now_ms)?;
+    let verdict = reserve.check_process_permit_wire_verdict(
+        &retained.permit,
+        &retained.binding,
+        &retained.request,
+        &boundary,
+    );
+    capacity_verify_answer(&presentation, verdict.as_verdict_str())
 }
 
 /// Serializes the established native-worker material without capacity evidence.
@@ -4620,9 +4849,10 @@ fn mark_reconciled(
     if let Some(record) = launches.by_identity.get_mut(identity) {
         record.phase = LaunchPhase::Reconciled;
     }
-    // The converged slot is closed: its retained launch capacity, if any,
-    // releases here exactly once (#1679 A7).
-    release_retained_native_worker_capacity(contour, identity);
+    // Convergence is admission readback, not a terminal effect
+    // disposition: the retained launch capacity, if any, stays held until
+    // evidenced owner resolution through `release_launched_attempt`
+    // (issue #1679 W11/A7/A8).
     launches.native_worker_process_receipts.remove(identity);
     let pending = launches
         .native_worker_pending_starts
@@ -5226,6 +5456,13 @@ pub fn reconcile_launched_testd_attempt(
 /// terminality lives in the owner store and therefore never auto-release
 /// kernel-side. The dispatch file is reaped best-effort on release so a
 /// stale presentation never lingers for a later invocation.
+///
+/// Native-worker slots additionally require evidenced terminal
+/// resolution: the record must already be `Reconciled` or carry a
+/// terminal `effect_digest`. A live (`Launched`), unknown-outcome
+/// (`Unreconciled`) or pre-effect (`Reserved`) native slot refuses, so a
+/// matching digest alone can never drop a nonterminal holding (issue
+/// #1679 W11/A7/A8; I14.6).
 pub fn release_launched_attempt(
     kind: DispatchedWorkerKind,
     identity: &str,
@@ -5243,10 +5480,13 @@ pub fn release_launched_attempt(
             .and_then(|record| record.material_path.clone())
     };
     let mut launches = launches_table(contour)?;
-    let release = launches
-        .by_identity
-        .get(identity)
-        .is_some_and(|record| record.kind == kind && record.request_digest == request_digest);
+    let release = launches.by_identity.get(identity).is_some_and(|record| {
+        record.kind == kind
+            && record.request_digest == request_digest
+            && (record.kind != DispatchedWorkerKind::NativeWorker
+                || record.phase == LaunchPhase::Reconciled
+                || record.effect_digest.is_some())
+    });
     if release {
         launches.by_identity.remove(identity);
         launches.native_worker_process_receipts.remove(identity);
@@ -5575,7 +5815,13 @@ pub fn prepare_native_worker_launch(
                     &receipt.claim_id,
                     &replay_boundary,
                 ) {
-                    Ok(PermitCurrency::Current | PermitCurrency::Absent) => {}
+                    Ok(PermitCurrency::Current | PermitCurrency::Uncomposed) => {}
+                    Ok(PermitCurrency::NotHeld) => {
+                        return Err(DispatchLaunchError::Inconsistent(
+                            "retained launch capacity is not held while configured: reconcile owns recovery"
+                                .to_owned(),
+                        ));
+                    }
                     Ok(PermitCurrency::Stale(refusal)) => {
                         return Err(DispatchLaunchError::Inconsistent(format!(
                             "retained launch capacity is no longer current: {refusal}"
@@ -5722,7 +5968,13 @@ pub async fn start_ready_native_worker_launch(
     let start_boundary =
         process_capacity_boundary(kernel, &live_epoch, live_generation, start_now_ms)?;
     match check_retained_native_worker_capacity(contour, &ready.receipt.claim_id, &start_boundary) {
-        Ok(PermitCurrency::Current | PermitCurrency::Absent) => {}
+        Ok(PermitCurrency::Current | PermitCurrency::Uncomposed) => {}
+        Ok(PermitCurrency::NotHeld) => {
+            return Err(DispatchLaunchError::Inconsistent(
+                "launch capacity is not held while configured: spawn refuses before any child effect"
+                    .to_owned(),
+            ));
+        }
         Ok(PermitCurrency::Stale(refusal)) => {
             return Err(DispatchLaunchError::Inconsistent(format!(
                 "launch capacity is no longer current at spawn: {refusal}"
@@ -5931,9 +6183,11 @@ fn retain_unknown_native_worker_launch(
 }
 
 /// Returns the Unreconciled outcome when the retained launch capacity is
-/// stale, or `None` when convergence may proceed (issue #1679 W11/W4/A7,
-/// A8: a stale, released or foreign permit keeps the attempt excluded
-/// until its owner reconciles instead of converging on dead authority).
+/// stale or missing while configured, or `None` when convergence may
+/// proceed (issue #1679 W11/W4/A7, A8: a stale, released or foreign permit
+/// keeps the attempt excluded until its owner reconciles instead of
+/// converging on dead authority; deliberately uncomposed capacity carries
+/// no holding to exclude on).
 fn unreconciled_when_capacity_stale(
     contour: &'static ComposedDispatchContour,
     kernel: &KernelComposition,
@@ -5959,11 +6213,13 @@ fn unreconciled_when_capacity_stale(
     let permit_boundary =
         process_capacity_boundary(kernel, &permit_epoch, permit_generation, permit_now_ms)?;
     match check_retained_native_worker_capacity(contour, claim_id, &permit_boundary) {
-        Ok(PermitCurrency::Current | PermitCurrency::Absent) => Ok(None),
-        Ok(PermitCurrency::Stale(_)) => Ok(Some(ReconcileLaunchedOutcome::Unreconciled {
-            kind: DispatchedWorkerKind::NativeWorker,
-            identity: claim_id.to_owned(),
-        })),
+        Ok(PermitCurrency::Current | PermitCurrency::Uncomposed) => Ok(None),
+        Ok(PermitCurrency::Stale(_) | PermitCurrency::NotHeld) => {
+            Ok(Some(ReconcileLaunchedOutcome::Unreconciled {
+                kind: DispatchedWorkerKind::NativeWorker,
+                identity: claim_id.to_owned(),
+            }))
+        }
         Err(error) => Err(error),
     }
 }
@@ -6054,17 +6310,19 @@ pub fn reconcile_launched_native_worker_attempt(
     if let Some(outcome) = unreconciled_when_capacity_stale(contour, kernel, claim_id)? {
         return Ok(outcome);
     }
+    if retained.phase == LaunchPhase::Launched {
+        // Live child with no terminal child/effect evidence: the attempt
+        // is still outstanding, so the exact holding stays retained for
+        // revalidation and the slot stays open for a later reconcile.
+        // Admission readback binding here is not a terminal disposition
+        // (issue #1679 W11/A7/A8; I14.6: an active reservation attached to
+        // a nonterminal attempt cannot be expired as cleanup).
+        return Ok(ReconcileLaunchedOutcome::Unreconciled {
+            kind: DispatchedWorkerKind::NativeWorker,
+            identity: claim_id.to_owned(),
+        });
+    }
     if binds {
-        if retained.phase == LaunchPhase::Launched {
-            // Converged with a live child: the closed slot releases its
-            // retained capacity here exactly once (#1679 A7).
-            release_retained_native_worker_capacity(contour, claim_id);
-            return Ok(ReconcileLaunchedOutcome::Reconciled {
-                kind: DispatchedWorkerKind::NativeWorker,
-                identity: claim_id.to_owned(),
-                admission_digest: retained.admission_digest,
-            });
-        }
         if let Some(path) = retained.material_path.as_deref() {
             reap_material_file(path);
         }
@@ -9094,9 +9352,9 @@ mod tests {
             matches!(
                 check_retained_native_worker_capacity(contour, "claim-cap-A", &boundary)
                     .expect("check released"),
-                PermitCurrency::Absent
+                PermitCurrency::NotHeld
             ),
-            "a released holding reads absent"
+            "a released holding reads not-held while configured, never silently absent"
         );
         let reacquired =
             acquire_native_worker_capacity(contour, &native_request, &boundary).expect("reacquire");
@@ -9105,6 +9363,536 @@ mod tests {
             "the released slot issues again exactly once"
         );
         release_retained_native_worker_capacity(contour, "claim-cap-A");
+    }
+
+    /// Builds the consumer-shaped capacity-verify payload from one claim
+    /// and its retained pair (field-for-field with the #1701
+    /// `capacity_verify_payload`: flat claim projection plus the exact
+    /// typed pair under `permit`).
+    fn capacity_verify_payload_for(
+        claim: &eliot_kernel_service::NativeWorkerClaimRequest,
+        request: &CapacityRequest,
+        binding: &CapacityPermitBinding,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "operation": super::super::native_worker_capacity_verify_route::NATIVE_WORKER_CAPACITY_VERIFY_OPERATION,
+            "claim_id": claim.claim_id,
+            "binding_digest": claim.binding_digest,
+            "worker_generation": claim.worker_generation,
+            "authority_epoch": claim.authority_epoch.sequence.get(),
+            "state_fence": serde_json::to_value(&claim.state_fence).expect("fence JSON"),
+            "registration_id": claim.registration_id,
+            "permit": {
+                "request": serde_json::to_value(request).expect("request JSON"),
+                "binding": serde_json::to_value(binding).expect("binding JSON"),
+            },
+        })
+    }
+
+    /// Composes the contour capacity side once per process and returns the
+    /// live owner boundary with the live activation generation for the
+    /// ready kernel.
+    fn verify_ready_boundary(kernel: &KernelComposition) -> (ProcessOwnerBoundary, Generation) {
+        match compose_dispatch_contour(PRINCIPAL.to_owned()) {
+            Ok(()) | Err(DispatchLaunchError::AlreadyComposed(_)) => {}
+            Err(other) => panic!("contour must compose: {other:?}"),
+        }
+        match compose_process_capacity_reserve(8, 2, 2, 2) {
+            Ok(()) | Err(DispatchLaunchError::AlreadyComposed(_)) => {}
+            Err(other) => panic!("capacity reserve must compose: {other:?}"),
+        }
+        let epoch = live_epoch(kernel);
+        let live_generation_value = kernel
+            .service
+            .lock()
+            .expect("service lock")
+            .activation_receipt()
+            .expect("activation receipt")
+            .generation
+            .value();
+        let live_generation = Generation::new(live_generation_value).expect("generation");
+        let now_ms = i64::try_from(super::super::unix_ms()).expect("now ms");
+        let boundary =
+            process_capacity_boundary(kernel, &epoch, live_generation, now_ms).expect("boundary");
+        (boundary, live_generation)
+    }
+
+    /// The provider half of the joint owner contract (issue #1679 W11,
+    /// answering the CS1 `stitch/1679.returned.md` provider point).
+    ///
+    /// One ordered test drives the composed producer to the authenticated
+    /// child query: acquire issues the live pair, the dispatch writer
+    /// carries exactly that pair, the route answers `verified` against the
+    /// retained holding with the consumer-mapped echo, and every
+    /// substitution reads its typed refusal. The claimed-start edge
+    /// (currency `Current`) and the recovery edge (reconcile may proceed
+    /// while current, stays unreconciled once the holding is gone) close
+    /// the proof without spawning a child.
+    #[test]
+    fn native_worker_capacity_verify_serves_live_holding() {
+        let root = temp_root("capacity-verify");
+        let kernel = ready_kernel(&root);
+        let (boundary, live_generation) = verify_ready_boundary(&kernel);
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+
+        // 1. The composed producer issues the live pair for the claim.
+        let claim = native_claim_request("claim-verify-1", "reg-verify-1", "attempt-v-1", "op-v-1");
+        let (request, binding) = acquire_native_worker_capacity(contour, &claim, &boundary)
+            .expect("acquire")
+            .expect("composed reserve issues");
+
+        // 2. The dispatch bytes carry exactly the issued pair.
+        let receipt = eliot_kernel_service::NativeWorkerClaimReceipt {
+            wire_id: eliot_kernel_service::NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            claim_id: claim.claim_id.clone(),
+            registration_id: claim.registration_id.clone(),
+            attempt_id: claim.attempt_id.clone(),
+            operation_id: claim.operation_id.clone(),
+            worker_generation: claim.worker_generation,
+            authority_epoch: claim.authority_epoch.clone(),
+            state_fence: claim.state_fence.clone(),
+            binding_digest: claim.binding_digest.clone(),
+            admitted_at_unix_ms: super::super::unix_ms(),
+            receipt_digest: String::new(),
+        };
+        let grant = dispatch_grant_for(
+            DispatchedWorkerKind::NativeWorker,
+            &receipt.binding_digest,
+            &claim.authority_epoch,
+            live_generation,
+            receipt.admitted_at_unix_ms * 1_000_000,
+            None,
+        )
+        .expect("grant");
+        let bytes = native_worker_material_bytes_with_capacity(
+            &claim,
+            &receipt,
+            &claim.authority_epoch,
+            live_generation.get(),
+            "launch-nonce-0123456789abcdef",
+            &grant,
+            Some(NativeWorkerCapacitySection {
+                request: &request,
+                binding: &binding,
+            }),
+        )
+        .expect("material bytes");
+        let file_json: serde_json::Value = serde_json::from_slice(&bytes).expect("material JSON");
+        let section = file_json
+            .get("capacity_permit")
+            .expect("material carries the capacity section");
+        let file_request: CapacityRequest =
+            serde_json::from_value(section["request"].clone()).expect("request parses");
+        let file_binding: CapacityPermitBinding =
+            serde_json::from_value(section["binding"].clone()).expect("binding parses");
+        assert_eq!(
+            file_request, request,
+            "dispatch bytes carry the issued request"
+        );
+        assert_eq!(
+            file_binding, binding,
+            "dispatch bytes carry the issued binding"
+        );
+
+        // 3. The authenticated child query verifies against the holding.
+        let payload = capacity_verify_payload_for(&claim, &file_request, &file_binding);
+        let answer =
+            answer_native_worker_capacity_verify(&kernel, &payload).expect("verify answers");
+        assert_eq!(
+            answer.get("kind").and_then(serde_json::Value::as_str),
+            Some(super::super::native_worker_capacity_verify_route::CAPACITY_VERIFY_ANSWER_KIND),
+            "answer names the capacity-verify query"
+        );
+        assert_eq!(
+            answer.get("verdict").and_then(serde_json::Value::as_str),
+            Some("verified"),
+            "the live holding verifies"
+        );
+        for (field, expected) in [
+            ("claim_id", claim.claim_id.as_str()),
+            ("permit_id", binding.permit_id.as_str()),
+            ("operation_id", binding.operation_id.as_str()),
+            ("capacity_owner_ref", binding.capacity_owner_ref.as_str()),
+            ("profile_id", binding.profile_id.as_str()),
+            ("profile_revision", binding.profile_revision.as_str()),
+        ] {
+            assert_eq!(
+                answer.get(field).and_then(serde_json::Value::as_str),
+                Some(expected),
+                "verified answer echoes {field}"
+            );
+        }
+        assert_eq!(
+            answer
+                .get("owner_generation")
+                .and_then(serde_json::Value::as_u64),
+            Some(binding.capacity_owner_generation_ref.value()),
+            "verified answer echoes the owner generation"
+        );
+        assert_eq!(
+            answer
+                .get("authority_epoch")
+                .and_then(serde_json::Value::as_u64),
+            Some(claim.authority_epoch.sequence.get()),
+            "verified answer echoes the authority sequence"
+        );
+
+        // 4. Substitutions read their typed refusals, never a pass.
+        let mut unknown = payload.clone();
+        unknown["claim_id"] = serde_json::Value::from("claim-verify-unknown");
+        assert_eq!(
+            answer_native_worker_capacity_verify(&kernel, &unknown)
+                .expect("unknown answers")
+                .get("verdict")
+                .and_then(serde_json::Value::as_str),
+            Some("not_held"),
+            "no holding under the identity answers not_held"
+        );
+        let mut tampered = payload.clone();
+        tampered["permit"]["binding"]["operation_id"] =
+            serde_json::Value::from("tampered-operation");
+        assert_eq!(
+            answer_native_worker_capacity_verify(&kernel, &tampered)
+                .expect("tampered answers")
+                .get("verdict")
+                .and_then(serde_json::Value::as_str),
+            Some("conflict"),
+            "a substituted pair conflicts instead of replaying"
+        );
+        let mut foreign = payload.clone();
+        foreign["registration_id"] = serde_json::Value::from("reg-foreign");
+        assert_eq!(
+            answer_native_worker_capacity_verify(&kernel, &foreign)
+                .expect("foreign answers")
+                .get("verdict")
+                .and_then(serde_json::Value::as_str),
+            Some("conflict"),
+            "a foreign registration conflicts instead of replaying"
+        );
+        assert!(
+            answer_native_worker_capacity_verify(&kernel, &serde_json::json!({"claim_id": "x"}))
+                .is_err(),
+            "a shapeless presentation fails closed without an answer"
+        );
+
+        // 5. The claimed-start edge stays open while the holding is live.
+        assert!(
+            matches!(
+                check_retained_native_worker_capacity(contour, "claim-verify-1", &boundary)
+                    .expect("check live"),
+                PermitCurrency::Current
+            ),
+            "live holding keeps the claimed start usable"
+        );
+
+        // 6. The recovery edge converges while current and refuses once
+        // the holding is gone: no convergence on a missing holding.
+        assert!(
+            unreconciled_when_capacity_stale(contour, &kernel, "claim-verify-1")
+                .expect("recovery gate")
+                .is_none(),
+            "current holding lets recovery converge"
+        );
+        release_retained_native_worker_capacity(contour, "claim-verify-1");
+        assert!(
+            matches!(
+                check_retained_native_worker_capacity(contour, "claim-verify-1", &boundary)
+                    .expect("check released"),
+                PermitCurrency::NotHeld
+            ),
+            "released holding reads not-held while configured"
+        );
+        assert!(
+            matches!(
+                unreconciled_when_capacity_stale(contour, &kernel, "claim-verify-1")
+                    .expect("recovery gate after release"),
+                Some(ReconcileLaunchedOutcome::Unreconciled { .. })
+            ),
+            "missing holding keeps recovery unreconciled"
+        );
+        assert_eq!(
+            answer_native_worker_capacity_verify(&kernel, &payload)
+                .expect("released answers")
+                .get("verdict")
+                .and_then(serde_json::Value::as_str),
+            Some("not_held"),
+            "released holding answers not_held"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Stages one native-worker launch record at the given phase for the
+    /// release-gating proof (no admission or spawn: the seam under test is
+    /// the release contract itself).
+    fn stage_release_gate_record(
+        identity: &str,
+        phase: LaunchPhase,
+        effect_digest: Option<String>,
+    ) {
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+        let mut launches = launches_table(contour).expect("launches table");
+        launches.by_identity.insert(
+            identity.to_owned(),
+            LaunchRecord {
+                kind: DispatchedWorkerKind::NativeWorker,
+                identity: identity.to_owned(),
+                admission_digest: "a".repeat(64),
+                request_digest: "b".repeat(64),
+                effect_digest,
+                material_path: None,
+                testd_owner_binding: None,
+                nonce: "launch-nonce-0123456789abcdef".to_owned(),
+                operation_id: "op-release-gate".to_owned(),
+                phase,
+                testd_admission: None,
+                native_receipt: None,
+                native_request: None,
+            },
+        );
+    }
+
+    /// The retention half of the joint owner contract (issue #1679 W11/A7,
+    /// answering the CS1 `stitch/1679.returned.md` retention point).
+    ///
+    /// The operator release seam refuses native-worker slots without
+    /// evidenced terminal resolution: live, unknown-outcome and pre-effect
+    /// phases stay retained even under the exact request digest, while a
+    /// terminal effect digest or a converged phase releases exactly once.
+    /// Other worker kinds keep their established digest-only contract.
+    #[test]
+    fn native_worker_release_requires_terminal_evidence() {
+        let contour = match compose_dispatch_contour(PRINCIPAL.to_owned()) {
+            Ok(()) | Err(DispatchLaunchError::AlreadyComposed(_)) => {
+                DISPATCH_CONTOUR.get().expect("contour")
+            }
+            Err(other) => panic!("contour must compose: {other:?}"),
+        };
+        let digest = "b".repeat(64);
+        let retained = || {
+            launches_table(contour)
+                .expect("launches table")
+                .by_identity
+                .contains_key("claim-release-gate-1")
+        };
+
+        stage_release_gate_record("claim-release-gate-1", LaunchPhase::Launched, None);
+        assert!(
+            !release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-release-gate-1",
+                &digest
+            )
+            .expect("live release"),
+            "a live native slot refuses even under the exact digest"
+        );
+        assert!(retained(), "refused release retains the record");
+        {
+            let mut launches = launches_table(contour).expect("launches table");
+            let record = launches
+                .by_identity
+                .get_mut("claim-release-gate-1")
+                .expect("staged record");
+            record.phase = LaunchPhase::Unreconciled;
+        }
+        assert!(
+            !release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-release-gate-1",
+                &digest
+            )
+            .expect("unreconciled release"),
+            "an unknown-outcome native slot refuses: a possible effect is still nonterminal"
+        );
+        {
+            let mut launches = launches_table(contour).expect("launches table");
+            let record = launches
+                .by_identity
+                .get_mut("claim-release-gate-1")
+                .expect("staged record");
+            record.phase = LaunchPhase::Reserved;
+        }
+        assert!(
+            !release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-release-gate-1",
+                &digest
+            )
+            .expect("reserved release"),
+            "a pre-effect native slot refuses through the operator seam"
+        );
+        {
+            let mut launches = launches_table(contour).expect("launches table");
+            let record = launches
+                .by_identity
+                .get_mut("claim-release-gate-1")
+                .expect("staged record");
+            record.effect_digest = Some("c".repeat(64));
+        }
+        assert!(
+            release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-release-gate-1",
+                &digest
+            )
+            .expect("terminal release"),
+            "a terminal effect digest evidences the release"
+        );
+        assert!(
+            !retained(),
+            "evidenced release removes the record exactly once"
+        );
+
+        stage_release_gate_record("claim-release-gate-1", LaunchPhase::Reconciled, None);
+        assert!(
+            release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-release-gate-1",
+                &digest
+            )
+            .expect("converged release"),
+            "a converged native slot releases"
+        );
+        assert!(!retained(), "converged release removes the record");
+    }
+
+    /// Builds one capacity-verify frame over the live session fence with
+    /// the claim-bound idempotency key, mirroring the consumer transport.
+    fn capacity_verify_frame(
+        session: &Session,
+        request_id: &str,
+        payload: &serde_json::Value,
+    ) -> eliot_protocol::Frame {
+        let fence_value =
+            serde_json::to_value(&session.module_generation.state_fence).expect("fence JSON");
+        let clock_value =
+            serde_json::to_value(eliot_contracts::ClockReading::default()).expect("clock JSON");
+        let claim_id = payload
+            .get("claim_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("payload claim");
+        let identity_value = serde_json::json!({
+            "request": {
+                "metadata": {
+                    "request_id": request_id,
+                    "session_id": null,
+                    "task_id": null,
+                    "product_id": "eliot-native-worker",
+                    "source_id": "eliot-native-worker",
+                    "state_fence": fence_value,
+                    "clock": clock_value,
+                },
+                "state_fence": fence_value,
+            },
+            "idempotency_key": claim_id,
+            "deadline_unix_ms": 4_000_000_000_000u64,
+            "cancellation_id": format!("{request_id}:cancel"),
+        });
+        let identity: eliot_protocol::RequestIdentity =
+            serde_json::from_value(identity_value).expect("request identity");
+        let frame_request_id =
+            serde_json::from_value::<eliot_contracts::RequestId>(serde_json::json!(request_id))
+                .expect("frame request id");
+        eliot_protocol::Frame {
+            protocol_version: session.protocol_version,
+            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+            connection_id: session.connection_id.clone(),
+            request_id: Some(frame_request_id),
+            kind: eliot_protocol::FrameKind::Request,
+            message_type: eliot_protocol::MessageType::Execute,
+            request_identity: Some(identity),
+            payload: eliot_protocol::ProtocolPayload::Json(payload.clone()),
+            trace_context: BTreeMap::new(),
+        }
+    }
+
+    /// The serving half of the joint owner contract (issue #1679 W11).
+    ///
+    /// The `native_worker.capacity_verify` operation is served through the
+    /// closed frame gateway: the operation allowlist names it beside the
+    /// eight established operations, and a well-formed frame over the live
+    /// session fence replies with the owner's verified answer while a
+    /// foreign idempotency key fences without an answer.
+    #[test]
+    fn native_worker_capacity_verify_frame_serves_answer() {
+        use super::super::native_worker_capacity_verify_route::NATIVE_WORKER_CAPACITY_VERIFY_OPERATION;
+        use super::super::native_worker_lifecycle_route::is_native_worker_operation;
+
+        for operation in [
+            "native_worker.registration",
+            "native_worker.claim",
+            "native_worker.ready",
+            "native_worker.heartbeat",
+            "native_worker.checkpoint",
+            "native_worker.result_submit",
+            "native_worker.cancel_observe",
+            "native_worker.reconcile",
+            NATIVE_WORKER_CAPACITY_VERIFY_OPERATION,
+        ] {
+            assert!(
+                is_native_worker_operation(operation),
+                "gateway allowlist serves {operation}"
+            );
+        }
+        assert_eq!(
+            NATIVE_WORKER_CAPACITY_VERIFY_OPERATION,
+            "native_worker.capacity_verify"
+        );
+        assert!(
+            !is_native_worker_operation("native_worker.capacity_invent"),
+            "the gateway admits no unlisted operation"
+        );
+
+        let root = temp_root("capacity-verify-frame");
+        let kernel = ready_kernel(&root);
+        let (boundary, _) = verify_ready_boundary(&kernel);
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+        let claim = native_claim_request("claim-verify-2", "reg-verify-2", "attempt-v-2", "op-v-2");
+        let (request, binding) = acquire_native_worker_capacity(contour, &claim, &boundary)
+            .expect("acquire")
+            .expect("composed reserve issues");
+        let payload = capacity_verify_payload_for(&claim, &request, &binding);
+        let session = worker_session(&kernel, DispatchedWorkerKind::NativeWorker.module_id());
+
+        let action = kernel
+            .dispatch_native_worker_capacity_verify(
+                &session,
+                &capacity_verify_frame(&session, "req-verify-2", &payload),
+            )
+            .expect("dispatch capacity verify");
+        match action {
+            crate::KernelFrameAction::Reply(frame) => {
+                let body = reply_payload(&frame);
+                assert_eq!(
+                    body.get("verdict").and_then(serde_json::Value::as_str),
+                    Some("verified"),
+                    "the served query verifies the live holding"
+                );
+                assert_eq!(
+                    body.get("claim_id").and_then(serde_json::Value::as_str),
+                    Some("claim-verify-2"),
+                    "the served answer names the queried claim"
+                );
+            }
+            _ => panic!("capacity verify must reply"),
+        }
+
+        let mut foreign_frame = capacity_verify_frame(&session, "req-verify-3", &payload);
+        if let Some(identity) = foreign_frame.request_identity.as_mut() {
+            let mut value = serde_json::to_value(&*identity).expect("identity JSON");
+            value["idempotency_key"] = serde_json::Value::from("claim-verify-other");
+            foreign_frame.request_identity =
+                Some(serde_json::from_value(value).expect("foreign identity"));
+        }
+        assert!(
+            matches!(
+                kernel.dispatch_native_worker_capacity_verify(&session, &foreign_frame),
+                Err(TransportError::SessionFenced)
+            ),
+            "a foreign idempotency key fences without an answer"
+        );
+        release_retained_native_worker_capacity(contour, "claim-verify-2");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn assert_nonce_shape(nonce: &str) {

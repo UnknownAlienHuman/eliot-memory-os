@@ -45,8 +45,9 @@
 
 use super::{
     KernelComposition, KernelFrameAction, KernelServiceState, ProcessExecutionRequest,
-    caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
-    status_frame, unix_ms,
+    caller_binding, native_worker_capacity_verify_route::NATIVE_WORKER_CAPACITY_VERIFY_OPERATION,
+    native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json, status_frame,
+    unix_ms,
 };
 use eliot_contracts::{
     CapabilityCellId, EpochId, RequestId, StateFence, canonical_json_bytes, sha256_hex,
@@ -92,9 +93,10 @@ pub(crate) const NATIVE_WORKER_RESULT_SUBMIT_OPERATION: &str = "native_worker.re
 /// Observes cancellation for one exact attempt and fences it.
 pub(crate) const NATIVE_WORKER_CANCEL_OBSERVE_OPERATION: &str = "native_worker.cancel_observe";
 
-/// Returns true for the eight native-worker operations (seven lifecycle
+/// Returns true for the nine native-worker operations (seven lifecycle
 /// operations owned here plus reconciliation owned by the sibling
-/// `native_worker_reconcile_route` module).
+/// `native_worker_reconcile_route` module and capacity verification owned
+/// by the sibling `native_worker_capacity_verify_route` module).
 ///
 /// Paired with the worker-side operation constants in
 /// `bins/eliot-native-worker/src/kernel_admission_client.rs`; both lists must
@@ -110,6 +112,7 @@ pub(crate) fn is_native_worker_operation(operation: &str) -> bool {
             | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
             | NATIVE_WORKER_RECONCILE_OPERATION
+            | NATIVE_WORKER_CAPACITY_VERIFY_OPERATION
     )
 }
 
@@ -544,6 +547,13 @@ fn native_worker_presented_currentness(
                 .filter(|claim| claim.is_object())
                 .ok_or(NativeWorkerRouteError::Shape { field: "claim" })?;
             (claim, Some(require_op_id(claim, "claim_id")?), None)
+        }
+        NATIVE_WORKER_CAPACITY_VERIFY_OPERATION => {
+            // Flat claim projection plus the carried pair (no nested
+            // `binding` object): the claim identity, worker generation
+            // and state fence ride top-level, mirroring the consumer's
+            // `capacity_verify_payload` shape.
+            (payload, Some(require_op_id(payload, "claim_id")?), None)
         }
         _ => {
             let binding = payload
@@ -1115,6 +1125,10 @@ impl KernelComposition {
             .map_err(NativeWorkerRouteError::into_transport)?;
         if context.operation == NATIVE_WORKER_RECONCILE_OPERATION {
             let action = self.dispatch_native_worker_reconcile(session, frame)?;
+            return Self::attach_native_worker_proof_to_action(action, current_proof);
+        }
+        if context.operation == NATIVE_WORKER_CAPACITY_VERIFY_OPERATION {
+            let action = self.dispatch_native_worker_capacity_verify(session, frame)?;
             return Self::attach_native_worker_proof_to_action(action, current_proof);
         }
         if context.operation == NATIVE_WORKER_CANCEL_OBSERVE_OPERATION {

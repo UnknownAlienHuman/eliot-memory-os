@@ -349,6 +349,7 @@ pub mod integration_candidate;
 pub mod integration_lease;
 pub mod integration_owner;
 pub mod kernel_unavailability;
+mod native_worker_capacity_verify_route;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;
