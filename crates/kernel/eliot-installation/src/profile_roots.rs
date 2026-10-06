@@ -200,11 +200,6 @@ impl InstallationRoots {
         &self,
         profile: InstallationProfile,
     ) -> Result<(), InstallationError> {
-        let profile_root = self.runtime_state_roots.installer_profile_root()?;
-        let profile_root = WindowsPathIdentity::parse_root(
-            profile_root.as_str(),
-            "runtime_state_roots.profile_root",
-        )?;
         let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
         match profile {
             InstallationProfile::SystemService => {
@@ -215,9 +210,19 @@ impl InstallationRoots {
                     ),
                     "durable_data",
                 )?;
+                // The contained object is the INSTALLATION root, not the
+                // profile root: the durable-data root and the profile root are
+                // the same `<anchor>\Eliot` directory, so comparing those two
+                // refuses every SystemService binding including production.
+                // The I3.1 rule this enforces is that the per-installation
+                // runtime tree sits strictly below the durable-data root.
+                let installation = WindowsPathIdentity::parse_root(
+                    self.runtime_state_roots.installation_root.as_str(),
+                    "runtime_state_roots.installation_root",
+                )?;
                 if durable != expected_durable
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable == installation
+                    || !durable.contains(&installation)
                 {
                     return Err(InstallationError::ProfileViolation(
                         "runtime installation root must sit strictly below the I3.1 durable-data root"
@@ -245,11 +250,23 @@ impl InstallationRoots {
                 let user_config =
                     WindowsPathIdentity::parse_root(&self.user_config, "user_config")?;
                 let user_cache = WindowsPathIdentity::parse_root(&self.user_cache, "user_cache")?;
+                // The contained object is the INSTALLATION root, not the
+                // profile root: the durable-data root (`<anchor>\Eliot\data`)
+                // can never contain the profile root (`<anchor>\Eliot`), so
+                // comparing those two refuses every UserMode binding including
+                // production. The I3.1 rule this enforces is that the
+                // per-installation runtime tree sits strictly below the
+                // durable-data root — the same rule the `SystemService` arm
+                // enforces above.
+                let installation = WindowsPathIdentity::parse_root(
+                    self.runtime_state_roots.installation_root.as_str(),
+                    "runtime_state_roots.installation_root",
+                )?;
                 if durable != expected_data
                     || user_config != expected_config
                     || user_cache != expected_cache
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable == installation
+                    || !durable.contains(&installation)
                 {
                     return Err(InstallationError::ProfileViolation(
                         "UserMode data, config, cache, and runtime roots must preserve the I3.1 sibling layout"

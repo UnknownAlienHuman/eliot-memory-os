@@ -276,6 +276,33 @@ pub struct RetainedSourceRevision {
     /// Each region is re-proved against the retained bytes: an out-of-bounds or
     /// inverted range is refused at construction, so a region cannot be widened
     /// to cover the whole document and make the arm permanently pass.
+    ///
+    /// # The declared set is empty on every real run, and that is the honest
+    /// answer rather than a gap to be filled in
+    ///
+    /// No production caller supplies a non-empty set. The only construction path
+    /// for this type is [`RetainedSourceRevision::retain`], and the live
+    /// `InquiryObservation.retained_revisions` map that would carry these values is
+    /// built as an **empty** map by `bins/eliot-mod-research`, which states the
+    /// reason in its own words: the provider process's stdout bytes are the whole
+    /// of the retained material, this subtree has no canonical-store write
+    /// authority, and "a digest of bytes nobody holds is not a retained original."
+    ///
+    /// That boundary fetched nothing from a web page and ran no search engine, so
+    /// there is no search-result excerpt anywhere in the bytes to declare. The
+    /// empty set is therefore a **true statement about this material** — every byte
+    /// is the provider's own output prose, none of it is a search snippet — and
+    /// [`OccurrenceFailure::InsideSnippetRegion`] cannot fire on this path.
+    ///
+    /// The fix is explicitly NOT to populate the set. A region invented here to
+    /// make the arm reachable would be a fabricated claim about bytes whose origin
+    /// this crate does not know, and the only owner entitled to make it is the one
+    /// that retained the bytes. Worse, an owner that could declare a region could
+    /// also declare none: the arm cannot be made to fire by a value this crate
+    /// authors. Populating it would convert a check that is silent-because-nothing-
+    /// was-declared into one that permanently passes, which is the worse failure.
+    /// The arm becomes live the moment a run genuinely persists a fetched page, and
+    /// it is correct on that day without any change here.
     pub snippet_regions: Vec<SnippetRegion>,
     /// Digest over the five fields above.
     pub digest: String,
@@ -491,6 +518,27 @@ pub struct ContextFinding {
 /// remaining ones — paraphrase that shifts meaning, and the semantic question
 /// of whether the excerpt suffices at all — belong to the admitted
 /// semantic-evaluation route and are recorded as `Unknown` there, not here.
+///
+/// # Four of these thirteen are dormant, and they are dormant for two different
+/// reasons
+///
+/// A reader auditing this surface should not conclude that a variant which never
+/// appears in a real run is therefore wrong. Each is either blocked by a producer
+/// this crate does not own, or blocked by the shape of the material itself, and in
+/// neither case is the fix to author an input that trips it. The per-variant
+/// verdicts, with the code each is based on, are on
+/// [`verify_excerpt_occurrence`], which is the single site that constructs all
+/// four; the short form:
+///
+/// - [`Self::NegationCropped`] — the arm is sound and reachable, but the only
+///   product excerpt producer offers a quote that starts at the first non-blank
+///   byte of the revision, so there is no leading context for it to read.
+/// - [`Self::SnippetNotQuote`] — constructed only from a branch no product caller
+///   enters, and inert even for a caller that did.
+/// - [`Self::InsideSnippetRegion`] — its declared input set is empty on every
+///   real run, which is a true statement about provider-stdout bytes, not a gap.
+/// - [`Self::ForeignSourceRevision`] — the one of the four that is correct as
+///   written and fires as soon as a run retains an original at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OccurrenceFailure {
     /// The excerpt's handle is not a source this audit admitted.
@@ -535,9 +583,30 @@ pub enum OccurrenceFailure {
     /// about most sentences; "this sentence sits inside a negated clause that
     /// the quote removed" is the defect. See
     /// [`OccurrenceCheck::cropped_negation`].
+    ///
+    /// DORMANT, and blocked by the producer rather than by this arm. The
+    /// measurement is sound and the code is reachable from both position variants;
+    /// what never happens is a quote with leading context. The sole product
+    /// producer of an [`AdmittedExcerpt`] offers the whole trimmed revision, so the
+    /// bytes before the occurrence are the whitespace it trimmed and the
+    /// `governs` conjunct is false. Fixing it means changing that producer to
+    /// offer a sub-window, which is not this file; until then a crop is caught as
+    /// [`Self::OffsetDoesNotMatch`], which refuses the claim but names the defect
+    /// as a failed position assertion.
     NegationCropped,
     /// The excerpt is a fragment of the admitted revision rather than a
     /// contiguous quotation of it, and is being presented as a quote.
+    ///
+    /// DORMANT, and unreachable from any product path. The only construction site
+    /// is the `found.is_empty()` branch of the [`ExcerptPosition::Unpositioned`]
+    /// arm, and no product caller offers an `Unpositioned` excerpt. It is inert
+    /// even for a caller that does: that branch is entered precisely when the
+    /// quote is *absent*, and an elided quote is not a fragment of the revision —
+    /// the retained bytes hold the full passage. This variant is kept so the wire
+    /// name stays stable, and it is not the arm that catches a search snippet; see
+    /// [`Self::InsideSnippetRegion`] for that, and
+    /// [`crate::admitted_excerpt::verify_excerpt_occurrence`] for the full
+    /// determination.
     SnippetNotQuote,
     /// The occurrence appears in a region of the revision that is a
     /// search-result excerpt rather than the source's own prose.
@@ -580,6 +649,13 @@ impl OccurrenceFailure {
 /// Byte range into the retained bytes. Declared by the owner that committed the
 /// bytes — the same owner that supplied [`RetainedSourceRevision`] — and
 /// re-proved by this crate against that revision's digest.
+///
+/// This type carries no constructor. A value can only reach a retained revision
+/// through [`RetainedSourceRevisionParams::snippet_regions`], which the *retaining
+/// owner* fills, and that asymmetry is the point: see
+/// [`RetainedSourceRevision::snippet_regions`] for why that set is empty on every
+/// real run and must not be populated here to make
+/// [`OccurrenceFailure::InsideSnippetRegion`] reachable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnippetRegion {
     /// Inclusive start byte offset.
@@ -845,6 +921,67 @@ fn section_finding(text: &str, quote: &str) -> (ContextFinding, bool) {
 /// (`NoRetainedRevision`), not a skip: an excerpt nobody compared with the
 /// original has not been verified, and the requirement that depends on it is
 /// `Unsatisfied` rather than `Satisfied`.
+///
+/// # Which arms can fire on a real run today, and which cannot
+///
+/// This function has exactly one product caller,
+/// `evidence_portfolio::audit_claim_with_excerpts`, reached from
+/// `inquiry_governance::claim_audit_for_run`. That caller is live, but on the
+/// current provider path every excerpt it offers arrives with `retained == None`,
+/// because `InquiryObservation.retained_revisions` is built as an empty map by
+/// `bins/eliot-mod-research`. The `NoRetainedRevision` arm therefore returns before
+/// any byte is read, and **all four arms below are dormant on today's run for that
+/// one reason.** They are not equally dormant once that reason is removed, and the
+/// difference matters to whoever removes it:
+///
+/// - [`OccurrenceFailure::ForeignSourceRevision`] is **producible the moment any
+///   run retains an original.** It is compared above the `as_text()` call, so a
+///   differing digest is reported on a revision whose bytes never have to be text.
+///   It is the one arm whose two halves come from two different owners — the bytes
+///   re-prove themselves through `verify_integrity`, the admitted
+///   `SourceRecord::content_digest` names the revision — and the same comparison
+///   is enforced independently on the W2 commit path at
+///   `source_admissibility::SourceAdmissibilityRecord::transition_request_committing_freeze`.
+/// - [`OccurrenceFailure::NegationCropped`] is **producible in principle and
+///   blocked in practice by the excerpt producer, not by the check.**
+///   `finish_check` is reached from *both* position arms, so a
+///   [`ExcerptPosition::ByteOffset`] excerpt that matches fires it: `governs`
+///   reads the 2 KiB leading window and `quoted_carries` reads the quote's own
+///   bytes, so any occurrence at least one byte into a revision whose leading
+///   context holds a negation marker the quote does not contain trips it. The
+///   blocker is the shape of the quote, not the arm. The sole product producer,
+///   `inquiry_governance::retained_excerpts`, slices the **entire** trimmed
+///   revision as one contiguous quote, so `leading` is only the trimmed-off
+///   whitespace, which carries no marker and can never trip it. Fixing that means
+///   changing the producer to offer a sub-window, which is another lane's file.
+/// - [`OccurrenceFailure::SnippetNotQuote`] is **not producible from any
+///   production path.** It is pushed only inside the `if found.is_empty()` branch
+///   of the `Unpositioned` arm, and no product caller offers an
+///   `Unpositioned` excerpt — `inquiry_governance::retained_excerpts` always
+///   offers [`ExcerptPosition::ByteOffset`]. It is additionally inert even for a
+///   caller that did: the branch is only entered when the quote is absent, and a quote
+///   that is absent *because it was elided* is not a fragment of the revision at
+///   all — the retained bytes hold the full passage, not the shortened form. The
+///   [`OccurrenceFailure::AbsentFromRevision`] conjunct does the real work and the
+///   truncation marker is decoration. The variant stays exported so the accepted
+///   wire name does not disappear, but no input to this function produces it.
+/// - [`OccurrenceFailure::InsideSnippetRegion`] is **not producible from any
+///   production path,** and must not be made so here. It measures `positions`
+///   against `retained.snippet_regions`, a set only the retaining owner may fill
+///   and which is empty on every real run: see
+///   [`RetainedSourceRevision::snippet_regions`] for why that emptiness is a true
+///   statement about this material rather than a gap.
+///
+/// # What this arm set is not
+///
+/// Nothing here is weakened, widened or auto-populated to make an arm reachable.
+/// The two arms with no producer are documented rather than deleted or fed, and
+/// the two with a producer are left exactly as written. On a run that retains
+/// originals, [`OccurrenceFailure::ForeignSourceRevision`] is live immediately and
+/// [`OccurrenceFailure::OffsetDoesNotMatch`] is what currently stands between a
+/// cropped quote and a released claim — the crop is caught as a failed offset
+/// assertion, which refuses the claim, but reports it as a position failure rather
+/// than as the context defect it is.
 #[allow(clippy::too_many_lines)]
 pub fn verify_excerpt_occurrence(
     excerpt: &AdmittedExcerpt,
@@ -1006,6 +1143,15 @@ fn finish_check(
     // the page once and in the snippet once has been presented from a source
     // that is not the page, and the reader cannot tell which occurrence the
     // author meant.
+    //
+    // `snippet_regions` is empty on every current run, so this is `.any()` over an
+    // empty set and the arm cannot fire. That is the *declared* state, not a
+    // measurement this module declined to make: an empty set is the retaining
+    // owner's statement that the whole revision is its own prose, which is exactly
+    // what a provider process's stdout is. The set is read from the revision and
+    // is never synthesised here — see
+    // [`RetainedSourceRevision::snippet_regions`], which records why filling it in
+    // would be a fabrication and not a fix.
     let inside_snippet = positions.iter().any(|position| {
         let start = *position;
         let end = start + quote.len();

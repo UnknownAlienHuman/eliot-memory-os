@@ -624,15 +624,9 @@ impl SnapshotPage {
     /// to the bytes of the page it actually came from and not to a digest some
     /// other definition produced.
     ///
-    /// The predecessor commitment is currently not compared by
-    /// [`Self::validate_continuation`]: `bins/eliot-store-surreal`'s frozen
-    /// `backup-store-edge` page fixtures carry an illustrative placeholder
-    /// there (documented as such at
-    /// `tests/backup_store_edge.rs:1656`), and that suite is not this
-    /// issue's mutable scope. Comparing the two would refuse those fixtures
-    /// rather than bind them, so the comparison is left to their owner. The
-    /// accepted concrete owner already stores this exact value for the next
-    /// page.
+    /// [`Self::validate_continuation`] compares exactly this value against the
+    /// continuation's [`SnapshotPage::predecessor_digest`], so a continuation
+    /// commits to the bytes of the page it actually came from.
     #[must_use = "the computed digest must be bound into the successor page"]
     pub fn compute_digest(&self) -> Result<String, StoreError> {
         let bytes = canonical_json_bytes(self)
@@ -811,7 +805,10 @@ impl SnapshotPage {
     /// point, the digest and the operation identity must all stay on the one
     /// owner-issued handle. A substituted consistency point or operation field
     /// is refused before any cursor or cumulative bound is examined, so a
-    /// continuation can never advance a capture it does not belong to.
+    /// continuation can never advance a capture it does not belong to. The
+    /// continuation's `predecessor_digest` must equal
+    /// `previous.compute_digest()`, so a well-formed but foreign 64-hex
+    /// commitment is refused here rather than compared onward.
     ///
     /// Both pages are validated on their own terms first. This method claims to
     /// validate a continuation, so it may not assume its two arguments already
@@ -848,6 +845,12 @@ impl SnapshotPage {
             || self.handle.idempotency_key != previous.handle.idempotency_key
         {
             return Err(StoreError::IdentityConflict);
+        }
+        if self.predecessor_digest != previous.compute_digest()? {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.predecessor_digest",
+                reason: "continuation does not commit to the previous page digest",
+            });
         }
         let expected_page_index = previous
             .cursor
