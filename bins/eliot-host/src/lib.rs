@@ -7170,22 +7170,34 @@ impl HostComposition {
         // together, under the registry CAS revision fence and the live exclusive
         // Host owner capability the authority requires of every mutation of its
         // own projection. The writer re-opens here (released above for the
-        // read-only re-inspection); the fence below still pins the admission
-        // revision, so any concurrent movement fails closed into uncertainty.
-        // Repeating the request with the same pair is idempotent
-        // and resolves the same verified destination. A failure here — including
-        // a lost CAS response after the write committed — is uncertain rather
-        // than a refusal: the root may exist, and only reconciliation can say.
+        // read-only re-inspection); the fence below pins the live revision the
+        // re-opened handle observes — which includes our own intent write, so a
+        // fence on the older evidence revision would refuse our own committed
+        // admission — and any movement after this observation still fails
+        // closed into uncertainty. Repeating the request with the same pair is
+        // idempotent and resolves the same verified destination. A failure here
+        // — including a lost CAS response after the write committed — is
+        // uncertain rather than a refusal: the root may exist, and only
+        // reconciliation can say.
         let store = self.open_registry_store().map_err(|_| {
             IsolatedPreparationFailure::EffectUncertain(
                 "the created isolated destination may or may not be retained: reconcile the \
                  operation to learn whether the creation committed",
             )
         })?;
+        let creation_expected_revision = store
+            .load()
+            .map(|projection| projection.revision())
+            .map_err(|_| {
+                IsolatedPreparationFailure::EffectUncertain(
+                    "the created isolated destination may or may not be retained: reconcile the \
+                 operation to learn whether the creation committed",
+                )
+            })?;
         store
             .record_prepared_isolated_destination_creation(
                 &capability,
-                evidence_revision,
+                creation_expected_revision,
                 &allocation.admission,
                 &allocation.destination_generation,
                 &materialisation,

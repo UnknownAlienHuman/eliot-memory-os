@@ -1748,6 +1748,26 @@ impl RuntimeLaunchDescriptor {
         ]
     }
 
+    /// Re-derives the kernel child argv from the descriptor's own fields
+    /// (issue #958: destination derivation moves the work root and resets
+    /// unpublished digests, so cloned argv would no longer select the
+    /// descriptor-bound config).
+    pub(crate) fn refresh_kernel_arguments(&mut self) -> Result<(), InstallationError> {
+        let store_config = self.store_config_path.clone();
+        let expected = self.expected_kernel_arguments(&store_config);
+        let mut refreshed = Vec::with_capacity(expected.len());
+        for value in expected {
+            refreshed.push(PlatformHandle::new(value).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "runtime_launch.kernel_arguments".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?);
+        }
+        self.kernel_arguments = refreshed;
+        Ok(())
+    }
+
     /// Validates the launch contour against the exact approved generation
     /// configuration. Child argv is an authority input, not caller metadata.
     pub fn validate_for_config(

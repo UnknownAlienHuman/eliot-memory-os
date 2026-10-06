@@ -1712,6 +1712,10 @@ fn destination_profiled_roots(
 /// refuses; the recomputed descriptor digest, the manifest validation and the
 /// approval-against-manifest binding are all re-verified before the row is
 /// returned.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the destination derivation re-binds every source-cloned field in one auditable order"
+)]
 pub fn destination_generation_for_admission(
     approved_target: &ApprovedGeneration,
     operation_id: &PlatformHandle,
@@ -1823,6 +1827,73 @@ pub fn destination_generation_for_admission(
     } else {
         manifest.runtime_launch.runtime_state_roots =
             destination_profiled_roots(approved_target, destination_installation)?;
+        // The row describes the destination installation, so its installation
+        // key is the destination key the roots were derived under — never the
+        // source key the manifest was cloned with (`validate` requires the key
+        // to equal the runtime root identity).
+        manifest.runtime_launch.profile_installation_key = Some(
+            PlatformHandle::new(destination_installation.as_str()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "prepared_destination.profile_installation_key".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        // The legacy kernel work-root mirror follows the derived destination
+        // roots, not the source's (`validate` requires the legacy field to
+        // equal `RuntimeStateRoots.kernel_work_root`).
+        manifest.runtime_launch.kernel_work_root = manifest
+            .runtime_launch
+            .runtime_state_roots
+            .kernel_work_root
+            .clone();
+        // The canonical provider argv binds the runtime store contour
+        // (temp/work/data roots), which the derivation moved below the
+        // destination key — rebind those three entries to the derived
+        // destination roots, keeping the flags and the caller-selected
+        // loopback bind (`validate` gates this exact binding).
+        {
+            let roots = manifest.runtime_launch.runtime_state_roots.clone();
+            let arguments = manifest.runtime_launch.canonical_store_arguments.clone();
+            if arguments.len() != 12 {
+                return Err(IsolatedDestinationError::Installation(
+                    InstallationError::IncompleteObservation(
+                        "the approved target carries no 12-entry canonical provider argv to rebind \
+                         to the destination contour"
+                            .to_owned(),
+                    ),
+                ));
+            }
+            let data_url = PlatformHandle::new(format!(
+                "surrealkv://{}",
+                roots.store_data_root.as_str().replace('\\', "/")
+            ))
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination.canonical_store_arguments".to_owned(),
+                reason: error.to_string(),
+            })?;
+            manifest.runtime_launch.canonical_store_arguments = vec![
+                arguments[0].clone(),
+                arguments[1].clone(),
+                arguments[2].clone(),
+                arguments[3].clone(),
+                arguments[4].clone(),
+                roots.store_temp_root.clone(),
+                arguments[6].clone(),
+                arguments[7].clone(),
+                roots.store_work_root.clone(),
+                arguments[9].clone(),
+                arguments[10].clone(),
+                data_url,
+            ];
+        }
+        // The manifest-level roots digest binds the launch roots: it follows
+        // the derived destination roots, not the source's.
+        manifest.runtime_state_roots_digest = manifest
+            .runtime_launch
+            .runtime_state_roots
+            .roots_digest
+            .clone();
         // The I3.1 binding mirrors the exact runtime roots: the destination
         // runs under the derived roots, not the source's.
         manifest
@@ -1830,6 +1901,9 @@ pub fn destination_generation_for_admission(
             .profile_governed_roots
             .runtime_state_roots = manifest.runtime_launch.runtime_state_roots.clone();
     }
+    // The kernel child argv is derived from the descriptor's own fields, so
+    // it is re-derived after every field the derivation moved above.
+    manifest.runtime_launch.refresh_kernel_arguments()?;
     manifest.runtime_launch = manifest.runtime_launch.with_computed_digest()?;
     manifest.validate()?;
     let approval = InstallationActivationApproval::from_preparation_parts(
