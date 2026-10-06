@@ -49,7 +49,7 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
@@ -204,6 +204,7 @@ struct OrsReserveInner {
     transaction_protected_in_flight: AtomicU64,
     durable_normal_in_flight_bytes: AtomicU64,
     durable_protected_in_flight_bytes: AtomicU64,
+    restart_sealed: AtomicBool,
 }
 
 /// The ORS control reserve: disjoint normal/protected partitions for the two
@@ -365,6 +366,7 @@ impl OrsReserve {
                 transaction_protected_in_flight: AtomicU64::new(0),
                 durable_normal_in_flight_bytes: AtomicU64::new(0),
                 durable_protected_in_flight_bytes: AtomicU64::new(0),
+                restart_sealed: AtomicBool::new(false),
             }),
         })
     }
@@ -433,6 +435,46 @@ impl OrsReserve {
         )
     }
 
+    /// Returns whether the reserve is sealed after a restart.
+    ///
+    /// While sealed, every acquisition fails closed with its typed exhaustion
+    /// disposition: unknown held capacity stays excluded until the recovery
+    /// journal owner reconciles it. A sealed reserve reports zero
+    /// availability everywhere, but the cause is recorded here rather than
+    /// inferred from the counters.
+    #[must_use]
+    pub fn restart_sealed(&self) -> bool {
+        self.inner.restart_sealed.load(Ordering::Acquire)
+    }
+
+    /// Seals the reserve at a restart boundary: restart never restores
+    /// capacity by resetting a local counter (issue #1679 W5/A8).
+    ///
+    /// Every in-flight counter is pinned to its full partition capacity, so
+    /// no new acquisition can succeed on the back of a zeroed counter.
+    /// Unknown held capacity stays excluded: there is no in-module unseal
+    /// because lifting the seal needs the epoch fence only the durable
+    /// recovery-journal owner observes — the seal is lifted by rebuilding
+    /// the reserve from reconciled journal state (STITCH: the embedding
+    /// owner calls this exactly once when it detects an unclean restart
+    /// before admitting new work).
+    pub fn seal_after_restart(&self) {
+        self.inner
+            .transaction_normal_in_flight
+            .fetch_max(self.inner.transaction_normal_capacity, Ordering::AcqRel);
+        self.inner
+            .transaction_protected_in_flight
+            .fetch_max(self.inner.transaction_protected_capacity, Ordering::AcqRel);
+        self.inner
+            .durable_normal_in_flight_bytes
+            .fetch_max(self.inner.durable_normal_capacity_bytes, Ordering::AcqRel);
+        self.inner.durable_protected_in_flight_bytes.fetch_max(
+            self.inner.durable_protected_capacity_bytes,
+            Ordering::AcqRel,
+        );
+        self.inner.restart_sealed.store(true, Ordering::Release);
+    }
+
     /// Attempts to acquire one normal transaction slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
@@ -464,6 +506,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::NormalCapacityExhausted {
+                bottleneck: ORS_TRANSACTION_BOTTLENECK,
+                work_class: work,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.transaction_normal_in_flight,
             self.inner.transaction_normal_capacity,
@@ -521,6 +572,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::NormalCapacityExhausted {
+                bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
+                work_class: work,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.durable_normal_in_flight_bytes,
             self.inner.durable_normal_capacity_bytes,
@@ -579,6 +639,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::ProtectedReserveExhausted {
+                bottleneck: ORS_TRANSACTION_BOTTLENECK,
+                operation,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.transaction_protected_in_flight,
             self.inner.transaction_protected_capacity,
@@ -636,6 +705,15 @@ impl OrsReserve {
                 reason: "must be non-blank",
             }
         })?;
+        if self.inner.restart_sealed.load(Ordering::Acquire) {
+            return Err(OrsReserveError::ProtectedReserveExhausted {
+                bottleneck: ORS_DURABLE_BYTES_BOTTLENECK,
+                operation,
+                operation_id: operation_id.to_owned(),
+                owner: owner.to_owned(),
+                epoch,
+            });
+        }
         if !cas_add(
             &self.inner.durable_protected_in_flight_bytes,
             self.inner.durable_protected_capacity_bytes,
@@ -938,5 +1016,846 @@ impl OrsRejectionParts {
             .validate()
             .map_err(|error| OrsReserveError::Contract(error.to_string()))?;
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    /// Saturating the single normal transaction slot leaves the protected
+    /// partition untouched (issue #1679). The positive control comes FIRST and
+    /// its permit is held across the assertions: a reserve that refused
+    /// everything would also refuse normal work, so only an admitted
+    /// cancellation proves the protected slot is genuinely still available
+    /// while ordinary work is being shed. The shedding refusal then names the
+    /// exact bottleneck, so exhaustion of one dimension is never reported as
+    /// global exhaustion.
+    #[test]
+    fn ors_normal_transaction_saturation_leaves_protected_slot_available() {
+        let reserve = OrsReserve::partitioned(
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-1",
+                epoch,
+            )
+            .expect("first slot");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // slot while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-ctl-1",
+                epoch,
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_transactions(), 1);
+
+        let err = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-shed-1",
+                epoch,
+            )
+            .expect_err("saturated normal partition must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+    }
+
+    /// A restart never restores capacity by resetting a local counter (issue
+    /// #1679 W5/A8): sealing pins every in-flight counter to its full
+    /// partition capacity, so all four acquisition paths fail closed with
+    /// their typed exhaustion dispositions and every availability reads zero.
+    /// Unknown held capacity stays excluded until the recovery-journal owner
+    /// reconciles it — there is no in-module unseal.
+    #[test]
+    fn ors_restart_seal_closes_all_partitions_without_restoring_capacity() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(16).expect("bytes"),
+            NonZeroU64::new(16).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+        assert!(!reserve.restart_sealed());
+
+        // Positive control: every path admits before the seal.
+        let _held = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-live-1",
+                epoch,
+            )
+            .expect("normal transaction admits");
+        assert_eq!(reserve.available_normal_transactions(), 1);
+
+        reserve.seal_after_restart();
+        assert!(reserve.restart_sealed());
+
+        // The pinned counters read as fully held: no availability anywhere.
+        assert_eq!(reserve.available_normal_transactions(), 0);
+        assert_eq!(reserve.available_protected_transactions(), 0);
+        assert_eq!(reserve.available_normal_durable_bytes(), 0);
+        assert_eq!(reserve.available_protected_durable_bytes(), 0);
+
+        // Every acquisition path fails closed with its typed disposition.
+        let err = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-sealed-1",
+                epoch,
+            )
+            .expect_err("sealed normal transaction must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+        let err = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-sealed-2",
+                epoch,
+            )
+            .expect_err("sealed protected transaction must refuse");
+        assert!(
+            matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+        let err = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-dur-sealed-1",
+                NonZeroU64::new(1).expect("byte"),
+                epoch,
+            )
+            .expect_err("sealed normal durable bytes must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
+        );
+        let err = reserve
+            .try_acquire_protected_durable_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-dur-sealed-2",
+                NonZeroU64::new(1).expect("byte"),
+                epoch,
+            )
+            .expect_err("sealed protected durable bytes must refuse");
+        assert!(
+            matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
+        );
+    }
+
+    /// The durable-byte face of the same property (issue #1679): saturating the
+    /// normal durable-byte partition leaves the protected byte partition
+    /// untouched, so an admitted cancellation keeps its recovery lane while
+    /// ordinary work is shed naming exactly `ORS_DURABLE_BYTES_BOTTLENECK`.
+    /// Exhaustion of one dimension is therefore never reported as global
+    /// exhaustion, and normal work never borrows the reserve.
+    #[test]
+    fn ors_normal_durable_saturation_leaves_protected_bytes_available() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+                epoch,
+            )
+            .expect("normal bytes");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // protected byte path while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_durable_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-bytes-ctl-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_durable_bytes(), 3);
+
+        let err = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-shed-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect_err("saturated normal bytes must refuse");
+        assert!(
+            matches!(err, OrsReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
+        );
+    }
+
+    /// The reporting face of the same property (issue #1679):
+    /// `normal_durable_exhaustion_response` must never manufacture a
+    /// `STORAGE_BACKPRESSURE` response for a durable partition that still
+    /// admits the request. A response that names an exhausted resource while
+    /// durable staging is available would be false pressure evidence, so the
+    /// admitting partition is refused instead.
+    #[test]
+    fn ors_durable_exhaustion_response_refuses_an_admitting_partition() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_durable_bytes(), 8);
+
+        let err = reserve
+            .normal_durable_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-bytes-admitting-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("an admitting partition must not produce pressure evidence");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.normal_durable_bytes",
+                ..
+            }
+        ));
+    }
+
+    /// The positive complement of
+    /// `ors_durable_exhaustion_response_refuses_an_admitting_partition`: that
+    /// test pins no-manufactured-pressure while durable staging is available,
+    /// this one pins that a truly saturated normal durable partition yields a
+    /// real `STORAGE_BACKPRESSURE` report naming the durable-byte bottleneck.
+    #[test]
+    fn ors_durable_exhaustion_response_reports_live_saturation() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop, and the report
+        // below must observe the live saturated partition.
+        let _held = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-fill-2",
+                NonZeroU64::new(2).expect("bytes"),
+                epoch,
+            )
+            .expect("normal bytes");
+        assert_eq!(reserve.available_normal_durable_bytes(), 0);
+
+        let response = reserve
+            .normal_durable_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-bytes-report-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("live saturation must report");
+        assert!(matches!(
+            response.disposition,
+            BackpressureDisposition::StorageBackpressure
+        ));
+    }
+
+    /// The W1 per-owner rows for ORS (issue #1679): the owner publishes live,
+    /// validated rows for BOTH its dimensions, naming exactly
+    /// `ORS_TRANSACTION_BOTTLENECK` then `ORS_DURABLE_BYTES_BOTTLENECK` with
+    /// the frozen-map owners, so the Kernel profile composition joins real owner
+    /// evidence. Per I14.3 there is one row per bottleneck in the frozen owner
+    /// binding and no borrowed capacity, so each row is checked against the
+    /// frozen map rather than a hard-coded owner: a hard-coded owner would only
+    /// prove the test agrees with itself.
+    #[test]
+    fn ors_publish_owner_rows_name_both_frozen_dimensions() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let ctx = OrsOwnerEvidenceContext {
+            owner_generation_ref: "gen-7".to_owned(),
+            proof_profile_ref: "proof-ors-1".to_owned(),
+            evidence_refs: vec!["ev-ors-1".to_owned()],
+            invalidation_set: vec!["inv-ors-1".to_owned()],
+        };
+        let rows = reserve.publish_owner_rows(&ctx).expect("owner rows");
+
+        // The constructor returns transaction first, durable second.
+        assert_eq!(rows[0].bottleneck, ORS_TRANSACTION_BOTTLENECK);
+        assert_eq!(rows[1].bottleneck, ORS_DURABLE_BYTES_BOTTLENECK);
+        assert!(
+            rows.iter()
+                .all(|row| row.coverage_state == BottleneckCoverageState::Claimed)
+        );
+
+        for row in &rows {
+            let bound = frozen_bottleneck_owner_map()
+                .into_iter()
+                .find(|b| b.bottleneck == row.bottleneck)
+                .expect("frozen ors owner");
+            assert_eq!(row.owner_ref, bound.owner);
+        }
+    }
+
+    /// A claimed row must name one runtime owner AND one owner generation
+    /// (norm I14.3), so a blank `owner_generation_ref` must be refused at
+    /// publication rather than publishing an unaccountable claimed row:
+    /// `publish_owner_rows` funnels every row through the shared
+    /// `row.validate()` contract check, and a claimed row without an owner
+    /// generation is not valid.
+    #[test]
+    fn ors_publish_owner_rows_rejects_blank_generation() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let ctx = OrsOwnerEvidenceContext {
+            owner_generation_ref: String::new(),
+            proof_profile_ref: "proof-ors-1".to_owned(),
+            evidence_refs: vec!["ev-ors-1".to_owned()],
+            invalidation_set: vec!["inv-ors-1".to_owned()],
+        };
+        let err = reserve
+            .publish_owner_rows(&ctx)
+            .expect_err("blank generation must never publish a row");
+        assert!(matches!(err, OrsReserveError::Contract(_)));
+    }
+
+    /// The transaction dimension of issue #1679: the same fail-closed property
+    /// as the durable face, applied to the slot dimension.
+    /// `normal_transaction_exhaustion_response` must never manufacture
+    /// pressure evidence for a normal transaction partition that still admits
+    /// work. Per I14.3 pressure evidence exists only for live saturation, so an
+    /// admitting partition refuses the response rather than reporting an
+    /// exhausted resource that is not exhausted.
+    #[test]
+    fn ors_transaction_exhaustion_response_refuses_an_admitting_partition() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_transactions(), 2);
+
+        let err = reserve
+            .normal_transaction_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-tx-admitting-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("an admitting partition must not produce pressure evidence");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.normal_transaction_slots",
+                ..
+            }
+        ));
+    }
+
+    /// The positive complement of
+    /// `ors_transaction_exhaustion_response_refuses_an_admitting_partition`:
+    /// that test pins that an admitting partition refuses to manufacture
+    /// pressure evidence, this one pins that a truly saturated normal
+    /// transaction partition yields a real `BUSY` report naming the transaction
+    /// dimension (issue #1679 A3).
+    #[test]
+    fn ors_transaction_exhaustion_response_reports_live_saturation() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop, and the report
+        // below must observe the live saturated partition.
+        let _held_a = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-1",
+                epoch,
+            )
+            .expect("first slot");
+        let _held_b = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-2",
+                epoch,
+            )
+            .expect("second slot");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        let response = reserve
+            .normal_transaction_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "op-tx-report-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect("live saturation must report");
+        assert!(matches!(
+            response.disposition,
+            BackpressureDisposition::Busy
+        ));
+    }
+
+    /// The identity complement of
+    /// `ors_transaction_exhaustion_response_reports_live_saturation`: that test
+    /// pins a real `BUSY` report from a live-saturated partition, this one pins
+    /// that the same saturated partition still refuses a blank operation identity
+    /// as `InvalidField { field: "ors_rejection.operation_id" }`, so no report
+    /// carries an identity the contract cannot name (issue #1679 A10).
+    #[test]
+    fn ors_transaction_response_rejects_malformed_operation_id() {
+        let reserve = OrsReserve::partitioned(
+            1,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // The single normal transaction slot is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the malformed
+        // identity and not from an unsaturated partition.
+        let _held = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-1",
+                epoch,
+            )
+            .expect("slot");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        let err = reserve
+            .normal_transaction_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_rejection.operation_id",
+                ..
+            }
+        ));
+    }
+
+    /// The byte-dimension identity complement of
+    /// `ors_transaction_exhaustion_response_reports_live_saturation`: that test
+    /// pins a real `BUSY` report from a live-saturated partition, this one pins
+    /// that the saturated durable byte partition still refuses a blank operation
+    /// identity as `InvalidField { field: "ors_rejection.operation_id" }`, so no
+    /// report carries an identity the contract cannot name (issue #1679 A10).
+    #[test]
+    fn ors_durable_response_rejects_malformed_operation_id() {
+        let reserve = OrsReserve::partitioned(
+            4,
+            4,
+            NonZeroU64::new(1).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        let _held = reserve
+            .try_acquire_normal_durable_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-bytes-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect("normal bytes");
+        assert_eq!(reserve.available_normal_durable_bytes(), 0);
+
+        let err = reserve
+            .normal_durable_exhaustion_response(
+                NormalWorkClass::CanonicalWrite,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_rejection.operation_id",
+                ..
+            }
+        ));
+    }
+
+    /// The constructor floor of issue #1679: a reserve with no normal
+    /// transaction slots can never admit any ORS work, so building one must fail
+    /// at build rather than surprise a caller at runtime with an always-shedding
+    /// partition. The refusal names the exact field.
+    #[test]
+    fn ors_partitioned_zero_normal_transactions_fails_closed() {
+        let Err(err) = OrsReserve::partitioned(
+            0,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero normal transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.normal_transaction_slots",
+                ..
+            }
+        ));
+    }
+
+    /// The protected-partition complement of the normal floor (issue #1679):
+    /// a reserve with no protected transaction slots can never admit protected
+    /// ORS work, so building one must fail at build rather than surprise a
+    /// caller at runtime with an always-shedding partition. The refusal names
+    /// the exact field.
+    #[test]
+    fn ors_partitioned_zero_protected_transactions_fails_closed() {
+        let Err(err) = OrsReserve::partitioned(
+            4,
+            0,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        ) else {
+            panic!("zero protected transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_reserve.protected_transaction_slots",
+                ..
+            }
+        ));
+    }
+
+    /// The owner-identity complement of the acquisition paths (issue #1679
+    /// A10): every permit binds owner, operation and epoch, so a blank owner
+    /// must never hold an ORS permit. The refusal names the exact field
+    /// `ors_permit.owner` before any partition capacity is consumed.
+    #[test]
+    fn ors_acquire_rejects_blank_owner() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        let Err(err) = reserve.try_acquire_normal_transaction(
+            NormalWorkClass::CanonicalWrite,
+            "",
+            "op-owner-1",
+            epoch,
+        ) else {
+            panic!("blank owner must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_permit.owner",
+                ..
+            }
+        ));
+    }
+
+    /// The operation-identity complement of the owner check (issue #1679
+    /// A10): every permit binds owner, operation and epoch, so a blank
+    /// operation id must never hold an ORS permit. The refusal names the
+    /// exact field `ors_permit.operation_id` before any partition capacity is
+    /// consumed.
+    #[test]
+    fn ors_acquire_rejects_blank_operation_id() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        let Err(err) = reserve.try_acquire_normal_transaction(
+            NormalWorkClass::CanonicalWrite,
+            "owner-a",
+            "",
+            epoch,
+        ) else {
+            panic!("blank operation id must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            OrsReserveError::InvalidField {
+                field: "ors_permit.operation_id",
+                ..
+            }
+        ));
+    }
+
+    /// Protected-partition exhaustion names its dimension (issue
+    /// #1679 A6/W4): a full protected transaction partition refuses
+    /// with `ProtectedReserveExhausted` naming exactly
+    /// `ORS_TRANSACTION_BOTTLENECK`, so exhaustion of one dimension
+    /// is never reported as global exhaustion (I14.3). The fill permit
+    /// is held across the assertions: it releases on drop.
+    #[test]
+    fn ors_protected_transaction_exhaustion_names_bottleneck() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-fill-1",
+                epoch,
+            )
+            .expect("protected slot");
+        assert_eq!(reserve.available_protected_transactions(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_transaction(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-tx-shed-1",
+            epoch,
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_TRANSACTION_BOTTLENECK)
+        );
+    }
+
+    /// The durable-byte face of the same property (issue #1679 A6/W4): a full
+    /// protected durable-byte partition refuses with
+    /// `ProtectedReserveExhausted` naming exactly
+    /// `ORS_DURABLE_BYTES_BOTTLENECK`, so exhaustion of one dimension is never
+    /// reported as global exhaustion (I14.3). The fill permit is held across the
+    /// assertions: it releases on drop.
+    #[test]
+    fn ors_protected_durable_exhaustion_names_bottleneck() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(1).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_durable_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-bytes-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+                epoch,
+            )
+            .expect("protected bytes");
+        assert_eq!(reserve.available_protected_durable_bytes(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_durable_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-bytes-shed-1",
+            NonZeroU64::new(1).expect("bytes"),
+            epoch,
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, OrsReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == ORS_DURABLE_BYTES_BOTTLENECK)
+        );
+    }
+
+    /// A fresh reserve reports exactly the partition capacities it was
+    /// configured with (issue #1679): quantities are copied from
+    /// configuration and never derived or scaled at construction, so no
+    /// capacity can be invented while building the reserve (I14.3).
+    #[test]
+    fn ors_reserve_reports_configured_capacities() {
+        let reserve = OrsReserve::partitioned(
+            3,
+            5,
+            NonZeroU64::new(7).expect("bytes"),
+            NonZeroU64::new(9).expect("bytes"),
+        )
+        .expect("reserve");
+
+        assert_eq!(reserve.available_normal_transactions(), 3);
+        assert_eq!(reserve.available_protected_transactions(), 5);
+        assert_eq!(reserve.available_normal_durable_bytes(), 7);
+        assert_eq!(reserve.available_protected_durable_bytes(), 9);
+    }
+
+    /// Release is automatic and exact (issue #1679, norm
+    /// `control-reserve.contract.toml:44`): `OrsPermit` has no release method,
+    /// so `impl Drop for OrsPermit` is the ONLY release path and a dropped
+    /// permit must restore exactly its held amount - once, never twice. A
+    /// reserve that released nothing would strand capacity forever and one that
+    /// released twice would mint capacity out of a counter, so both the
+    /// restored value and the reuse of the slot are pinned: a fresh operation id
+    /// acquires the returned slot again, which no surviving process or counter
+    /// could do. No permit is held across the final assertions: each is
+    /// explicitly released so nothing leaks past this test.
+    #[test]
+    fn ors_dropped_normal_permit_returns_slot_exactly_once() {
+        let reserve = OrsReserve::partitioned(
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        // The pre-acquire baseline: dropping the permit below must return
+        // exactly this value, so a duplicate release is visible.
+        assert_eq!(reserve.available_normal_transactions(), 1);
+
+        let first = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-rel-1",
+                epoch,
+            )
+            .expect("first slot");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        // The only release path: drop returns exactly the held amount.
+        drop(first);
+        assert_eq!(reserve.available_normal_transactions(), 1);
+
+        // The restored slot is genuinely reusable: a fresh operation id acquires
+        // it again and the reserve never has to fabricate ownership.
+        let second = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-rel-2",
+                epoch,
+            )
+            .expect("released slot is reusable");
+        assert_eq!(reserve.available_normal_transactions(), 0);
+
+        drop(second);
+    }
+
+    /// A dropped protected permit returns its slot exactly once (issue
+    /// #1679): the `Drop` match routes by capacity class, so a protected
+    /// transaction permit restores the protected partition - never the normal
+    /// one - and a fresh control operation can then re-acquire the returned
+    /// slot (A7 release-at-most-once on the protected path).
+    #[test]
+    fn ors_dropped_protected_permit_returns_slot_exactly_once() {
+        let reserve = OrsReserve::partitioned(
+            2,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        let epoch = AuthorityEpoch::new(1).expect("epoch");
+
+        assert_eq!(reserve.available_protected_transactions(), 1);
+
+        let first = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-prel-1",
+                epoch,
+            )
+            .expect("protected slot");
+        assert_eq!(reserve.available_protected_transactions(), 0);
+
+        // The only release path: drop returns exactly the held amount.
+        drop(first);
+        assert_eq!(reserve.available_protected_transactions(), 1);
+
+        let second = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-prel-2",
+                epoch,
+            )
+            .expect("released slot is reusable");
+        assert_eq!(reserve.available_protected_transactions(), 0);
+
+        drop(second);
     }
 }

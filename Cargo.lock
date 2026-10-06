@@ -3026,6 +3026,7 @@ dependencies = [
  "eliot-research-exchange",
  "eliot-research-exchange-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

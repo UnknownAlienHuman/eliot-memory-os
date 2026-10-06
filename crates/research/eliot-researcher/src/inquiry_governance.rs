@@ -38,26 +38,44 @@
 //! *inputs* for the existing deterministic `TaskGraphCompiler` (I10.15); a
 //! researcher-local compiler, a second graph, an order, a lease and a schedule
 //! are all outside this crate's ownership.
+//!
+//! # Where the evidence freeze is retained
+//!
+//! [`EvidenceFreeze`] has one store owner and it is in this module:
+//! [`EvidenceFreeze::retained_bytes`] is its write path and
+//! [`EvidenceFreeze::reload`] is its read path, over the repository's accepted
+//! canonical encoder. That is the whole retention mechanism, and it is here
+//! rather than in a store crate for the reason I21.1 gives: the freeze is a
+//! *non-canonical* candidate artifact, so it is not canonical state (the
+//! canonical store, I5.2), not operational metadata (ORS, I5.2) and not a
+//! large payload (Blob Store, I5.2). Its writer and reader are the same
+//! contract, and that contract is the domain that owns the freeze. What this
+//! does **not** do is place a blob, open a store handle, or move the freeze
+//! into canonical state — those belong to the owners I21.1 names: "canonical
+//! transition, Current Epistemic Position and finish → Governor through
+//! existing canonical/finish paths". A retained freeze is what a later
+//! synthesis author or auditor reads, and it is never admission.
 
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, DisclosureClass,
     LocatorClass, ResearchContractError, SourceClass, classify_locator,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding, AuditedClaim,
     AuthorizedManifest, AuthorizedManifestParams, ClaimConditionSources, ClaimCoverageMap,
     ClaimVerdict, CoverageAccount, EvidencePortfolio, LineageTable, ManifestSource,
     MaterialClaimRoster, NoMatchEvaluation, ObservedOutsideScope, PortfolioError,
-    PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
-    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text, check_precision,
-    digest, fence_preimage, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
-    text,
+    PrecisionAssertion, PrecisionKind, PresentedEvaluation, RiskState, SourceDisposition,
+    SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text,
+    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
+    push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -277,6 +295,17 @@ pub enum InquiryError {
         /// Failing field path.
         field: &'static str,
     },
+    /// Retained bytes are not an evidence freeze of this declared shape.
+    ///
+    /// The readback side of [`Self::Unencodable`]: a value that cannot be
+    /// encoded is never written, and bytes that are not a freeze of this shape
+    /// are not adopted as one. The two refusals stay separate because "this
+    /// freeze could not be written" and "these bytes are not a freeze this owner
+    /// wrote" are different facts about opposite sides of the same boundary.
+    FreezeStoreDecode {
+        /// Failing field path.
+        field: &'static str,
+    },
     /// The frozen acquisition-side discipline refused the material.
     Portfolio(PortfolioError),
     /// The run-bound audit reference authorization refused to bind.
@@ -389,6 +418,9 @@ impl std::fmt::Display for InquiryError {
                     formatter,
                     "{field} cannot be encoded into its canonical preimage"
                 )
+            }
+            Self::FreezeStoreDecode { field } => {
+                write!(formatter, "{field} is not a retained evidence freeze")
             }
             Self::Portfolio(error) => write!(formatter, "frozen portfolio discipline: {error}"),
             Self::AuditBinding(cause) => {
@@ -3316,13 +3348,22 @@ impl CoverageReceipt {
         // document behind it, and `AbsencePreconditions::derive` re-proves both
         // on the way in, so a rewritten one is refused before any of its content
         // is believed.
+        // The admitted query has no producer on this route (the retaining
+        // composition owns it, #1762 OPEN), so `None` is passed rather than a
+        // synthesized commitment; the presented evaluation is bound against its
+        // bundle-retained twin, which arrives together with it by the doctrine
+        // above (`None` evidence still derives `None`/`None` exactly as before).
         let absence_preconditions = AbsencePreconditions::derive(
             account,
             &vetted_records(records),
             absence_evidence.map(|evidence| &evidence.manifest),
             assessment_time_ms,
             frozen_scope_digest,
-            absence_evidence.map(|evidence| evidence.evaluation.clone()),
+            PresentedEvaluation {
+                evaluation: absence_evidence.map(|evidence| evidence.evaluation.clone()),
+                admitted_query: None,
+                retained_evaluation: absence_evidence.map(|evidence| &evidence.evaluation),
+            },
         )?;
         let absence_verdict = assess_absence(account, &absence_preconditions);
         // The retained identity and ceiling come from the record the derivation
@@ -3730,7 +3771,16 @@ fn coordinate_residue(
 /// admission, so the accepted evidence revision is frozen before prose
 /// synthesis begins. The freeze is a non-canonical governed artifact: it is
 /// candidate material that only Governor admission can promote.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The codec is `Serialize`/`Deserialize` with `deny_unknown_fields` and **no**
+/// `#[serde(default)]` on any field, because [`Self::retained_bytes`] and
+/// [`Self::reload`] are a store-owner pair: the bytes written are the bytes a
+/// later reader must decode, and a field that defaulted on read would let a
+/// body written under one shape be adopted as a freeze of another. A newly
+/// added field is therefore a wire-shape change, and its absence is a refusal
+/// rather than a silent empty value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceFreeze {
     /// Stable freeze identity.
     ///
@@ -3776,6 +3826,25 @@ pub struct EvidenceFreeze {
     pub evidence_set_id: String,
     /// Included evidence references, in canonical order.
     pub included_evidence_refs: Vec<String>,
+    /// The admission and persistence receipt of every included member, in the
+    /// same canonical order as [`Self::included_evidence_refs`].
+    ///
+    /// I21.8 item 1 requires the freeze to record an admission/persistence
+    /// receipt, and until this field existed the record could not show WHICH
+    /// receipt authorised its own evidence: the commitment lived only on
+    /// `CommittedFreeze` and on each request's `FreezeCommitment`, so a reader
+    /// holding one freeze had to go and correlate it with a sibling record to
+    /// learn what admitted and what persisted each member. This is that
+    /// correlation, carried on the record itself.
+    ///
+    /// Every value here is produced by a different owner and none is recomputed
+    /// from a sibling field: `admission_digest` is the admission owner's own
+    /// `SourceAdmissibilityRecord::digest` over the eligibility decision it made
+    /// for this handle, and `persistence_digest` is the persistence owner's own
+    /// `RetainedSourceRevision::digest` over the exact retained bytes, which
+    /// re-proves that those bytes hash to the content digest the record was
+    /// admitted under. See [`FreezeMemberReceipt`].
+    pub member_receipts: Vec<FreezeMemberReceipt>,
     /// Excluded evidence and the reason it was excluded.
     pub excluded_evidence: Vec<(String, String)>,
     /// Unresolved contradictions observed between members.
@@ -3792,6 +3861,83 @@ pub struct EvidenceFreeze {
     pub governor_admission_required: bool,
     /// Digest over the freeze shape.
     pub digest: String,
+}
+
+/// The admission and persistence receipt of one included freeze member.
+///
+/// I21.8 item 1 requires the freeze to record an admission/persistence receipt,
+/// and this is what it names. One receipt per member of
+/// [`EvidenceFreeze::included_evidence_refs`], in the same order.
+///
+/// Every field is a value a **different** owner produced, and none is recomputed
+/// from a sibling field, which is what keeps the pairing a check rather than a
+/// restatement:
+///
+/// - `admission_digest` is the admission owner's own
+///   [`SourceAdmissibilityRecord::digest`] over the eligibility decision it made
+///   for this handle. The Researcher cannot re-derive it, because the decision
+///   and the policy that produced it are the admission owner's.
+/// - `content_digest` is the admitted record's own `SourceRecord::content_digest`
+///   — the revision identity the eligibility decision was made about.
+/// - `persistence_digest` is the persistence owner's own
+///   [`crate::admitted_excerpt::RetainedSourceRevision::digest`] over the exact
+///   retained bytes, its artifact reference and the same `content_digest`. That
+///   owner re-proves the bytes against the content digest at construction, so a
+///   receipt naming both is a receipt whose bytes exist and hash to the revision
+///   they were filed under.
+/// - `retained_artifact_ref` is the immutable artifact reference the original was
+///   committed under, so a reader goes back to the artifact rather than trusting
+///   the copy in hand.
+///
+/// The receipt is a **commitment**, not a copy: it does not carry the bytes. That
+/// is deliberate and is the same boundary
+/// [`crate::source_admissibility::FreezeCommitment`] draws, and the bytes
+/// themselves live on the record that retains them
+/// ([`InquiryGovernance::retained_revisions`]), which re-runs each revision's own
+/// `verify_integrity` on readback. What this adds over that sibling is the
+/// direction: the freeze names the receipt that authorised its own member, so the
+/// freeze can be checked on its own bytes rather than only by correlation.
+///
+/// The codec mirrors [`EvidenceFreeze`]: `deny_unknown_fields` and no field
+/// defaults, because a receipt is only ever decoded as part of a retained
+/// freeze whose shape is exact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreezeMemberReceipt {
+    /// The admitted source handle. Equal to this receipt's position in
+    /// [`EvidenceFreeze::included_evidence_refs`]; the constructor refuses a
+    /// mismatch so the two lists cannot be read as parallel by accident.
+    pub source_handle: String,
+    /// The admission owner's own digest over its eligibility decision for this
+    /// handle.
+    pub admission_digest: String,
+    /// The admitted revision's content digest, as the admission record commits
+    /// it.
+    pub content_digest: String,
+    /// The persistence owner's own digest over the retained-revision record.
+    pub persistence_digest: String,
+    /// The immutable artifact reference the original was committed under.
+    pub retained_artifact_ref: String,
+}
+
+impl FreezeMemberReceipt {
+    /// Wire lines for a digest preimage, so the freeze's own preimage and any
+    /// reader of it cannot spell these fields differently.
+    fn push_into(&self, preimage: &mut String) {
+        push_field(preimage, "receipt_source_handle", &self.source_handle);
+        push_field(preimage, "receipt_admission_digest", &self.admission_digest);
+        push_field(preimage, "receipt_content_digest", &self.content_digest);
+        push_field(
+            preimage,
+            "receipt_persistence_digest",
+            &self.persistence_digest,
+        );
+        push_field(
+            preimage,
+            "receipt_retained_artifact_ref",
+            &self.retained_artifact_ref,
+        );
+    }
 }
 
 /// Named constructor arguments for [`EvidenceFreeze::freeze`].
@@ -3814,6 +3960,9 @@ pub struct EvidenceFreezeParams {
     pub evidence_set_id: String,
     /// Included evidence references.
     pub included_evidence_refs: Vec<String>,
+    /// The admission and persistence receipt of each included member, in the
+    /// same order as `included_evidence_refs`.
+    pub member_receipts: Vec<FreezeMemberReceipt>,
     /// Excluded evidence and the reason it was excluded.
     pub excluded_evidence: Vec<(String, String)>,
     /// Unresolved contradictions observed between members.
@@ -3913,6 +4062,7 @@ impl EvidenceFreeze {
             coverage_receipt_digest: params.coverage_receipt_digest,
             evidence_set_id: params.evidence_set_id,
             included_evidence_refs: params.included_evidence_refs,
+            member_receipts: params.member_receipts,
             excluded_evidence: params.excluded_evidence,
             unresolved_contradictions: params.unresolved_contradictions,
             open_research_debts: params.open_research_debts,
@@ -3922,6 +4072,7 @@ impl EvidenceFreeze {
             governor_admission_required: true,
             digest: String::new(),
         };
+        record.validate_member_receipts()?;
         record.digest = record.compute_digest();
         Ok(record)
     }
@@ -3934,7 +4085,16 @@ impl EvidenceFreeze {
     /// reopened, rehashed identically. One name must not cover two field sets,
     /// and the same rule the `coverage-receipt` and `inquiry-terminal-record`
     /// preimages state for themselves applies here.
-    pub const DIGEST_DOMAIN: &'static str = "evidence-freeze/v2";
+    ///
+    /// Bumped `v2` -> `v3` for `#1765`. The `v2` preimage named the included
+    /// evidence references but not the admission/persistence receipt that
+    /// authorised them, so two freezes admitting the same handles under different
+    /// receipts rehashed identically — and the receipt is precisely the field
+    /// I21.8 item 1 requires the record to carry, so leaving it out of the
+    /// identity would make the required field unauthenticated. The same rule
+    /// `v1` -> `v2` states for itself applies again: one name must not cover two
+    /// field sets.
+    pub const DIGEST_DOMAIN: &'static str = "evidence-freeze/v3";
 
     /// Whether this freeze is the successor of a prior one.
     #[must_use]
@@ -4032,6 +4192,17 @@ impl EvidenceFreeze {
         for reference in &self.included_evidence_refs {
             push_field(&mut preimage, "included", reference);
         }
+        // The admission/persistence receipt is inside the identity for the same
+        // reason the State Fence is: it is the field that says WHAT authorised
+        // these exact members, and a freeze whose receipt can be rewritten
+        // without moving its digest is a freeze that names a different authority
+        // under one identity. Counted as well as itemised, so a receipt list that
+        // gained or lost an entry cannot be spelled the same way as one that
+        // reordered them.
+        push_count(&mut preimage, "member_receipts", self.member_receipts.len());
+        for receipt in &self.member_receipts {
+            receipt.push_into(&mut preimage);
+        }
         push_count(
             &mut preimage,
             "excluded_evidence",
@@ -4076,13 +4247,15 @@ impl EvidenceFreeze {
         freeze(&preimage)
     }
 
-    /// Re-proves this freeze's own digest and its successor relation.
+    /// Re-proves this freeze's own digest and its successor relation, and
+    /// re-proves the receipt relation from this record's own bytes.
     ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
-    /// disagrees with the stored one, when the record claims canonical state, or
-    /// when the successor relation is half-present.
+    /// disagrees with the stored one, when the record claims canonical state, when
+    /// the successor relation is half-present, or when the admission/persistence
+    /// receipt list does not stand in one-to-one relation with the included set.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
         if self.canonical {
             return Err(InquiryError::IntegrityMismatch {
@@ -4090,12 +4263,150 @@ impl EvidenceFreeze {
             });
         }
         self.validate_successor()?;
+        // The readback half of the receipt relation `freeze` establishes at
+        // construction. The constructor's check runs on the arguments; this one
+        // runs on the record's own stored fields, which is what a reader of a
+        // **reloaded** record has and what the constructor's check cannot reach —
+        // the two are the same relation asked of two different carriers, and a
+        // record that lost a receipt between construction and publication, or
+        // carried one under a handle it does not include, is refused here rather
+        // than presented as a freeze whose members are all receipted.
+        self.validate_member_receipts()?;
         if self.compute_digest() != self.digest {
             return Err(InquiryError::IntegrityMismatch {
                 field: "freeze.digest",
             });
         }
         Ok(())
+    }
+
+    /// Re-proves that every included member carries its own admission and
+    /// persistence receipt, filed under its own handle.
+    ///
+    /// Stated once and called from the constructor and from
+    /// [`Self::validate_integrity`] so a record that is built and a record that is
+    /// read back are held to the identical relation rather than to a construction
+    /// rule that readback only inherits by accident.
+    ///
+    /// The receipt's own fields are shape-checked, not just counted: a receipt
+    /// whose `content_digest` is not a digest names no revision, and a receipt
+    /// naming a blank artifact reference asserts no persistence at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the two lists differ in
+    /// length, when a receipt is filed under a handle the record does not include,
+    /// or when a receipt field is blank or malformed.
+    fn validate_member_receipts(&self) -> Result<(), InquiryError> {
+        if self.member_receipts.len() != self.included_evidence_refs.len() {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "freeze.member_receipt_coverage",
+            });
+        }
+        for (handle, receipt) in self
+            .included_evidence_refs
+            .iter()
+            .zip(self.member_receipts.iter())
+        {
+            require_text(
+                receipt.source_handle.as_str(),
+                "freeze.receipt.source_handle",
+            )?;
+            require_digest(&receipt.admission_digest, "freeze.receipt.admission_digest")?;
+            require_digest(&receipt.content_digest, "freeze.receipt.content_digest")?;
+            require_digest(
+                &receipt.persistence_digest,
+                "freeze.receipt.persistence_digest",
+            )?;
+            require_text(
+                receipt.retained_artifact_ref.as_str(),
+                "freeze.receipt.retained_artifact_ref",
+            )?;
+            if receipt.source_handle != *handle {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "freeze.member_receipt_binding",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Deterministic retained bytes of this freeze, digest included.
+    ///
+    /// This is the write path of the freeze's store owner, and it is the
+    /// repository's own accepted canonical encoder
+    /// ([`eliot_contracts::canonical_json_bytes`]) rather than a second
+    /// encoding invented here — the same encoder every other record on this
+    /// plane already digests through, and the same one the `digest` preimage
+    /// names for the fence. One encoder means the retained body and the
+    /// identity it is checked against cannot be spelled two different ways.
+    ///
+    /// `digest` is **not** excluded, and that is the difference from the
+    /// `canonical_bytes`/`canonical_digest` pair on the acquisition-side
+    /// records: those exclude the stored digest so the encoder can *produce*
+    /// it, whereas this one is the body a retention owner actually commits,
+    /// and a retained freeze that did not carry the digest it was frozen under
+    /// would force a reader to take the identity from outside the record
+    /// instead of re-proving it from the bytes it holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::Unencodable`] when the freeze has no canonical
+    /// encoding.
+    pub fn retained_bytes(&self) -> Result<Vec<u8>, InquiryError> {
+        canonical_json_bytes(self).map_err(|_| InquiryError::Unencodable {
+            field: "freeze.retained_body",
+        })
+    }
+
+    /// Decodes one retained freeze and re-proves it against `origin`.
+    ///
+    /// This is the read path of the freeze's store owner, and it is the only
+    /// way a retained freeze becomes a value this domain will use. Three
+    /// checks run here, in this order, and each is one the constructor cannot
+    /// perform:
+    ///
+    /// 1. the bytes must decode as a freeze of this exact declared shape —
+    ///    `deny_unknown_fields` and no field defaults, so a body written under
+    ///    a different shape is refused rather than partially adopted;
+    /// 2. the decoded record must re-prove its **own** digest, the successor
+    ///    relation, and its non-canonical state, which is exactly what
+    ///    [`Self::validate_integrity`] does;
+    /// 3. it must be the **same** freeze that was written, which is what
+    ///    `origin` is for.
+    ///
+    /// Step 3 is what makes this a readback rather than a re-validation of a
+    /// live value. A freeze re-proving its own digest says the bytes in hand
+    /// are internally consistent; it cannot say they are the bytes that were
+    /// committed, because `digest` is a public field and a caller holding a
+    /// *different* self-consistent freeze would pass step 2. Comparing the
+    /// reloaded record against the original that `origin` names is what closes
+    /// that, and it is the comparison I21.8 asks for: "a report is a projection
+    /// of the frozen revision, not a truth source; correcting wording must not
+    /// require rewriting history" (A5.7) is only true if the reloaded
+    /// projection can be shown to be *of that revision*.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::FreezeStoreDecode`] when the bytes are not a
+    /// freeze of this declared shape,
+    /// [`InquiryError::IntegrityMismatch`] when the decoded freeze does not
+    /// re-prove its own digest, claims canonical state or states a
+    /// half-present successor relation, and
+    /// [`InquiryError::UnknownHandle`] when the reloaded freeze is not the
+    /// freeze `origin` names.
+    pub fn reload(bytes: &[u8], origin: &EvidenceFreeze) -> Result<Self, InquiryError> {
+        let reloaded: Self =
+            serde_json::from_slice(bytes).map_err(|_| InquiryError::FreezeStoreDecode {
+                field: "freeze.retained_body",
+            })?;
+        reloaded.validate_integrity()?;
+        if reloaded != *origin {
+            return Err(InquiryError::UnknownHandle {
+                field: "freeze.retained_body",
+            });
+        }
+        Ok(reloaded)
     }
 }
 
@@ -10559,6 +10870,56 @@ fn evidence_freeze(
         supersede_reason,
         expected_revision,
     } = freeze_predecessor(observation);
+    // I21.8 item 1's admission/persistence receipt, one per included member, in
+    // the same order `included` is built. Every value is read off an existing
+    // owner's own record rather than derived here:
+    //
+    // - `admission_digest` is `SourceAdmissibilityRecord::digest` — the admission
+    //   owner's own commitment to its own eligibility decision for this handle;
+    // - `content_digest` is that same record's `SourceRecord::content_digest` —
+    //   the admitted revision's identity, the revision the decision was made
+    //   about;
+    // - `persistence_digest` and `retained_artifact_ref` are the persistence
+    //   owner's own `RetainedSourceRevision` values, which its `retain` already
+    //   re-proved against that same content digest.
+    //
+    // A member with no retained original therefore produces no receipt, and since
+    // the receipt list must stand in one-to-one relation with the included set,
+    // the freeze is refused rather than published with a member it cannot name a
+    // persistence receipt for. That is not a new refusal: this is the same
+    // eligible-and-retained filter `commit_freeze_through_source_admission` and
+    // `CommittedFreeze::commit` already build their members from, applied one
+    // step earlier. A run that never persisted anything now produces no freeze at
+    // all instead of a freeze that claims members it retained nothing for — and
+    // `commit_freeze_through_source_admission` would have refused the same run one
+    // step later with no request to commit.
+    let retained = &observation.retained_revisions;
+    let mut member_receipts: Vec<FreezeMemberReceipt> = Vec::with_capacity(included.len());
+    for handle in &included {
+        let Some(record) = admissibility
+            .iter()
+            .find(|record| &record.record.handle == handle)
+        else {
+            // Unreachable by construction: `included` is built from the eligible
+            // records of this same slice. Refused rather than unwrapped, so the
+            // invariant is enforced rather than assumed.
+            return Err(InquiryError::UnknownHandle {
+                field: "freeze.member_receipt_source",
+            });
+        };
+        let Some(revision) = retained.get(handle) else {
+            return Err(InquiryError::UnknownHandle {
+                field: "freeze.member_receipt_retained",
+            });
+        };
+        member_receipts.push(FreezeMemberReceipt {
+            source_handle: handle.clone(),
+            admission_digest: record.digest.clone(),
+            content_digest: record.record.content_digest.clone(),
+            persistence_digest: revision.digest.clone(),
+            retained_artifact_ref: revision.artifact_ref.clone(),
+        });
+    }
     EvidenceFreeze::freeze(
         EvidenceFreezeParams {
             inquiry_id: observation.inquiry_id.clone(),
@@ -10567,6 +10928,7 @@ fn evidence_freeze(
             coverage_receipt_digest: coverage_receipt.digest.clone(),
             evidence_set_id: observation.evidence_set_id.clone(),
             included_evidence_refs: included,
+            member_receipts,
             excluded_evidence: excluded,
             unresolved_contradictions: contradictions,
             open_research_debts: debts.iter().map(|debt| debt.debt_id.clone()).collect(),
