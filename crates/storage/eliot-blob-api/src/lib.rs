@@ -3783,4 +3783,229 @@ mod tests {
         let malformed = r#"{"privacy_class":"PRIVATE","retention_class":"TASK","policy_ref":"","instruction_taint":"DATA_ONLY","effect_ceiling":"CANDIDATE_ONLY"}"#;
         assert!(serde_json::from_str::<BlobPolicyBinding>(malformed).is_err());
     }
+
+    /// Baseline every capacity negative case below mutates: a journal-stage
+    /// observation whose representation is fully consistent.
+    fn journal_capacity_failure() -> BlobCapacityFailure {
+        BlobCapacityFailure {
+            identity: BlobCapacityIdentity::Journal {
+                operation_id: "op-1".to_owned(),
+                idempotency_key: "idem-1".to_owned(),
+                locator: None,
+            },
+            stage: BlobCapacityStage::JournalWrite,
+            evidence: BlobCapacityEvidence {
+                cause: BlobCapacityCause::IoStorageFull,
+                attempted_bytes: Some(64),
+                effect: BlobCapacityEffect::PartialWriteUnknown,
+            },
+            cas_request: None,
+            cas_observed: None,
+            cas_backend_generation: None,
+            cas_durability: None,
+            cleanup: BlobCapacityCleanup::NotApplicable,
+            cleanup_stage: None,
+            cleanup_evidence: None,
+            gc_state: None,
+            recovery: BlobCapacityRecovery::CapacityRevalidationRequired,
+        }
+    }
+
+    #[test]
+    fn capacity_cause_identity_and_recovery_reject_representation_gaps() {
+        assert!(journal_capacity_failure().validate().is_ok());
+        let mut wrong_namespace = journal_capacity_failure();
+        wrong_namespace.evidence.cause = BlobCapacityCause::PosixEnospc { code: 1 };
+        assert!(wrong_namespace.validate().is_err());
+        let mut reconciling_unknown = journal_capacity_failure();
+        reconciling_unknown.recovery = BlobCapacityRecovery::ReconcileSameOperationThenRevalidate;
+        assert!(reconciling_unknown.validate().is_err());
+        let mut blind_possible = journal_capacity_failure();
+        blind_possible.evidence.effect = BlobCapacityEffect::PossibleMutation;
+        assert!(blind_possible.validate().is_err());
+        let mut anonymous_object = journal_capacity_failure();
+        anonymous_object.stage = BlobCapacityStage::PayloadWrite;
+        assert!(anonymous_object.validate().is_err());
+        let mut blank_operation = journal_capacity_failure();
+        blank_operation.identity = BlobCapacityIdentity::Journal {
+            operation_id: "   ".to_owned(),
+            idempotency_key: "idem-1".to_owned(),
+            locator: None,
+        };
+        assert!(blank_operation.validate().is_err());
+        let mut blank_root = journal_capacity_failure();
+        blank_root.identity = BlobCapacityIdentity::RootLease {
+            root_id: String::new(),
+            lease_id: None,
+        };
+        assert!(blank_root.validate().is_err());
+    }
+
+    #[test]
+    fn capacity_gc_and_cleanup_state_must_match_their_phase() {
+        assert!(journal_capacity_failure().validate().is_ok());
+        let mut gc_on_write = journal_capacity_failure();
+        gc_on_write.stage = BlobCapacityStage::PayloadWrite;
+        gc_on_write.gc_state = Some(GcState::TombstoneDurable);
+        assert!(gc_on_write.validate().is_err());
+        let mut gc_on_cleanup = journal_capacity_failure();
+        gc_on_cleanup.stage = BlobCapacityStage::GcCleanup;
+        gc_on_cleanup.identity = BlobCapacityIdentity::RootLease {
+            root_id: "root-1".to_owned(),
+            lease_id: Some("lease-1".to_owned()),
+        };
+        gc_on_cleanup.gc_state = Some(GcState::TombstoneDurable);
+        assert!(gc_on_cleanup.validate().is_ok());
+        let mut stage_without_evidence = journal_capacity_failure();
+        stage_without_evidence.cleanup_stage = Some(BlobCapacityStage::Cleanup);
+        assert!(stage_without_evidence.validate().is_err());
+        let mut evidence_without_stage = journal_capacity_failure();
+        evidence_without_stage.cleanup_evidence = Some(BlobCapacityEvidence {
+            cause: BlobCapacityCause::IoStorageFull,
+            attempted_bytes: None,
+            effect: BlobCapacityEffect::NotAttempted,
+        });
+        assert!(evidence_without_stage.validate().is_err());
+        let mut evidence_on_success = journal_capacity_failure();
+        evidence_on_success.cleanup = BlobCapacityCleanup::Succeeded;
+        evidence_on_success.cleanup_stage = Some(BlobCapacityStage::Cleanup);
+        evidence_on_success.cleanup_evidence = Some(BlobCapacityEvidence {
+            cause: BlobCapacityCause::IoStorageFull,
+            attempted_bytes: None,
+            effect: BlobCapacityEffect::NotAttempted,
+        });
+        assert!(evidence_on_success.validate().is_err());
+        let mut failed_cleanup = journal_capacity_failure();
+        failed_cleanup.cleanup = BlobCapacityCleanup::Failed;
+        failed_cleanup.cleanup_stage = Some(BlobCapacityStage::Cleanup);
+        failed_cleanup.cleanup_evidence = Some(BlobCapacityEvidence {
+            cause: BlobCapacityCause::IoStorageFull,
+            attempted_bytes: None,
+            effect: BlobCapacityEffect::NotAttempted,
+        });
+        assert!(failed_cleanup.validate().is_ok());
+    }
+
+    /// A CAS journal observation without its complete request, and stray CAS
+    /// observations outside any request, are rejected before any backend
+    /// generation or durability value is even read.
+    #[test]
+    fn capacity_cas_observations_require_a_request() {
+        assert!(journal_capacity_failure().validate().is_ok());
+        let mut journal_without_request = journal_capacity_failure();
+        journal_without_request.stage = BlobCapacityStage::CasJournal;
+        assert!(journal_without_request.validate().is_err());
+        let mut observed_without_request = journal_capacity_failure();
+        observed_without_request.cas_observed = Some(BlobCasState::Missing);
+        assert!(observed_without_request.validate().is_err());
+        let mut generation_without_request = journal_capacity_failure();
+        generation_without_request.cas_backend_generation = Some(7);
+        assert!(generation_without_request.validate().is_err());
+        let mut durability_without_request = journal_capacity_failure();
+        durability_without_request.cas_durability = Some(BlobCasDurability::Unconfirmed);
+        assert!(durability_without_request.validate().is_err());
+    }
+
+    fn cas_test_context(operation: &str) -> BlobReceiptContext {
+        let epoch = r#"{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":4}"#;
+        let fence = format!(
+            "{{\"authority_epoch\":{epoch},\"resource_generation\":7,\"task_revision\":null,\"policy_revision\":null,\"integration_revision\":null}}"
+        );
+        let request = format!("request-{operation}");
+        let metadata = format!(
+            "{{\"request_id\":\"{request}\",\"session_id\":null,\"task_id\":null,\"product_id\":\"product-1\",\"source_id\":\"source-1\",\"state_fence\":{fence},\"clock\":{{\"valid_time_ms\":1,\"known_time_ms\":1,\"transaction_sequence\":null,\"monotonic_ns\":1}}}}"
+        );
+        let json = format!(
+            "{{\"work_scope\":{{\"scope_id\":\"scope-1\",\"product_id\":\"product-1\",\"resource_generation\":7,\"state_fence\":{fence}}},\"task\":null,\"session\":null,\"causal\":{{\"state_fence\":{fence},\"transaction_sequence\":1,\"parent_receipt_id\":null,\"predecessor_receipt_ids\":[]}},\"request\":{{\"metadata\":{metadata},\"state_fence\":{fence}}},\"operation\":{{\"operation_id\":\"{operation}\",\"request_id\":\"{request}\",\"idempotency_key\":\"idem-1\",\"operation_kind\":\"blob-capacity-test\",\"effect\":\"REVERSIBLE_MUTATION\",\"state_fence\":{fence}}},\"authority\":{{\"authority_id\":\"authority-1\",\"authority_owner\":\"test-owner\",\"authority_epoch\":{epoch},\"state_fence\":{fence},\"allowed_effect\":\"REVERSIBLE_MUTATION\",\"proof_ceiling\":\"OBSERVED_EXTERNAL_EFFECT\"}}}}"
+        );
+        let Ok(context) = serde_json::from_str(&json) else {
+            panic!("the CAS test context must decode");
+        };
+        context
+    }
+
+    /// The complete CAS request the request-bound negative cases share. Built
+    /// through the intrinsic constructor, so a passing baseline proves the
+    /// request itself is valid and only the mutated field is under test.
+    fn cas_test_request() -> BlobCasRequest {
+        let context = cas_test_context("cas-intrinsic");
+        let lease_json = serde_json::json!({
+            "root_id": "root-1",
+            "owner_id": "owner-1",
+            "lease_id": "lease-1",
+            "root_generation": 7,
+            "fence_binding": context.request,
+        });
+        let Ok(lease) = serde_json::from_value(lease_json) else {
+            panic!("the CAS test lease must decode");
+        };
+        let Ok(target) = eliot_platform::WorkScopePath::new("transactions/journal.stage") else {
+            panic!("the CAS test target must be a valid path");
+        };
+        let Ok(expected) = BlobCasState::digest("c".repeat(64)) else {
+            panic!("the CAS test digest must be canonical");
+        };
+        let Ok(request) = BlobCasRequest::new(
+            context,
+            lease,
+            BlobCasNamespace::StageJournal,
+            target,
+            expected,
+            "d".repeat(64),
+            9,
+            7,
+            BlobCasDurability::Requested,
+        ) else {
+            panic!("the CAS test request must validate");
+        };
+        request
+    }
+
+    /// A CAS journal observation carrying its complete matching request.
+    fn cas_journal_capacity_failure(request: &BlobCasRequest) -> BlobCapacityFailure {
+        BlobCapacityFailure {
+            identity: BlobCapacityIdentity::Operation {
+                context: Box::new(request.context.clone()),
+                locator: None,
+            },
+            stage: BlobCapacityStage::CasJournal,
+            evidence: BlobCapacityEvidence {
+                cause: BlobCapacityCause::IoStorageFull,
+                attempted_bytes: None,
+                effect: BlobCapacityEffect::PartialWriteUnknown,
+            },
+            cas_request: Some(Box::new(request.clone())),
+            cas_observed: None,
+            cas_backend_generation: None,
+            cas_durability: None,
+            cleanup: BlobCapacityCleanup::NotApplicable,
+            cleanup_stage: None,
+            cleanup_evidence: None,
+            gc_state: None,
+            recovery: BlobCapacityRecovery::CapacityRevalidationRequired,
+        }
+    }
+
+    /// Request-bound CAS negatives: the request is valid, so each rejection
+    /// names exactly the mutated field.
+    #[test]
+    fn capacity_cas_request_bound_observations_reject_mismatches() {
+        let request = cas_test_request();
+        assert!(cas_journal_capacity_failure(&request).validate().is_ok());
+        let mut request_on_plain_stage = cas_journal_capacity_failure(&request);
+        request_on_plain_stage.stage = BlobCapacityStage::JournalWrite;
+        assert!(request_on_plain_stage.validate().is_err());
+        let mut zero_generation = cas_journal_capacity_failure(&request);
+        zero_generation.cas_backend_generation = Some(0);
+        assert!(zero_generation.validate().is_err());
+        let mut request_side_durability = cas_journal_capacity_failure(&request);
+        request_side_durability.cas_durability = Some(BlobCasDurability::Requested);
+        assert!(request_side_durability.validate().is_err());
+        let mut foreign_identity = cas_journal_capacity_failure(&request);
+        foreign_identity.identity = BlobCapacityIdentity::Operation {
+            context: Box::new(cas_test_context("other-operation")),
+            locator: None,
+        };
+        assert!(foreign_identity.validate().is_err());
+    }
 }
