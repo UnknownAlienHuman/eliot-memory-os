@@ -1285,6 +1285,154 @@ fn dispatch_t5_admitted_destination_carries_installation_identity() {
     release_contour(&contour);
 }
 
+/// Replay proof (A2/A4/T12): a repeated admitted prepare resolves the SAME
+/// verified destination instead of refusing or allocating again. The first
+/// prepare retains the destination; the second prepare — same canonical
+/// operation, fresh envelope — answers the identical `PossibleEffect` with
+/// the same retained identity digest, keeps the same destination row, and
+/// creates no second directory. Before the repair this second prepare was
+/// refused (`ExistingInstallation` out of the allocation, which ran before
+/// any retained lookup): the installation authority already held the
+/// destination the first prepare created, so the fresh-allocation guard fired
+/// on the operation's own effect.
+/// Norm: `docs/architecture/A13-06-operational-recovery-state.md`
+/// (receipt/effect reconciliation before replay) and the live issue (repeated
+/// requests resolve the same verified destination or conflict).
+#[test]
+fn dispatch_repeated_prepare_resolves_same_destination() {
+    use eliot_host_service::runtime_control::BackupOwnerOutcome;
+    use eliot_protocol::backup::BackupOperationKind;
+    let (contour, composition) = dispatch_contour("replay");
+    let dest_key = dispatch_sha256(&format!("destination-replay:{}", contour.installation));
+    let canonical_request_hash = dispatch_sha256(&format!(
+        "canonical-request-replay:{}",
+        contour.installation
+    ));
+    let build_prepare = || {
+        let identity = dispatch_identity(
+            &contour,
+            BackupOperationKind::PrepareIsolatedRestore,
+            &dest_key,
+            "prepare-958-replay",
+            &canonical_request_hash,
+        );
+        dispatch_envelope(
+            dispatch_prepare_body(identity, &dest_key),
+            "prepare-958-replay",
+        )
+    };
+    let first = match composition.dispatch_backup_owner_operation(&build_prepare()) {
+        Ok(BackupOwnerOutcome::PossibleEffect { retained }) => retained,
+        other => panic!("first prepare must answer PossibleEffect, got {other:?}"),
+    };
+    let staged_once: Vec<_> = std::fs::read_dir(&contour.staging_parent)
+        .expect("staging parent readable")
+        .collect();
+    assert_eq!(
+        staged_once.len(),
+        1,
+        "the first prepare creates exactly one destination"
+    );
+    let second = match composition.dispatch_backup_owner_operation(&build_prepare()) {
+        Ok(BackupOwnerOutcome::PossibleEffect { retained }) => retained,
+        other => panic!("repeated prepare must resolve, never refuse, got {other:?}"),
+    };
+    assert_eq!(
+        second.identity_digest, first.identity_digest,
+        "the replay retains the same operation, not a second one"
+    );
+    let staged_twice: Vec<_> = std::fs::read_dir(&contour.staging_parent)
+        .expect("staging parent readable")
+        .collect();
+    assert_eq!(
+        staged_twice.len(),
+        1,
+        "the replay allocates no second destination"
+    );
+    drop(composition);
+    release_contour(&contour);
+}
+
+/// Uncertainty proof (A2/A4/T12): an admission-only replay — the admission
+/// recorded, the creation not yet — stays retained and reconciling instead
+/// of allocating again or refusing. The fixture records the admission
+/// through the real seams (`admit_allocation` +
+/// `record_admission_before_materialise`, no materialisation, exactly the
+/// crash window between the two production steps), then dispatches the full
+/// prepare: the answer is `PossibleEffect`, and no destination directory
+/// appears behind it.
+#[test]
+fn dispatch_admission_only_replay_stays_uncertain() {
+    use eliot_host_service::runtime_control::{BackupOperationBody, BackupOwnerOutcome};
+    use eliot_protocol::backup::BackupOperationKind;
+    let (contour, composition) = dispatch_contour("admission-only");
+    let dest_key = dispatch_sha256(&format!("destination-admonly:{}", contour.installation));
+    let canonical_request_hash = dispatch_sha256(&format!(
+        "canonical-request-admonly:{}",
+        contour.installation
+    ));
+    let identity = dispatch_identity(
+        &contour,
+        BackupOperationKind::PrepareIsolatedRestore,
+        &dest_key,
+        "prepare-958-admonly",
+        &canonical_request_hash,
+    );
+    let facts =
+        eliot_installation::PreparedDestinationFacts::issue_for_admitted_identity(&identity)
+            .expect("admission facts issue from the admitted identity");
+    let BackupOperationBody::PrepareIsolatedRestore(ref body) =
+        dispatch_prepare_body(identity, &dest_key)
+    else {
+        panic!("prepare body builder builds a prepare body");
+    };
+    let max_restore_bytes =
+        u64::try_from(eliot_protocol::backup::MAX_BACKUP_PAYLOAD_BYTES).unwrap_or(u64::MAX);
+    let (_area_lease, allocation, purge_revision, evidence_revision) = composition
+        .admit_allocation(body, &facts, max_restore_bytes)
+        .expect("fresh admission allocates before anything is retained");
+    let store = composition
+        .open_registry_store()
+        .expect("writer store opens for the admission record");
+    HostComposition::record_admission_before_materialise(
+        &store,
+        &composition.owner_lease.activation_capability(),
+        &allocation,
+        evidence_revision,
+        purge_revision,
+    )
+    .expect("the admission record commits");
+    drop(store);
+    let replay_identity = dispatch_identity(
+        &contour,
+        BackupOperationKind::PrepareIsolatedRestore,
+        &dest_key,
+        "prepare-958-admonly",
+        &canonical_request_hash,
+    );
+    let replay = dispatch_envelope(
+        dispatch_prepare_body(replay_identity, &dest_key),
+        "prepare-958-admonly",
+    );
+    match composition.dispatch_backup_owner_operation(&replay) {
+        Ok(BackupOwnerOutcome::PossibleEffect { retained }) => assert_eq!(
+            retained.operation,
+            BackupOperationKind::PrepareIsolatedRestore,
+            "the uncertain replay retains the admitted operation for reconcile"
+        ),
+        other => panic!("admission-only replay must stay uncertain, got {other:?}"),
+    }
+    let staged: Vec<_> = std::fs::read_dir(&contour.staging_parent)
+        .expect("staging parent readable")
+        .collect();
+    assert!(
+        staged.is_empty(),
+        "the uncertain replay creates no destination behind the retained admission"
+    );
+    drop(composition);
+    release_contour(&contour);
+}
+
 /// Production-path refusal proof (P2): a destination identity that is not
 /// an owner installation key is refused by the installation authority
 /// before any effect — no directory appears and no row is retained.

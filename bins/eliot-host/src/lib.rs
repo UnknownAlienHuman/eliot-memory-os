@@ -5966,6 +5966,16 @@ enum IsolatedPreparationFailure {
     EffectUncertain(&'static str),
 }
 
+/// What one replay lookup found for an admitted operation identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedReplay {
+    /// Nothing is retained for this operation: the caller allocates fresh.
+    Allocate,
+    /// The retained pair matches: the caller resolves the same verified
+    /// destination instead of allocating or refusing.
+    Replay,
+}
+
 /// The exact closed prepare/cutover dispatch table this Host composition
 /// registers on the canonical Host runtime-control endpoint (#962).
 ///
@@ -6856,31 +6866,30 @@ impl HostComposition {
     /// variant-by-variant in [`Self::isolated_destination_reason`] rather than
     /// collapsed into one message.
     #[cfg(windows)]
-    /// Reads back an already-created destination for a repeated request.
+    /// Looks up what this authority already retains for one admitted operation
+    /// identity, BEFORE any fresh allocation.
     ///
-    /// Returns `Ok(true)` when the retained pair matches the admitted facts
-    /// (the caller resolves the same verified destination), `Ok(false)` when
-    /// nothing is retained yet (the caller allocates), and a refusal
-    /// otherwise. The readback is matched, not swallowed.
     /// `IncompleteObservation` is this authority's own "retains no record for
-    /// that operation" signal and is the ONLY outcome that means "allocate";
-    /// every other error — a capability refusal, a durable read fault, or a
-    /// created root that no longer carries the identity the record claims — is
-    /// reported rather than answered with a fresh allocation. Treating any
-    /// error as absence would let a faulted read allocate a SECOND
-    /// destination for an operation that already owns one.
+    /// that operation" signal and is the ONLY outcome that means "allocate".
+    /// A retained creation pair whose content matches the admitted facts is a
+    /// replay of the same verified destination. A retained admission without
+    /// its creation pair is durable intent with an unknown outcome — the
+    /// materialisation may have created the root, or the creation record may
+    /// have committed without an observed response — so the operation stays
+    /// retained and reconciling instead of allocating again. Any other error
+    /// — a capability refusal or a durable read fault — is uncertain rather
+    /// than a refusal: a faulted read is not absence, and answering it with a
+    /// fresh allocation could strand a SECOND destination beside one this
+    /// operation already owns, while answering it as no-effect would deny an
+    /// effect that may already have happened.
     #[cfg(windows)]
-    fn check_retained_creation(
+    fn replay_retained_preparation(
         store: &eliot_installation::RedbInstallationRegistry,
         capability: &eliot_platform_windows::HostOwnerEpochCapability,
         facts: &eliot_installation::PreparedDestinationFacts,
-    ) -> Result<bool, IsolatedPreparationFailure> {
+    ) -> Result<RetainedReplay, IsolatedPreparationFailure> {
+        let uncertain = |detail: &'static str| IsolatedPreparationFailure::EffectUncertain(detail);
         match store.read_prepared_isolated_destination_creation(capability, &facts.operation_id) {
-            Err(eliot_installation::InstallationError::IncompleteObservation(_)) => Ok(false),
-            Err(_) => Err(IsolatedPreparationFailure::Refused(
-                "the retained isolated destination for this operation could not be read back \
-                 with its created root re-proved, so no second destination is allocated",
-            )),
             Ok((retained, materialisation)) => {
                 if !Self::retained_isolated_destination_matches(&retained, &materialisation, facts)
                 {
@@ -6890,8 +6899,39 @@ impl HostComposition {
                          installation",
                     ));
                 }
-                Ok(true)
+                Ok(RetainedReplay::Replay)
             }
+            Err(eliot_installation::InstallationError::IncompleteObservation(_)) => {
+                match store.read_prepared_isolated_destination(capability, &facts.operation_id) {
+                    Err(eliot_installation::InstallationError::IncompleteObservation(_)) => {
+                        Ok(RetainedReplay::Allocate)
+                    }
+                    Err(_) => Err(uncertain(
+                        "the retained isolated-destination admission for this operation could \
+                         not be re-proved, so no second destination is allocated: reconcile \
+                         the operation to learn what it retains",
+                    )),
+                    Ok(retained) => {
+                        if !Self::retained_admission_matches_facts(&retained, facts) {
+                            return Err(IsolatedPreparationFailure::Refused(
+                                "a different isolated destination was already admitted for \
+                                 this operation, so the request conflicts instead of \
+                                 allocating a second installation",
+                            ));
+                        }
+                        Err(uncertain(
+                            "the isolated destination for this operation is admitted but its \
+                             creation is not yet recorded: reconcile the operation instead of \
+                             allocating a second installation",
+                        ))
+                    }
+                }
+            }
+            Err(_) => Err(uncertain(
+                "the retained isolated destination for this operation could not be read back \
+                 with its created root re-proved, so no second destination is allocated: \
+                 reconcile the operation to learn what it retains",
+            )),
         }
     }
 
@@ -7067,12 +7107,37 @@ impl HostComposition {
         // and the destination installation all have to be the ones this request
         // names, so a changed same-operation input is a conflict rather than a
         // second allocation.
-        // The source authority is proved and the destination allocated, all
-        // before any effect; every failure in there ran reads only. This runs
-        // BEFORE the writer store below is opened: `OwnerEvidence::inspect`
+        //
+        // The lookup runs BEFORE the fresh allocation below, because the
+        // allocation refuses an already-held destination (`ExistingInstallation`):
+        // reaching it on a replay would refuse an operation this authority
+        // already retains instead of resolving it. An admission-only replay —
+        // the admission recorded, the creation not yet — stays retained and
+        // reconciling for the same reason: allocating again could strand a
+        // second destination beside the first.
+        //
+        // The writer store is opened for the lookup and DROPPED before the
+        // allocation: `OwnerEvidence::inspect` (inside `admit_allocation`)
         // opens the registry read-only while an open writer `Database` holds
         // the file's exclusive lock, so the inspection would fail closed on
-        // lock contention every time, deterministically.
+        // lock contention every time, deterministically. Nothing is written
+        // between the drop and the re-open below — the allocation runs reads
+        // only — so no retained state can move under the lookup.
+        let replay = {
+            let store = self.open_registry_store().map_err(|_| {
+                IsolatedPreparationFailure::Refused(
+                    "the installation registry could not be opened to admit the isolated \
+                     destination",
+                )
+            })?;
+            let capability = self.owner_lease.activation_capability();
+            Self::replay_retained_preparation(&store, &capability, &facts)?
+        };
+        if matches!(replay, RetainedReplay::Replay) {
+            return Ok(());
+        }
+        // The source authority is proved and the destination allocated, all
+        // before any effect; every failure in there ran reads only.
         let (area_lease, allocation, purge_revision, evidence_revision) =
             self.admit_allocation(body, &facts, max_restore_bytes)?;
 
@@ -7082,9 +7147,6 @@ impl HostComposition {
             )
         })?;
         let capability = self.owner_lease.activation_capability();
-        if Self::check_retained_creation(&store, &capability, &facts)? {
-            return Ok(());
-        }
 
         // The destination is now actually CREATED, through the installation
         // authority's own create-new owned-directory publication, under the very
@@ -7209,11 +7271,16 @@ impl HostComposition {
             })
     }
 
-    /// Compares retained destination content with the exact admitted request.
+    /// Compares one retained admission's content with the exact admitted request.
+    ///
+    /// These are the six bound inputs a replay must repeat exactly: the
+    /// operation identity is the lookup key, and the archive, class, target
+    /// schema and both installation identities are the compared content, so a
+    /// changed same-operation input is a conflict rather than a second
+    /// allocation.
     #[cfg(windows)]
-    fn retained_isolated_destination_matches(
+    fn retained_admission_matches_facts(
         retained: &eliot_installation::PreparedDestinationAdmission,
-        materialisation: &eliot_installation::PreparedDestinationMaterialisation,
         facts: &eliot_installation::PreparedDestinationFacts,
     ) -> bool {
         retained.archive_id == facts.archive_id
@@ -7222,6 +7289,16 @@ impl HostComposition {
             && retained.target_schema_digest == facts.target_schema_digest
             && retained.source_installation == facts.source_installation
             && retained.destination_installation == facts.destination_installation
+    }
+
+    /// Compares retained destination content with the exact admitted request.
+    #[cfg(windows)]
+    fn retained_isolated_destination_matches(
+        retained: &eliot_installation::PreparedDestinationAdmission,
+        materialisation: &eliot_installation::PreparedDestinationMaterialisation,
+        facts: &eliot_installation::PreparedDestinationFacts,
+    ) -> bool {
+        Self::retained_admission_matches_facts(retained, facts)
             && materialisation.destination_installation == retained.destination_installation
             && materialisation.destination_installation_root
                 == retained.isolation.destination_installation_root
