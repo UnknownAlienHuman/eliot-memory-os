@@ -1148,7 +1148,10 @@ fn blocked_result(parts: BlockedParts) -> Result<OrientationPulseResult, PulseEr
 /// Builds the blocked result for the absent Governor supply channel: the
 /// CC-002 boundary is present and committed, the CC-004 boundary and every
 /// stage-owner record are absent, and no packet projects.
-fn supply_missing_blocked(
+///
+/// `pub(crate)` so the dispatch-side unit proofs pin each refusal code
+/// against the same admitted fixtures production derives (issue #2901 A1).
+pub(crate) fn supply_missing_blocked(
     admission: &KernelJobAdmission,
     admitted_job: &AdmittedOrientationJob,
     candidate: &ValidatedCandidate,

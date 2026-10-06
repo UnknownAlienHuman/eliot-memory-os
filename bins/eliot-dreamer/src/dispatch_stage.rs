@@ -2902,4 +2902,257 @@ mod orientation_packet_mapping_tests {
         let mapped = map_orientation_packet(&altered, &job);
         assert_eq!(mapped.question, altered.question);
     }
+
+    /// Direct probes of the remaining A1 refusal builders plus the A7
+    /// second-supplier assembly (issue #2901).
+    ///
+    /// The builders under proof see the same admitted records production
+    /// derives above -- minus the Governor supply channel, which is
+    /// precisely what the supply-missing path refuses on. The
+    /// closure/unusable builders stay mapping-level
+    /// (`model_disposition_tests` in `production_orientation.rs`) until
+    /// the supply channel exists (#1136): they are reachable only through
+    /// `compose_production_result` with Governor-supplied inputs, and
+    /// manufacturing those inputs here would be the fabricated authority
+    /// this carrier refuses.
+    mod blocked_builder_probes {
+        use super::super::*;
+        use super::{admission, admitted_packet_material, job};
+        use crate::dispatch_stage::PipelineOrientationRecords;
+        use crate::model_stage::{ModelRouteUsage, model_route_outcome, model_route_request};
+        use crate::orientation_supply_source::KernelStagedOwnerRecordSource;
+        use crate::production_orientation::{
+            AdmittedOrientationRefs, CC004_MISSING, MODEL_OUTCOME_MISSING,
+            ORIENTATION_SUPPLY_MISSING, OrientationResolution, resolve_production_inputs,
+            supply_missing_blocked,
+        };
+        use crate::pulse::PulseStageId;
+        use crate::{DreamerError, OrientationSupply, OrientationSupplySource};
+        use eliot_dreamer_orientation::OrientationDisposition;
+
+        /// The pipeline-owned pair (`PipelineOrientationRecords`
+        /// parameters): grounding request plus structured validated
+        /// candidate, derived through the stage chain, never caller-shaped
+        /// (same chain as `validated_for` in `slice_7_native_owner_tests`).
+        fn validated_pipeline(
+            admission: &KernelJobAdmission,
+            job: &DreamJobInput,
+        ) -> (
+            eliot_dreamer_claim_grounding::GroundingRequest,
+            eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate,
+        ) {
+            let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
+                Ok(inputs) => inputs,
+                Err(error) => panic!("fixture model inputs must resolve: {error:?}"),
+            };
+            let draft = match crate::model_stage::run_admitted_model(model_inputs) {
+                Ok(draft) => draft,
+                Err(error) => panic!("fixture model must prove: {error:?}"),
+            };
+            let request =
+                match crate::grounding_stage::resolve_grounding_inputs(admission, job, draft) {
+                    Ok(request) => request,
+                    Err(error) => panic!("fixture grounding must resolve: {error:?}"),
+                };
+            let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
+                Ok(grounded) => grounded,
+                Err(error) => panic!("fixture grounding must prove: {error:?}"),
+            };
+            let carrier = match crate::admitted_material::validation_input_for(
+                admission,
+                job,
+                grounded,
+                Some(0),
+            ) {
+                Ok(carrier) => carrier,
+                Err(error) => panic!("fixture carrier must build: {error:?}"),
+            };
+            match crate::validation_stage::validate_admitted_draft(&carrier) {
+                Ok(validated) => (request, validated),
+                Err(error) => panic!("fixture carrier must validate: {error:?}"),
+            }
+        }
+
+        /// The supply-missing builder publishes a blocked pulse with the
+        /// full ten-record denominator, no packet, and the CC-004 +
+        /// channel reasons when no route ran either.
+        #[test]
+        fn supply_missing_without_route_blocks_full_denominator() {
+            let admission = admission();
+            let (admitted_job, candidate, bundle, policy) = admitted_packet_material();
+            let result = match supply_missing_blocked(
+                &admission,
+                &admitted_job,
+                &candidate,
+                &bundle,
+                &policy,
+                None,
+            ) {
+                Ok(result) => result,
+                Err(error) => panic!("supply-missing must publish blocked: {error:?}"),
+            };
+            assert_eq!(result.disposition, OrientationDisposition::Blocked);
+            assert!(result.packet.is_none(), "a blocked pulse carries no packet");
+            assert_eq!(
+                result.stages.len(),
+                PulseStageId::ORDER.len(),
+                "all ten denominator records travel"
+            );
+            assert!(
+                result
+                    .omissions
+                    .contains(&ORIENTATION_SUPPLY_MISSING.to_owned()),
+                "the absent channel is named"
+            );
+            assert!(
+                result.omissions.contains(&CC004_MISSING.to_owned()),
+                "the absent projection set is named"
+            );
+            assert_eq!(
+                result.model_outcome.reason.as_deref(),
+                Some(MODEL_OUTCOME_MISSING),
+                "the absent route outcome is named on its boundary record"
+            );
+            assert_eq!(result.job_id, "job-packet-map");
+            assert!(!result.model_outcome.present);
+        }
+
+        /// With a real admitted route the same builder marks CC-002
+        /// present (commitment + disposition travel) while CC-004 still
+        /// refuses: the route ran, the projections did not.
+        #[test]
+        fn supply_missing_with_route_marks_cc002_present() {
+            let admission = admission();
+            let job = job();
+            let (admitted_job, candidate, bundle, policy) = admitted_packet_material();
+            let model = match crate::admitted_material::v1_model_of(&admission, &job) {
+                Ok(model) => model,
+                Err(error) => panic!("fixture model must derive: {error:?}"),
+            };
+            let request = match model_route_request(&admission, &job, &bundle) {
+                Ok(request) => request,
+                Err(error) => panic!("fixture route must build: {error:?}"),
+            };
+            let usage = match ModelRouteUsage::measured(&bundle, &model, 0, 0) {
+                Ok(usage) => usage,
+                Err(error) => panic!("fixture usage must measure: {error:?}"),
+            };
+            let outcome = match model_route_outcome(&request, &model, usage) {
+                Ok(outcome) => outcome,
+                Err(error) => panic!("fixture outcome must prove: {error:?}"),
+            };
+            let result = match supply_missing_blocked(
+                &admission,
+                &admitted_job,
+                &candidate,
+                &bundle,
+                &policy,
+                Some((&request, &outcome)),
+            ) {
+                Ok(result) => result,
+                Err(error) => panic!("supply-missing must publish blocked: {error:?}"),
+            };
+            assert_eq!(result.disposition, OrientationDisposition::Blocked);
+            assert!(result.packet.is_none(), "a blocked pulse carries no packet");
+            assert!(result.model_outcome.present, "the admitted route ran");
+            assert!(
+                result.model_outcome.commitment.is_some(),
+                "the route commitment travels"
+            );
+            assert!(
+                !result.projections.present,
+                "the projection set still refuses"
+            );
+            assert!(
+                result.omissions.contains(&CC004_MISSING.to_owned()),
+                "the absent projection set is named"
+            );
+        }
+
+        /// The production resolver routes an absent supply to the same
+        /// builder (never a defect): with no route and no supply the
+        /// composition answers blocked with the full denominator.
+        #[test]
+        fn resolve_absent_supply_blocks_without_defect() {
+            let admission = admission();
+            let job = job();
+            let (admitted_job, candidate, bundle, policy) = admitted_packet_material();
+            let (grounding, validated) = validated_pipeline(&admission, &job);
+            let pipeline = PipelineOrientationRecords::new(&grounding, &validated);
+            let refs = AdmittedOrientationRefs {
+                admission: &admission,
+                admitted_job: &admitted_job,
+                candidate: &candidate,
+                bundle: &bundle,
+                policy: &policy,
+            };
+            match resolve_production_inputs(&refs, None, None, &pipeline) {
+                Err(OrientationResolution::Blocked(result)) => {
+                    assert_eq!(result.disposition, OrientationDisposition::Blocked);
+                    assert!(result.packet.is_none());
+                    assert_eq!(result.stages.len(), PulseStageId::ORDER.len());
+                }
+                Err(OrientationResolution::Defect(error)) => {
+                    panic!("an absent supply blocks, never defects: {error:?}")
+                }
+                Ok(_) => panic!("an absent supply never composes inputs"),
+            }
+        }
+
+        /// Test-only second supplier behind the same seam (issue #2901
+        /// A7): proves the trait accepts another supplier with no Smart
+        /// changes. It answers from its own held absence, never from
+        /// admitted records.
+        struct SecondOwnerRecordSource;
+
+        impl OrientationSupplySource for SecondOwnerRecordSource {
+            fn resolve_supply(
+                &self,
+                _admission: &KernelJobAdmission,
+                _job: &DreamJobInput,
+            ) -> Result<Option<OrientationSupply<'_>>, DreamerError> {
+                Ok(None)
+            }
+        }
+
+        /// The second supplier resolves like the first (absent on this
+        /// tree) and assembles through the same resolver to the same
+        /// blocked answer: the seam is the contract, not the supplier.
+        #[test]
+        fn second_supply_impl_assembles_without_smart_changes() {
+            let admission = admission();
+            let job = job();
+            let first = KernelStagedOwnerRecordSource;
+            let second = SecondOwnerRecordSource;
+            let first_answer = match first.resolve_supply(&admission, &job) {
+                Ok(answer) => answer,
+                Err(error) => panic!("first supplier must answer: {error:?}"),
+            };
+            let second_answer = match second.resolve_supply(&admission, &job) {
+                Ok(answer) => answer,
+                Err(error) => panic!("second supplier must answer: {error:?}"),
+            };
+            assert!(first_answer.is_none() && second_answer.is_none());
+            let (admitted_job, candidate, bundle, policy) = admitted_packet_material();
+            let (grounding, validated) = validated_pipeline(&admission, &job);
+            let pipeline = PipelineOrientationRecords::new(&grounding, &validated);
+            let refs = AdmittedOrientationRefs {
+                admission: &admission,
+                admitted_job: &admitted_job,
+                candidate: &candidate,
+                bundle: &bundle,
+                policy: &policy,
+            };
+            match resolve_production_inputs(&refs, None, None, &pipeline) {
+                Err(OrientationResolution::Blocked(result)) => {
+                    assert_eq!(result.disposition, OrientationDisposition::Blocked);
+                    assert!(result.packet.is_none());
+                }
+                Err(OrientationResolution::Defect(error)) => {
+                    panic!("an absent supply blocks, never defects: {error:?}")
+                }
+                Ok(_) => panic!("an absent supply never composes inputs"),
+            }
+        }
+    }
 }
