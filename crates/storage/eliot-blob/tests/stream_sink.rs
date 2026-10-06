@@ -180,6 +180,11 @@ fn unique_test_root() -> String {
 }
 
 #[derive(Default)]
+// One boolean per documented fault-injection arm: each arm is armed and read
+// independently by name across the cases, so grouping them behind an options
+// enum would rename every call site without changing any behaviour. The
+// sibling `storage_exhausted` fake keeps the same shape.
+#[allow(clippy::struct_excessive_bools)]
 struct FaultState {
     files: BTreeMap<String, Vec<u8>>,
     claim: Option<RootClaimProof>,
@@ -275,10 +280,9 @@ struct FixturePlatform {
 
 impl FixturePlatform {
     fn lock(&self) -> std::sync::MutexGuard<'_, FaultState> {
-        match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => panic!("fixture platform lock poisoned"),
-        }
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("fixture platform lock poisoned"))
     }
 
     /// A typed capacity failure as this port's owner reports it.
@@ -649,7 +653,7 @@ struct DirPlatform {
 }
 
 impl DirPlatform {
-    fn platform_error(context: &str, error: std::io::Error) -> BlobError {
+    fn platform_error(context: &str, error: &std::io::Error) -> BlobError {
         BlobError::InvalidContract(format!("dir platform {context}: {error}"))
     }
 
@@ -674,9 +678,9 @@ impl DirPlatform {
         out: &mut Vec<WorkScopePath>,
     ) -> Result<(), BlobError> {
         let entries =
-            std::fs::read_dir(dir).map_err(|error| Self::platform_error("list", error))?;
+            std::fs::read_dir(dir).map_err(|error| Self::platform_error("list", &error))?;
         for entry in entries {
-            let entry = entry.map_err(|error| Self::platform_error("list", error))?;
+            let entry = entry.map_err(|error| Self::platform_error("list", &error))?;
             let path = entry.path();
             if path.is_dir() {
                 Self::list_recursive(root, &path, out)?;
@@ -701,7 +705,7 @@ impl DirPlatform {
 impl BlobPlatformPort for DirPlatform {
     fn claim_root(&mut self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
         std::fs::create_dir_all(&self.root)
-            .map_err(|error| Self::platform_error("claim root", error))?;
+            .map_err(|error| Self::platform_error("claim root", &error))?;
         let proof = RootClaimProof {
             root_id: lease.root_id.as_str().to_owned(),
             owner_id: lease.owner_id.as_str().to_owned(),
@@ -710,20 +714,20 @@ impl BlobPlatformPort for DirPlatform {
             containment_proven: true,
             permissions_proven: true,
         };
-        match self.claim.lock() {
-            Ok(mut slot) => {
-                *slot = Some(proof.clone());
-                Ok(proof)
-            }
-            Err(_) => panic!("dir platform lock poisoned"),
-        }
+        let mut slot = self
+            .claim
+            .lock()
+            .unwrap_or_else(|_| panic!("dir platform lock poisoned"));
+        *slot = Some(proof.clone());
+        Ok(proof)
     }
 
     fn inspect_root(&self, _lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
-        match self.claim.lock() {
-            Ok(slot) => slot.clone().ok_or(BlobError::OwnerConflict),
-            Err(_) => panic!("dir platform lock poisoned"),
-        }
+        let slot = self
+            .claim
+            .lock()
+            .unwrap_or_else(|_| panic!("dir platform lock poisoned"));
+        slot.clone().ok_or(BlobError::OwnerConflict)
     }
 
     fn prove_contained(
@@ -740,7 +744,7 @@ impl BlobPlatformPort for DirPlatform {
             if error.kind() == std::io::ErrorKind::NotFound {
                 BlobError::NotFound
             } else {
-                Self::platform_error("read", error)
+                Self::platform_error("read", &error)
             }
         })?;
         if bytes.len() as u64 > max_bytes {
@@ -755,7 +759,7 @@ impl BlobPlatformPort for DirPlatform {
         let resolved = self.resolve(path)?;
         if let Some(parent) = resolved.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|error| Self::platform_error("write parent", error))?;
+                .map_err(|error| Self::platform_error("write parent", &error))?;
         }
         match std::fs::OpenOptions::new()
             .write(true)
@@ -765,12 +769,12 @@ impl BlobPlatformPort for DirPlatform {
             Ok(mut file) => {
                 use std::io::Write as _;
                 file.write_all(bytes)
-                    .map_err(|error| Self::platform_error("write", error))
+                    .map_err(|error| Self::platform_error("write", &error))
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(BlobError::IdempotencyConflict)
             }
-            Err(error) => Err(Self::platform_error("write", error)),
+            Err(error) => Err(Self::platform_error("write", &error)),
         }
     }
 
@@ -779,7 +783,7 @@ impl BlobPlatformPort for DirPlatform {
         if !resolved.exists() {
             return Err(BlobError::NotFound);
         }
-        std::fs::write(&resolved, bytes).map_err(|error| Self::platform_error("replace", error))
+        std::fs::write(&resolved, bytes).map_err(|error| Self::platform_error("replace", &error))
     }
 
     fn cas_capability(&self) -> BlobCasCapability {
@@ -816,13 +820,13 @@ impl BlobPlatformPort for DirPlatform {
         }
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|error| Self::platform_error("rename parent", error))?;
+                .map_err(|error| Self::platform_error("rename parent", &error))?;
         }
         std::fs::rename(&from, &to).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 BlobError::NotFound
             } else {
-                Self::platform_error("rename", error)
+                Self::platform_error("rename", &error)
             }
         })
     }
@@ -832,7 +836,7 @@ impl BlobPlatformPort for DirPlatform {
         match std::fs::remove_file(&resolved) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Self::platform_error("remove", error)),
+            Err(error) => Err(Self::platform_error("remove", &error)),
         }
     }
 
@@ -846,7 +850,7 @@ impl BlobPlatformPort for DirPlatform {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(BlobPathState::Missing)
             }
-            Err(error) => Err(Self::platform_error("stat", error)),
+            Err(error) => Err(Self::platform_error("stat", &error)),
         }
     }
 
@@ -1287,7 +1291,7 @@ fn open_observed_sink(
     // clone of this shared handle, never a second construction on the same
     // root.
     let store = store_with_platform(platform, &root);
-    let (sink, session) = open_sink_on_store(case, &root, store.clone());
+    let (sink, session) = open_sink_on_store(case, &root, &store);
     (platform_handle, store, sink, session)
 }
 
@@ -1299,7 +1303,7 @@ fn open_observed_sink(
 fn open_sink_on_store(
     case: &str,
     root: &str,
-    store: FixtureStore,
+    store: &FixtureStore,
 ) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
     open_sink_on_store_with_limits(case, root, store, replay_limits())
 }
@@ -1312,7 +1316,7 @@ fn open_sink_on_store(
 fn open_sink_on_store_with_limits(
     case: &str,
     root: &str,
-    store: FixtureStore,
+    store: &FixtureStore,
     limits: ProcessStreamSinkLimits,
 ) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
     let stage_context = receipt_context(&format!("sink-{case}-stage"));
@@ -1398,7 +1402,7 @@ fn durable_write_counts(platform: &FixturePlatform) -> (u64, u64, usize) {
     let state = platform
         .state
         .lock()
-        .expect("fixture platform state is observable");
+        .unwrap_or_else(|_| panic!("fixture platform state is observable"));
     (
         state.write_new_calls,
         state.replace_calls,
@@ -1425,6 +1429,10 @@ fn append_chunk(
 
 /// Asserts that a disposition is exactly `Accepted`/`Replayed` at these
 /// coordinates, by name, rather than by count.
+// By-value keeps all nineteen call sites readable: the compared enum is
+// small, assert-only, and never retained, so borrowing would add noise at
+// every call without changing any behaviour.
+#[allow(clippy::needless_pass_by_value)]
 fn assert_disposition(
     disposition: ProcessStreamSinkAppendDisposition,
     expected: ProcessStreamSinkAppendDisposition,
@@ -2003,10 +2011,9 @@ fn cancelled_abort_retains_admitted_prefix_as_durable_partial_source() {
     // carries. The evidence source and the recorded publication must agree —
     // either one alone could be an unbacked claim.
     let expected_locator = format!("blob:{}", blake3::hash(PREFIX).to_hex());
-    let source = terminal
-        .evidence()
-        .source()
-        .expect("a partial terminal keeps its retained source");
+    let Some(source) = terminal.evidence().source() else {
+        panic!("a partial terminal keeps its retained source")
+    };
     assert_eq!(source.locator(), expected_locator);
     assert_eq!(source.sha256(), expected_sha256);
     assert_eq!(source.byte_length(), prefix_len);
@@ -2157,7 +2164,7 @@ fn repeat_finalize_reuses_object_and_fresh_adapter_holds_no_proof() {
     let platform = FixturePlatform::default();
     let platform_handle = platform.clone();
     let store = store_with_platform(platform, &root);
-    let (sink, session) = open_sink_on_store("restart-pub", &root, store.clone());
+    let (sink, session) = open_sink_on_store("restart-pub", &root, &store);
     assert_disposition(
         ok(append_chunk(&sink, &session, 0, 0, &ALL[..4])),
         ProcessStreamSinkAppendDisposition::Accepted {
@@ -2223,7 +2230,7 @@ fn repeat_finalize_reuses_object_and_fresh_adapter_holds_no_proof() {
     // carrying a fabricated uncertainty — well-formed and bound to this
     // session, but never issued by any reservation — is refused instead of
     // inventing a `COMPLETE_SOURCE` terminal.
-    let (fresh_sink, fresh_session) = open_sink_on_store("restart-clean", &root, store.clone());
+    let (fresh_sink, fresh_session) = open_sink_on_store("restart-clean", &root, &store);
     assert!(
         fresh_sink.publication().is_none(),
         "a new adapter retains no publication outcome"
@@ -2283,7 +2290,7 @@ fn pressure_sheds_without_stalling_and_late_abort_conflicts() {
     let limits = ok(ProcessStreamSinkLimits::new(
         64, 4096, 8, 4096, 2, 250, 10, 20, 20,
     ));
-    let (sink, session) = open_sink_on_store_with_limits("pressure", &root, store, limits);
+    let (sink, session) = open_sink_on_store_with_limits("pressure", &root, &store, limits);
 
     assert_disposition(
         ok(append_chunk(&sink, &session, 0, 0, &KEPT[..9])),
@@ -2408,6 +2415,11 @@ fn pressure_sheds_without_stalling_and_late_abort_conflicts() {
 /// I05-12: one active root owner per store; the directory root is a unique
 /// temp case root removed at the end.
 // WORK_UNIT_CASE: 297/A2
+// One end-to-end matrix: splitting the arrange/act/assert chain across
+// helpers would sever the seam-by-seam proof this single case documents
+// (codec, keys, AEAD, both platforms, digest agreement), so the length
+// stays with the case it proves.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn seam_matrix_stages_and_reads_through_a_real_directory() {
     const BYTES: &[u8] = b"a2-matrix-real-fs-297";
@@ -2589,28 +2601,29 @@ fn seam_matrix_stages_and_reads_through_a_real_directory() {
 #[test]
 fn truncated_preview_finalizes_with_honest_omitted_suffix() {
     const ALL: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    assert_eq!(ALL.len(), 64);
     const HEAD: usize = 16;
+    assert_eq!(ALL.len(), 64);
     let root = unique_test_root();
     let platform = FixturePlatform::default();
     let store = store_with_platform(platform, &root);
     let limits = ok(ProcessStreamSinkLimits::new(
         64, 8192, 256, 16, 8, 8192, 10, 20, 20,
     ));
-    let (sink, session) = open_sink_on_store_with_limits("truncated-preview", &root, store, limits);
-    for sequence in 0..8 {
-        let start = (sequence * 8) as usize;
+    let (sink, session) =
+        open_sink_on_store_with_limits("truncated-preview", &root, &store, limits);
+    for sequence in 0..8u64 {
+        let start = ok(usize::try_from(sequence * 8));
         assert_disposition(
             ok(append_chunk(
                 &sink,
                 &session,
-                sequence as u64,
-                (start) as u64,
+                sequence,
+                ok(u64::try_from(start)),
                 &ALL[start..start + 8],
             )),
             ProcessStreamSinkAppendDisposition::Accepted {
-                next_sequence: sequence as u64 + 1,
-                next_offset: (start + 8) as u64,
+                next_sequence: sequence + 1,
+                next_offset: ok(u64::try_from(start + 8)),
             },
         );
     }

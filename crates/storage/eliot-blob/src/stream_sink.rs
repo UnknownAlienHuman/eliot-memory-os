@@ -1427,54 +1427,50 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             None
         };
         let mut state = self.lock();
-        let (persistence, source, terminal_state, publication) = match retained {
-            Some(ready) => {
-                let byte_length = ready.plaintext_length();
-                let sha256 = ready.plaintext_sha256().to_owned();
-                let locator = format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash);
-                let receipt_ref = ready.receipt().identity.receipt_id.to_string();
-                let source = DurableProcessStreamSource::exact_transport(
-                    DurableStreamLocatorKind::Blob,
-                    locator.clone(),
-                    receipt_ref.clone(),
-                    sha256.clone(),
-                    byte_length,
-                )?;
-                let publication =
-                    BlobStreamPublication::Partial(Box::new(BlobStreamPartialPrefix {
-                        locator,
-                        ready_receipt_ref: receipt_ref,
-                        byte_length,
-                        sha256,
-                    }));
-                (
-                    StreamPersistenceStatus::PartialSource,
-                    Some(source),
-                    ProcessStreamSinkState::PartialSource,
-                    publication,
-                )
-            }
-            None => {
-                let reason = match prepared.reason {
-                    ProcessStreamSinkAbortReason::PolicyProhibition => {
-                        BlobStreamUnavailableReason::PolicyProhibited
-                    }
-                    ProcessStreamSinkAbortReason::RedactionFailure => {
-                        BlobStreamUnavailableReason::RedactionFailed
-                    }
-                    ProcessStreamSinkAbortReason::TransportFailure
-                    | ProcessStreamSinkAbortReason::Cancellation
-                    | ProcessStreamSinkAbortReason::CallerShutdown => {
-                        unavailable_reason(prepared.request.gaps())
-                    }
-                };
-                (
-                    StreamPersistenceStatus::SourceUnavailable,
-                    None,
-                    Self::abort_state(prepared.reason),
-                    BlobStreamPublication::Unavailable { reason },
-                )
-            }
+        let (persistence, source, terminal_state, publication) = if let Some(ready) = retained {
+            let byte_length = ready.plaintext_length();
+            let sha256 = ready.plaintext_sha256().to_owned();
+            let locator = format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash);
+            let receipt_ref = ready.receipt().identity.receipt_id.to_string();
+            let source = DurableProcessStreamSource::exact_transport(
+                DurableStreamLocatorKind::Blob,
+                locator.clone(),
+                receipt_ref.clone(),
+                sha256.clone(),
+                byte_length,
+            )?;
+            let publication = BlobStreamPublication::Partial(Box::new(BlobStreamPartialPrefix {
+                locator,
+                ready_receipt_ref: receipt_ref,
+                byte_length,
+                sha256,
+            }));
+            (
+                StreamPersistenceStatus::PartialSource,
+                Some(source),
+                ProcessStreamSinkState::PartialSource,
+                publication,
+            )
+        } else {
+            let reason = match prepared.reason {
+                ProcessStreamSinkAbortReason::PolicyProhibition => {
+                    BlobStreamUnavailableReason::PolicyProhibited
+                }
+                ProcessStreamSinkAbortReason::RedactionFailure => {
+                    BlobStreamUnavailableReason::RedactionFailed
+                }
+                ProcessStreamSinkAbortReason::TransportFailure
+                | ProcessStreamSinkAbortReason::Cancellation
+                | ProcessStreamSinkAbortReason::CallerShutdown => {
+                    unavailable_reason(prepared.request.gaps())
+                }
+            };
+            (
+                StreamPersistenceStatus::SourceUnavailable,
+                None,
+                Self::abort_state(prepared.reason),
+                BlobStreamPublication::Unavailable { reason },
+            )
         };
         let evidence = ProcessStreamEvidence::new_raw(
             prepared.session.binding().clone(),
@@ -2310,42 +2306,6 @@ fn map_blob_error(error: &BlobError) -> ProcessStreamSinkError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::StagedPrefix;
-
-    /// Pins the whole push-only seam API so a later durable swap is caught by
-    /// name.
-    #[test]
-    fn staged_prefix_push_and_len() {
-        let mut staged = StagedPrefix::new();
-        assert!(staged.is_empty());
-        assert_eq!(staged.len(), 0);
-        assert!(staged.as_bytes().is_empty());
-
-        staged.extend_from_slice(b"ab");
-        staged.extend_from_slice(b"c");
-
-        assert!(!staged.is_empty());
-        assert_eq!(staged.len(), 3);
-        assert_eq!(staged.as_bytes(), b"abc");
-    }
-
-    /// Pins that clear drops every staged byte and leaves the seam reusable.
-    #[test]
-    fn staged_prefix_clear_drops_bytes() {
-        let mut staged = StagedPrefix::new();
-        staged.extend_from_slice(b"abc");
-        assert_eq!(staged.as_bytes(), b"abc");
-
-        staged.clear();
-
-        assert!(staged.is_empty());
-        assert_eq!(staged.len(), 0);
-        assert!(staged.as_bytes().is_empty());
-    }
-}
-
 impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
     fn open(
         &self,
@@ -2429,5 +2389,41 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
             Self::session_view(&existing, &state)
         });
         Self::ready(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StagedPrefix;
+
+    /// Pins the whole push-only seam API so a later durable swap is caught by
+    /// name.
+    #[test]
+    fn staged_prefix_push_and_len() {
+        let mut staged = StagedPrefix::new();
+        assert!(staged.is_empty());
+        assert_eq!(staged.len(), 0);
+        assert!(staged.as_bytes().is_empty());
+
+        staged.extend_from_slice(b"ab");
+        staged.extend_from_slice(b"c");
+
+        assert!(!staged.is_empty());
+        assert_eq!(staged.len(), 3);
+        assert_eq!(staged.as_bytes(), b"abc");
+    }
+
+    /// Pins that clear drops every staged byte and leaves the seam reusable.
+    #[test]
+    fn staged_prefix_clear_drops_bytes() {
+        let mut staged = StagedPrefix::new();
+        staged.extend_from_slice(b"abc");
+        assert_eq!(staged.as_bytes(), b"abc");
+
+        staged.clear();
+
+        assert!(staged.is_empty());
+        assert_eq!(staged.len(), 0);
+        assert!(staged.as_bytes().is_empty());
     }
 }
