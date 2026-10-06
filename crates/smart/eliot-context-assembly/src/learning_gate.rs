@@ -36,11 +36,13 @@ use eliot_improvement::{
     CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
 };
 
-use crate::{ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view};
+use crate::{ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy};
+
+use crate::assemble::assemble_validated_view;
 
 /// Governed compile/delivery entrypoint: re-verify learning-marked admitted
 /// atoms against the live Governor issuance, then run the unchanged
-/// [`assemble_active_view`] projection.
+/// shared validated projection (`assemble_validated_view`).
 ///
 /// Fails closed: ticket, fence, overlay, backlog, cross-task, or per-mark
 /// violations return `Err` and render nothing. Unmarked sets project
@@ -83,5 +85,5 @@ where
     check_governed_carriage(&presented, &admitted.binding.state_fence, &marks)
         .map_err(bounds_to_context_error)
         .map_err(AssemblyError::Contract)?;
-    assemble_active_view(admitted, recipe, approved, quality, policy, measure)
+    assemble_validated_view(admitted, recipe, approved, quality, policy, measure)
 }

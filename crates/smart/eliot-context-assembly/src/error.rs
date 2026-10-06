@@ -46,4 +46,13 @@ pub enum AssemblyError {
         Box<eliot_context_contracts::QualityScorecard>,
         Box<eliot_context_contracts::QualityRefusal>,
     ),
+    /// Learning-marked atoms require the governed delivery entry (#1869 W4/A2).
+    ///
+    /// The plain entry holds no verified permit, so it cannot establish
+    /// admission and refuses marked sets instead of rendering them ungoverned.
+    /// Render marked sets through `assemble_active_view_with_learning`.
+    #[error(
+        "admitted set carries learning marks: assemble through assemble_active_view_with_learning"
+    )]
+    LearningPresentationRequired,
 }
