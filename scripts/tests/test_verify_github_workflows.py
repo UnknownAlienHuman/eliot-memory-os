@@ -26,6 +26,15 @@ check_nuget_lock = vgw.check_nuget_lock
 check_pip_install_lock = vgw.check_pip_install_lock
 verify_all = vgw.verify_all
 
+# Load scripts/verify-retired-authority-surfaces.py dynamically
+_retired_path = Path(__file__).resolve().parents[1] / "verify-retired-authority-surfaces.py"
+_retired_spec = importlib.util.spec_from_file_location("verify_retired_authority_surfaces", _retired_path)
+if _retired_spec is None or _retired_spec.loader is None:
+    raise ImportError(f"Cannot load {_retired_path}")
+vras = importlib.util.module_from_spec(_retired_spec)
+sys.modules["verify_retired_authority_surfaces"] = vras
+_retired_spec.loader.exec_module(vras)
+
 CHECKOUT_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
 CACHE_SHA = "1bd1e32a3bdc45362d1e726936510720a7c30a57"
 OTHER_SHA = "a" * 40
@@ -320,6 +329,27 @@ class TestVerifyGithubWorkflows(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[2]
         findings = verify_all(repo_root)
         self.assertEqual(findings, [])
+
+
+    def test_retired_surface_present_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "swarm").mkdir()
+            record = root / "record.toml"
+            record.write_text('[[surface]]\npath = "swarm"\n[[surface]]\npath = "reports"\n', encoding="utf-8")
+            self.assertEqual(vras.check_retired_surfaces(root, vras.load_record_surfaces(record)), ["swarm"])
+
+    def test_retirement_record_edit_flips_verdict(self) -> None:
+        # The verdict follows the accepted source: removing a surface from the
+        # record accepts a tree the previous record refused (issue #1225 AC6).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "swarm").mkdir()
+            record = root / "record.toml"
+            record.write_text('[[surface]]\npath = "swarm"\n', encoding="utf-8")
+            self.assertEqual(vras.check_retired_surfaces(root, vras.load_record_surfaces(record)), ["swarm"])
+            record.write_text('[[surface]]\npath = "reports"\n', encoding="utf-8")
+            self.assertEqual(vras.check_retired_surfaces(root, vras.load_record_surfaces(record)), [])
 
 
 if __name__ == "__main__":
