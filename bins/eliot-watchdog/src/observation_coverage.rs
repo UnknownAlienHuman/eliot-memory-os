@@ -1460,6 +1460,45 @@ mod replay_disposition_tests {
         assert!(report.valid());
     }
 
+    /// A removed competent sensor is a named hole, never silent and never
+    /// covered (#1755 A7, first half): the wired channel the tick observed
+    /// nothing for stays `UNKNOWN` with `NO_ESTABLISHABLE_SAMPLE`, blocks
+    /// full coverage, and the report stays internally valid. The downstream
+    /// profile gate (second half) lands with W7.
+    #[test]
+    fn removed_competent_sensor_is_a_named_hole_blocking_full_coverage() {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            if channel == ObservationChannel::ScmServiceState {
+                continue;
+            }
+            let capability = channel_capability(channel);
+            for class in capability.supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        let report = publisher.close(2_000);
+        let removed = report
+            .records()
+            .iter()
+            .find(|record| record.channel() == ObservationChannel::ScmServiceState)
+            .expect("removed wired channel present");
+        assert_eq!(removed.disposition(), CoverageDisposition::Unknown);
+        assert!(
+            removed
+                .gaps()
+                .iter()
+                .any(|gap| gap.reason == "NO_ESTABLISHABLE_SAMPLE")
+        );
+        assert!(
+            report
+                .blocking_channels()
+                .contains(&ObservationChannel::ScmServiceState)
+        );
+        assert!(!report.full_coverage_claimed());
+        assert!(report.valid());
+    }
+
     /// A replay substitutes the missing live source without discarding the
     /// live classes the tick did record: the disposition names the replay
     /// and the live samples stay in the record.
