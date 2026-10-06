@@ -1256,8 +1256,9 @@ mod tests {
     };
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-        OperationId, OperationIdentity, OperationManifestDigest, OrderingScopeId, ReceiptEnvelope,
-        ScopeId, SecurityContext, StateFence, TransitionClass, bind_issue18_digests,
+        OperationId, OperationIdentity, OrderingScopeId, ReceiptEnvelope, ScopeId, SecurityContext,
+        StateFence, TransitionClass, bind_issue18_digests, generated_operation_manifests,
+        operation_manifest_set_digest, supported_admission_contract_set_digest,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1303,8 +1304,15 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "a".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            // The admitted contract-set digest, never a placeholder: plan
+            // validation rejects anything else with `ManifestMismatch`
+            // (issue #10, same staleness as the live-test fixture).
+            admission_contract_set_digest: supported_admission_contract_set_digest()?,
+            // Same staleness as above: the admitted catalogue digest, never
+            // a placeholder (unknown digests fail with `UnknownOperation`).
+            operation_manifest_digest: operation_manifest_set_digest(
+                &generated_operation_manifests()?,
+            )?,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
             admission_digest: String::new(),
@@ -1316,8 +1324,11 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: Vec::new(),
-                projection_kinds: vec![String::from("task_state")],
-                relation_kinds: vec![String::from("causes")],
+                // No projection/relation intents: the closed catalogue
+                // declares no `task_state`/`causes` kinds (the live-test
+                // fixture binds empty intents for the same reason).
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
@@ -1407,7 +1418,10 @@ mod tests {
         use eliot_store_api::{ExactJsonBytes, PayloadSource};
 
         let (_, transition) = fixture()?;
-        let raw = br#"{"subject":"op-envelope"}"#;
+        // Non-canonical spacing: decodes to exactly the admitted parameters
+        // but binds different bytes than the canonical fallback, so the
+        // digest assertion below proves verbatim carriage, not re-serialization.
+        let raw = br#"{"subject" : "op-envelope"}"#;
         let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)?;
         assert_eq!(
             authority.decode_object_parameters()?,
@@ -1495,8 +1509,10 @@ mod tests {
         assert_eq!(fresh.commit_sequence, 2);
         assert_eq!(stale.next_commit_sequence, 2);
         assert_eq!(fresh.next_commit_sequence, 3);
-        assert_eq!(stale.next_outbox_sequence, 2);
-        assert_eq!(fresh.next_outbox_sequence, 5);
+        // Two outbox rows per plan: the event intent plus the LAUNCH intent
+        // (I10.15 step 3 / I14.6), so sequences advance by two per plan.
+        assert_eq!(stale.next_outbox_sequence, 3);
+        assert_eq!(fresh.next_outbox_sequence, 6);
         assert_ne!(stale.committed_at, fresh.committed_at);
         assert_eq!(
             stale.outbox_records.len(),
@@ -1559,9 +1575,11 @@ mod tests {
         assert_eq!(recomputed.commit_sequence, 2);
         assert_eq!(recomputed.committed_at, "commit-sequence-0000000000000002");
         assert_eq!(recomputed.next_commit_sequence, 3);
-        assert_eq!(recomputed.next_outbox_sequence, 5);
-        assert_eq!(recomputed.outbox_records.len(), 1);
+        // Event intent plus the LAUNCH intent (I10.15 step 3 / I14.6).
+        assert_eq!(recomputed.next_outbox_sequence, 6);
+        assert_eq!(recomputed.outbox_records.len(), 2);
         assert_eq!(recomputed.outbox_records[0].sequence, 4);
+        assert_eq!(recomputed.outbox_records[1].sequence, 5);
         assert_eq!(recomputed.evidence_records.len(), 1);
         assert_eq!(recomputed.evidence_records[0].commit_sequence, 2);
         // Identical to the full plan at the same allocation.
