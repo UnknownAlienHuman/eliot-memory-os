@@ -3087,14 +3087,14 @@ impl KernelControlReader {
         // the conflict is the only non-impersonating choice — failing the
         // loop on foreign-owned evidence would wedge intake, and overwriting
         // would impersonate it.
-        match stage_ack_bytes(
+        if let Err(error) = stage_ack_bytes(
             &self.directory.join(control_ack_name(generation, sequence)),
             &bytes,
-        ) {
-            Ok(_) => Ok(()),
-            Err(MaterialError::DigestMismatch) => Ok(()),
-            Err(_) => Err(LoopError::ChannelUnavailable),
+        ) && !matches!(error, MaterialError::DigestMismatch)
+        {
+            return Err(LoopError::ChannelUnavailable);
         }
+        Ok(())
     }
 
     /// Pins a legacy Shutdown frame to this operation. The parse carries its
