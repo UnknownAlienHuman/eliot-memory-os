@@ -3751,6 +3751,10 @@ fn is_known_message_type(value: &str) -> bool {
             | "DrainStatus"
             | "Shutdown"
             | "Fatal"
+            | "NativeWorkerHeartbeat"
+            | "NativeWorkerReconnect"
+            | "NativeWorkerReconcile"
+            | "NativeWorkerAcknowledge"
     )
 }
 
@@ -7620,6 +7624,35 @@ mod tests {
             wire.len() - 4
         );
         assert_eq!(codec.decode(&wire)?, source);
+        for operation in [
+            NativeWorkerOperationV1::Heartbeat,
+            NativeWorkerOperationV1::Reconnect,
+            NativeWorkerOperationV1::Reconcile,
+            NativeWorkerOperationV1::Acknowledge,
+        ] {
+            let mut native = frame()?;
+            native.kind = operation.frame_kind();
+            native.message_type = operation.message_type();
+            native.request_identity = None;
+            native.payload = ProtocolPayload::NativeWorkerFrameV1(NativeWorkerFramePayloadV1 {
+                wire_version: NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
+                native_protocol_version: NATIVE_WORKER_PROTOCOL_VERSION.to_owned(),
+                operation,
+                deadline_unix_ms: 10,
+                authority_epoch: fence().authority_epoch.clone(),
+                state_fence: fence(),
+                lease_id: serde_json::from_value(serde_json::json!({
+                    "namespace": "eliot.governor.work-lease",
+                    "revision": "v1",
+                    "value": "lease-codec",
+                }))
+                .map_err(|error| ProtocolError::Json(error.to_string()))?,
+                admission_revision: "admission-codec".to_owned(),
+                producer_generation: 1,
+                body: serde_json::json!({"kind": operation.body_kind()}),
+            });
+            assert_eq!(codec.decode(&codec.encode(&native)?)?, native);
+        }
         Ok(())
     }
 

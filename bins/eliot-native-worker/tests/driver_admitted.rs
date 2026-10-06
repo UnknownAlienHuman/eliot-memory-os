@@ -867,20 +867,20 @@ fn health_frame() -> WorkerFrame {
 }
 
 fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
-    let body = serde_json::to_vec(frame).expect("frame");
-    let mut out = u32::try_from(body.len())
-        .expect("len")
-        .to_le_bytes()
-        .to_vec();
-    out.extend_from_slice(&body);
-    out
+    let frame = frame
+        .to_ebp_frame()
+        .unwrap_or_else(|error| panic!("worker frame projects to valid EBP: {error}"));
+    eliot_ipc::encode_frame(&frame, eliot_ipc::TransportLimits::default())
+        .unwrap_or_else(|error| panic!("valid EBP frame encodes: {error}"))
 }
 
 fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
-    let (prefix, body) = bytes.split_at(4);
-    let length = u32::from_le_bytes(prefix.try_into().expect("prefix")) as usize;
-    assert_eq!(length, body.len());
-    serde_json::from_slice(body).expect("response")
+    let frame = eliot_ipc::decode_frame(bytes, eliot_ipc::TransportLimits::default())
+        .unwrap_or_else(|error| panic!("response is a valid EBP frame: {error}"));
+    let eliot_protocol::ProtocolPayload::Json(payload) = frame.payload else {
+        panic!("worker response uses the EBP JSON payload");
+    };
+    serde_json::from_value(payload).unwrap_or_else(|error| panic!("response payload: {error}"))
 }
 
 type DriverWorker = NativeWorker<
