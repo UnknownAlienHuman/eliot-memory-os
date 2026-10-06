@@ -1144,8 +1144,18 @@ fn inventory_one_record(entry: &HistoricalRecordInventoryEntry) -> HistoricalRec
     let disposition = if entry.provenance.exact_source_bytes_available {
         HistoricalRecordDisposition::ReplayFromExactSource
     } else {
+        // The truncation signature classifies pre-fix bytes only: a post-fix
+        // record carries positive preservation evidence (it was written
+        // through the fixed path and its digest binding revalidated upstream),
+        // so legitimately stored signature-shaped values (`scope:scope`,
+        // `memory:operator`) stay intact instead of disposing as corrupted.
+        // This mirrors `dispose_historical_record`, which returns
+        // `PreservedIntact` for every post-fix string.
         match serde_json::from_slice::<Value>(&entry.stored) {
-            Ok(value) if value_holds_truncation_signature(&value) => {
+            Ok(value)
+                if entry.provenance.written_before_record_coercion_fix
+                    && value_holds_truncation_signature(&value) =>
+            {
                 HistoricalRecordDisposition::CorruptedStaleUnreconstructable {
                     signature: HISTORICAL_TRUNCATION_SIGNATURE,
                 }
@@ -1209,6 +1219,31 @@ mod historical_inventory_tests {
             Some(stored.len())
         );
         assert!(report.records[0].replay_error.is_none());
+        assert!(report.all_intact());
+    }
+
+    #[test]
+    fn post_fix_signature_shaped_values_stay_intact() {
+        // The truncation signature classifies pre-fix bytes only: legitimately
+        // stored signature-shaped values written through the post-fix path
+        // carry positive preservation evidence and stay intact.
+        let report = inventory_historical_payloads(&[
+            entry(br#"{"subject":"scope:scope"}"#, POST_FIX),
+            entry(br#"{"subject":"memory:operator"}"#, POST_FIX),
+            entry(br#"{"subject":"sha256:abc"}"#, POST_FIX),
+            entry(br#"{"subject":"observation:f31e5b3f"}"#, POST_FIX),
+        ]);
+        assert_eq!(report.records.len(), 4);
+        for record in &report.records {
+            assert_eq!(
+                record.disposition,
+                HistoricalRecordDisposition::PreservedIntact,
+                "unexpected disposition: {:?}",
+                record.disposition
+            );
+            assert!(record.replayed.is_some());
+            assert!(record.replay_error.is_none());
+        }
         assert!(report.all_intact());
     }
 
