@@ -2692,7 +2692,21 @@ pub fn solo_status(
     if composition.readiness() != CompositionReadiness::Ready {
         return Err(DaemonError::Composition(CompositionError::NotReady));
     }
-    let projection = load_projection(composition.state_root(), operation_id)?;
+    solo_status_in_root(composition.state_root(), operation_id)
+}
+
+/// Reads one retained attempt back through the durable path (issue #2567 A2).
+///
+/// Post-readiness half of [`solo_status`]: the projection is loaded from the
+/// state-root file (digest-verified envelope, never memory), and the status
+/// is correlated under the same operation/attempt identity. Extracted so
+/// restart readback is provable without a live composition: a fresh reader
+/// over the same state root observes the original retained attempt.
+pub fn solo_status_in_root(
+    state_root: &std::path::Path,
+    operation_id: &str,
+) -> Result<SoloAttemptStatus, DaemonError> {
+    let projection = load_projection(state_root, operation_id)?;
     let attempt_key = projection.attempt_id.clone();
     let lifecycle = projection
         .snapshot
@@ -3652,6 +3666,107 @@ mod solo_intake_consume_chain_tests {
     /// unconnected test kernel fails every exchange as an unestablished
     /// outcome, so the refusal names the kernel seam rather than inventing
     /// an answer.
+    /// Issues #2567 W3/A6: the real async drive takes owned inputs only — no
+    /// composition guard exists to hold — so an independent queue control
+    /// progresses while the drive suspends in the Kernel verifier (owner IO).
+    /// The intake speaks the staffed `bulk_implementation` vocabulary (same
+    /// mutation as the A3 order proof), so the drive passes validation and
+    /// staffing, awaits the owner verifier, and refuses with the typed Kernel
+    /// transport error (no live Kernel on the test pipe). Reaching the
+    /// transport refusal proves the future traversed the verifier await; the
+    /// concurrent control proves nothing was blocked behind it. Guarded by a
+    /// timeout: a shared lock held across the await would stall the join.
+    #[tokio::test]
+    async fn verified_drive_awaits_owner_io_while_control_progresses() {
+        const CLASS: &str = "bulk_implementation";
+        let (_, mut intake, now) = solo_test_pair();
+        intake.plan.recipe.eligible_route_classes = vec![CLASS.to_owned()];
+        for profile in &mut intake.plan.recipe.role_profiles {
+            profile.allowed_route_classes = vec![CLASS.to_owned()];
+        }
+        intake.plan.launch.allowed_route_classes = vec![CLASS.to_owned()];
+        for lane in &mut intake.plan.lanes {
+            for candidate in &mut lane.route_candidates {
+                candidate.route_classes = vec![CLASS.to_owned()];
+                candidate.route.provider = CLASS.to_owned();
+            }
+        }
+        let fence = intake.claimed.presented_fence.clone();
+        let kernel = Arc::new(
+            crate::daemon_kernel_client::DaemonKernelClient::new_for_test(
+                fence.authority_epoch.clone(),
+                fence,
+            ),
+        );
+        kernel.seed_validated_session_binding_for_test("test-session-binding");
+        let drive = drive_solo_delegate_async(&kernel, intake, now);
+        let control = async {
+            let (_, control_intake, control_now) = solo_test_pair();
+            let mut state = SoloDriverState::new();
+            push_validated_intake(&mut state, control_intake, control_now)?;
+            Ok::<_, DaemonError>(state.queue.len())
+        };
+        let (drive_outcome, control_outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                tokio::join!(drive, control)
+            })
+            .await
+            .expect("drive and control complete without stalling");
+        assert_eq!(control_outcome.expect("independent control progresses"), 1);
+        match drive_outcome {
+            Err(DaemonError::Kernel(_)) => {}
+            other => panic!(
+                "expected typed Kernel transport refusal after the verifier await, got {other:?}"
+            ),
+        }
+    }
+
+    /// Issues #2567 W5/A6: the async owner-verified drive-transport seam
+    /// (`agent_fabric_new_verified_from_resolved_async`, the prepare half of
+    /// the verified drive) takes owned inputs only, so it awaits the Kernel
+    /// verifier with no composition guard held. With a seeded owner session
+    /// the seam reaches the transport, which refuses typed (no live Kernel on
+    /// the test pipe); reaching that refusal proves the future traversed the
+    /// owner-IO await instead of refusing before it. The cancel/ingest legs
+    /// use the sibling restore seam with the same guard discipline (short
+    /// locks, owned inputs into the await). Guarded by a timeout: a guard
+    /// held across the await would stall.
+    #[tokio::test]
+    async fn verified_transport_seam_awaits_owner_io_guard_free() {
+        let (_, intake, _) = solo_test_pair();
+        let fence = intake.claimed.presented_fence.clone();
+        let kernel = Arc::new(
+            crate::daemon_kernel_client::DaemonKernelClient::new_for_test(
+                fence.authority_epoch.clone(),
+                fence,
+            ),
+        );
+        kernel.seed_validated_session_binding_for_test("test-session-binding");
+        let ports = crate::agent_fabric::FabricPorts {
+            model_registry: std::sync::Arc::new(crate::ProductionModelRegistryPort),
+            peer_channel: std::sync::Arc::new(crate::ProductionPeerChannelPort),
+            swarm_control: std::sync::Arc::new(crate::ProductionSwarmControlPort),
+            admission_authority: std::sync::Arc::new(crate::ProductionAdmissionAuthorityPort),
+            activation_authority: std::sync::Arc::new(crate::ProductionActivationAuthorityPort),
+            dispatch_egress: std::sync::Arc::new(crate::ProductionDispatchEgressPort),
+        };
+        let material = intake.claimed.material();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::DaemonComposition::agent_fabric_new_verified_from_resolved_async(
+                &kernel,
+                ports,
+                material,
+                &intake.claimed,
+            ),
+        )
+        .await
+        .expect("transport seam completes without stalling");
+        if !matches!(outcome, Err(DaemonError::Kernel(_))) {
+            panic!("expected typed Kernel transport refusal after the verifier await");
+        }
+    }
+
     #[tokio::test]
     async fn queued_intake_drives_to_typed_refusal() {
         let (_, intake, now) = solo_test_pair();
@@ -4104,6 +4219,56 @@ mod solo_retained_discover_tests {
         std::fs::create_dir_all(root.join(SOLO_PROJECTION_DIR)).expect("projection dir builds");
         let retained = discover_retained_solo_operations(&root).expect("empty retain set reads");
         assert!(retained.is_empty());
+        drop_scratch(&root, guard);
+    }
+
+    #[test]
+    fn persisted_attempt_reads_back_through_status_path() {
+        let (root, guard) = scratch_state_root("readback");
+        persist_projection(
+            &root,
+            &solo_projection_for_test("op-readback-1", "att-readback-1", false),
+        )
+        .expect("open projection persists");
+        // Fresh readback over the same state root, no memory carried: the
+        // public status path observes the original retained attempt with its
+        // attempt/route/fence correlation intact.
+        let status = solo_status_in_root(&root, "op-readback-1").expect("status reads back");
+        assert_eq!(status.operation_id, "op-readback-1");
+        assert_eq!(status.attempt_id, "att-readback-1");
+        assert_eq!(
+            status.lifecycle,
+            crate::agent_fabric::AttemptLifecycle::Admitted
+        );
+        assert!(!status.emitted);
+        assert_eq!(status.result_digest, None);
+        assert_eq!(status.cancellation, None);
+        // Discovery agrees on the same durable row.
+        let retained = discover_retained_solo_operations(&root).expect("discovery reads");
+        assert_eq!(retained, vec!["op-readback-1".to_owned()]);
+        drop_scratch(&root, guard);
+    }
+
+    #[test]
+    fn status_readback_refuses_tampered_envelope() {
+        let (root, guard) = scratch_state_root("tampered-status");
+        persist_projection(
+            &root,
+            &solo_projection_for_test("op-readback-2", "att-readback-2", false),
+        )
+        .expect("open projection persists");
+        let path = root
+            .join(SOLO_PROJECTION_DIR)
+            .join("attempt-op-readback-2.json");
+        let bytes = std::fs::read(&path).expect("envelope reads");
+        let text = String::from_utf8(bytes).expect("envelope is JSON text");
+        let tampered = text.replacen("op-readback-2", "op-readback-X", 1);
+        assert_ne!(tampered, text);
+        std::fs::write(&path, tampered).expect("tampered envelope writes");
+        match solo_status_in_root(&root, "op-readback-2") {
+            Err(DaemonError::Composition(CompositionError::Recovery(_))) => {}
+            other => panic!("expected Recovery refusal, got {other:?}"),
+        }
         drop_scratch(&root, guard);
     }
 
