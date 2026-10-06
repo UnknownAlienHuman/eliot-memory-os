@@ -902,6 +902,12 @@ impl ProcessTreeReserve {
                 reason: "CONFLICT: the presented binding does not match its request; changed content never replays",
             });
         }
+        if binding.capacity_owner_generation_ref != boundary.owner_generation {
+            return Err(KernelError::InvalidField {
+                field: "capacity_permit_binding.capacity_owner_generation_ref",
+                reason: "STALE_OWNER: the binding is not from the current process-tree owner generation",
+            });
+        }
         if binding.profile_id != boundary.profile_id
             || binding.profile_revision != boundary.profile_revision
         {
@@ -1572,6 +1578,15 @@ mod tests {
         );
         let live = boundary(epoch)?;
         let (_permit, binding) = owner.issue_process_permit(&request, &live)?;
+        let mut replaced_owner = live.clone();
+        replaced_owner.owner_generation = ResourceGeneration::new(2)?;
+        assert!(matches!(
+            ProcessTreeReserve::verify_process_permit(&binding, &request, &replaced_owner),
+            Err(KernelError::InvalidField {
+                field: "capacity_permit_binding.capacity_owner_generation_ref",
+                ..
+            })
+        ));
         // The profile moved on: the once-current binding is now stale.
         let mut moved = live.clone();
         moved.profile_revision = "rev-10".to_owned();
