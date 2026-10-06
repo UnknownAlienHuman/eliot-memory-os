@@ -10294,11 +10294,10 @@ mod tests {
             "a genuine terminal effect releases the attempt"
         );
         assert!(
-            launches_table(contour)
+            !launches_table(contour)
                 .expect("table")
                 .by_identity
-                .get("claim-terminal-1")
-                .is_none(),
+                .contains_key("claim-terminal-1"),
             "the released record is gone exactly once"
         );
         assert!(

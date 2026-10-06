@@ -478,8 +478,10 @@ async fn main() {
         // consumer refuses fail-closed); a miscomposed bound fails the
         // launch instead of issuing under a guess.
         match compose_process_capacity_reserve_from_profile(kernel.control_reserve_profile()) {
-            Ok(ProcessCapacityReserveComposition::Composed) => {}
-            Ok(ProcessCapacityReserveComposition::SkippedUnestablished) => {}
+            Ok(
+                ProcessCapacityReserveComposition::Composed
+                | ProcessCapacityReserveComposition::SkippedUnestablished,
+            ) => {}
             Err(error) => exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string()),
         }
     }
