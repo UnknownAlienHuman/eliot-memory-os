@@ -17,11 +17,13 @@ use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
-    FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    FencedProjectionPublication, HistoricalInventoryReport, HistoricalRecordInventoryEntry,
+    HistoricalRecordProvenance, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
     PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey, ScopeId,
     ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
-    audit_heads_digest, generated_operation_manifests, named_mutation_operation_name,
+    audit_heads_digest, generated_operation_manifests,
+    inventory_historical_payloads as inventory_payload_population, named_mutation_operation_name,
 };
 
 use super::{
@@ -1679,6 +1681,133 @@ fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthor
     }
     Ok(indexed)
 }
+
+/// Historical payload inventory over one authority+evidence snapshot (issue
+/// #10, W7/A5).
+///
+/// One entry per persisted payload: authority records where the receipt
+/// carries a bound authority array, else the legacy evidence records, so the
+/// same logical payload is never counted twice. Provenance is re-validated,
+/// never assumed: an authority record whose envelope
+/// (version/encoding/length/digest/parse) re-validates carries post-fix
+/// provenance; any other stored bytes — envelope-damaged authority rows and
+/// authority-less legacy evidence rows, whose stored projection can never
+/// self-prove a post-fix origin — dispose by signature under pre-fix
+/// provenance, never intact (fail-closed direction). Disposal and replay run
+/// through the store-api pure inventory, so per-record dispositions match the
+/// unit-tested evidence rules exactly.
+pub(crate) async fn inventory_historical_payloads(
+    adapter: &SurrealStoreAdapter,
+) -> Result<HistoricalInventoryReport, AdapterError> {
+    let db = super::client(adapter).await?;
+    let authorities = read_authority_records(db, &adapter.config).await?;
+    let evidence = read_evidence_records(db, &adapter.config).await?;
+    let mut evidence_by_commit: BTreeMap<u64, Vec<EvidenceRecordRow>> = BTreeMap::new();
+    for row in &evidence {
+        if let Some(sequence) = row.commit_sequence {
+            evidence_by_commit
+                .entry(sequence)
+                .or_default()
+                .extend(row.evidence_records.clone().unwrap_or_default());
+        }
+    }
+    Ok(inventory_payload_population(&join_inventory_entries(
+        &authorities,
+        &evidence_by_commit,
+    )))
+}
+
+/// Joins one snapshot into inventory entries without double counting.
+fn join_inventory_entries(
+    authorities: &[AuthorityReceiptRow],
+    evidence_by_commit: &BTreeMap<u64, Vec<EvidenceRecordRow>>,
+) -> Vec<HistoricalRecordInventoryEntry> {
+    let mut entries = Vec::new();
+    for row in authorities {
+        match row.payload_authority.as_deref() {
+            Some(records) if !records.is_empty() => {
+                entries.extend(records.iter().map(authority_inventory_entry));
+            }
+            _ => {
+                if let Some(sequence) = row.commit_sequence
+                    && let Some(records) = evidence_by_commit.get(&sequence)
+                {
+                    entries.extend(records.iter().map(evidence_inventory_entry));
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// Builds the inventory entry for one persisted authority record.
+fn authority_inventory_entry(record: &AuthorityRecordRow) -> HistoricalRecordInventoryEntry {
+    let stored = record.bytes_utf8.as_bytes().to_vec();
+    let provenance = if revalidated_authority_bytes(record).is_some() {
+        POST_FIX_INVENTORY_PROVENANCE
+    } else {
+        PRE_FIX_INVENTORY_PROVENANCE
+    };
+    HistoricalRecordInventoryEntry {
+        stored,
+        provenance,
+        exact_source: None,
+    }
+}
+
+/// Builds the inventory entry for one legacy evidence record.
+///
+/// Authority-less rows predate bound authorities, so they never claim
+/// post-fix preservation: the adapter holds no external canonical source for
+/// them (`exact_source` stays `None`) and the stored projection disposes by
+/// signature.
+fn evidence_inventory_entry(record: &EvidenceRecordRow) -> HistoricalRecordInventoryEntry {
+    HistoricalRecordInventoryEntry {
+        stored: record.bytes_utf8.as_bytes().to_vec(),
+        provenance: PRE_FIX_INVENTORY_PROVENANCE,
+        exact_source: None,
+    }
+}
+
+/// Re-validates one persisted authority envelope, returning the trusted
+/// bytes on success.
+///
+/// Mirrors the envelope half of [`validate_authority_record`] (no decode, no
+/// count): a mismatch here forfeits the post-fix provenance claim instead of
+/// failing the whole scan, so one damaged row quarantines by signature while
+/// the rest still inventory.
+fn revalidated_authority_bytes(record: &AuthorityRecordRow) -> Option<Vec<u8>> {
+    if record.version != PAYLOAD_AUTHORITY_VERSION {
+        return None;
+    }
+    if record.encoding != PayloadEncoding::Utf8Json.mnemonic() {
+        return None;
+    }
+    if record.byte_len != record.bytes_utf8.len() {
+        return None;
+    }
+    let bound = ExactJsonBytes::parse(
+        PayloadSource::NamedOperationParameter,
+        record.bytes_utf8.as_bytes(),
+    )
+    .ok()?;
+    if bound.digest_hex() != record.digest_hex || bound.byte_len() != record.byte_len {
+        return None;
+    }
+    Some(record.bytes_utf8.as_bytes().to_vec())
+}
+
+/// Write-path provenance for envelope-revalidated authority bytes.
+const POST_FIX_INVENTORY_PROVENANCE: HistoricalRecordProvenance = HistoricalRecordProvenance {
+    written_before_record_coercion_fix: false,
+    exact_source_bytes_available: false,
+};
+
+/// Write-path provenance for bytes that cannot prove a post-fix origin.
+const PRE_FIX_INVENTORY_PROVENANCE: HistoricalRecordProvenance = HistoricalRecordProvenance {
+    written_before_record_coercion_fix: true,
+    exact_source_bytes_available: false,
+};
 
 fn parse_max_records_param(query: &NamedReadRequest) -> Result<(u32, usize), StoreError> {
     let bound_raw = query
@@ -5264,6 +5393,123 @@ mod admitted_read_tests {
         assert_eq!(
             task_state_payload(&stale_query, &other_fence, &rows),
             Err(StoreError::FenceMismatch)
+        );
+    }
+}
+
+#[cfg(test)]
+mod historical_inventory_tests {
+    use super::*;
+    use eliot_store_api::HistoricalRecordDisposition;
+
+    const INTACT_BYTES: &[u8] = br#"{"subject":"memory:operator-runtime-proof"}"#;
+    const TRUNCATED_BYTES: &[u8] = br#"{"subject":"observation:f31e5b3f"}"#;
+
+    fn authority_record(bytes: &[u8], digest_hex: String) -> AuthorityRecordRow {
+        AuthorityRecordRow {
+            operation_index: 0,
+            version: PAYLOAD_AUTHORITY_VERSION,
+            encoding: PayloadEncoding::Utf8Json.mnemonic().to_owned(),
+            digest_hex,
+            byte_len: bytes.len(),
+            bytes_utf8: String::from_utf8(bytes.to_vec()).expect("test bytes are UTF-8"),
+        }
+    }
+
+    fn authority_row(records: Option<Vec<AuthorityRecordRow>>) -> AuthorityReceiptRow {
+        AuthorityReceiptRow {
+            commit_sequence: Some(7),
+            named_operation_count: Some(1),
+            payload_authority: records,
+            receipt: None,
+        }
+    }
+
+    fn evidence_record(bytes: &[u8]) -> EvidenceRecordRow {
+        EvidenceRecordRow {
+            operation_index: 0,
+            subject: "memory:operator-runtime-proof".to_owned(),
+            parameters: BTreeMap::from([(
+                "subject".to_owned(),
+                Value::String("memory:operator-runtime-proof".to_owned()),
+            )]),
+            version: PAYLOAD_AUTHORITY_VERSION,
+            encoding: PayloadEncoding::Utf8Json.mnemonic().to_owned(),
+            digest_hex: String::new(),
+            byte_len: bytes.len(),
+            bytes_utf8: String::from_utf8(bytes.to_vec()).expect("test bytes are UTF-8"),
+            commit_sequence: 7,
+            named_operation_count: 1,
+        }
+    }
+
+    #[test]
+    fn revalidated_authority_row_inventories_intact() {
+        let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, INTACT_BYTES)
+            .expect("test authority parses");
+        let row = authority_row(Some(vec![authority_record(
+            INTACT_BYTES,
+            bound.digest_hex(),
+        )]));
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &BTreeMap::new());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provenance, POST_FIX_INVENTORY_PROVENANCE);
+        assert!(inventory_payload_population(&entries).all_intact());
+    }
+
+    #[test]
+    fn damaged_envelope_quarantines_by_signature() {
+        let row = authority_row(Some(vec![authority_record(
+            TRUNCATED_BYTES,
+            "0".repeat(64),
+        )]));
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &BTreeMap::new());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provenance, PRE_FIX_INVENTORY_PROVENANCE);
+        let report = inventory_payload_population(&entries);
+        assert!(
+            matches!(
+                report.records[0].disposition,
+                HistoricalRecordDisposition::CorruptedStaleUnreconstructable { .. }
+            ),
+            "unexpected disposition: {:?}",
+            report.records[0].disposition
+        );
+        assert!(!report.all_intact());
+    }
+
+    #[test]
+    fn authority_absent_row_falls_back_to_evidence_without_intact_claim() {
+        let row = authority_row(None);
+        let evidence = BTreeMap::from([(7u64, vec![evidence_record(INTACT_BYTES)])]);
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &evidence);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provenance, PRE_FIX_INVENTORY_PROVENANCE);
+        let report = inventory_payload_population(&entries);
+        assert_eq!(
+            report.records[0].disposition,
+            HistoricalRecordDisposition::UnverifiedPreFix
+        );
+        assert!(!report.all_intact());
+    }
+
+    #[test]
+    fn authority_present_row_ignores_evidence() {
+        let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, INTACT_BYTES)
+            .expect("test authority parses");
+        let row = authority_row(Some(vec![authority_record(
+            INTACT_BYTES,
+            bound.digest_hex(),
+        )]));
+        let evidence = BTreeMap::from([(
+            7u64,
+            vec![evidence_record(INTACT_BYTES), evidence_record(INTACT_BYTES)],
+        )]);
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &evidence);
+        assert_eq!(
+            entries.len(),
+            1,
+            "one persisted payload inventories exactly once"
         );
     }
 }
