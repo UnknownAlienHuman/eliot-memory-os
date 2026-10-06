@@ -1,6 +1,6 @@
 //! Reversible, expiring task-local overlay candidates.
 
-use eliot_contracts::{ArtifactId, TaskRevision};
+use eliot_contracts::{ArtifactId, TaskRevision, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +85,17 @@ impl OverlayChange {
         }
         Ok(())
     }
+}
+
+/// Render one frozen field as `name:byte_len:value` on its own line.
+/// Mirrors the overlay `freeze` canonical text so both digests agree.
+fn push_frozen_field(text: &mut String, name: &str, value: &str) {
+    text.push_str(name);
+    text.push(':');
+    text.push_str(&value.len().to_string());
+    text.push(':');
+    text.push_str(value);
+    text.push('\n');
 }
 
 /// Dependency edge between overlay changes.
@@ -356,6 +367,53 @@ impl CampaignHarnessOverlayCandidate {
     pub fn seal(&mut self) -> Result<(), LearningContractError> {
         self.canonical_digest = digest_without_field(self, "canonical_digest")?;
         Ok(())
+    }
+
+    /// Digest binding the frozen pre-evaluation texts to this overlay identity
+    /// and canonical digest.
+    ///
+    /// Uses the same canonical frozen text and hash inputs as the overlay
+    /// `freeze` digest, so carriers recording this value bind the identical
+    /// digest the admission receipt stores. It lives here (rather than behind
+    /// an overlay-crate dependency) because assessment-time producers must not
+    /// depend on that crate.
+    #[must_use]
+    pub fn frozen_digest(&self) -> String {
+        let mut text = String::from("frozen-pre-evaluation/v1\n");
+        push_frozen_field(&mut text, "intended_mechanism", &self.intended_mechanism);
+        push_frozen_field(&mut text, "prediction", &self.prediction);
+        push_frozen_field(&mut text, "expected_observable", &self.expected_observable);
+        push_frozen_field(
+            &mut text,
+            "possible_regressions",
+            &self.possible_regressions,
+        );
+        push_frozen_field(&mut text, "confounders", &self.confounders);
+        push_frozen_field(
+            &mut text,
+            "preserved_success_constraint",
+            &self.preserved_success_constraint,
+        );
+        push_frozen_field(
+            &mut text,
+            "next_discriminator_text",
+            &self.next_discriminator_text,
+        );
+        push_frozen_field(&mut text, "rollback_condition", &self.rollback_condition);
+        let overlay_id = self.overlay_id.as_str();
+        let mut bytes = Vec::with_capacity(
+            overlay_id
+                .len()
+                .saturating_add(self.canonical_digest.len())
+                .saturating_add(text.len())
+                .saturating_add(2),
+        );
+        bytes.extend_from_slice(overlay_id.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(self.canonical_digest.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(text.as_bytes());
+        sha256_hex(&bytes)
     }
 
     /// Report whether every change carries a complete exact inverse.
