@@ -398,12 +398,14 @@ fn observe_interval(
         // coverage verdict itself comes from the owner-issued manifest below,
         // never from a second derivation here.
         match record.disposition() {
-            // A continuous channel is no blocking channel either. A channel
-            // the map says has no competent source is a measured structural
-            // limitation at this build, not a capability that degraded between
-            // two intervals, so it is neither an unexplained blocking channel
-            // nor a stale capability.
-            CoverageDisposition::Continuous | CoverageDisposition::Blind => {}
+            // A continuous or replay-covered channel is no blocking channel
+            // either. A channel the map says has no competent source is a
+            // measured structural limitation at this build, not a capability
+            // that degraded between two intervals, so it is neither an
+            // unexplained blocking channel nor a stale capability.
+            CoverageDisposition::Continuous
+            | CoverageDisposition::Blind
+            | CoverageDisposition::JournalReplayed => {}
             CoverageDisposition::Partial | CoverageDisposition::Unknown => {
                 blocking_channels += 1;
                 if capability.wiring.is_wired() {

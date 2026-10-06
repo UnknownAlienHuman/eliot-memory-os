@@ -57,11 +57,12 @@ pub fn project_interval_coverage(
 ///
 /// Field-for-field: the channel name, expected source and expected classes come
 /// from the owner's capability map, the observed classes are the live samples it
-/// actually recorded, and the disposition, dropped count, replay count, closure
-/// flag and named gap reasons are its own. A channel carrying a replay count is
-/// passed through unchanged and refused by the shared contract's own
-/// `JOURNAL_REPLAYED` rule, because no replay adapter exists yet.
+/// actually recorded, and the disposition, dropped count, replay count with its
+/// exact evidence, closure flag and named gap reasons are its own. A replayed
+/// record projects only with the evidence the shared contract's binding
+/// version 2 requires; anything else is refused by that contract's own rules.
 fn project_channel(record: &ChannelIntervalCoverage) -> InstallationChannelCoverage {
+    let provenance = record.replayed_provenance();
     InstallationChannelCoverage {
         channel: record.channel().as_str().to_owned(),
         expected_source: record.expected_source().to_owned(),
@@ -76,6 +77,13 @@ fn project_channel(record: &ChannelIntervalCoverage) -> InstallationChannelCover
             .map(|class| class.as_str().to_owned())
             .collect(),
         observed_replayed_observations: record.observed_replayed_observations(),
+        replay_evidence: record.replayed_evidence().cloned(),
+        replay_scope_root: provenance
+            .map_or(String::new(), |provenance| provenance.scope_root.clone()),
+        replay_scope_generation: provenance.map_or(String::new(), |provenance| {
+            provenance.scope_generation.clone()
+        }),
+        replay_interval_start_ms: provenance.map_or(0, |provenance| provenance.interval_start_ms),
         dropped_samples: record.dropped_samples(),
         interval_closed: record.interval_closed(),
         disposition: record.disposition().as_str().to_owned(),
@@ -92,7 +100,7 @@ fn project_channel(record: &ChannelIntervalCoverage) -> InstallationChannelCover
 /// The omitted arm is a real outcome, not a silent skip: it names exactly which
 /// owner value was unavailable, so an unprojected interval is visible instead of
 /// looking like a Watchdog that simply had nothing to report.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoverageManifestOutcome {
     /// The shared manifest was produced from the owner's own report.
     Published {
@@ -100,6 +108,10 @@ pub enum CoverageManifestOutcome {
         completeness: CoverageCompleteness,
         /// Per-channel streams the manifest now declares.
         streams: usize,
+        /// The full manifest payload for the supervision tick to retain as
+        /// owner evidence (#1755 W6): summaries travel in the log, the payload
+        /// travels here, boxed so the summary-only omission arm stays small.
+        manifest: Box<ObservationCoverageManifest>,
     },
     /// No manifest was produced, and this is why.
     Omitted(&'static str),
@@ -144,6 +156,7 @@ pub fn publish_interval_coverage_manifest(
         Ok(manifest) => CoverageManifestOutcome::Published {
             completeness: manifest.completeness,
             streams: manifest.first_and_last_expected_cursors_by_stream.len(),
+            manifest: Box::new(manifest),
         },
         // A typed contract refusal is still an omission, never a partial
         // manifest: the shared denominator either holds or it does not.
@@ -171,7 +184,7 @@ mod tests {
         InstallationCoverageBinding {
             installation_id: "installation-1755".to_owned(),
             allowed_manifest_digest: "a".repeat(64),
-            sensor_map_revision: 2,
+            sensor_map_revision: crate::observation_coverage::SENSOR_MAP_REVISION,
             interval_start_ms: 1_000,
             interval_end_ms: 2_000,
             binding_version: INSTALLATION_COVERAGE_BINDING_VERSION,
@@ -276,14 +289,24 @@ mod tests {
             CoverageManifestOutcome::Omitted("ALLOWED_MANIFEST_DIGEST_UNAVAILABLE"),
             "the allowed manifest revision has a single owner and is never defaulted"
         );
-        // Non-vacuity: with both owner values the same report publishes.
+        // Non-vacuity: with both owner values the same report publishes, and
+        // the outcome carries the full payload (#1755 W6), not just the
+        // summary the tick used to log.
         match publish_interval_coverage_manifest(
             Some("installation-1755"),
             Some(&"a".repeat(64)),
             &report,
         ) {
-            CoverageManifestOutcome::Published { streams, .. } => {
+            CoverageManifestOutcome::Published {
+                streams,
+                manifest,
+                completeness,
+            } => {
                 assert_eq!(streams, report.records().len());
+                let direct = project_interval_coverage(&binding(), &report)
+                    .expect("the same report projects directly");
+                assert_eq!(*manifest, direct, "the published payload is the projection");
+                assert_eq!(completeness, direct.completeness);
             }
             CoverageManifestOutcome::Omitted(reason) => {
                 panic!("both owner identities are present, got omission {reason}");

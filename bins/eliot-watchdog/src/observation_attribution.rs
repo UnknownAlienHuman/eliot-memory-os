@@ -25,13 +25,14 @@
 //! crosses into unregistered or private roots to fill an observation gap —
 //! there is no scan or read API here to misuse.
 //!
-//! STITCH: the production consumer is the W3 registered-scope filesystem
-//! replay increment of this same issue, which feeds one journal event path
-//! plus its volume/journal binding through [`resolve_scope_membership`],
-//! upgrades the origin only through [`EventOrigin::authenticated_correlation`],
-//! and attributes only through [`FileChangeEvidence::attribute_to_task`].
-//! No filesystem event flows through this owner yet, so no caller exists to
-//! wire without fabricating events.
+//! STITCH: the production consumer is the W3 registered-scope replay step of
+//! this same issue
+//! (`registered_scope_replay::replay_registered_scopes`), which resolves
+//! every candidate scope root through [`resolve_scope_membership`], builds one
+//! [`FileChangeEvidence`] per replayed scope with [`EventOrigin::unknown`],
+//! and enforces [`FileChangeEvidence::attribute_to_task`] fail-closed:
+//! journal records name no writer, so no authenticated correlation exists and
+//! task attribution is refused, never guessed.
 //!
 //! Forbidden by construction: task attribution from path reuse, rename, or
 //! unresolved membership; origin from anything but an authenticated

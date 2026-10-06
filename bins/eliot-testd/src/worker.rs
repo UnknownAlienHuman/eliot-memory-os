@@ -786,6 +786,38 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
         )?;
         return Ok(());
     }
+    // Issue #456 (WD1): the production path persists the admitted typed
+    // bundles with the durable job row, so a daemon restart reopens the
+    // same evidence identities without operation memory. A checkpoint or
+    // persist failure refuses promotion: the attempt reschedules as
+    // unknown instead of finishing without restart evidence.
+    let restart = match collector.checkpoint_typed_evidence(
+        &claimed.job_id,
+        claimed.invocation.request.request_id.as_str(),
+        &claimed.invocation.request.state_fence,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            finish_unknown(
+                store,
+                claimed,
+                lease,
+                collector,
+                format!("typed restart checkpoint failed; outcome rescheduled as unknown: {error}"),
+            )?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = store.persist_typed_evidence_restart(&restart) {
+        finish_unknown(
+            store,
+            claimed,
+            lease,
+            collector,
+            format!("typed restart persist failed; outcome rescheduled as unknown: {error}"),
+        )?;
+        return Ok(());
+    }
     let finish_now = current_clock_ms();
     let verification = match evaluate_testd_verification(claimed, &receipt, finish_now) {
         Ok(run) => Some(run),
