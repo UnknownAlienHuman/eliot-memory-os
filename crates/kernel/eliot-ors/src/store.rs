@@ -41265,4 +41265,91 @@ mod bridge_handoff_retirement_2731 {
         let _ = std::fs::remove_file(path);
         Ok(())
     }
+
+    #[test]
+    fn blocked_retirement_disposes_nothing_and_stays_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 items A3/I5 (negative): an eligible prefix whose
+        // receiving-owner receipt is still missing must not dispose anything.
+        // Three staged events reconcile to RECONCILED with a covering
+        // producer frontier — passing `retirement_eligible` — yet the retire
+        // entry removes zero rows and reports continuation, because the join
+        // flag has no receipt to join (I7.2: a transport acknowledgement
+        // cannot impersonate durable application acceptance).
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=3_u64 {
+            let tag = format!("rel-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        // Producer acknowledgement advances the acked frontier (I7.2: it
+        // is transport/durable evidence, never receiving-owner acceptance —
+        // it compacts nothing and disposes nothing by itself).
+        store.acknowledge_bridge_event_batch(&json!({
+            "items": [{
+                "namespace": namespace,
+                "expected_revision": 1,
+                "expected_incarnation": 1,
+                "sequence": 3,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+            }],
+        }))?;
+        let reconciled =
+            store.reconcile_bridge_event_handoffs_checked(&namespace, 3, &"a".repeat(64))?;
+        assert_eq!(
+            reconciled
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64),
+            Some(3),
+            "all three handoffs must reconcile under the covering frontier"
+        );
+        let retired = store.retire_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            retired.get("retired").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "no handoff may retire without the receiving-owner receipt"
+        );
+        assert_eq!(
+            retired
+                .get("terminalized")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "no terminalization may run without the receiving-owner receipt"
+        );
+        assert_eq!(
+            retired
+                .get("retirement_continuation")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the blocked prefix must resume at its blocker, never strand it"
+        );
+        // A second entry is the same no-op: the obligation stays pending
+        // with its source, projection, and replay identity intact.
+        let again = store.retire_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            again.get("retired").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "retirement without receipt must stay a no-op on repeat"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }
