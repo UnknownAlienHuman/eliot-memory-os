@@ -155,6 +155,8 @@ pub(crate) const INTENT_RECEIPT_SCHEMA_VERSION: u16 = 1;
 /// and the retained-record denominator never read this table.
 pub(crate) const SPOOL_COVERAGE_MANIFEST_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eliot_watchdog_coverage_manifest_v1");
+pub(crate) const SPOOL_JOURNAL_CURSOR_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("eliot_watchdog_journal_cursor_v1");
 /// Single-key row of the latest shared coverage manifest.
 pub(crate) const SPOOL_COVERAGE_MANIFEST_KEY: u64 = 0;
 /// Maximum accepted length for one persisted cursor identity string.
@@ -1275,6 +1277,94 @@ impl WatchdogSpool {
             ))
         })?;
         Ok(Some(manifest))
+    }
+
+    /// Retains the journal read position for one volume (#1755 W3).
+    ///
+    /// The cursor is validated before anything is written: an unusable
+    /// volume label or a zero journal identity is refused whole and the
+    /// previously retained row stands untouched. On success the volume's
+    /// row is replaced: the cursor always names the last consumed USN of
+    /// the journal lifetime the adapter stands behind. A missing journal
+    /// writes no cursor — absence of a position is not a position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the volume label or cursor is unusable,
+    /// cannot be serialized, or the row cannot be committed.
+    pub(crate) fn retain_journal_cursor(
+        &self,
+        volume: &str,
+        cursor: &eliot_platform_windows::UsnCursor,
+    ) -> Result<(), SpoolError> {
+        validate_journal_cursor_volume(volume)?;
+        if cursor.journal_id == 0 {
+            return Err(SpoolError::Corrupt(
+                "refused to retain a journal cursor with no journal identity".to_owned(),
+            ));
+        }
+        let record = StoredJournalCursorRecord {
+            schema_version: JOURNAL_CURSOR_SCHEMA_VERSION,
+            journal_id: cursor.journal_id,
+            next_usn: cursor.next_usn,
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_JOURNAL_CURSOR_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(volume, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reads the retained journal read position for one volume (#1755 W3).
+    ///
+    /// `Ok(None)` when no page was ever retained for the volume. A stored
+    /// row that no longer parses, names another schema, or carries no
+    /// journal identity is refused as corrupt rather than served as a
+    /// position: resuming from a forged or decayed cursor would replay the
+    /// wrong history as continuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the database cannot be read or the
+    /// stored row is corrupt.
+    pub(crate) fn read_journal_cursor(
+        &self,
+        volume: &str,
+    ) -> Result<Option<eliot_platform_windows::UsnCursor>, SpoolError> {
+        validate_journal_cursor_volume(volume)?;
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_JOURNAL_CURSOR_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let row = table
+            .get(volume)
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let record: StoredJournalCursorRecord =
+            serde_json::from_slice(row.value()).map_err(|error| {
+                SpoolError::Corrupt(format!("stored journal cursor is not valid JSON: {error}"))
+            })?;
+        decode_journal_cursor_record(&record)
     }
 
     /// Counts one genuinely observed Governor-unavailability proof and commits a
@@ -3020,6 +3110,53 @@ fn validate_intent_submission_receipt(
     Ok(())
 }
 
+/// Storage encoding of the Watchdog-owned journal read position (#1755 W3).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredJournalCursorRecord {
+    schema_version: u32,
+    journal_id: u64,
+    next_usn: u64,
+}
+
+/// Schema of [`StoredJournalCursorRecord`]; a stored row naming anything
+/// else is refused rather than migrated silently.
+const JOURNAL_CURSOR_SCHEMA_VERSION: u32 = 1;
+
+/// Refuses an unusable journal-cursor volume label before any spool write.
+fn validate_journal_cursor_volume(volume: &str) -> Result<(), SpoolError> {
+    if volume.is_empty() || !volume.is_ascii() || volume.chars().any(char::is_control) {
+        return Err(SpoolError::Corrupt(
+            "journal cursor volume label is unusable".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decodes one stored journal-cursor row into a resume position.
+///
+/// A row naming another schema or no journal identity is corrupt: resuming
+/// from it would replay the wrong history as continuity.
+fn decode_journal_cursor_record(
+    record: &StoredJournalCursorRecord,
+) -> Result<Option<eliot_platform_windows::UsnCursor>, SpoolError> {
+    if record.schema_version != JOURNAL_CURSOR_SCHEMA_VERSION {
+        return Err(SpoolError::Corrupt(format!(
+            "stored journal cursor names unknown schema {}",
+            record.schema_version
+        )));
+    }
+    if record.journal_id == 0 {
+        return Err(SpoolError::Corrupt(
+            "stored journal cursor carries no journal identity".to_owned(),
+        ));
+    }
+    Ok(Some(eliot_platform_windows::UsnCursor {
+        journal_id: record.journal_id,
+        next_usn: record.next_usn,
+    }))
+}
+
 /// Storage encoding of the Watchdog-owned export cursor.
 ///
 /// This private record exists only because the owner-neutral core contract
@@ -3786,6 +3923,66 @@ mod shared_manifest_retention_tests {
             .commit()
             .map_err(|error| SpoolError::Database(error.to_string()))?;
         assert!(spool.read_shared_coverage_manifest().is_err());
+        Ok(())
+    }
+
+    /// A retained journal cursor reads back identical: the resume position
+    /// reaches durable owner evidence (#1755 W3).
+    #[test]
+    fn journal_cursor_round_trips_through_owner_spool() -> TestResult {
+        let spool = test_spool("journal-cursor-round-trip")?;
+        assert_eq!(spool.read_journal_cursor("\\\\.\\C:")?, None);
+        let cursor = eliot_platform_windows::UsnCursor {
+            journal_id: 0x01dc_2182_7839_5a3f,
+            next_usn: 0x20bb_b2c5d0,
+        };
+        spool.retain_journal_cursor("\\\\.\\C:", &cursor)?;
+        assert_eq!(spool.read_journal_cursor("\\\\.\\C:")?, Some(cursor));
+        Ok(())
+    }
+
+    /// A zero journal identity is refused whole and the previously retained
+    /// row stands untouched: a position in no journal is not a position.
+    #[test]
+    fn zero_journal_identity_is_refused_and_prior_row_stands() -> TestResult {
+        let spool = test_spool("journal-cursor-refused")?;
+        let cursor = eliot_platform_windows::UsnCursor {
+            journal_id: 0x01dc_2182_7839_5a3f,
+            next_usn: 7,
+        };
+        spool.retain_journal_cursor("\\\\.\\C:", &cursor)?;
+        let zero = eliot_platform_windows::UsnCursor {
+            journal_id: 0,
+            next_usn: 9,
+        };
+        assert!(spool.retain_journal_cursor("\\\\.\\C:", &zero).is_err());
+        assert!(spool.retain_journal_cursor("", &cursor).is_err());
+        assert_eq!(spool.read_journal_cursor("\\\\.\\C:")?, Some(cursor));
+        Ok(())
+    }
+
+    /// A stored cursor row that no longer parses is refused as corrupt
+    /// rather than served as a position: resuming from decay would replay
+    /// the wrong history as continuity.
+    #[test]
+    fn corrupt_journal_cursor_row_is_refused() -> TestResult {
+        let spool = test_spool("journal-cursor-corrupt")?;
+        let write = spool
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_JOURNAL_CURSOR_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert("\\\\.\\C:", b"not-json".as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        assert!(spool.read_journal_cursor("\\\\.\\C:").is_err());
         Ok(())
     }
 }

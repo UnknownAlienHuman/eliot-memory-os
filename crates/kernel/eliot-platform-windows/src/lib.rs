@@ -336,8 +336,6 @@ pub use usn_journal::{
     UsnCursor, UsnJournalError, UsnJournalPage, UsnJournalState, UsnRecordView,
     query_usn_journal_state, read_usn_journal_page,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use usn_journal::{parse_usn_record_page, volume_device_path};
 
 /// Failure returned by a Windows-only primitive before it can be projected
 /// into a provider-neutral P-01 outcome.

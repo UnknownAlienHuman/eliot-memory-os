@@ -9,6 +9,7 @@
 //! sharded fragments named per anchor above.
 //! Policy: No wildcard imports, no new lint allows; existing test-module import/lint policy moves unchanged.
 use super::*;
+use crate::usn_journal::{parse_usn_record_page, volume_device_path};
 #[cfg(windows)]
 use crate::secret_store::{
     HOST_CREDENTIAL_INTERLOCK_TIMEOUT_MS, classify_host_credential_interlock_wait,
