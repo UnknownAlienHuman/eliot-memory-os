@@ -41529,4 +41529,77 @@ mod bridge_handoff_retirement_2731 {
         let _ = std::fs::remove_file(path);
         Ok(())
     }
+
+    #[test]
+    fn pressure_stays_truthful_and_recovery_legs_usable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Issue #2731 item A6: with the record table full, a fresh stage
+        // sheds with typed EventRecords pressure while a scoped gap on the
+        // same namespace still records — recovery legs stay usable under
+        // saturation, and saturation never masquerades as loss.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=2048_u64 {
+            let tag = format!("prs-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} of 2048 must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        let overflow =
+            store.stage_bridge_event_checked(&staged_event_payload(2049, "prs-2731-02049"));
+        let is_records_pressure = matches!(
+            overflow,
+            Err(OrsError::BridgeEventCapacityExceeded(pressure))
+                if pressure.dimension
+                    == eliot_contracts::BridgeEventCapacityDimension::EventRecords
+        );
+        assert!(
+            is_records_pressure,
+            "the 2049th fresh event must shed with EventRecords pressure, got {overflow:?}"
+        );
+        let gap = store
+            .record_bridge_event_gap_checked(&json!({
+                "gap_id": "gap-2731-pressure",
+                "stream_id": "stream-2731",
+                "start_sequence": 1,
+                "end_sequence": 1,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+                "reason_ref": "reason-2731",
+                "staging_connection": "conn-2731",
+                "owner_connection": "conn-2731",
+                "owner_launch_nonce": "nonce-2731",
+                "owner_session_epoch": 1,
+            }))
+            .map_err(|error| format!("scoped gap on the live stream must record, got {error:?}"))?;
+        assert_eq!(
+            gap.get("accepted").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the scoped gap must be accepted while fresh stages shed"
+        );
+        let gap_owner = {
+            let read = store.database.begin_write().map_err(storage)?;
+            let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            let mut owner = String::new();
+            for entry in gaps.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventGapRow = decode(value.value())?;
+                if row.gap_id == "gap-2731-pressure" {
+                    owner = row.owner_namespace.clone();
+                }
+            }
+            owner
+        };
+        assert_eq!(
+            gap_owner, namespace,
+            "the gap must bind the live stream namespace, not a fresh one"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }
