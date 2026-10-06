@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .cargo import nearest_agents
-from .common import NavigationError, normalize_repo_path, relative_to_root
+from .common import NavigationError, normalize_repo_path, path_matches, relative_to_root
 from .handle_destinations import get_resolver, natural_handle_key
 from .registry import build_registry
 
@@ -127,6 +127,54 @@ def _handles(package: dict[str, Any], blocks: dict[str, dict[str, Any]]) -> list
     return sorted(result, key=natural_handle_key)
 
 
+def _target_blocks(target_path: str, blocks: dict[str, dict[str, Any]]) -> list[str]:
+    """Ids of logical blocks whose path globs match one target path (issue #690 P3)."""
+    return sorted(
+        block_id
+        for block_id, block in blocks.items()
+        if any(
+            path_matches(target_path, str(pattern))
+            for pattern in block.get("path_globs", []) or []
+        )
+    )
+
+
+def target_relations(
+    package: dict[str, Any], blocks: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Per-target documentation relation shared by validate and render (#690 P3/P4).
+
+    Each record binds one target to the logical blocks selected for its own
+    path and the governing handles derived from exactly those blocks. Family
+    (package-level) evidence is reused but never replaces a target record:
+    when the registry carries no block path globs (minimal synthetic
+    registries), every target inherits the package block set.
+    """
+    package_blocks = [str(item) for item in package.get("logical_blocks", [])]
+    globbed = any(
+        bool(blocks[block_id].get("path_globs"))
+        for block_id in package_blocks
+        if block_id in blocks
+    )
+    relations: list[dict[str, Any]] = []
+    for target in package.get("targets", []) or []:
+        relative = normalize_repo_path(str(target.get("path", "")))
+        target_path = normalize_repo_path(str(package.get("root_path", "")) + "/" + relative)
+        selected = (
+            _target_blocks(target_path, blocks) if globbed else list(package_blocks)
+        )
+        scoped = dict(package, logical_blocks=selected)
+        relations.append(
+            {
+                "target": target,
+                "path": target_path,
+                "blocks": selected,
+                "handles": _handles(scoped, blocks),
+            }
+        )
+    return relations
+
+
 def validate(root: Path, registry: dict[str, Any]) -> None:
     root = root.resolve()
     packages = _packages(registry)
@@ -188,6 +236,28 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
             if resolver is None:
                 resolver = get_resolver(root)
             resolver.resolve(handle)
+
+        # Per-target closure (issue #690 P3): every target reconciles its own
+        # inherited AGENTS chain, block selection and governing handles. The
+        # package-level evidence above is reused, never a replacement.
+        for relation in target_relations(package, blocks):
+            target = relation["target"]
+            relative = normalize_repo_path(str(target.get("path", "")))
+            chain = nearest_agents(root, relation["path"])
+            if contract not in chain:
+                raise NavigationError(
+                    f"workspace package target does not inherit {contract}: "
+                    f"{package_root}/{relative}"
+                )
+            if not relation["blocks"]:
+                raise NavigationError(
+                    f"workspace package target matches no logical block: "
+                    f"{package_root}/{relative}"
+                )
+            for handle in relation["handles"]:
+                if resolver is None:
+                    resolver = get_resolver(root)
+                resolver.resolve(handle)
 
 
 def _md_link(label: str, destination: str) -> str:

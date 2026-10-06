@@ -14,7 +14,7 @@ from .common import NavigationError, normalize_repo_path, read_toml, relative_to
 from .handle_destinations import get_resolver, natural_handle_key
 from .package_docs import INDEX_PATH as WORKSPACE_INDEX_PATH
 from .package_docs import PROTOCOL_PATH, family_contract
-from .package_docs import reverse_target_cell, target_cell
+from .package_docs import reverse_target_cell, target_cell, target_relations
 from .registry import build_registry
 
 SCHEMA = "eliot-prototype-doc-index-v1"
@@ -194,6 +194,27 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
             if resolver is None:
                 resolver = get_resolver(root)
             resolver.resolve(handle)
+
+        # Per-target closure (issue #690 P3): every target reconciles its own
+        # inherited AGENTS chain, block selection and governing handles. The
+        # package-level evidence above is reused, never a replacement.
+        for relation in target_relations(package, blocks):
+            target = relation["target"]
+            relative = normalize_repo_path(str(target.get("path", "")))
+            if CONTRACT_PATH not in nearest_agents(root, relation["path"]):
+                raise NavigationError(
+                    "prototype package target does not inherit "
+                    f"{CONTRACT_PATH}: {package_root}/{relative}"
+                )
+            if not relation["blocks"]:
+                raise NavigationError(
+                    "prototype package target matches no logical block: "
+                    f"{package_root}/{relative}"
+                )
+            for handle in relation["handles"]:
+                if resolver is None:
+                    resolver = get_resolver(root)
+                resolver.resolve(handle)
 
 
 def _md_link(label: str, destination: str) -> str:
