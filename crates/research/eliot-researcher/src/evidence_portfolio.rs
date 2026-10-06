@@ -7874,6 +7874,14 @@ fn audit_claim_with_retained(
         }
     } else if stale_hit {
         ClaimOutcome::StaleLimited
+    } else if claim.material && claim.citations.is_empty() && counterevidence.is_empty() {
+        // A material claim recording no citations at all is open accounting, and
+        // that precise finding is decided before the excerpt arm: with no
+        // excerpts offered the excerpt obligation is Unsatisfied by vacuity, and
+        // the vacuous gap must not shadow "records no citations" with
+        // `PartiallySupported`. A claim that cites sources but offers no (or
+        // failing) excerpts still reaches the excerpt arm below.
+        ClaimOutcome::IncompleteAccounting
     } else if excerpt_gap {
         // The cited source satisfies the requirement, but the exact words the
         // claim quotes do not verify against the admitted revision — they are
@@ -7890,20 +7898,17 @@ fn audit_claim_with_retained(
         // It is placed there by this change rather than above the support-gap
         // arms as it was: read in that position it reported a quote failure for
         // a claim whose excerpts were never the thing being audited, replacing a
-        // more specific finding (a citation outside the claim's domain, a claim
-        // recording no citations at all) with the weaker one. The flag itself is
-        // unchanged and still means exactly what it says — the excerpt
-        // obligation was `Unsatisfied` — so `requirements`,
-        // `requirement_outcome` and `releasable_as_supported` read the same
-        // value they did before; only which terminal class names it changed, and
-        // only for a claim that fails some other obligation too.
+        // more specific finding (a citation outside the claim's domain) with the
+        // weaker one. The citationless-claim finding is decided by its own arm
+        // above instead. The flag itself is unchanged and still means exactly
+        // what it says — the excerpt obligation was `Unsatisfied` — so
+        // `requirements`, `requirement_outcome` and `releasable_as_supported`
+        // read the same value they did before; only which terminal class names
+        // it changed, and only for a claim that fails some other obligation too.
         ClaimOutcome::PartiallySupported
-    } else if !unknowns.is_empty()
-        || unfrozen_material_claim
-        || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
-    {
-        // An open material claim, an unfrozen one, or one with preserved unknowns
-        // is not supported. This arm sits after the support gaps so a claim that
+    } else if !unknowns.is_empty() || unfrozen_material_claim {
+        // An unfrozen material claim, or one with preserved unknowns, is not
+        // supported. This arm sits after the support gaps so a claim that
         // is both unsupported and unfrozen reports the support gap, which is the
         // more specific finding.
         ClaimOutcome::IncompleteAccounting

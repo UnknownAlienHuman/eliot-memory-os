@@ -41105,3 +41105,605 @@ mod effect_delivery_current_state_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod bridge_handoff_retirement_2731 {
+    use super::*;
+    use serde_json::json;
+
+    const RETIRE_LINEAGE_2731: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn unscoped_gap_payload(nonce: &str, gap_tag: &str) -> serde_json::Value {
+        json!({
+            "gap_id": gap_tag,
+            "stream_id": "",
+            "start_sequence": 1,
+            "end_sequence": 1,
+            "owner_authority_lineage": RETIRE_LINEAGE_2731,
+            "owner_principal": "principal-2731",
+            "reason_ref": "reason-2731",
+            "staging_connection": "conn-2731",
+            "owner_connection": "conn-2731",
+            "owner_launch_nonce": nonce,
+            "owner_session_epoch": 1,
+        })
+    }
+
+    fn temp_retire_store() -> (RedbRecoveryStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-2731-retire-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = RedbRecoveryStore::open(&path).expect("temp retire store opens");
+        (store, path)
+    }
+
+    #[test]
+    fn owner_table_saturation_breaks_through_with_typed_limit() -> Result<(), OrsError> {
+        // Issue #2731 item 6: the 2048-owner table bound is a measured,
+        // reachable saturation — not an assumed constant. Each unscoped gap
+        // binds its reporter's own occurrence namespace through the real
+        // public gap entry (the same call the :8016 route arm serves).
+        let (store, path) = temp_retire_store();
+        for index in 0..2048 {
+            let tag = format!("2731-{index:05}");
+            let outcome = store.record_bridge_event_gap_checked(&unscoped_gap_payload(
+                &format!("nonce-{tag}"),
+                &format!("gap-{tag}"),
+            ))?;
+            assert_eq!(
+                outcome.get("accepted").and_then(serde_json::Value::as_bool),
+                Some(true),
+                "owner bind {index} of 2048 must stage its gap"
+            );
+        }
+        // The 2049th fresh namespace fails with the typed projection limit
+        // (store.rs `bind_bridge_stream_owner_in`), never with silent loss
+        // and never by evicting a retained owner.
+        let overflow = store.record_bridge_event_gap_checked(&unscoped_gap_payload(
+            "nonce-2731-overflow",
+            "gap-2731-overflow",
+        ));
+        assert!(
+            matches!(overflow, Err(OrsError::ProjectionLimitExceeded)),
+            "the 2049th fresh owner bind must fail with ProjectionLimitExceeded, got {overflow:?}"
+        );
+        // A retained namespace still binds: replaying its gap answers the
+        // stored duplicate instead of a second row.
+        let replay = store.record_bridge_event_gap_checked(&unscoped_gap_payload(
+            "nonce-2731-00000",
+            "gap-2731-00000",
+        ))?;
+        assert_eq!(
+            replay.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a retained owner namespace must replay its gap, not bind twice"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    fn staged_event_payload(sequence: u64, event_tag: &str) -> serde_json::Value {
+        let envelope = json!({
+            "stream_id": "stream-2731",
+            "event_id": event_tag,
+            "sequence": sequence,
+            "producer_id": "producer-2731",
+            "producer_generation": 1,
+            "authority_epoch": {
+                "lineage_id": RETIRE_LINEAGE_2731,
+                "sequence": 1,
+            },
+            "note": format!("delivery-{event_tag}"),
+        });
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&envelope).expect("envelope canonicalizes");
+        let sha = eliot_contracts::sha256_hex(&bytes);
+        json!({
+            "stream_id": "stream-2731",
+            "event_id": event_tag,
+            "sequence": sequence,
+            "producer_id": "producer-2731",
+            "producer_generation": 1,
+            "authority_epoch": format!("{RETIRE_LINEAGE_2731}:1"),
+            "envelope": envelope,
+            "envelope_sha256": sha,
+            "staging_connection": "conn-2731",
+            "privacy_disposition": "redacted",
+            "redacted_classes": ["privacy_authorization_absent"],
+            "redaction_reason": "DECLARED_OUT_OF_SCOPE",
+            "adapter_version": "test-1",
+            "requested_route": "test-route",
+            "owner_principal": "principal-2731",
+            "owner_authority_lineage": RETIRE_LINEAGE_2731,
+            "owner_connection": "conn-2731",
+            "owner_launch_nonce": "nonce-2731",
+            "owner_session_epoch": 1,
+        })
+    }
+
+    #[test]
+    fn records_bound_sheds_with_typed_pressure_and_keeps_serving()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item A1: past 2048 cumulative staged records, fresh
+        // delivery sheds with the typed EventRecords pressure — delivery
+        // continues, nothing is discarded, and stored identities still
+        // replay. One stream keeps every other table under its bound, so
+        // the only reachable refusal is the record budget.
+        let (store, path) = temp_retire_store();
+        for index in 1..=2048_u64 {
+            let tag = format!("evt-2731-{index:05}");
+            store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} of 2048 must succeed, got {error:?}"))?;
+        }
+        let overflow =
+            store.stage_bridge_event_checked(&staged_event_payload(2049, "evt-2731-02049"));
+        let is_records_pressure = matches!(
+            overflow,
+            Err(OrsError::BridgeEventCapacityExceeded(pressure))
+                if pressure.dimension
+                    == eliot_contracts::BridgeEventCapacityDimension::EventRecords
+        );
+        assert!(
+            is_records_pressure,
+            "the 2049th fresh event must shed with EventRecords pressure, got {overflow:?}"
+        );
+        // A stored identity still replays: delivery evidence survives the
+        // saturated table instead of being discarded with it.
+        store
+            .stage_bridge_event_checked(&staged_event_payload(5, "evt-2731-00005"))
+            .map_err(|error| format!("a stored identity must still replay, got {error:?}"))?;
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_retirement_disposes_nothing_and_stays_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 items A3/I5 (negative): an eligible prefix whose
+        // receiving-owner receipt is still missing must not dispose anything.
+        // Three staged events reconcile to RECONCILED with a covering
+        // producer frontier — passing `retirement_eligible` — yet the retire
+        // entry removes zero rows and reports continuation, because the join
+        // flag has no receipt to join (I7.2: a transport acknowledgement
+        // cannot impersonate durable application acceptance).
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=3_u64 {
+            let tag = format!("rel-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        // Producer acknowledgement advances the acked frontier (I7.2: it
+        // is transport/durable evidence, never receiving-owner acceptance —
+        // it compacts nothing and disposes nothing by itself).
+        store.acknowledge_bridge_event_batch(&json!({
+            "items": [{
+                "namespace": namespace,
+                "expected_revision": 1,
+                "expected_incarnation": 1,
+                "sequence": 3,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+            }],
+        }))?;
+        let reconciled =
+            store.reconcile_bridge_event_handoffs_checked(&namespace, 3, &"a".repeat(64))?;
+        assert_eq!(
+            reconciled
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64),
+            Some(3),
+            "all three handoffs must reconcile under the covering frontier"
+        );
+        let retired = store.retire_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            retired.get("retired").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "no handoff may retire without the receiving-owner receipt"
+        );
+        assert_eq!(
+            retired
+                .get("terminalized")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "no terminalization may run without the receiving-owner receipt"
+        );
+        assert_eq!(
+            retired
+                .get("retirement_continuation")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the blocked prefix must resume at its blocker, never strand it"
+        );
+        // A second entry is the same no-op: the obligation stays pending
+        // with its source, projection, and replay identity intact.
+        let again = store.retire_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            again.get("retired").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "retirement without receipt must stay a no-op on repeat"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn repair_restores_handoff_under_original_identity() -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item A4: a handoff lost to a crash (simulated here by
+        // removing its row straight from the table) is restored under the
+        // ORIGINAL identity — same key, sequence, digest — while a namespace
+        // with no staged events gains nothing: repair never synthesizes.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=2_u64 {
+            let tag = format!("rep-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        let lost_key = format!("{namespace}::rep-2731-00001");
+        {
+            let write = store.database.begin_write().map_err(storage)?;
+            {
+                let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                handoffs.remove(lost_key.as_str()).map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+        }
+        let repaired = store.repair_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            repaired.get("repaired").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "repair must restore exactly the lost handoff"
+        );
+        // The restored handoff binds the original identity: acknowledgement
+        // plus reconcile accept both events with no conflict.
+        store.acknowledge_bridge_event_batch(&json!({
+            "items": [{
+                "namespace": namespace,
+                "expected_revision": 1,
+                "expected_incarnation": 1,
+                "sequence": 2,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+            }],
+        }))?;
+        let reconciled =
+            store.reconcile_bridge_event_handoffs_checked(&namespace, 2, &"b".repeat(64))?;
+        assert_eq!(
+            reconciled
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "the restored handoff must reconcile under its original identity"
+        );
+        // A namespace with no staged events gains nothing: repair of a
+        // never-staged (unknown but well-formed) identity refuses with
+        // RecoveryOwnerMismatch instead of synthesizing a handoff, and a
+        // repeat repair with nothing lost restores nothing.
+        let unknown_namespace = "c".repeat(64);
+        assert_ne!(
+            unknown_namespace, namespace,
+            "the unknown probe must not collide with the staged namespace"
+        );
+        let unknown_repair = store.repair_bridge_event_handoffs_checked(&json!({
+            "namespace": unknown_namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }));
+        assert!(
+            matches!(unknown_repair, Err(OrsError::RecoveryOwnerMismatch)),
+            "repair of a never-staged identity must refuse, got {unknown_repair:?}"
+        );
+        let repeat = store.repair_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            repeat.get("repaired").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "repair with nothing lost must restore nothing"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_after_reconcile_answers_duplicate_without_second_application()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item A5: a lost acknowledgement replayed after
+        // reconcile answers the retained duplicate (fresh=false) instead of
+        // applying twice — one record row, the exact receipt preserved.
+        let (store, path) = temp_retire_store();
+        let first = store
+            .stage_bridge_event_checked(&staged_event_payload(1, "rpl-2731-00001"))
+            .map_err(|error| format!("first stage must succeed, got {error:?}"))?;
+        assert_eq!(
+            first.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the first stage of a new identity must be fresh"
+        );
+        let namespace = first
+            .get("owner_namespace")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("staged outcome must carry its owner namespace")?
+            .to_owned();
+        store.acknowledge_bridge_event_batch(&json!({
+            "items": [{
+                "namespace": namespace,
+                "expected_revision": 1,
+                "expected_incarnation": 1,
+                "sequence": 1,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+            }],
+        }))?;
+        let reconciled =
+            store.reconcile_bridge_event_handoffs_checked(&namespace, 1, &"b".repeat(64))?;
+        assert_eq!(
+            reconciled
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the handoff must reconcile under its covering frontier"
+        );
+        let records_before = {
+            let read = store.database.begin_write().map_err(storage)?;
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records.len().map_err(storage)?
+        };
+        // The lost acknowledgement: the producer resubmits the identical
+        // stage after reconcile already covered it.
+        let replay = store
+            .stage_bridge_event_checked(&staged_event_payload(1, "rpl-2731-00001"))
+            .map_err(|error| format!("identical replay must succeed, got {error:?}"))?;
+        assert_eq!(
+            replay.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "the replay must answer duplicate, never a fresh insertion"
+        );
+        assert_eq!(
+            replay
+                .get("disposition")
+                .and_then(serde_json::Value::as_str),
+            Some("duplicate"),
+            "the replay disposition must name the retained duplicate"
+        );
+        assert_eq!(
+            replay
+                .get("envelope_sha256")
+                .and_then(serde_json::Value::as_str),
+            first
+                .get("envelope_sha256")
+                .and_then(serde_json::Value::as_str),
+            "the replay must preserve the exact receipt bytes"
+        );
+        let records_after = {
+            let read = store.database.begin_write().map_err(storage)?;
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records.len().map_err(storage)?
+        };
+        assert_eq!(
+            records_after, records_before,
+            "the replay must add no second record row"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_stays_truthful_and_recovery_legs_usable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Issue #2731 item A6: with the record table full, a fresh stage
+        // sheds with typed EventRecords pressure while a scoped gap on the
+        // same namespace still records — recovery legs stay usable under
+        // saturation, and saturation never masquerades as loss.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=2048_u64 {
+            let tag = format!("prs-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} of 2048 must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        let overflow =
+            store.stage_bridge_event_checked(&staged_event_payload(2049, "prs-2731-02049"));
+        let is_records_pressure = matches!(
+            overflow,
+            Err(OrsError::BridgeEventCapacityExceeded(pressure))
+                if pressure.dimension
+                    == eliot_contracts::BridgeEventCapacityDimension::EventRecords
+        );
+        assert!(
+            is_records_pressure,
+            "the 2049th fresh event must shed with EventRecords pressure, got {overflow:?}"
+        );
+        let gap = store
+            .record_bridge_event_gap_checked(&json!({
+                "gap_id": "gap-2731-pressure",
+                "stream_id": "stream-2731",
+                "start_sequence": 1,
+                "end_sequence": 1,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+                "reason_ref": "reason-2731",
+                "staging_connection": "conn-2731",
+                "owner_connection": "conn-2731",
+                "owner_launch_nonce": "nonce-2731",
+                "owner_session_epoch": 1,
+            }))
+            .map_err(|error| format!("scoped gap on the live stream must record, got {error:?}"))?;
+        assert_eq!(
+            gap.get("accepted").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the scoped gap must be accepted while fresh stages shed"
+        );
+        let gap_owner = {
+            let read = store.database.begin_write().map_err(storage)?;
+            let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            let mut owner = String::new();
+            for entry in gaps.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventGapRow = decode(value.value())?;
+                if row.gap_id == "gap-2731-pressure" {
+                    owner = row.owner_namespace.clone();
+                }
+            }
+            owner
+        };
+        assert_eq!(
+            gap_owner, namespace,
+            "the gap must bind the live stream namespace, not a fresh one"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_scans_without_resetting_or_disposing() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Issue #2731 item I4: maintenance over a stalled cursor (staged
+        // handoffs, no acknowledgement, nothing reconciled) runs its
+        // bounded retire/repair slices, reports continuation, and moves no
+        // cursor sequence backward while disposing nothing.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=3_u64 {
+            let tag = format!("mnt-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        let snapshot =
+            |store: &RedbRecoveryStore| -> Result<(u64, u64, u64, u64, u64, u64), OrsError> {
+                let read = store.database.begin_write().map_err(storage)?;
+                let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+                let cursor: BridgeEventCursorRow = cursors
+                    .get(namespace.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_cursor",
+                        reason: "staged stream must retain its position cursor".to_owned(),
+                    })?;
+                let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                Ok((
+                    cursor.last_observed_sequence,
+                    cursor.last_durable_sequence,
+                    cursor.last_acked_sequence,
+                    cursor.last_compacted_sequence,
+                    records.len().map_err(storage)?,
+                    handoffs.len().map_err(storage)?,
+                ))
+            };
+        let before = snapshot(&store)?;
+        assert_eq!(
+            before.0, 3,
+            "three staged events must observe sequence 3 before maintenance"
+        );
+        let maintained = store.maintain_bridge_event_handoffs_for_owner_checked(&json!({
+            "owner_authority_lineage": RETIRE_LINEAGE_2731,
+            "owner_principal": "principal-2731",
+        }))?;
+        assert_eq!(
+            maintained
+                .get("owner_maintenance_continuation")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "one idle owner must complete with no continuation"
+        );
+        let processed = maintained
+            .get("owners_processed")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("maintenance must report its processed owners")?;
+        let item = processed
+            .iter()
+            .find(|entry| {
+                entry.get("namespace").and_then(serde_json::Value::as_str)
+                    == Some(namespace.as_str())
+            })
+            .ok_or("maintenance must process the staged stream namespace")?;
+        assert!(
+            item.get("retired")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+                && item
+                    .get("repaired")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+            "the per-owner item must carry its bounded retire/repair slice counts"
+        );
+        let after = snapshot(&store)?;
+        assert_eq!(
+            after.0, before.0,
+            "maintenance must never reset last_observed_sequence"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "maintenance must never reset last_durable_sequence"
+        );
+        assert_eq!(
+            after.2, before.2,
+            "maintenance must never reset last_acked_sequence"
+        );
+        assert_eq!(
+            after.3, before.3,
+            "maintenance must never advance last_compacted_sequence"
+        );
+        assert_eq!(after.4, before.4, "maintenance must dispose no record row");
+        assert_eq!(after.5, before.5, "maintenance must dispose no handoff row");
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
