@@ -494,3 +494,84 @@ pub(crate) fn inspect_process_handle(
         })
     })()
 }
+
+/// Failure to bind one PID to a live process identity.
+///
+/// Norm: `docs/architecture/I08-02-independent-observation-routes.md:21`
+/// (attribution needs correlation identity; a PID alone never identifies a
+/// subject, so every unbindable PID is a typed refusal, never an
+/// absent-or-unknown guess).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessIdentityError {
+    /// The PID is zero (System Idle), never an observable subject.
+    InvalidProcessId,
+    /// No live process owns the PID (it exited or was never assigned).
+    ProcessExited,
+    /// Windows denied the process query.
+    AccessDenied,
+    /// The process opened but its start time or image path is unusable.
+    UnusableIdentity,
+    /// Process observation is unavailable on this platform.
+    UnsupportedPlatform,
+    /// Another OS failure prevented a trustworthy classification.
+    ProviderFailed,
+}
+
+impl std::fmt::Display for ProcessIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidProcessId => formatter.write_str("process identity PID is not observable"),
+            Self::ProcessExited => formatter.write_str("no live process owns the observed PID"),
+            Self::AccessDenied => formatter.write_str("process identity observation was denied"),
+            Self::UnusableIdentity => formatter.write_str("process identity is unusable"),
+            Self::UnsupportedPlatform => {
+                formatter.write_str("process identity observation is unsupported")
+            }
+            Self::ProviderFailed => formatter.write_str("process identity observation failed"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessIdentityError {}
+
+/// Binds one PID to its live (PID, creation time, image path) identity.
+///
+/// This is the instance-free counterpart to
+/// [`crate::WindowsPlatform::process_identity`]: the same `unsafe` core
+/// (`inspect_process_identity`) behind a safe signature, for probe paths such
+/// as the Watchdog store-endpoint probe that own no adapter work root to
+/// construct a platform instance from. The returned triple must be compared
+/// whole before a PID is reused: PID reuse without a creation-time match is
+/// a different subject.
+///
+/// # Errors
+///
+/// Returns a typed fail-closed [`ProcessIdentityError`] for PID zero, an
+/// exited or unknown PID, denied queries, unusable identities, and
+/// non-Windows platforms.
+pub fn observe_process_identity(process_id: u32) -> Result<ProcessIdentity, ProcessIdentityError> {
+    if process_id == 0 {
+        return Err(ProcessIdentityError::InvalidProcessId);
+    }
+    #[cfg(windows)]
+    {
+        let identity =
+            inspect_process_identity(process_id).map_err(|error| match error.kind() {
+                std::io::ErrorKind::PermissionDenied => ProcessIdentityError::AccessDenied,
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => {
+                    ProcessIdentityError::ProcessExited
+                }
+                _ => ProcessIdentityError::ProviderFailed,
+            })?;
+        if identity.is_usable() {
+            Ok(identity)
+        } else {
+            Err(ProcessIdentityError::UnusableIdentity)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process_id;
+        Err(ProcessIdentityError::UnsupportedPlatform)
+    }
+}

@@ -4966,3 +4966,30 @@ fn kernel_front_door_proof_binds_process_image_file_and_artifact() {
         Some(file)
     );
 }
+
+#[test]
+fn observe_process_identity_refuses_pid_zero() {
+    assert_eq!(
+        observe_process_identity(0),
+        Err(ProcessIdentityError::InvalidProcessId)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn observe_process_identity_binds_the_current_process() {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let process_id = unsafe { GetCurrentProcessId() };
+    let identity = observe_process_identity(process_id)
+        .unwrap_or_else(|error| panic!("current process unobservable: {error}"));
+    assert_eq!(identity.process_id, process_id);
+    assert!(identity.start_time_100ns > 0);
+    assert!(!identity.image_path.is_empty());
+    assert!(identity.stable_key().starts_with("windows-pid:"));
+}
+
+#[cfg(windows)]
+#[test]
+fn observe_process_identity_refuses_an_unknown_pid() {
+    assert!(observe_process_identity(u32::MAX).is_err());
+}
