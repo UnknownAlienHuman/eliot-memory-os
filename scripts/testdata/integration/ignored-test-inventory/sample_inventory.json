@@ -1,6 +1,6 @@
 {
   "header": {
-    "aggregate_sha256": "c7bef5ff1515fdf9e2917e7464d57bc9ecec47516e9c83186631ef8d253b39e9",
+    "aggregate_sha256": "28cfc733abc8b9e4073d8a32fdfeb2893709b6f75fb86a293f1a2087b3d829c1",
     "artifact_denominator": [
       {
         "executable": "debug/deps/sample_package-1111111111111111",
@@ -72,8 +72,8 @@
     "row_classification_status": "complete",
     "row_count": 1,
     "rule_table": {
-      "sha256": "3e234effc0726d1a33af6dfe96bb02a500b858baf125e827123ebc8d0415e36b",
-      "version": "1.3.0"
+      "sha256": "bad2af4a06b1c3ceaced1189a66693bae9135a5007e990bb9573e331a748f599",
+      "version": "1.4.0"
     },
     "schema": "eliot.integration.ignored-test-inventory.v1",
     "source_count": 1,
@@ -128,7 +128,7 @@
       }
     ],
     "target_denominator_sha256": "5467214bd0687a55dfe1435a32494b593f756361b1c4025222dff0b85611d4ad",
-    "tool_version": "0.6.0",
+    "tool_version": "0.7.0",
     "toolchain": {
       "channel": "1.97.1",
       "commit_hash": "1111111111111111111111111111111111111111",

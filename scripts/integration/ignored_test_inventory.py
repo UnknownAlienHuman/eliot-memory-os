@@ -29,7 +29,7 @@ SCHEMA: Final = "eliot.integration.ignored-test-inventory.v1"
 # TOOL_VERSION binds the emitted artifact identity: any change to the header,
 # row schema, requirement classes, or classification rules bumps it, so two
 # different tool states never certify indistinguishable artifacts (issue #905 W3).
-TOOL_VERSION: Final = "0.6.0"
+TOOL_VERSION: Final = "0.7.0"
 OUTPUT_ROOT: Final = ".eliot"
 _TARGET_ROOT_PARTS: Final = (".eliot", "integration", "ignored-test-inventory", "target")
 _CARGO_METADATA_ARGV: Final = ("cargo", "metadata", "--locked", "--format-version", "1")
@@ -2105,6 +2105,20 @@ _REQUIREMENT_MATCHERS: Final = (
     _NETWORK_MATCHER,
 )
 
+# Literal words of the finite rule table (issue #905 W7/W24/W6). A leftover
+# unit word the table itself names (e.g. "runtime" inside "windows runtime")
+# is table vocabulary, never an unknown provider; anything else uncovered is.
+_TABLE_LITERAL_WORDS: Final = frozenset(
+    word
+    for patterns in (
+        _STORE_PATTERNS, _RUNTIME_PATTERNS, _GIT_PATTERNS,
+        _EXTERNAL_PATTERNS, _NETWORK_PATTERNS,
+    )
+    for pattern in patterns
+    for word in re.findall(r"[a-z_]+", re.sub(r"\\.", "", pattern))
+)
+
+
 # Negation remains local to the clause containing a recognized requirement
 # token. The bounded prefix/suffix windows catch explicit forms such as "no
 # network", "without local SurrealDB", and "network access not required";
@@ -2132,29 +2146,46 @@ _NEGATION_SUFFIX: Final = re.compile(
 # another explicit provider the rule table does not know ("requires SurrealDB
 # and Redis", "requires store with PostgreSQL"): the extra provider is an
 # unleased dependency (I18.32:3), so the composed set keeps UNKNOWN and
-# reconcile leaves the row UNCLASSIFIED. Only conjunction-governed tokens are
-# inspected, so all-known phrases ("requires local authenticated SurrealDB",
-# "... store and governor host runtime") are unaffected. Bare articles after a
-# conjunction ("a", "an", "the") are determiners, never providers. The unit
-# after a conjunction is the whole following phrase, not one word: "runtime
-# windows pipe" is known through its "windows pipe" phrase even though lone
-# "runtime" is no vocabulary word, while "Redis" in "SurrealDB and Redis" is
-# covered by nothing.
+# reconcile leaves the row UNCLASSIFIED. Every unit of a multi-provider
+# enumeration (conjunction- or comma-separated, first unit included) accounts
+# for each word (match span, glue, or table literal), so all-known phrases
+# ("requires local authenticated SurrealDB", "... store and governor host
+# runtime") are unaffected; single declarations keep matcher-only semantics.
+# "runtime" is a table literal (inside "windows runtime"), while "Redis" in
+# "SurrealDB and Redis" is covered by nothing. Bare articles ("a", "an",
+# "the") are determiners, never providers.
 
-_PROVIDER_CONJUNCTION_SPLIT: Final = re.compile(r"\b(?:and|or|with|plus)\b")
+_PROVIDER_UNIT_SPLIT: Final = re.compile(r"\b(?:and|or|with|plus)\b|,")
 _PROVIDER_NON_PROVIDER_WORDS: Final = frozenset({"a", "an", "the"})
+_PROVIDER_GLUE_WORDS: Final = _PROVIDER_NON_PROVIDER_WORDS | frozenset({"requires", "require", "needs", "need"})
 
 
 def _has_unknown_provider(value: str) -> bool:
-    """An explicit additional provider the rule table does not cover."""
-    segments = _PROVIDER_CONJUNCTION_SPLIT.split(value)
-    for segment in segments[1:]:
-        words = segment.strip().split()
-        if not words:
-            continue
-        if all(word in _PROVIDER_NON_PROVIDER_WORDS for word in words):
-            continue
-        if not any(matcher.search(segment) for matcher in _REQUIREMENT_MATCHERS):
+    """An explicit additional provider the rule table does not cover.
+
+    Every unit of a multi-provider enumeration (conjunction- or
+    comma-separated, including the first) must account for each of its words:
+    inside a known-phrase match span, verb/determiner glue, or a literal word
+    of the rule table itself. A leftover word (e.g. "redis" beside generic
+    "database") is an unleased dependency (I18.32:3). Single declarations keep
+    matcher-only semantics, so all-known phrases are unaffected.
+    """
+    units = [unit.strip() for unit in _PROVIDER_UNIT_SPLIT.split(value)]
+    units = [unit for unit in units if unit]
+    if len(units) < 2:
+        return False
+    for unit in units:
+        covered: set[int] = set()
+        for matcher in _REQUIREMENT_MATCHERS:
+            for match in matcher.finditer(unit):
+                covered.update(range(match.start(), match.end()))
+        for token in re.finditer(r"\S+", unit):
+            if set(range(token.start(), token.end())) <= covered:
+                continue
+            if token.group(0) in _PROVIDER_GLUE_WORDS:
+                continue
+            if token.group(0) in _TABLE_LITERAL_WORDS:
+                continue
             return True
     return False
 
@@ -2163,7 +2194,7 @@ def _has_unknown_provider(value: str) -> bool:
 # table"). RULE_TABLE_VERSION is the human identity; RULE_TABLE_SHA256 binds the
 # exact pattern literals, so any rule edit changes the emitted header and
 # aggregate digest even when no row's composed requirement set changes.
-RULE_TABLE_VERSION: Final = "1.3.0"
+RULE_TABLE_VERSION: Final = "1.4.0"
 RULE_TABLE_SHA256: Final = _sha256(
     _canonical_bytes(
         {
@@ -2178,8 +2209,9 @@ RULE_TABLE_SHA256: Final = _sha256(
                 "suffix": _NEGATION_SUFFIX.pattern,
             },
             "provider_conjunction": {
-                "conjunction": _PROVIDER_CONJUNCTION_SPLIT.pattern,
+                "conjunction": _PROVIDER_UNIT_SPLIT.pattern,
                 "non_provider_words": sorted(_PROVIDER_NON_PROVIDER_WORDS),
+                "glue_words": sorted(_PROVIDER_GLUE_WORDS),
             },
         }
     )

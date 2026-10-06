@@ -101,7 +101,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
     def test_closed_descriptor_schema_round_trip(self) -> None:
         """Closed descriptor/schema round trip."""
         self.assertEqual(SCHEMA, "eliot.integration.ignored-test-inventory.v1")
-        self.assertEqual(TOOL_VERSION, "0.6.0")
+        self.assertEqual(TOOL_VERSION, "0.7.0")
 
         fixture_path = self.fixture_dir / "sample_inventory.json"
         self.assertTrue(fixture_path.is_file(), f"missing fixture: {fixture_path}")
@@ -1997,6 +1997,18 @@ class TestIgnoredTestInventory(unittest.TestCase):
             _requirements("requires store and runtime windows pipe"),
             (Requirement.RUNTIME.value, Requirement.STORE.value),
         )
+        # Order, shared-generic-word and comma variants name the same extra
+        # unleased dependency regardless of position or masking vocabulary.
+        for phrase in (
+            "requires Redis and SurrealDB",
+            "requires SurrealDB and Redis database",
+            "requires SurrealDB, Redis",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(
+                    _requirements(phrase),
+                    (Requirement.STORE.value, Requirement.UNKNOWN.value),
+                )
         self.assertEqual(
             _requirements("requires store database"),
             (Requirement.STORE.value,),
@@ -2027,6 +2039,33 @@ class TestIgnoredTestInventory(unittest.TestCase):
         self.assertEqual(len(mixed_rows), 1)
         self.assertEqual(mixed_rows[0].state, RowState.UNCLASSIFIED.value)
         self.assertEqual(mixed_rows[0].remediation_owner, "test-declaration-owner")
+
+        # Comma-enumerated unknown provider, same guarantee end to end.
+        comma_code = """
+        #[test]
+        #[ignore = "requires SurrealDB, Redis"]
+        fn test_store_comma_unknown_provider() {}
+        """
+        comma_tests = _scan_snippet(comma_code)
+        self.assertEqual(len(comma_tests), 1)
+        comma_source = comma_tests[0]
+        self.assertEqual(
+            comma_source.requirements,
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        comma_compiled = CompiledTest(
+            package_id=comma_source.package_id,
+            package_name=comma_source.package_name,
+            target_name=comma_source.target_name,
+            target_kind=comma_source.target_kind,
+            executable="target/debug/deps/lib",
+            executable_digest="ed",
+            test_name=comma_source.test_name,
+        )
+        comma_rows = reconcile([comma_source], [comma_compiled])
+        self.assertEqual(len(comma_rows), 1)
+        self.assertEqual(comma_rows[0].state, RowState.UNCLASSIFIED.value)
+        self.assertEqual(comma_rows[0].remediation_owner, "test-declaration-owner")
 
     # WORK_UNIT_CASE: 905/16
     def test_local_authenticated_surrealdb_version_binary_requirement_maps_to_store(self) -> None:
@@ -4013,7 +4052,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
     def test_exact_repository_owned_disabled_test_entries_and_composed_requirements(self) -> None:
         """Exact repository-owned disabled-test entries and composed Runtime+Store requirements stay in denominator."""
         code = """
-        #[disabled_test = "requires local authenticated surrealdb store and governor host runtime"]
+        #[disabled_test = "requires authenticated surrealdb store and governor host runtime"]
         fn test_disabled_composed() {}
 
         #[eliot_disabled_test = "requires store and runtime windows pipe"]
@@ -4035,6 +4074,10 @@ class TestIgnoredTestInventory(unittest.TestCase):
         by_name = {t.test_name: t for t in tests}
         self.assertNotIn("test_near_miss_singular", by_name)
 
+        # No locality adjective ("local") here by design: inside an
+        # enumeration an unaccountable word keeps UNKNOWN under the
+        # conservative norm (false-clean forbidden, false-unknown safe);
+        # "local"+known-product coverage stays pinned by case 16 instead.
         composed = by_name["test_disabled_composed"]
         self.assertEqual(composed.requirements, (Requirement.RUNTIME.value, Requirement.STORE.value))
 
