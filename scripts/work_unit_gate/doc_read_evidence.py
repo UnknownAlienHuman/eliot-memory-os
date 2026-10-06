@@ -1150,6 +1150,9 @@ ORACLE_REVIEW_FIELDS = (
 ORACLE_PATH_PREFIXES = (".github/workflows/",)
 ORACLE_PATH_FILES = (
     "scripts/verify-github-workflows.py",
+    "scripts/verify-retired-authority-surfaces.py",
+    "scripts/work_unit_gate/__main__.py",
+    "scripts/work_unit_gate/doc_read_evidence.py",
     "scripts/verify.ps1",
     "scripts/verify-dependency-policy.py",
     "scripts/requirements-verification.txt",
@@ -1220,8 +1223,69 @@ def _extract_oracle_review(pr_body: str) -> dict[str, Any]:
     return record
 
 
+# GitHub-attested reviewer authority (issue #1225 AUD2/AUD3). The PR-body
+# block proves WHAT was reviewed; only a GitHub APPROVED review proves WHO
+# accepted it and may authorize an oracle change. The association gate admits
+# GitHub's write-access family (OWNER/MEMBER/COLLABORATOR: the associations
+# GitHub itself defines for accounts with a standing repository relationship);
+# exact permission mapping stays with the branch ruleset. The review must
+# approve the exact PR head commit, so any re-push invalidates it, and the
+# reviewer must differ from the PR author, so a self-approval never counts.
+APPROVED_REVIEW_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+
+
+def _require_oracle_approval(reviews: Any, pr_author: str, pr_head: str) -> dict[str, Any]:
+    """Accept the GitHub APPROVED review authorizing an oracle change."""
+    if type(reviews) is not list or not reviews:
+        _fail(
+            EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH,
+            "oracle change requires a GitHub APPROVED review snapshot (--approval)",
+        )
+    author = pr_author.strip().casefold() if isinstance(pr_author, str) else ""
+    if not author:
+        _fail(
+            EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH,
+            "oracle change requires the trusted PR author login (--pr-author)",
+        )
+    if type(pr_head) is not str or not _FULL_COMMIT.fullmatch(pr_head):
+        _fail(
+            EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH,
+            "oracle approval must bind the full PR head commit id (--pr-head)",
+        )
+    refusal = "no APPROVED review by a distinct admitted reviewer on the exact PR head commit"
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        if review.get("state") != "APPROVED":
+            continue
+        user = review.get("user")
+        login = user.get("login") if isinstance(user, dict) else None
+        if not isinstance(login, str) or not login.strip():
+            continue
+        if login.strip().casefold() == author:
+            refusal = "oracle approval by the candidate author is self-certification"
+            continue
+        association = review.get("author_association")
+        if association not in APPROVED_REVIEW_ASSOCIATIONS:
+            refusal = f"oracle reviewer association {association!r} is not admitted"
+            continue
+        commit = review.get("commit_id")
+        if not isinstance(commit, str) or commit.strip().lower() != pr_head.lower():
+            refusal = "no APPROVED review on the exact PR head commit (a re-push invalidates approval)"
+            continue
+        if not isinstance(review.get("id"), int):
+            continue
+        submitted = review.get("submitted_at")
+        if not isinstance(submitted, str) or not submitted.strip():
+            refusal = "APPROVED review lacks submitted_at evidence"
+            continue
+        return review
+    _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, refusal)
+
+
 def _require_oracle_blind_review(
-    root: Path, pr_body: str, base_tree: str, candidate_tree: str, oracle_changed: Sequence[str]
+    root: Path, pr_body: str, base_tree: str, candidate_tree: str, oracle_changed: Sequence[str],
+    approval_reviews: Any = None, pr_author: str = "", pr_head: str = ""
 ) -> None:
     """Enforce I18.27 for an oracle-touching candidate. Returns None on accept."""
     record = _extract_oracle_review(pr_body)
@@ -1258,6 +1322,7 @@ def _require_oracle_blind_review(
     if record["decision"] != "accept":
         _fail(EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, 'decision must be "accept"')
     _text(record["statement"], "statement", EvidenceFailure.ORACLE_BLIND_REVIEW_MISMATCH, descriptive=True)
+    _require_oracle_approval(approval_reviews, pr_author, pr_head)
 
 
 # ---------------------------------------------------------------------------
@@ -2231,7 +2296,8 @@ def merge_integration_status(root: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def verify(
-    root: Path, base: str, candidate: str, pr_body: str, work_issue: int | None = None
+    root: Path, base: str, candidate: str, pr_body: str, work_issue: int | None = None,
+    approval_reviews: Any = None, pr_author: str = "", pr_head: str = ""
 ) -> dict[str, Any]:
     """Recompute every envelope field for the final merge candidate and compare.
 
@@ -2276,7 +2342,10 @@ def verify(
     # boundary; anything else ignores it entirely.
     oracle_changed = sorted({path for path in changed if _is_oracle_path(path)})
     if oracle_changed:
-        _require_oracle_blind_review(root, pr_body, base_tree, candidate_tree, oracle_changed)
+        _require_oracle_blind_review(
+            root, pr_body, base_tree, candidate_tree, oracle_changed,
+            approval_reviews, pr_author, pr_head,
+        )
 
     if schema == COMPOSED_SCHEMA:
         return _verify_composed(root, shaped, provenance, changed, work_issue)
@@ -3542,6 +3611,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--candidate", help="final candidate commit or tree (the merge result to gate)",
     )
     parser.add_argument("--pr-body", help="path to the pull request body markdown file")
+    parser.add_argument(
+        "--approval", default=None,
+        help="path to the trusted GitHub reviews JSON snapshot (gh api pulls/N/reviews); "
+        "required when the candidate touches the workflow oracle",
+    )
+    parser.add_argument(
+        "--pr-author", default="",
+        help="trusted PR author login from the workflow event (self-approvals never count)",
+    )
+    parser.add_argument(
+        "--pr-head", default="",
+        help="trusted PR head commit SHA from the workflow event (a re-push invalidates approval)",
+    )
     parser.add_argument("--root", default=".", help="repository root holding the candidate history")
     parser.add_argument(
         "--work-issue", default=None,
@@ -3637,7 +3719,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        _emit(verify(root, parsed.base, parsed.candidate, body, work_issue), parsed.json)
+        approval_reviews: Any = None
+        if parsed.approval:
+            try:
+                approval_reviews = json.loads(Path(parsed.approval).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                print(
+                    f"DOC_READ_EVIDENCE_FAIL: {EvidenceFailure.EMPTY_DOCUMENTATION_EVIDENCE.value}: "
+                    f"--approval unreadable ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+                return 1
+        _emit(
+            verify(
+                root, parsed.base, parsed.candidate, body, work_issue,
+                approval_reviews, parsed.pr_author or "", parsed.pr_head or "",
+            ),
+            parsed.json,
+        )
         return 0
     except EvidenceError as exc:
         print(f"DOC_READ_EVIDENCE_FAIL: {exc.code.value}: {exc.detail}", file=sys.stderr)

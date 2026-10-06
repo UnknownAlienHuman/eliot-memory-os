@@ -322,3 +322,134 @@ async fn receipt_publication_race_retries_only_exact_pre_admission_failures()
     assert_eq!(substituted_attempts.load(Ordering::Relaxed), 1);
     Ok(())
 }
+
+#[test]
+fn production_ports_order_refuses_at_first_missing_port() {
+    let ports = FabricPorts {
+        model_registry: std::sync::Arc::new(crate::ProductionModelRegistryPort),
+        peer_channel: std::sync::Arc::new(crate::ProductionPeerChannelPort),
+        swarm_control: std::sync::Arc::new(crate::ProductionSwarmControlPort),
+        admission_authority: std::sync::Arc::new(crate::ProductionAdmissionAuthorityPort),
+        activation_authority: std::sync::Arc::new(crate::ProductionActivationAuthorityPort),
+        dispatch_egress: std::sync::Arc::new(crate::ProductionDispatchEgressPort),
+    };
+    assert_eq!(
+        ports.model_registry.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.peer_channel.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.swarm_control.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.admission_authority.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.activation_authority.interface_binding(),
+        PortBindingState::Missing
+    );
+    assert_eq!(
+        ports.dispatch_egress.interface_binding(),
+        PortBindingState::Missing
+    );
+    let order = [
+        (
+            FabricOperation::ResolveModelRoute,
+            FabricPortId::ModelRegistry,
+        ),
+        (
+            FabricOperation::StageReservation,
+            FabricPortId::AdmissionAuthority,
+        ),
+        (
+            FabricOperation::CommitAdmission,
+            FabricPortId::AdmissionAuthority,
+        ),
+        (FabricOperation::Activate, FabricPortId::ActivationAuthority),
+        (FabricOperation::Emit, FabricPortId::DispatchEgress),
+    ];
+    for (operation, port) in order {
+        assert_eq!(operation.required_port(), port);
+        match crate::blocked_port(port, operation, "work-2567-1".to_owned(), None, None) {
+            FabricError::MissingPrerequisite(residual) => {
+                assert_eq!(residual.port, port);
+                assert_eq!(residual.state, PortBindingState::Missing);
+                assert_eq!(residual.blocked_operation, operation);
+            }
+            other => panic!("expected typed residual for {operation:?}, got {other:?}"),
+        }
+    }
+}
+
+/// Drives the real saga methods on the real production ports and asserts the
+/// refusals come out of them in order (issue #2567 A3 round-2).
+///
+/// The staffing policy staffs only policy worker classes, and the solo slice's
+/// own "provider-fabric-a" vocabulary is not one — so the plan below speaks
+/// the policy's `bulk_implementation` class in all four vocabulary spots
+/// (recipe, role profiles, launch, lane candidates). The SHAPE stays solo (one
+/// lane, fanout one, solo recipe, same admitted fixture otherwise), and only
+/// the capability vocabulary is the policy's: the plan staffs, and what this
+/// proof exercises is the port order, not staffing. `resolve_model_route` is
+/// the drive's first gate (route before planning); `define_and_plan` must
+/// succeed (planning is the composed coordinator owner, never port-gated);
+/// `stage_reservation` then refuses at the admission owner.
+/// Commit/activate/emit are unreachable without owner-affirmed bindings, which
+/// no test can mint: that is the stated residual, not a gap in this proof.
+#[test]
+fn saga_methods_refuse_at_first_missing_port() -> Result<(), Box<dyn std::error::Error>> {
+    const CLASS: &str = "bulk_implementation";
+    let ports = FabricPorts {
+        model_registry: std::sync::Arc::new(crate::ProductionModelRegistryPort),
+        peer_channel: std::sync::Arc::new(crate::ProductionPeerChannelPort),
+        swarm_control: std::sync::Arc::new(crate::ProductionSwarmControlPort),
+        admission_authority: std::sync::Arc::new(crate::ProductionAdmissionAuthorityPort),
+        activation_authority: std::sync::Arc::new(crate::ProductionActivationAuthorityPort),
+        dispatch_egress: std::sync::Arc::new(crate::ProductionDispatchEgressPort),
+    };
+    let (_, mut intake, _) = crate::solo_agent_driver::solo_test_pair();
+    intake.plan.recipe.eligible_route_classes = vec![CLASS.to_owned()];
+    for profile in &mut intake.plan.recipe.role_profiles {
+        profile.allowed_route_classes = vec![CLASS.to_owned()];
+    }
+    intake.plan.launch.allowed_route_classes = vec![CLASS.to_owned()];
+    for lane in &mut intake.plan.lanes {
+        for candidate in &mut lane.route_candidates {
+            candidate.route_classes = vec![CLASS.to_owned()];
+            // The coordinator binds allowed classes against the route's own
+            // provider/host_family/adapter, not the candidate class list, so
+            // the route itself must carry the staffed class.
+            candidate.route.provider = CLASS.to_owned();
+        }
+    }
+    let mut fabric = AgentFabric::new(daemon_coordinator_config()?, ports)?;
+    match fabric.resolve_model_route(&intake.requirements) {
+        Err(FabricError::MissingPrerequisite(residual)) => {
+            assert_eq!(residual.port, FabricPortId::ModelRegistry);
+            assert_eq!(
+                residual.blocked_operation,
+                FabricOperation::ResolveModelRoute
+            );
+            assert_eq!(residual.state, PortBindingState::Missing);
+        }
+        other => panic!("route resolution must refuse at its missing owner, got {other:?}"),
+    }
+    let (definition, _) = fabric.define_and_plan(intake.plan)?;
+    match fabric.stage_reservation(&definition.definition_id) {
+        Err(FabricError::MissingPrerequisite(residual)) => {
+            assert_eq!(residual.port, FabricPortId::AdmissionAuthority);
+            assert_eq!(
+                residual.blocked_operation,
+                FabricOperation::StageReservation
+            );
+            assert_eq!(residual.state, PortBindingState::Missing);
+        }
+        other => panic!("staging must refuse at its missing owner, got {other:?}"),
+    }
+    Ok(())
+}

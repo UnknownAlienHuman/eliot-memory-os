@@ -309,7 +309,14 @@ impl WatchdogSpool {
         path_lease
             .verify_path_identity()
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let database = Database::open(path_lease.path())
+        // A new isolated installation has no spool yet: the retained lease
+        // above materializes an empty file, which `open` would refuse as
+        // invalid data. `create` initializes a missing-or-empty file and
+        // opens an existing valid database without truncating it, so a
+        // first import starts a fresh spool while a replayed import
+        // reopens the retained one. (Issue #955: without this, no fresh
+        // destination could ever import.)
+        let database = Database::create(path_lease.path())
             .map_err(|error| SpoolError::Database(error.to_string()))?;
         let spool = Self {
             database,

@@ -733,6 +733,18 @@ pub const BACKPRESSURE_BRIDGE_RECOVERY_CUTS: BackpressureSignal = BackpressureSi
     "only the requested new recovery cut deferred; all existing recovery windows and cuts retained",
 );
 
+/// A fresh bridge stream-owner bind was refused at the bounded 2048-owner
+/// table capacity (issue #2731): owner rows are retained for the store
+/// lifetime, so new namespaces shed while every retained binding keeps
+/// serving its stream. Recover by presenting the already-bound occurrence
+/// for an admitted namespace, then resubmit the shed frame; the refused bind
+/// staged nothing and evicted no retained owner.
+pub const BACKPRESSURE_BRIDGE_STREAM_OWNERS: BackpressureSignal = BackpressureSignal::new(
+    "bridge-stream-owners",
+    "present the already-bound occurrence for an admitted namespace, then resubmit",
+    "only the fresh owner bind shed and deferred; all retained bindings keep serving",
+);
+
 impl TransportError {
     /// Reports the backpressure dimension attributable at the transport
     /// seam: [`BACKPRESSURE_BRIDGE_DISPATCH`] for [`TransportError::Backpressure`],
@@ -3817,6 +3829,67 @@ mod tests {
     fn uncertainty_never_becomes_delivery_proof() {
         assert_eq!(classify_disconnect(false), DeliveryOutcome::UnknownOutcome);
         assert_eq!(classify_disconnect(true), DeliveryOutcome::UnknownOutcome);
+    }
+
+    #[test]
+    fn every_bridge_dimension_keeps_its_own_signal() {
+        // Issue #2731 item A6 (disposition precision): each bridge
+        // saturation dimension the route arms can shed carries its own
+        // signal from the arm to the driver reply - no two dimensions share
+        // one, and the unattributed dispatch fallback never stands in for
+        // a dimension. The driver retains the admitted session on every one
+        // of these (front_door_driver backpressure arm revokes nothing, so
+        // gap/reconcile/retirement recovery stays usable on the transport).
+        let dimensions = [
+            (BACKPRESSURE_BRIDGE_STREAM_OWNERS, "bridge-stream-owners"),
+            (
+                BACKPRESSURE_BRIDGE_HANDOFF_ROWS,
+                "bridge-event-handoff-rows",
+            ),
+            (BACKPRESSURE_BRIDGE_EVENT_RECORDS, "bridge-event-records"),
+            (BACKPRESSURE_BRIDGE_ENVELOPE_BYTES, "bridge-envelope-bytes"),
+            (
+                BACKPRESSURE_BRIDGE_RECOVERY_WINDOWS,
+                "bridge-recovery-windows",
+            ),
+            (BACKPRESSURE_BRIDGE_RECOVERY_CUTS, "bridge-recovery-cuts"),
+        ];
+        for (signal, dimension) in dimensions {
+            assert_eq!(signal.dimension, dimension);
+            assert_ne!(
+                signal, BACKPRESSURE_BRIDGE_DISPATCH,
+                "{dimension} must not collapse into the dispatch fallback"
+            );
+            let attributed = TransportError::AttributedBackpressure(signal);
+            assert_eq!(
+                attributed.backpressure_signal(),
+                Some(signal),
+                "{dimension} must round-trip its own signal to the driver"
+            );
+        }
+        for (index, (first, _)) in dimensions.iter().enumerate() {
+            for (other, _) in &dimensions[index + 1..] {
+                assert_ne!(first, other, "two bridge dimensions share one signal");
+            }
+        }
+    }
+
+    #[test]
+    fn stream_owner_saturation_names_its_dimension() {
+        // Issue #2731 item 6: the owner-table bind refused at the 2048-owner
+        // bound reports its own dimension — never the generic dispatch one.
+        let signal = BACKPRESSURE_BRIDGE_STREAM_OWNERS;
+        assert_eq!(signal.dimension, "bridge-stream-owners");
+        assert_ne!(signal, BACKPRESSURE_BRIDGE_DISPATCH);
+        let attributed = TransportError::AttributedBackpressure(signal);
+        assert_eq!(attributed.backpressure_signal(), Some(signal));
+        // A bare Backpressure keeps meaning "unattributed at this seam":
+        // producing routes must name their dimension (this const), never
+        // rely on the dispatch fallback for a saturated owner table.
+        assert_eq!(
+            TransportError::Backpressure.backpressure_signal(),
+            Some(BACKPRESSURE_BRIDGE_DISPATCH)
+        );
     }
 
     #[test]

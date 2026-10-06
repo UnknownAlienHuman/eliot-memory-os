@@ -691,6 +691,133 @@ pub(super) fn validate_runtime_binding(
     Ok(())
 }
 
+/// Mints one active binding from a test contour's own registry, running the
+/// full production [`load_runtime_binding`] chain minus exactly one gate.
+///
+/// The skipped gate is the running-image string-equality check
+/// (`current_exe == manifest watchdog image`): it binds the RUNNING process
+/// by design, and no test process can satisfy it — manifest validation
+/// forces the approved `eliot-watchdog.exe` filename while `current_exe` is
+/// always the harness binary. Every other gate runs unchanged: retained Host
+/// root, exact registry child, manifest selection, durable provisioned
+/// authority bound to the selected generation, installer SCM approvals, both
+/// approved-image digest verifications over real bytes, the `SystemService`
+/// profile, and full root retention. Test-only (issue #955 import legs):
+/// no production path calls this, and `from_registry` keeps its gate.
+#[cfg(test)]
+pub(crate) fn test_binding_from_registry(
+    registry_path: PathBuf,
+    bootstrap: &ServiceBootstrapArguments,
+) -> Result<WatchdogRuntimeBinding, SpoolError> {
+    let declared_host_root = bootstrap.host_state_root().ok_or_else(|| {
+        SpoolError::InvalidLease(
+            "Watchdog SCM bootstrap omitted the installer-approved Host state root".to_owned(),
+        )
+    })?;
+    let host_state_root_lease =
+        ProtectedRootLease::open_existing(declared_host_root).map_err(|error| {
+            SpoolError::InvalidLease(format!("Host state root open failed: {error}"))
+        })?;
+    let canonical_host_root = host_state_root_lease.canonical_path().map_err(|error| {
+        SpoolError::InvalidLease(format!("Host state root resolve failed: {error}"))
+    })?;
+    if !windows_paths_equal(&canonical_host_root, declared_host_root) {
+        return Err(SpoolError::InvalidLease(
+            "SCM Host state root is not the exact retained installation root".to_owned(),
+        ));
+    }
+    let expected_registry_path = canonical_host_root.join(INSTALLATION_REGISTRY_FILE_NAME);
+    if !windows_paths_equal(&registry_path, &expected_registry_path) {
+        return Err(SpoolError::InvalidLease(
+            "Watchdog registry path is not the exact approved Host child".to_owned(),
+        ));
+    }
+    let registry = inspect_registry_at(
+        ProtectedRootLease::open_existing(&canonical_host_root).map_err(|error| {
+            SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
+        })?,
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+    .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
+    let selected_manifest =
+        super::runtime_manifest_selection::select_runtime_manifest(&registry, bootstrap)?;
+    let provisioned_supervision_authority = registry
+        .provisioned_supervision_authority_for_generation(&selected_manifest.generation)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
+        .cloned()
+        .ok_or_else(|| {
+            SpoolError::InvalidLease(
+                "selected generation has no durable provisioned supervision authority".to_owned(),
+            )
+        })?;
+    provisioned_supervision_authority
+        .validate()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if provisioned_supervision_authority.candidate_generation
+        != selected_manifest.generation.as_str()
+    {
+        return Err(SpoolError::InvalidLease(
+            "provisioned supervision authority is foreign to the selected generation".to_owned(),
+        ));
+    }
+    let (approved_host_registration, watchdog_request) =
+        super::service_registration_projection::load_approved_service_registrations(
+            &registry,
+            &selected_manifest,
+            bootstrap,
+        )?;
+    let roots = selected_manifest.runtime_launch.runtime_state_roots.clone();
+    let watchdog_image = PathBuf::from(
+        selected_manifest
+            .runtime_launch
+            .watchdog_executable_path
+            .as_str(),
+    );
+    let approved_host_image =
+        super::runtime_manifest_selection::approved_host_artifact_path(&selected_manifest)?;
+    let approved_host_image_lease =
+        ProtectedPathLease::open_existing_absolute(&approved_host_image).map_err(|error| {
+            SpoolError::InvalidLease(format!("approved Host image open failed: {error}"))
+        })?;
+    verify_file_digest_with_lease(
+        &approved_host_image_lease,
+        &selected_manifest.runtime_launch.host_artifact_digest,
+        "runtime_launch.host_artifact_digest",
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    // The manifest-declared Watchdog image bytes are verified against the
+    // approved digest exactly as production does; only the comparison of
+    // that path against THIS process's running image is skipped (see above).
+    verify_file_digest(
+        &watchdog_image,
+        &selected_manifest.runtime_launch.watchdog_artifact_digest,
+        "runtime_launch.watchdog_artifact_digest",
+    )
+    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if roots.profile != InstallationProfile::SystemService {
+        return Err(SpoolError::InvalidLease(
+            "watchdog has no retained file adapter for this installation profile".to_owned(),
+        ));
+    }
+    let mut provider = WindowsRuntimeRootLeaseProvider::for_roots(&roots)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let leases = roots
+        .retain_and_validate(&mut provider)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    Ok(WatchdogRuntimeBinding {
+        host_state_root: canonical_host_root,
+        roots,
+        selected_manifest: Arc::new(selected_manifest),
+        approved_host_image,
+        approved_host_registration,
+        approved_watchdog_registration: watchdog_request,
+        provisioned_supervision_authority,
+        host_state_root_lease: Arc::new(host_state_root_lease),
+        _approved_host_image_lease: Arc::new(approved_host_image_lease),
+        _root_leases: Arc::new(leases),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
