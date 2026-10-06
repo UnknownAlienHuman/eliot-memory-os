@@ -291,6 +291,30 @@ impl RuntimeStateRoots {
             ));
         }
         Self::validate_profile_anchor_path_os(profile, &profile_anchor_root)?;
+        Self::derive_profiled_below_proved_anchor(profile, profile_anchor_root, installation_key)
+    }
+
+    /// Derives profiled roots below an anchor the caller already proved
+    /// through a retained OS lease.
+    ///
+    /// No OS anchor is consulted here: the caller proved the anchor when it
+    /// retained the lease the derivation is computed under (e.g. the
+    /// owner-evidence inspection that admitted the operation deriving a
+    /// destination below the inspected source's own anchor). Re-resolving it
+    /// would duplicate that proof while refusing every override-pinned test
+    /// contour, and it would add no fact the lease proof did not already
+    /// establish. Callers with no such proof must use
+    /// [`Self::derive_profiled`].
+    pub(crate) fn derive_profiled_below_proved_anchor(
+        profile: InstallationProfile,
+        profile_anchor_root: PlatformHandle,
+        installation_key: &str,
+    ) -> Result<Self, InstallationError> {
+        if profile == InstallationProfile::PortableDev {
+            return Err(InstallationError::ProfileViolation(
+                "portable_dev requires derive_portable with one retained root".to_owned(),
+            ));
+        }
         validate_installation_key(installation_key)?;
         let suffix = match profile {
             InstallationProfile::SystemService => {

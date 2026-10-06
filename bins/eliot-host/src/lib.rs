@@ -7067,6 +7067,15 @@ impl HostComposition {
         // and the destination installation all have to be the ones this request
         // names, so a changed same-operation input is a conflict rather than a
         // second allocation.
+        // The source authority is proved and the destination allocated, all
+        // before any effect; every failure in there ran reads only. This runs
+        // BEFORE the writer store below is opened: `OwnerEvidence::inspect`
+        // opens the registry read-only while an open writer `Database` holds
+        // the file's exclusive lock, so the inspection would fail closed on
+        // lock contention every time, deterministically.
+        let (area_lease, allocation, purge_revision, evidence_revision) =
+            self.admit_allocation(body, &facts, max_restore_bytes)?;
+
         let store = self.open_registry_store().map_err(|_| {
             IsolatedPreparationFailure::Refused(
                 "the installation registry could not be opened to admit the isolated destination",
@@ -7076,11 +7085,6 @@ impl HostComposition {
         if Self::check_retained_creation(&store, &capability, &facts)? {
             return Ok(());
         }
-
-        // The source authority is proved and the destination allocated, all
-        // before any effect; every failure in there ran reads only.
-        let (area_lease, allocation, purge_revision, evidence_revision) =
-            self.admit_allocation(body, &facts, max_restore_bytes)?;
 
         // The destination is now actually CREATED, through the installation
         // authority's own create-new owned-directory publication, under the very
@@ -7131,6 +7135,11 @@ impl HostComposition {
             evidence_revision,
             purge_revision,
         )?;
+        // The writer lock releases here: the time-separated re-read below
+        // opens the registry read-only, which the exclusive lock above would
+        // refuse. The final record re-opens the writer afterwards; its CAS
+        // fence still fails closed on any revision movement in between.
+        drop(store);
 
         // A refusal here is still PRE-EFFECT for the destination root: nothing
         // is created by this read, and a publication that committed without a
@@ -7160,10 +7169,19 @@ impl HostComposition {
         // One compare-and-swap writes the admission and its materialisation
         // together, under the registry CAS revision fence and the live exclusive
         // Host owner capability the authority requires of every mutation of its
-        // own projection. Repeating the request with the same pair is idempotent
+        // own projection. The writer re-opens here (released above for the
+        // read-only re-inspection); the fence below still pins the admission
+        // revision, so any concurrent movement fails closed into uncertainty.
+        // Repeating the request with the same pair is idempotent
         // and resolves the same verified destination. A failure here — including
         // a lost CAS response after the write committed — is uncertain rather
         // than a refusal: the root may exist, and only reconciliation can say.
+        let store = self.open_registry_store().map_err(|_| {
+            IsolatedPreparationFailure::EffectUncertain(
+                "the created isolated destination may or may not be retained: reconcile the \
+                 operation to learn whether the creation committed",
+            )
+        })?;
         store
             .record_prepared_isolated_destination_creation(
                 &capability,
@@ -7274,12 +7292,6 @@ impl HostComposition {
             }
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationNotAbsent) => {
                 "the derived destination leaf already exists and is not owned by this operation"
-            }
-            IsolatedDestinationError::Refused(
-                IsolatedDestinationRefusal::ProvisionedSupervisionAuthority,
-            ) => {
-                "the approved target carries a provisioned supervision authority bound to its own \
-                 generation, so no destination generation can be derived from it"
             }
             IsolatedDestinationError::BoundRecord(_) => {
                 "an owner-issued backup record bound to this operation did not validate"

@@ -47,7 +47,7 @@ use crate::isolated_destination::materialise_prepared_isolated_destination;
 use crate::{
     ApprovedGeneration, ApprovedGenerationRegistry, CandidateManifest, FileIdentity,
     InstallationActivationApproval, InstallationError, IsolatedDestinationError,
-    IsolatedDestinationRefusal, PlatformHandle,
+    IsolatedDestinationRefusal, PlatformHandle, SupervisionAuthorityBinding,
 };
 
 /// Purge-ledger revision the ORS owner reports for the admitted preparation.
@@ -426,6 +426,70 @@ fn purge_ledger_revision_is_compared_against_the_live_owner_value() {
     }
     assert!(fixture.registry.prepared_isolated_destinations().is_empty());
     must(record(&mut fixture, &admission, LIVE_PURGE_REVISION));
+}
+
+/// A provisioned (installer-bound) approved source still allocates: the
+/// destination is a new installation the installer has not provisioned yet, so
+/// it carries the Phase-A pending authority under the approved row's own lease
+/// scope rather than the source's transaction-bound receipt.
+///
+/// The running service's active generation is provisioned, so refusing
+/// provisioned sources would refuse every real preparation while Pending-only
+/// tests stayed green. The scope is the owner's own retained value; only the
+/// transaction binding is dropped.
+#[test]
+fn provisioned_source_yields_pending_destination_under_the_same_lease_scope() {
+    let fixture = fixture();
+    let mut provisioned = fixture
+        .registry
+        .generations
+        .iter()
+        .find(|generation| generation.manifest.generation == fixture.active_generation)
+        .expect("the fixture retains its active approved row")
+        .clone();
+    let authority = crate::test_provisioned_supervision_authority(
+        provisioned
+            .manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str(),
+        provisioned.manifest.generation.as_str(),
+        provisioned.manifest.runtime_launch.authority_generation,
+    );
+    let scope = authority.supervision_lease_scope_id.clone();
+    // The source row is consumed as the authority retains it: the derivation
+    // reads its scope and re-binds the approval, and never re-validates the
+    // source launch, so no digest is recomputed here.
+    provisioned.manifest.runtime_launch.supervision_authority =
+        SupervisionAuthorityBinding::Provisioned {
+            authority: Box::new(authority),
+        };
+    provisioned.approval = approval_for(&provisioned.manifest, "approval:958-provisioned-source");
+    let fence = provisioned
+        .manifest
+        .runtime_launch
+        .authority_state_fence
+        .clone();
+    let destination = must(destination_generation_for_admission(
+        &provisioned,
+        &test_handle("operation:958-provisioned-source"),
+        &installation_key("6"),
+        &test_handle("d".repeat(64)),
+        &fence,
+        &test_handle("owner:958-isolated-destination"),
+    ));
+    assert!(
+        !destination.active,
+        "a prepared destination never activates at preparation"
+    );
+    assert_eq!(
+        destination.manifest.runtime_launch.supervision_authority,
+        SupervisionAuthorityBinding::Pending {
+            supervision_lease_scope_id: must(PlatformHandle::new(scope)),
+        },
+        "the destination carries the pending plan state under the approved lease scope, never the source receipt"
+    );
 }
 
 /// The source generation the admission was prepared against is compared against

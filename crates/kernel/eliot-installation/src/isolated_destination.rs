@@ -220,17 +220,6 @@ pub enum IsolatedDestinationRefusal {
     /// not own it.
     #[error("the destination leaf already exists and is not owned by this operation")]
     DestinationNotAbsent,
-
-    /// The approved target carries a provisioned (transaction-bound)
-    /// supervision authority, which names the source generation and cannot be
-    /// re-bound to a new destination generation. A destination is only
-    /// allocated for an approved target whose supervision authority is still
-    /// pending; anything else is refused rather than re-issued.
-    #[error(
-        "the approved target carries a provisioned supervision authority bound to its own \
-         generation, so no destination generation can be derived from it"
-    )]
-    ProvisionedSupervisionAuthority,
 }
 
 /// Durable wire discriminator of one materialised destination root.
@@ -1681,7 +1670,12 @@ fn destination_profiled_roots(
     approved_target: &ApprovedGeneration,
     destination_installation: &PlatformHandle,
 ) -> Result<RuntimeStateRoots, IsolatedDestinationError> {
-    RuntimeStateRoots::derive_profiled(
+    // The anchor is the inspected source's own anchor: the owner-evidence
+    // inspection proved it through a retained protected-root lease before this
+    // admission ran, so the derivation joins paths below that proved anchor
+    // rather than re-resolving the OS contour (which would also refuse the
+    // override-pinned contours every test of this path runs under).
+    RuntimeStateRoots::derive_profiled_below_proved_anchor(
         approved_target.manifest.runtime_launch.profile,
         approved_target
             .manifest
@@ -1709,11 +1703,13 @@ fn destination_profiled_roots(
 /// [`InstallationActivationApproval::from_preparation_parts`], the explicit
 /// preparation issuer, never through the signed activation bridge.
 ///
-/// Fail-closed properties, in order: a provisioned (transaction-bound)
-/// supervision authority names the source generation and cannot be re-bound,
-/// so it refuses; the allocation fence must be a non-zero generation with a
-/// consistent state fence, otherwise the approval's own validation refuses;
-/// the recomputed descriptor digest, the manifest validation and the
+/// Fail-closed properties, in order: the destination carries the Phase-A
+/// pending supervision authority under the approved row's own lease scope,
+/// never the source's transaction-bound receipt (which names the source
+/// generation and cannot be re-bound) — the installer provisions the
+/// destination at cutover; the allocation fence must be a non-zero generation
+/// with a consistent state fence, otherwise the approval's own validation
+/// refuses; the recomputed descriptor digest, the manifest validation and the
 /// approval-against-manifest binding are all re-verified before the row is
 /// returned.
 pub fn destination_generation_for_admission(
@@ -1732,16 +1728,28 @@ pub fn destination_generation_for_admission(
             ),
         ));
     }
-    if !matches!(
+    let mut manifest = approved_target.manifest.clone();
+    // The destination is a new installation the installer has not provisioned
+    // yet, so its authority is the Phase-A plan state under the approved row's
+    // own lease scope — never the source's transaction-bound receipt, which
+    // names the source generation and cannot be re-bound to this one. The
+    // scope is owner-issued (it comes from the approved row this authority
+    // retains); only the transaction binding is dropped. This mirrors the
+    // descriptor-digest reset below: a pending digest pair validates only
+    // beside a pending authority.
+    let pending_scope = PlatformHandle::new(
         approved_target
             .manifest
             .runtime_launch
-            .supervision_authority,
-        SupervisionAuthorityBinding::Pending { .. }
-    ) {
-        return Err(IsolatedDestinationRefusal::ProvisionedSupervisionAuthority.into());
-    }
-    let mut manifest = approved_target.manifest.clone();
+            .supervision_lease_scope_id(),
+    )
+    .map_err(|error| InstallationError::InvalidField {
+        field: "prepared_destination.supervision_lease_scope_id".to_owned(),
+        reason: error.to_string(),
+    })?;
+    manifest.runtime_launch.supervision_authority = SupervisionAuthorityBinding::Pending {
+        supervision_lease_scope_id: pending_scope,
+    };
     manifest.generation = destination_installation.clone();
     manifest.runtime_launch.generation = destination_installation.clone();
     let lineage_bytes = canonical_json_bytes(&(
@@ -1770,6 +1778,16 @@ pub fn destination_generation_for_admission(
         PlatformHandle::new(PHASE_B_PENDING_MARKER).map_err(|error| {
             InstallationError::InvalidField {
                 field: "prepared_destination.authority_descriptor_digest".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    // The Store bootstrap bytes are likewise unpublished for the destination:
+    // the pending pair validates only beside the pending authority above, and
+    // the cutover child publishes both digests before activation.
+    manifest.runtime_launch.store_bootstrap_descriptor_digest =
+        PlatformHandle::new(PHASE_B_PENDING_MARKER).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "prepared_destination.store_bootstrap_descriptor_digest".to_owned(),
                 reason: error.to_string(),
             }
         })?;
@@ -1805,6 +1823,12 @@ pub fn destination_generation_for_admission(
     } else {
         manifest.runtime_launch.runtime_state_roots =
             destination_profiled_roots(approved_target, destination_installation)?;
+        // The I3.1 binding mirrors the exact runtime roots: the destination
+        // runs under the derived roots, not the source's.
+        manifest
+            .runtime_launch
+            .profile_governed_roots
+            .runtime_state_roots = manifest.runtime_launch.runtime_state_roots.clone();
     }
     manifest.runtime_launch = manifest.runtime_launch.with_computed_digest()?;
     manifest.validate()?;

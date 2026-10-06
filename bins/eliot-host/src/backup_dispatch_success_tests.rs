@@ -500,7 +500,43 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
     let registry = store.load().expect("case registry projection");
     drop(store);
     let ors_file = Path::new(roots.kernel_ors_root.as_str()).join("kernel-ors.redb");
-    drop(eliot_ors::RedbRecoveryStore::open(&ors_file).expect("case ORS store"));
+    // The contour's ORS owner applies one purge before any preparation runs:
+    // the admission seam refuses a zero purge-ledger revision (a destination
+    // bound to no purge revision would restore without the current privacy
+    // purge), so the fixture carries the owner's own issued revision rather
+    // than an empty ledger. Entry shape mirrors the ORS owner's own
+    // `purge_ledger_advances_953_18` precedent; only the case-bound ids differ.
+    let ors_store = eliot_ors::RedbRecoveryStore::open(&ors_file).expect("case ORS store");
+    let purge_epoch = eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap_or_else(|_| unreachable!()),
+        std::num::NonZeroU64::new(1).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    let purge = eliot_security_contracts::PurgeLedgerEntry {
+        purge_id: format!("purge-958-dispatch-{unique}"),
+        subject_ref: format!("subject-958-dispatch-{unique}"),
+        scope: format!("scope-958-dispatch-{unique}"),
+        purged_locations: vec![
+            eliot_security_contracts::PurgeLocation::OperationalRecovery,
+            eliot_security_contracts::PurgeLocation::BackupRestorePath,
+        ],
+        tombstone_digest: dispatch_sha256(&format!("tombstone-958-dispatch-{unique}")),
+        state: eliot_security_contracts::PurgeState::Purged,
+        state_fence: eliot_contracts::StateFence::new(
+            purge_epoch,
+            eliot_contracts::ResourceGeneration::genesis(),
+        ),
+        revision: 1,
+    };
+    assert_eq!(
+        ors_store
+            .apply_purge_ledger_entry(&purge)
+            .expect("case purge applies"),
+        1,
+        "the contour's first applied purge consumes ledger revision one"
+    );
+    drop(ors_store);
     let journal_file = case_root.join("host-journal.redb");
     let (journal, host, activation_generation, activation_id, _) =
         super::host_epoch_reopen::open_test_support_epoch(
@@ -988,6 +1024,17 @@ fn dispatch_arm_admits_and_records_destination() {
         row.manifest.generation.as_str(),
         contour.manifest.generation.as_str(),
         "destination row is a new installation, not the source generation"
+    );
+    // The destination is a new installation the installer has not provisioned
+    // yet: its authority is the Phase-A plan state, never the source's
+    // transaction-bound receipt (which names the source generation and cannot
+    // be re-bound).
+    assert!(
+        matches!(
+            row.manifest.runtime_launch.supervision_authority,
+            eliot_installation::SupervisionAuthorityBinding::Pending { .. }
+        ),
+        "destination row carries pending plan authority, not the source receipt"
     );
     let (admission, materialisation) = store
         .read_prepared_isolated_destination_creation(&capability, &operation_id)

@@ -6256,12 +6256,10 @@ fn system_service_installation_roots_validate_below_durable_data() {
         anchor.clone(),
         &"e".repeat(64),
     ));
-    let user_root = test_handle(
-        std::env::temp_dir()
-            .join("eliot-958-user-root")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    let user_root = std::env::temp_dir()
+        .join("eliot-958-user-root")
+        .to_string_lossy()
+        .into_owned();
     let governed = InstallationRoots {
         binding_version: INSTALLATION_ROOT_BINDING_VERSION,
         immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
