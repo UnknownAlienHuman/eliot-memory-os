@@ -604,3 +604,577 @@ impl IpcRejectionParts {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn ipc_normal_saturation_leaves_protected_bytes_available() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(1).expect("normal bytes"),
+            NonZeroU64::new(4).expect("protected bytes"),
+        );
+
+        // Saturating the single normal byte holds the partition: the
+        // permit must stay alive for the saturation proven below.
+        let _held = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-fill-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("first normal byte");
+
+        // Positive control first: the admitted cancellation keeps its
+        // protected path while normal pipe bytes are saturated.
+        let _ctl = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-ctl-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_bytes(), 3);
+
+        // Ordinary traffic observes exhaustion naming the exact
+        // dimension, never a collapsed scalar reason.
+        let err = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-shed-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect_err("saturated normal partition must refuse");
+        assert!(matches!(
+            err,
+            IpcReserveError::NormalCapacityExhausted { bottleneck, .. }
+                if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
+        ));
+    }
+
+    /// The mirror of [`ipc_normal_saturation_leaves_protected_bytes_available`]
+    /// in the other direction (issue #1679): saturating the protected
+    /// partition must never block normal work, and normal work must never
+    /// borrow protected control bytes (I14.3).
+    #[test]
+    fn ipc_protected_saturation_leaves_normal_bytes_available() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(1).expect("bytes"),
+        );
+
+        // Saturating the single protected byte holds the partition: the
+        // permit must stay alive for the saturation proven below.
+        let _held = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-ctl-fill-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("first protected byte");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+
+        // Positive control first: normal work keeps its path open while
+        // the protected partition is saturated.
+        let _norm = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-norm-1",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect("normal path stays open");
+
+        // Control traffic observes exhaustion naming the exact dimension,
+        // never a collapsed scalar reason.
+        let err = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-ctl-2",
+                NonZeroU64::new(1).expect("one byte"),
+            )
+            .expect_err("exhausted protected partition must refuse");
+        assert!(matches!(
+            err,
+            IpcReserveError::ProtectedReserveExhausted { bottleneck, .. }
+                if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
+        ));
+    }
+
+    #[test]
+    fn ipc_exhaustion_response_refuses_an_admitting_partition() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        // The pipe partition still admits the request, so no BUSY
+        // pressure evidence may be manufactured for it.
+        assert_eq!(reserve.available_normal_bytes(), 4);
+
+        // A refusal to admit is not exhaustion: the disposition must
+        // name the partition rather than a fabricated retry directive.
+        let err = reserve
+            .normal_bytes_exhaustion_response(
+                NormalWorkClass::Interactive,
+                "op-pipe-admitting-1",
+                ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("an admitting partition must not produce pressure evidence");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_reserve.normal_pipe_bytes",
+                ..
+            }
+        ));
+    }
+
+    /// The IPC owner must publish a live, validated
+    /// [`BottleneckCapacityProfile`] row for the Kernel profile composition to
+    /// join (issue #1679): the row names exactly
+    /// [`IPC_PIPE_BYTES_BOTTLENECK`] with the frozen-map owner, so the
+    /// composition joins real owner evidence rather than a borrowed or
+    /// invented capacity story.
+    #[test]
+    fn ipc_publish_claimed_row_names_the_frozen_pipe_owner() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        // A returned row already passed `row.validate()`, so a contract
+        // failure here would be the fail-closed property itself.
+        let row = reserve
+            .publish_claimed_row("gen-7", "proof-ipc-1", "ev-ipc-1", "inv-ipc-1")
+            .expect("claimed row");
+
+        assert_eq!(row.bottleneck, IPC_PIPE_BYTES_BOTTLENECK);
+        assert_eq!(row.coverage_state, BottleneckCoverageState::Claimed);
+
+        // The owner string is read from the frozen contract rather than
+        // restated here: a hard-coded owner would only prove that the test
+        // agrees with itself.
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|b| b.bottleneck == IPC_PIPE_BYTES_BOTTLENECK)
+            .expect("frozen pipe owner");
+        assert_eq!(row.owner_ref, bound.owner);
+
+        // This owner claims no emergency partition.
+        assert!(row.emergency_limit.is_none());
+    }
+
+    /// A genuinely saturated normal pipe-byte partition is the positive
+    /// complement of the admitting-partition refusal above (issue #1679):
+    /// exhaustion of this one dimension yields real pressure evidence — a
+    /// [`BackpressureDisposition::Busy`] directive naming
+    /// [`IPC_PIPE_BYTES_BOTTLENECK`] — rather than a generic refusal or a
+    /// claim of global exhaustion.
+    #[test]
+    fn ipc_bytes_exhaustion_response_reports_live_saturation() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        // Saturating the whole normal partition holds the permit alive: the
+        // report below must observe the live saturated state, not a partition
+        // that already released.
+        let _held = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-pipe-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+            )
+            .expect("normal pipe bytes");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+
+        // The request cannot be admitted, so the response must be pressure
+        // evidence for this dimension.
+        let response = reserve
+            .normal_bytes_exhaustion_response(
+                NormalWorkClass::Interactive,
+                "op-pipe-report-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("live saturation must report");
+        assert!(matches!(
+            response.disposition,
+            BackpressureDisposition::Busy
+        ));
+    }
+
+    /// The identity complement of `ipc_bytes_exhaustion_response_reports_live_saturation`:
+    /// that test pins a real `BUSY` report from a live-saturated pipe partition,
+    /// this one pins that the same saturated partition still refuses a blank
+    /// operation identity as
+    /// `InvalidField { field: "ipc_rejection.operation_id" }`, so no report
+    /// carries an identity the contract cannot name (issue #1679 A10).
+    #[test]
+    fn ipc_bytes_response_rejects_malformed_operation_id() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(1).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        // The whole normal pipe partition is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the malformed
+        // identity and not from an unsaturated partition.
+        let _held = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-pipe-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("normal pipe bytes");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+
+        let err = reserve
+            .normal_bytes_exhaustion_response(
+                NormalWorkClass::Interactive,
+                "",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("malformed operation identity must never produce a report");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_rejection.operation_id",
+                ..
+            }
+        ));
+    }
+
+    /// The acquisition-side identity guard: `try_acquire_normal_bytes` refuses a
+    /// blank owner as `InvalidField { field: "ipc_permit.owner" }` on a
+    /// partition with free bytes, so no permit ever binds an identity the
+    /// contract cannot name and capacity is never held anonymously
+    /// (issue #1679 A10; `I14.3` every permit binds owner/operation/epoch).
+    #[test]
+    fn ipc_acquire_rejects_blank_owner() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_normal_bytes(
+            NormalWorkClass::Interactive,
+            "",
+            "op-owner-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank owner must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.owner",
+                ..
+            }
+        ));
+    }
+
+    /// The acquisition-side identity guard: `try_acquire_normal_bytes` refuses a
+    /// blank operation id as `InvalidField { field:
+    /// "ipc_permit.operation_id" }` on a partition with free bytes, so no
+    /// permit ever binds an identity the contract cannot name and capacity is
+    /// never held anonymously (issue #1679 A10; `I14.3` every permit binds
+    /// owner/operation/epoch).
+    #[test]
+    fn ipc_acquire_rejects_blank_operation_id() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_normal_bytes(
+            NormalWorkClass::Interactive,
+            "owner-a",
+            "",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank operation id must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.operation_id",
+                ..
+            }
+        ));
+    }
+
+    /// Publication-side identity guard (issue #1679 A10/W1): a
+    /// claimed row is never published under a blank owner-generation
+    /// reference, so `publish_claimed_row` refuses the blank
+    /// generation as `InvalidField { field:
+    /// "ipc_evidence.owner_generation_ref" }` before any row is
+    /// assembled and the Kernel composition never joins evidence
+    /// whose generation reference the contract cannot name (I14.3;
+    /// rows carry exact generation references per
+    /// `I14-03-control-reserve.md`).
+    #[test]
+    fn ipc_publish_claimed_row_rejects_blank_generation() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        let err = reserve
+            .publish_claimed_row("", "proof-ipc-1", "ev-ipc-1", "inv-ipc-1")
+            .expect_err("blank generation must never publish a row");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_evidence.owner_generation_ref",
+                ..
+            }
+        ));
+    }
+
+    /// Publication-side identity guard (issue #1679 A10/W1): a
+    /// claimed row is never published under a blank evidence
+    /// reference, so `publish_claimed_row` refuses the blank
+    /// evidence ref as `InvalidField { field:
+    /// "ipc_evidence.evidence_ref" }` before any row is assembled
+    /// and the Kernel composition never joins evidence whose
+    /// evidence reference the contract cannot name (I14.3; rows
+    /// carry exact evidence references per
+    /// `I14-03-control-reserve.md`).
+    #[test]
+    fn ipc_publish_claimed_row_rejects_blank_evidence_ref() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        let err = reserve
+            .publish_claimed_row("gen-7", "proof-ipc-1", "", "inv-ipc-1")
+            .expect_err("blank evidence ref must never publish a row");
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_evidence.evidence_ref",
+                ..
+            }
+        ));
+    }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679
+    /// A6/W4): a full protected pipe partition refuses with
+    /// [`IpcReserveError::ProtectedReserveExhausted`] naming exactly
+    /// [`IPC_PIPE_BYTES_BOTTLENECK`], so exhaustion of one dimension is
+    /// never reported as global exhaustion
+    /// (`docs/architecture/I14-03-control-reserve.md`).
+    #[test]
+    fn ipc_protected_bytes_exhaustion_names_bottleneck() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(2).expect("bytes"),
+        );
+
+        // The whole protected partition is consumed and held: the permit
+        // releases on drop, so the refusal below comes from the saturated
+        // partition and not from a partition that already released.
+        let _held = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-pipe-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+            )
+            .expect("protected bytes");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-pipe-shed-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::ProtectedReserveExhausted { bottleneck, .. }
+                if bottleneck == IPC_PIPE_BYTES_BOTTLENECK
+        ));
+    }
+
+    /// The protected-side identity guard (issue #1679 A10):
+    /// `try_acquire_protected_bytes` refuses a blank owner as
+    /// `InvalidField { field: "ipc_permit.owner" }` on a partition
+    /// with free protected bytes, so no control permit ever binds an
+    /// identity the contract cannot name and protected capacity is
+    /// never held anonymously (I14.3: every permit binds
+    /// owner/operation/epoch; control-channel permits are not exempt
+    /// from identity per `docs/architecture/I14-03-control-reserve.md`).
+    /// The normal-side guard test pins only the normal path; a
+    /// regression silently dropping validation on the protected path
+    /// would still pass it while letting control permits be held
+    /// anonymously.
+    #[test]
+    fn ipc_protected_acquire_rejects_blank_owner() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(2).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_protected_bytes(
+            ControlOperationClass::CancelOperation,
+            "",
+            "op-ctl-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank owner must never hold a protected permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.owner",
+                ..
+            }
+        ));
+    }
+
+    /// The protected-side identity guard (issue #1679 A10):
+    /// `try_acquire_protected_bytes` refuses a blank operation id as
+    /// `InvalidField { field: "ipc_permit.operation_id" }` on a
+    /// partition with free protected bytes, so no control permit ever
+    /// binds an identity the contract cannot name and protected
+    /// capacity is never held under an unnameable operation (I14.3:
+    /// every permit binds owner/operation/epoch; control-channel
+    /// permits are not exempt from identity per
+    /// `docs/architecture/I14-03-control-reserve.md`). The neighbour
+    /// pins only the owner check on this path; a regression silently
+    /// dropping the operation-id check would still pass it while
+    /// letting control permits be held under an unnameable operation.
+    #[test]
+    fn ipc_protected_acquire_rejects_blank_operation_id() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(2).expect("bytes"),
+        );
+
+        let Err(err) = reserve.try_acquire_protected_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("blank operation id must never hold a protected permit");
+        };
+        assert!(matches!(
+            err,
+            IpcReserveError::InvalidField {
+                field: "ipc_permit.operation_id",
+                ..
+            }
+        ));
+    }
+
+    /// A fresh reserve reports exactly the partition capacities it was
+    /// configured with (issue #1679): quantities are copied from
+    /// configuration and never derived or scaled at construction, so no
+    /// capacity can be invented while building the reserve (I14.3).
+    #[test]
+    fn ipc_reserve_reports_configured_capacities() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(10).expect("bytes"),
+            NonZeroU64::new(6).expect("bytes"),
+        );
+
+        assert_eq!(reserve.available_normal_bytes(), 10);
+        assert_eq!(reserve.available_protected_bytes(), 6);
+    }
+
+    /// A dropped normal permit returns exactly the bytes it consumed
+    /// (issue #1679): `IpcPermit` has no release method, so `Drop` is
+    /// the only release path, and dropping must restore the normal
+    /// partition to exactly its pre-acquire value so the same bytes
+    /// can be acquired exactly once more (I14.3).
+    #[test]
+    fn ipc_dropped_normal_permit_returns_bytes_exactly_once() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        assert_eq!(reserve.available_normal_bytes(), 4);
+
+        let permit = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-rel-1",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("normal pipe bytes");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+
+        drop(permit);
+        assert_eq!(reserve.available_normal_bytes(), 4);
+
+        let _reacquired = reserve
+            .try_acquire_normal_bytes(
+                NormalWorkClass::Interactive,
+                "owner-a",
+                "op-rel-2",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("dropped bytes return exactly once");
+        assert_eq!(reserve.available_normal_bytes(), 0);
+    }
+
+    /// A dropped protected permit returns exactly the bytes it consumed
+    /// (issue #1679): the `Drop` match routes by capacity class, so dropping
+    /// a protected-bytes permit restores the protected partition - never the
+    /// normal one - and the same bytes can be acquired exactly once more
+    /// (A7 release-at-most-once on the protected path).
+    #[test]
+    fn ipc_dropped_protected_permit_returns_bytes_exactly_once() {
+        let reserve = IpcReserve::partitioned(
+            NonZeroU64::new(4).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        );
+
+        assert_eq!(reserve.available_protected_bytes(), 4);
+
+        let permit = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-prel-1",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("protected pipe bytes");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+
+        drop(permit);
+        assert_eq!(reserve.available_protected_bytes(), 4);
+
+        let _reacquired = reserve
+            .try_acquire_protected_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-prel-2",
+                NonZeroU64::new(4).expect("bytes"),
+            )
+            .expect("dropped bytes return exactly once");
+        assert_eq!(reserve.available_protected_bytes(), 0);
+    }
+}
