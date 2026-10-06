@@ -1583,9 +1583,8 @@ mod model_disposition_tests {
             unusable_model_reason(ModelRouteDisposition::Timeout),
         ];
         for reason in reasons {
-            let reason = match reason {
-                Some(reason) => reason,
-                None => panic!("an unusable outcome must name its reason"),
+            let Some(reason) = reason else {
+                panic!("an unusable outcome must name its reason")
             };
             assert!(
                 !reason.is_empty(),
@@ -1713,9 +1712,8 @@ mod blocked_result_tests {
             Ok(value) => value,
             Err(error) => panic!("stage record must serialize: {error:?}"),
         };
-        let object = match value.as_object() {
-            Some(object) => object,
-            None => panic!("stage record serializes as a JSON object"),
+        let Some(object) = value.as_object() else {
+            panic!("stage record serializes as a JSON object")
         };
         for member in [
             "stage",

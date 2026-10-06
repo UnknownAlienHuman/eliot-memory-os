@@ -85,7 +85,7 @@ use crate::curation_screen_stage::{CurationProtection, CurationProtectionSet, Pr
 use crate::production_orientation::OrientationSupply;
 use crate::{
     CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
-    KernelJobAdmission, OrientationDisposition, SourceCoverage, pulse::PulseStageId,
+    KernelJobAdmission, SourceCoverage,
 };
 
 /// Terminal fail-closed reason when the A-31 fan-in cannot be invoked: the
@@ -1804,6 +1804,7 @@ mod slice_7_native_owner_tests {
     use std::num::NonZeroU64;
 
     use crate::KERNEL_ADMISSION_REQUIRED;
+    use crate::{OrientationDisposition, pulse::PulseStageId};
     use curation_test_support::CurationTestHarness;
     use eliot_contracts::{
         EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, StateFence,
