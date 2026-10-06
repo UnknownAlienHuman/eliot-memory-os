@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$BridgeExe,
+    [string]$ClientDeclaration,
     [string]$McpbCli,
     [string]$PnpmCli,
     [string]$NpxCli
@@ -91,6 +92,43 @@ New-Item -ItemType Directory -Path (Join-Path $targetRoot 'server') -Force | Out
 New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $targetRoot -Recurse -Force
 Copy-Item -LiteralPath $BridgeExe -Destination (Join-Path $targetRoot 'server\eliot-agent-bridge.exe')
+
+# Producer (issue #18 P3): stage the installation-owned client declaration
+# by COPY, never generation — the same rule as the Claude Code front-door
+# staging (crates/eliot-app/src/host_runtime/integration.rs:2723-2741).
+# Resolution order: explicit -ClientDeclaration (caller-supplied
+# installation-owned file wins); otherwise the installation root holding
+# the approved bridge binary (<root>/agent-bridge/client-declaration-v2.json
+# beside <root>/bin/eliot-agent-bridge.exe). Symlinks are refused. Absent
+# everywhere: stage nothing here — the launch-argv gate below refuses the
+# package with the producer contract instead of shipping an unlaunchable
+# bundle.
+$declarationSource = $null
+if ($ClientDeclaration) {
+    $resolvedDeclaration = [System.IO.Path]::GetFullPath($ClientDeclaration)
+    if (-not (Test-Path -LiteralPath $resolvedDeclaration -PathType Leaf)) {
+        throw "explicit -ClientDeclaration is missing: $resolvedDeclaration"
+    }
+    $declarationSource = $resolvedDeclaration
+} else {
+    $bridgeParent = Split-Path $BridgeExe -Parent
+    $installedDeclaration = Join-Path (Split-Path $bridgeParent -Parent) 'agent-bridge\client-declaration-v2.json'
+    if (Test-Path -LiteralPath $installedDeclaration -PathType Leaf) {
+        $declarationSource = [System.IO.Path]::GetFullPath($installedDeclaration)
+    }
+}
+$stagedDeclarationSha256 = $null
+$stagedDeclarationSource = $null
+if ($declarationSource) {
+    if ((Get-Item -LiteralPath $declarationSource).LinkType) {
+        throw "refuse client declaration symlink: $declarationSource"
+    }
+    $stagedDeclarationDir = Join-Path $targetRoot 'server\agent-bridge'
+    New-Item -ItemType Directory -Path $stagedDeclarationDir -Force | Out-Null
+    Copy-Item -LiteralPath $declarationSource -Destination (Join-Path $stagedDeclarationDir 'client-declaration-v2.json') -Force
+    $stagedDeclarationSha256 = Get-Sha256Hex (Join-Path $stagedDeclarationDir 'client-declaration-v2.json')
+    $stagedDeclarationSource = $declarationSource
+}
 
 # The bridge is the only tool/prompt catalog authority. The tracked manifest
 # is deliberately just a package template; materialize the MCPB metadata from
@@ -206,6 +244,8 @@ $buildManifest = [ordered]@{
     manifest_sha256 = Get-Sha256Hex (Join-Path $targetRoot 'manifest.json')
     bridge_sha256 = $bridgeSha256
     bridge_source = $BridgeExe
+    declaration_sha256 = $stagedDeclarationSha256
+    declaration_source = $stagedDeclarationSource
     server_entry_point = $sourceManifest.server.entry_point
     host_argument = 'claude-desktop'
     another_bridge_or_store_bundled = $false
