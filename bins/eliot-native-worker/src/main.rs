@@ -838,15 +838,16 @@ mod tests {
         ActionEnvelopeCarrier, AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope,
         BudgetEnvelope, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
         CapabilityAdmissionPort, CapabilityAdmissionRequest, CapabilityLivenessRequest,
-        CheckpointProviderOutcome, CheckpointReceiptFacts, ClaimAdmissionRequest,
-        DurableCheckpointPort, DurableCheckpointRequest, DurableRequestDecision,
-        EXECUTION_UNIT_SCHEMA_VERSION, EffectAdmissionOutcome, EffectAdmissionRequest,
-        EffectCeiling, EffectKind, JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+        CapacityAuthorityError, CapacityAuthorityLink, CheckpointProviderOutcome,
+        CheckpointReceiptFacts, ClaimAdmissionRequest, DurableCheckpointPort,
+        DurableCheckpointRequest, DurableRequestDecision, EXECUTION_UNIT_SCHEMA_VERSION,
+        EffectAdmissionOutcome, EffectAdmissionRequest, EffectCeiling, EffectKind,
+        JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
         NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId,
         NativeRegistrationId, NativeRenewalId, NativeWorkerClaim, NativeWorkerExecutableBinding,
         NativeWorkerExecutableExpectation, NativeWorkerRegistration, PROTOCOL_VERSION,
-        ProviderFailure, WorkerCore, WorkerEventEnvelope, WorkerFrame, WorkerFrameBody,
-        WorkerHello, WorkerLifecycle,
+        ProcessCapacityAuthority, ProviderFailure, VerifiedCapacityIdentity, WorkerCore,
+        WorkerEventEnvelope, WorkerFrame, WorkerFrameBody, WorkerHello, WorkerLifecycle,
     };
     use eliot_process::SessionId as ProcessSessionId;
     use eliot_process::{
@@ -1873,11 +1874,88 @@ mod tests {
         }
     }
 
+    /// Test-only live owner lookup behind [`ProcessCapacityAuthority`] (issue
+    /// #1701, R2-owners/W5): holds the presented issuance record and replays
+    /// the owner's exact issuance/currency check — exact record, request
+    /// match, owner generation / profile / epoch currency — so the governed
+    /// drive fixtures exercise the enforced live gate instead of its
+    /// absence. The negative taxonomy (released, foreign, stale, swapped) is
+    /// proved in `eliot-native-worker-core` unit tests; this lookup stays
+    /// live because the fixtures never mutate the holding.
+    struct TestCapacityAuthority {
+        record: Mutex<TestAuthorityRecord>,
+    }
+
+    struct TestAuthorityRecord {
+        live: bool,
+        binding: CapacityPermitBinding,
+        owner_generation: ResourceGeneration,
+        profile_id: String,
+        profile_revision: String,
+        epoch: EpochId,
+    }
+
+    impl TestCapacityAuthority {
+        fn mint(permit: &CapacityPermitBinding) -> CapacityAuthorityLink {
+            Arc::new(Self {
+                record: Mutex::new(TestAuthorityRecord {
+                    live: true,
+                    binding: permit.clone(),
+                    owner_generation: permit.capacity_owner_generation_ref,
+                    profile_id: permit.profile_id.clone(),
+                    profile_revision: permit.profile_revision.clone(),
+                    epoch: permit.authority_epoch_ref.clone(),
+                }),
+            })
+        }
+    }
+
+    impl ProcessCapacityAuthority for TestCapacityAuthority {
+        fn verify_live_capacity(
+            &self,
+            binding: &CapacityPermitBinding,
+            request: &CapacityRequest,
+        ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+            let record = lock(&self.record);
+            if !record.live {
+                return Err(CapacityAuthorityError::NotHeld);
+            }
+            if *binding != record.binding {
+                return Err(CapacityAuthorityError::Conflict);
+            }
+            if !binding.matches_request(request) {
+                return Err(CapacityAuthorityError::Conflict);
+            }
+            if binding.capacity_owner_generation_ref != record.owner_generation {
+                return Err(CapacityAuthorityError::StaleOwner);
+            }
+            if binding.profile_id != record.profile_id
+                || binding.profile_revision != record.profile_revision
+            {
+                return Err(CapacityAuthorityError::StaleOwner);
+            }
+            if !binding.authority_epoch_ref.is_same_authority(&record.epoch) {
+                return Err(CapacityAuthorityError::StaleEpoch);
+            }
+            Ok(VerifiedCapacityIdentity {
+                permit_id: binding.permit_id.clone(),
+                operation_id: binding.operation_id.clone(),
+                bottleneck: binding.bottleneck,
+                capacity_owner_ref: binding.capacity_owner_ref.clone(),
+                owner_generation: binding.capacity_owner_generation_ref,
+                profile_id: binding.profile_id.clone(),
+                profile_revision: binding.profile_revision.clone(),
+                authority_epoch: binding.authority_epoch_ref.clone(),
+            })
+        }
+    }
+
     /// Presents the owner-issued process-launch capacity evidence the
-    /// claimed start/recovery gates require (issue #1701, R2-owners/W5).
-    /// Test-only presentation: the dispatch contour will carry the
-    /// owner-issued binding; until then the drive fixtures present the
-    /// matching pair explicitly so the production gate stays enforced.
+    /// claimed start/recovery gates require (issue #1701, R2-owners/W5),
+    /// with its live owner lookup. Test-only presentation: the dispatch
+    /// contour will carry the owner-issued binding; until then the drive
+    /// fixtures present the matching pair explicitly so the production gate
+    /// stays enforced.
     fn admit_drive_capacity(worker: &mut SliceDWorker, operation: &str, epoch_value: &EpochId) {
         let operation_tag = RequestedOperationClass::Normal(NormalWorkClass::Swarm);
         let slot = || CapacityLimit {
@@ -1917,8 +1995,9 @@ mod tests {
             expires_at_ms: 4_000_000_001_000,
             owner_evidence_refs: vec!["test-evidence-1".to_owned()],
         };
+        let authority = TestCapacityAuthority::mint(&permit);
         worker
-            .admit_capacity_permit(&permit, &request, fake_now_ms())
+            .admit_capacity_permit_verified(&permit, &request, fake_now_ms(), authority)
             .unwrap_or_else(|error| panic!("drive capacity admits: {error:?}"));
     }
 

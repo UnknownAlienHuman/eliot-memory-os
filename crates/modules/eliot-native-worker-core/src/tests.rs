@@ -2127,11 +2127,13 @@ fn capacity_permit_for(
     }
 }
 
-fn admit_test_permit(core: &mut TestCore, operation: &str) {
+fn admit_test_permit(core: &mut TestCore, operation: &str) -> Arc<TestCapacityAuthority> {
     let request = capacity_request_for(operation, test_epoch(1), TEST_CAPACITY_REVISION);
     let permit = capacity_permit_for(&request, 1_000, 10_000);
-    core.admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
         .expect("capacity permit");
+    authority
 }
 
 fn capacity_request_with(
@@ -2186,6 +2188,159 @@ fn capacity_permit_for_request(
         issued_at_ms,
         expires_at_ms,
         owner_evidence_refs: vec!["test-evidence-1".to_owned()],
+    }
+}
+
+/// Test-only faithful model of the process-capacity owner behind
+/// [`ProcessCapacityAuthority`] (issue #1701, R2-owners/W5).
+///
+/// Mirrors the owner rules the consumer relies on — one live holding per
+/// instance, exact issuance-record match, request match, and owner
+/// generation / profile / epoch currency — so the consumer-side composition
+/// proofs transfer to the real owner lookup once it is linked. The
+/// production owner lives in `eliot-kernel-core` (owner O3, issue #1679) and
+/// is NOT duplicated here: this model holds no real capacity and starts
+/// nothing; it only answers the port with the same refusal taxonomy.
+struct TestCapacityAuthority {
+    instance: u64,
+    state: Mutex<TestAuthorityState>,
+}
+
+struct TestAuthorityState {
+    live: bool,
+    issuer: u64,
+    record_binding: CapacityPermitBinding,
+    owner_generation: ResourceGeneration,
+    profile_id: String,
+    profile_revision: String,
+    epoch: EpochId,
+    calls: usize,
+}
+
+impl TestCapacityAuthority {
+    fn mint(
+        instance: u64,
+        _request: &CapacityRequest,
+        permit: &CapacityPermitBinding,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            instance,
+            state: Mutex::new(TestAuthorityState {
+                live: true,
+                issuer: instance,
+                record_binding: permit.clone(),
+                owner_generation: permit.capacity_owner_generation_ref,
+                profile_id: permit.profile_id.clone(),
+                profile_revision: permit.profile_revision.clone(),
+                epoch: permit.authority_epoch_ref.clone(),
+                calls: 0,
+            }),
+        })
+    }
+
+    /// Returns a second instance holding a copy of the same issuance record:
+    /// the holding lives elsewhere, so lookups through this instance are
+    /// foreign.
+    fn foreign_copy_of(source: &Arc<Self>, instance: u64) -> Arc<Self> {
+        let state = source.state.lock().expect("authority lock");
+        Arc::new(Self {
+            instance,
+            state: Mutex::new(TestAuthorityState {
+                live: state.live,
+                issuer: state.issuer,
+                record_binding: state.record_binding.clone(),
+                owner_generation: state.owner_generation,
+                profile_id: state.profile_id.clone(),
+                profile_revision: state.profile_revision.clone(),
+                epoch: state.epoch.clone(),
+                calls: 0,
+            }),
+        })
+    }
+
+    fn release(&self) {
+        self.state.lock().expect("authority lock").live = false;
+    }
+
+    fn advance_epoch(&self, epoch: EpochId) {
+        self.state.lock().expect("authority lock").epoch = epoch;
+    }
+
+    fn advance_profile(&self, profile_revision: &str) {
+        self.state.lock().expect("authority lock").profile_revision = profile_revision.to_owned();
+    }
+
+    fn advance_generation(&self, generation: ResourceGeneration) {
+        self.state.lock().expect("authority lock").owner_generation = generation;
+    }
+
+    fn swap_record(&self, permit: &CapacityPermitBinding) {
+        self.state.lock().expect("authority lock").record_binding = permit.clone();
+    }
+
+    fn calls(&self) -> usize {
+        self.state.lock().expect("authority lock").calls
+    }
+}
+
+impl ProcessCapacityAuthority for TestCapacityAuthority {
+    fn verify_live_capacity(
+        &self,
+        binding: &CapacityPermitBinding,
+        request: &CapacityRequest,
+    ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+        let mut state = self.state.lock().expect("authority lock");
+        state.calls += 1;
+        if !state.live {
+            return Err(CapacityAuthorityError::NotHeld);
+        }
+        if state.issuer != self.instance {
+            return Err(CapacityAuthorityError::ForeignOwner);
+        }
+        if *binding != state.record_binding {
+            return Err(CapacityAuthorityError::Conflict);
+        }
+        if !binding.matches_request(request) {
+            return Err(CapacityAuthorityError::Conflict);
+        }
+        if binding.capacity_owner_generation_ref != state.owner_generation {
+            return Err(CapacityAuthorityError::StaleOwner);
+        }
+        if binding.profile_id != state.profile_id
+            || binding.profile_revision != state.profile_revision
+        {
+            return Err(CapacityAuthorityError::StaleOwner);
+        }
+        if !binding.authority_epoch_ref.is_same_authority(&state.epoch) {
+            return Err(CapacityAuthorityError::StaleEpoch);
+        }
+        Ok(VerifiedCapacityIdentity {
+            permit_id: binding.permit_id.clone(),
+            operation_id: binding.operation_id.clone(),
+            bottleneck: binding.bottleneck,
+            capacity_owner_ref: binding.capacity_owner_ref.clone(),
+            owner_generation: binding.capacity_owner_generation_ref,
+            profile_id: binding.profile_id.clone(),
+            profile_revision: binding.profile_revision.clone(),
+            authority_epoch: binding.authority_epoch_ref.clone(),
+        })
+    }
+}
+
+/// Test-only lookup that answers with a fixed identity regardless of the
+/// presented binding: proves the gate carries the presentation identity and
+/// refuses a substituted one.
+struct SpoofedIdentityAuthority {
+    identity: VerifiedCapacityIdentity,
+}
+
+impl ProcessCapacityAuthority for SpoofedIdentityAuthority {
+    fn verify_live_capacity(
+        &self,
+        _binding: &CapacityPermitBinding,
+        _request: &CapacityRequest,
+    ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+        Ok(self.identity.clone())
     }
 }
 
@@ -2730,7 +2885,8 @@ fn capacity_permit_links_new_revision_after_clean_terminal() {
     assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
     let request2 = capacity_request_for("operation-1", test_epoch(1), "rev-8");
     let permit2 = capacity_permit_for(&request2, 1_000, 10_000);
-    core.admit_capacity_permit(&permit2, &request2, TEST_CAPACITY_NOW_MS)
+    let authority2 = TestCapacityAuthority::mint(7, &request2, &permit2);
+    core.admit_capacity_permit_verified(&permit2, &request2, TEST_CAPACITY_NOW_MS, authority2)
         .expect("linked new revision replaces after clean terminal");
     let error = drive_claim(&mut core, &claim).expect_err("executor still unavailable");
     assert!(
@@ -2856,4 +3012,330 @@ fn capacity_permit_generation_change_refuses_recovery_after_restart() {
         ),
         "unexpected refusal: {error:?}"
     );
+}
+
+/// Owner/consumer composition: one live owner-issued reservation drives the
+/// real claimed start to `Ready` (issue #1701, R2-owners/W5).
+///
+/// The permit is issued by the owner model, presented with its live lookup,
+/// and the real `demand_start_claimed` path replays that lookup before the
+/// one recorded P-03 start. The carried identity is the exact issuance
+/// identity, and the lookup ran at both presentation and use.
+#[test]
+fn capacity_authority_live_permit_drives_claimed_start_to_ready() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    let carried = core
+        .retained_capacity_identity()
+        .expect("presentation carries the authenticated identity");
+    assert_eq!(carried.permit_id, permit.permit_id);
+    assert_eq!(carried.operation_id, "operation-1");
+    assert_eq!(carried.bottleneck, CapacityBottleneck::ProcessLaunchSlots);
+    assert_eq!(authority.calls(), 1);
+    drive_claim(&mut core, &claim).expect("live reservation permits the start");
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Ready);
+    assert_eq!(executor_starts(&executor), 1);
+    assert!(authority.calls() >= 2);
+}
+
+/// A data-only presentation (valid evidence, no live lookup) refuses at the
+/// real gate: a detached binding alone is evidence of a past grant, not live
+/// capacity (issue #1701, R2-owners/W5). Zero P-03 starts.
+#[test]
+fn capacity_authority_unlinked_data_only_refuses_at_gate() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    core.admit_capacity_permit(&permit, &request, TEST_CAPACITY_NOW_MS)
+        .expect("self-consistent pair retains as evidence");
+    assert!(core.retained_capacity_identity().is_none());
+    let error = drive_claim(&mut core, &claim).expect_err("unlinked retention must refuse");
+    assert!(
+        matches!(error, WorkerError::AdmissionRejected(ref detail) if detail.contains("capacity_authority_unlinked")),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// A holding that lives at another owner instance refuses: the lookup
+/// holding is not this instance's (issue #1701, R2-owners/W5). Zero P-03
+/// starts.
+#[test]
+fn capacity_authority_foreign_instance_refuses_before_process_start() {
+    let (mut core, executor, _claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let issuer = TestCapacityAuthority::mint(7, &request, &permit);
+    let foreign = TestCapacityAuthority::foreign_copy_of(&issuer, 9);
+    let error = core
+        .admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, foreign)
+        .expect_err("foreign holding must refuse at presentation");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_foreign_owner")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// A released holding refuses at the real gate and keeps the actual owner
+/// exclusion: the retention stays, so overlapping operations stay fenced
+/// until receipted resolution replaces it (issue #1701, R2-owners/W5). Zero
+/// P-03 starts.
+#[test]
+fn capacity_authority_released_permit_refuses_and_retains_exclusion() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    authority.release();
+    let error = drive_claim(&mut core, &claim).expect_err("released holding must refuse");
+    assert!(
+        matches!(error, WorkerError::AdmissionRejected(ref detail) if detail.contains("capacity_permit_released")),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+    let error = drive_claim(&mut core, &claim).expect_err("released holding still refuses");
+    assert!(
+        matches!(error, WorkerError::AdmissionRejected(ref detail) if detail.contains("capacity_permit_released")),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// An unknown outcome keeps the live owner exclusion: overlapping work stays
+/// fenced, and the retained lookup still authenticates the original holding
+/// (issue #1701, R2-owners/W5). Exactly one recorded P-03 start, never a
+/// duplicate.
+#[test]
+fn capacity_authority_unknown_outcome_retains_live_exclusion() {
+    let (mut core, executor, _, _, _) =
+        fixture_with_executor(FakeExecutor::with_start_mode(StartMode::Unknown));
+    let registration = claim_registration();
+    let process = process_request();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let claim_value = claim_for(&registration, &hello_value, &process);
+    let claim = claim_request_for(&registration, &claim_value);
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    let error = drive_claim(&mut core, &claim).expect_err("unknown start outcome");
+    assert!(
+        matches!(error, WorkerError::UnknownOutcome),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(core.lifecycle(), WorkerLifecycle::UnknownOutcome);
+    assert_eq!(executor_starts(&executor), 1);
+    let other_request = capacity_request_for("operation-9", test_epoch(1), TEST_CAPACITY_REVISION);
+    let other_permit = capacity_permit_for(&other_request, 1_000, 10_000);
+    let other_authority = TestCapacityAuthority::mint(7, &other_request, &other_permit);
+    let error = core
+        .admit_capacity_permit_verified(
+            &other_permit,
+            &other_request,
+            TEST_CAPACITY_NOW_MS,
+            other_authority,
+        )
+        .expect_err("other operation stays excluded while unknown");
+    assert!(
+        matches!(
+            error,
+            WorkerError::InvalidRequest("capacity_permit_excluded")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    let error = drive_claim(&mut core, &claim).expect_err("overlapping work stays fenced");
+    assert!(
+        matches!(error, WorkerError::InvalidLifecycle),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 1);
+}
+
+/// A moved authority epoch refuses at the real gate (issue #1701,
+/// R2-owners/W5). Zero P-03 starts.
+#[test]
+fn capacity_authority_stale_epoch_refuses_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    authority.advance_epoch(test_epoch(2));
+    let error = drive_claim(&mut core, &claim).expect_err("moved epoch must refuse");
+    assert!(
+        matches!(error, WorkerError::StaleEpoch),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// A moved compiled profile refuses at the real gate even though the claim
+/// carries no profile identity: the live lookup re-proves profile currency
+/// (issue #1701, R2-owners/W5). Zero P-03 starts.
+#[test]
+fn capacity_authority_stale_profile_refuses_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    authority.advance_profile("rev-8");
+    let error = drive_claim(&mut core, &claim).expect_err("moved profile must refuse");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_stale_owner")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// A moved owner generation refuses at the real gate (issue #1701,
+/// R2-owners/W5). Zero P-03 starts.
+#[test]
+fn capacity_authority_stale_owner_generation_refuses_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    authority.advance_generation(ResourceGeneration::new(10).expect("generation"));
+    let error = drive_claim(&mut core, &claim).expect_err("moved owner generation must refuse");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_stale_owner")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// A substituted issuance record refuses at the real gate: changed content
+/// conflicts instead of replaying (issue #1701, R2-owners/W5). Zero P-03
+/// starts.
+#[test]
+fn capacity_authority_swapped_record_conflicts_before_process_start() {
+    let (mut core, executor, claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    core.admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    let other_request = capacity_request_for("operation-1", test_epoch(1), "rev-8");
+    let other_permit = capacity_permit_for(&other_request, 1_000, 10_000);
+    authority.swap_record(&other_permit);
+    let error = drive_claim(&mut core, &claim).expect_err("swapped record must conflict");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_authority_conflict")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// A lookup that answers for another binding refuses: the gate carries the
+/// presentation identity and requires the identical value at every use
+/// (issue #1701, R2-owners/W5). Zero P-03 starts.
+#[test]
+fn capacity_authority_spoofed_identity_refuses_before_process_start() {
+    let (mut core, executor, _claim) = unpermitted_claimed_parts();
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let spoofed = VerifiedCapacityIdentity {
+        permit_id: "SPOOFED-PERMIT".to_owned(),
+        operation_id: "operation-1".to_owned(),
+        bottleneck: CapacityBottleneck::ProcessLaunchSlots,
+        capacity_owner_ref: "test-capacity-owner".to_owned(),
+        owner_generation: ResourceGeneration::new(9).expect("generation"),
+        profile_id: TEST_CAPACITY_PROFILE.to_owned(),
+        profile_revision: TEST_CAPACITY_REVISION.to_owned(),
+        authority_epoch: test_epoch(1),
+    };
+    let authority: CapacityAuthorityLink = Arc::new(SpoofedIdentityAuthority { identity: spoofed });
+    let error = core
+        .admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority)
+        .expect_err("spoofed identity must refuse at presentation");
+    assert!(
+        matches!(
+            error,
+            WorkerError::AdmissionMismatch("capacity_permit_identity")
+        ),
+        "unexpected refusal: {error:?}"
+    );
+    assert_eq!(executor_starts(&executor), 0);
+}
+
+/// The real recovery path replays the live lookup: a live reservation
+/// recovers without a duplicate start, and a moved epoch refuses before any
+/// replay effect (issue #1701, R2-owners/W5).
+#[test]
+fn capacity_authority_recovery_replays_live_lookup_after_restart() {
+    let (fixture, executor, admission, replay, _) = fixture();
+    let registration = claim_registration();
+    let process = process_request();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let claim_value = claim_for(&registration, &hello_value, &process);
+    let claim = claim_request_for(&registration, &claim_value);
+    let mut first = fixture;
+    let request = capacity_request_for("operation-1", test_epoch(1), TEST_CAPACITY_REVISION);
+    let permit = capacity_permit_for(&request, 1_000, 10_000);
+    let authority = TestCapacityAuthority::mint(7, &request, &permit);
+    first
+        .admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits");
+    block_on(first.demand_start_claimed(
+        claim.clone(),
+        claim_hello("connection-claim-1", "start-claim-1"),
+        process_request(),
+    ))
+    .expect("live reservation permits the start");
+    let mut restarted = WorkerCore::new(
+        Some(executor.clone()),
+        Some(admission.clone()),
+        Some(replay.clone()),
+        Some(replay.clone()),
+        Some(Arc::new(RecordingSink::default())),
+    );
+    restarted
+        .admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect("live owner issuance admits after restart");
+    let recovery = block_on(restarted.recover_after_restart_claimed(
+        claim.clone(),
+        claim_hello("connection-claim-2", "recover-claim-1"),
+        process_request(),
+        0,
+    ))
+    .expect("live reservation permits recovery");
+    assert_eq!(recovery.lifecycle, WorkerLifecycle::Ready);
+    assert_eq!(executor_starts(&executor), 1);
+    authority.advance_epoch(test_epoch(2));
+    let mut fenced = WorkerCore::new(
+        Some(executor.clone()),
+        Some(admission.clone()),
+        Some(replay.clone()),
+        Some(replay.clone()),
+        Some(Arc::new(RecordingSink::default())),
+    );
+    fenced
+        .admit_capacity_permit_verified(&permit, &request, TEST_CAPACITY_NOW_MS, authority.clone())
+        .expect_err("moved epoch refuses at presentation");
+    assert_eq!(executor_starts(&executor), 1);
 }

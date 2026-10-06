@@ -28,7 +28,7 @@ pub use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind,
 };
 use eliot_agent_api::{AuthorizedEffect, ProposedEffect};
-use eliot_contracts::RequestId;
+use eliot_contracts::{EpochId, RequestId, ResourceGeneration};
 use eliot_process::{
     CancellationStatus, EvidenceSinkError, FencingToken, OperationId,
     PROCESS_CONTRACT_SCHEMA_VERSION, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
@@ -225,6 +225,187 @@ fn prepare_execute_call_and_fingerprint(
     serde_json::to_string(&frame.body).map_err(|_| WorkerError::InvalidFrame("fingerprint"))
 }
 
+/// Link to the live process-capacity owner consulted at every claimed launch
+/// and recovery use (issue #1701, R2-owners/W5).
+///
+/// The held reservation lives with the capacity owner (the Host/Kernel
+/// process-tree owner on the control-reserve boundary), never in this core: a
+/// retained [`CapacityPermitBinding`] alone is evidence of a past grant, not
+/// live capacity. The composition root links the current owner lookup here;
+/// the claimed gates replay it at every use and carry its authenticated
+/// identity into the start/recovery decision. No link means no live
+/// authority, and the gates refuse fail-closed.
+///
+/// Norm: `docs/architecture/I14-03-control-reserve.md:3-13,29`.
+pub type CapacityAuthorityLink = Arc<dyn ProcessCapacityAuthority + Send + Sync>;
+
+/// Authenticated owner-mediated capacity lookup for one retained permit
+/// (issue #1701, R2-owners/W5).
+///
+/// This is the consumer side of the process-capacity handoff: the implementor
+/// holds the live owner reservation (or a mediated path to it) and replays
+/// the owner's exact issuance/currency check — same owner instance, exact
+/// issuance record, current owner generation, profile, and epoch — against
+/// the retained binding and request. A detached binding alone is never
+/// sufficient: without the live holding there is nothing to authenticate
+/// against, so the lookup fails closed.
+///
+/// Norm: `docs/architecture/I14-06-durable-work-admission-and-execution-axes.md:49-61`.
+pub trait ProcessCapacityAuthority {
+    /// Replays the authenticated owner lookup for one retained pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapacityAuthorityError::NotHeld`] when no live holding
+    /// remains (released or never acquired),
+    /// [`CapacityAuthorityError::ForeignOwner`] when the holding lives at
+    /// another owner instance, [`CapacityAuthorityError::StaleEpoch`] when the
+    /// authority epoch moved, [`CapacityAuthorityError::StaleOwner`] when the
+    /// owner generation or compiled profile moved,
+    /// [`CapacityAuthorityError::Conflict`] when the binding is not the
+    /// holding's issuance record or does not match its request, or
+    /// [`CapacityAuthorityError::Unavailable`] when the lookup itself cannot
+    /// run (fail-closed, never a pass).
+    fn verify_live_capacity(
+        &self,
+        binding: &CapacityPermitBinding,
+        request: &CapacityRequest,
+    ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError>;
+}
+
+/// Exact identity the capacity owner authenticated for one live permit
+/// (issue #1701, R2-owners/W5).
+///
+/// Carried from the owner's verification into the consumer: the claimed gates
+/// keep this value alongside the retained binding and require the lookup to
+/// return the identical value at every use, so a rotated handle or a
+/// substituted record refuses instead of replaying.
+///
+/// Norm: `docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md:91-99`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedCapacityIdentity {
+    /// Owner-minted permit identity of the live holding.
+    pub permit_id: String,
+    /// Operation identity the holding was granted for.
+    pub operation_id: String,
+    /// Bottleneck dimension the holding was granted from.
+    pub bottleneck: CapacityBottleneck,
+    /// Capacity owner that authenticated the holding.
+    pub capacity_owner_ref: String,
+    /// Owner generation the holding was issued under.
+    pub owner_generation: ResourceGeneration,
+    /// Compiled profile identity the holding is bound to.
+    pub profile_id: String,
+    /// Compiled profile revision the holding is bound to.
+    pub profile_revision: String,
+    /// Authority epoch the holding is fenced against.
+    pub authority_epoch: EpochId,
+}
+
+impl VerifiedCapacityIdentity {
+    /// Returns `true` only when every authenticated field names the presented
+    /// binding. Changed content never matches; it conflicts instead of
+    /// replaying.
+    #[must_use]
+    pub fn binds_permit(&self, binding: &CapacityPermitBinding) -> bool {
+        self.permit_id == binding.permit_id
+            && self.operation_id == binding.operation_id
+            && self.bottleneck == binding.bottleneck
+            && self.capacity_owner_ref == binding.capacity_owner_ref
+            && self.owner_generation == binding.capacity_owner_generation_ref
+            && self.profile_id == binding.profile_id
+            && self.profile_revision == binding.profile_revision
+            && self.authority_epoch == binding.authority_epoch_ref
+    }
+}
+
+/// Typed refusal of one owner-mediated capacity lookup (issue #1701,
+/// R2-owners/W5). Every variant refuses before P-03 starts anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapacityAuthorityError {
+    /// No live holding remains: the permit was released (or never acquired).
+    NotHeld,
+    /// The permit is held at another owner instance.
+    ForeignOwner,
+    /// The authority epoch moved under the retained binding.
+    StaleEpoch,
+    /// The owner generation or compiled profile moved under the retained binding.
+    StaleOwner,
+    /// The binding is not the holding's issuance record, or does not match
+    /// its request: changed content conflicts instead of replaying.
+    Conflict,
+    /// The lookup itself was unavailable. Fail-closed, never a pass.
+    Unavailable,
+}
+
+/// Maps one owner-lookup refusal to the typed gate error.
+fn map_capacity_authority_error(operation_id: &str, error: CapacityAuthorityError) -> WorkerError {
+    match error {
+        CapacityAuthorityError::NotHeld => WorkerError::AdmissionRejected(format!(
+            "capacity_permit_released: no live owner holding remains for operation {operation_id}"
+        )),
+        CapacityAuthorityError::ForeignOwner => {
+            WorkerError::AdmissionMismatch("capacity_permit_foreign_owner")
+        }
+        CapacityAuthorityError::StaleEpoch => WorkerError::StaleEpoch,
+        CapacityAuthorityError::StaleOwner => {
+            WorkerError::AdmissionMismatch("capacity_permit_stale_owner")
+        }
+        CapacityAuthorityError::Conflict => {
+            WorkerError::AdmissionMismatch("capacity_permit_authority_conflict")
+        }
+        CapacityAuthorityError::Unavailable => WorkerError::AdmissionRejected(format!(
+            "capacity_authority_unavailable: owner lookup unavailable for operation {operation_id}"
+        )),
+    }
+}
+
+/// Owner-issued process-launch capacity retained under one operation identity
+/// (issue #1701, R2-owners/W5).
+///
+/// The binding and request are the presented evidence; the verified identity
+/// is what the linked owner lookup authenticated at presentation; the link
+/// is the live lookup the gates replay at every use. A data-only retention
+/// (no link) keeps the evidence but refuses at the gates: without a live
+/// authority there is nothing to authenticate against.
+struct RetainedCapacityPermit {
+    /// Presented owner-issued binding.
+    binding: CapacityPermitBinding,
+    /// Request the binding was issued for.
+    request: CapacityRequest,
+    /// Identity the linked lookup authenticated at presentation, if any.
+    verified_identity: Option<VerifiedCapacityIdentity>,
+    /// Live owner lookup replayed at every use, if any.
+    authority: Option<CapacityAuthorityLink>,
+}
+
+/// Evidence checks shared by both capacity presentations (issue #1701,
+/// R2-owners/W5): a malformed request or binding, a binding that does not
+/// match its request, a non-process-launch bottleneck, or an expired window
+/// refuses before any effect or retention.
+fn check_capacity_pair(
+    permit: &CapacityPermitBinding,
+    request: &CapacityRequest,
+    now_ms: u64,
+) -> Result<(), WorkerError> {
+    request
+        .validate()
+        .map_err(|_| WorkerError::InvalidRequest("capacity_permit_request"))?;
+    permit
+        .validate()
+        .map_err(|_| WorkerError::InvalidRequest("capacity_permit_binding"))?;
+    if !permit.matches_request(request) {
+        return Err(WorkerError::InvalidRequest("capacity_permit_foreign"));
+    }
+    if permit.bottleneck != CapacityBottleneck::ProcessLaunchSlots {
+        return Err(WorkerError::InvalidRequest("capacity_permit_bottleneck"));
+    }
+    if permit.expires_at_ms <= now_ms {
+        return Err(WorkerError::DeadlineExpired);
+    }
+    Ok(())
+}
+
 /// A-13's composition core. Generic P-03 injection is required because the
 /// canonical `ProcessExecutor` async trait deliberately remains provider-neutral.
 pub struct WorkerCore<E, A, R, C> {
@@ -235,7 +416,7 @@ pub struct WorkerCore<E, A, R, C> {
     evidence_sink: Option<Arc<dyn ProcessEvidenceSink>>,
     lifecycle: WorkerLifecycle,
     grant: Option<CapabilityGrant>,
-    capacity_permit: Option<CapacityPermitBinding>,
+    capacity_permit: Option<RetainedCapacityPermit>,
     process_binding: Option<ProcessBindingSnapshot>,
     process_start_receipt: Option<ProcessStartReceipt>,
     connection_id: Option<String>,
@@ -309,7 +490,11 @@ where
     /// `ControlReserveFrontDoor::issue_permit` boundary
     /// (`eliot-kernel-core`); this core never mints a permit, it only
     /// validates a presented binding against the request it was issued for
-    /// and retains the exact bytes. A malformed request or binding, a binding
+    /// and retains the exact pair. A data-only retention carries no live
+    /// lookup, so the claimed launch/recovery gates refuse it fail-closed
+    /// (`capacity_authority_unlinked`): use
+    /// [`WorkerCore::admit_capacity_permit_verified`] to attach the live
+    /// owner lookup. A malformed request or binding, a binding
     /// that does not match its request (foreign operation, owner, epoch, or
     /// profile revision), a binding that names any bottleneck dimension other
     /// than the process-launch path this core starts through, or an expired
@@ -344,23 +529,91 @@ where
         request: &CapacityRequest,
         now_ms: u64,
     ) -> Result<(), WorkerError> {
-        request
-            .validate()
-            .map_err(|_| WorkerError::InvalidRequest("capacity_permit_request"))?;
-        permit
-            .validate()
-            .map_err(|_| WorkerError::InvalidRequest("capacity_permit_binding"))?;
-        if !permit.matches_request(request) {
-            return Err(WorkerError::InvalidRequest("capacity_permit_foreign"));
+        check_capacity_pair(permit, request, now_ms)?;
+        self.retain_capacity_pair(permit, request, None, None)
+    }
+
+    /// Consumes one owner-issued process-launch capacity permit with its live
+    /// owner lookup and retains both under the admitted operation identity
+    /// (issue #1701, R2-owners/W5).
+    ///
+    /// Runs the same evidence checks as
+    /// [`WorkerCore::admit_capacity_permit`], then replays the linked owner
+    /// lookup against the presented pair before retaining anything: a
+    /// released holding, a foreign instance, a stale owner/generation/
+    /// profile/epoch, or a binding that is not the holding's issuance record
+    /// refuses here, before any effect. The authenticated identity is carried
+    /// into the retention and re-proved at every launch/recovery use, so a
+    /// rotated handle or substituted record after presentation refuses instead
+    /// of replaying. While a possible effect is outstanding, unknown outcomes
+    /// keep the actual retained owner exclusion until receipted resolution or
+    /// release replaces it — exactly like the data-only presentation, only
+    /// with the live lookup attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`WorkerCore::admit_capacity_permit`] evidence refusals,
+    /// the typed owner-lookup refusal (`AdmissionRejected`
+    /// `capacity_permit_released` / `capacity_authority_unavailable`,
+    /// `AdmissionMismatch` `capacity_permit_foreign_owner` /
+    /// `capacity_permit_authority_conflict` /
+    /// `capacity_permit_stale_owner`, or `StaleEpoch`), `AdmissionMismatch`
+    /// `capacity_permit_identity` when the lookup answers for another
+    /// binding, or the retention conflict/exclusion refusals.
+    pub fn admit_capacity_permit_verified(
+        &mut self,
+        permit: &CapacityPermitBinding,
+        request: &CapacityRequest,
+        now_ms: u64,
+        authority: CapacityAuthorityLink,
+    ) -> Result<(), WorkerError> {
+        check_capacity_pair(permit, request, now_ms)?;
+        let identity = authority
+            .verify_live_capacity(permit, request)
+            .map_err(|error| map_capacity_authority_error(&permit.operation_id, error))?;
+        if !identity.binds_permit(permit) {
+            return Err(WorkerError::AdmissionMismatch("capacity_permit_identity"));
         }
-        if permit.bottleneck != CapacityBottleneck::ProcessLaunchSlots {
-            return Err(WorkerError::InvalidRequest("capacity_permit_bottleneck"));
-        }
-        if permit.expires_at_ms <= now_ms {
-            return Err(WorkerError::DeadlineExpired);
-        }
+        self.retain_capacity_pair(permit, request, Some(identity), Some(authority))
+    }
+
+    /// Returns the owner-authenticated identity carried for the retained
+    /// permit, if a live lookup authenticated one at presentation.
+    #[must_use]
+    pub fn retained_capacity_identity(&self) -> Option<&VerifiedCapacityIdentity> {
+        self.capacity_permit
+            .as_ref()
+            .and_then(|retained| retained.verified_identity.as_ref())
+    }
+
+    /// Retains one evidence-checked pair under the operation identity.
+    ///
+    /// Re-presenting the identical binding is idempotent (post-restart
+    /// evidence replay): a verified re-presentation additionally refreshes
+    /// the carried identity and link, while a data-only re-presentation keeps
+    /// the existing retention untouched. Changed content for the same
+    /// operation conflicts instead of replaying unless the lifecycle is
+    /// quiescent — the previous attempt reached a proven terminal state, so
+    /// a linked new revision after a clean failure replaces the retention.
+    /// While a possible effect is outstanding, a different operation's permit
+    /// is refused: unknown outcomes retain exclusion.
+    fn retain_capacity_pair(
+        &mut self,
+        permit: &CapacityPermitBinding,
+        request: &CapacityRequest,
+        identity: Option<VerifiedCapacityIdentity>,
+        authority: Option<CapacityAuthorityLink>,
+    ) -> Result<(), WorkerError> {
         if let Some(retained) = self.capacity_permit.as_ref() {
-            if retained == permit {
+            if retained.binding == *permit {
+                if let (Some(identity), Some(authority)) = (identity, authority) {
+                    self.capacity_permit = Some(RetainedCapacityPermit {
+                        binding: permit.clone(),
+                        request: request.clone(),
+                        verified_identity: Some(identity),
+                        authority: Some(authority),
+                    });
+                }
                 return Ok(());
             }
             if matches!(
@@ -370,15 +623,25 @@ where
                     | WorkerLifecycle::Cancelled
                     | WorkerLifecycle::Reconciled
             ) {
-                self.capacity_permit = Some(permit.clone());
+                self.capacity_permit = Some(RetainedCapacityPermit {
+                    binding: permit.clone(),
+                    request: request.clone(),
+                    verified_identity: identity,
+                    authority,
+                });
                 return Ok(());
             }
-            if retained.operation_id == permit.operation_id {
+            if retained.binding.operation_id == permit.operation_id {
                 return Err(WorkerError::IdempotencyConflict);
             }
             return Err(WorkerError::InvalidRequest("capacity_permit_excluded"));
         }
-        self.capacity_permit = Some(permit.clone());
+        self.capacity_permit = Some(RetainedCapacityPermit {
+            binding: permit.clone(),
+            request: request.clone(),
+            verified_identity: identity,
+            authority,
+        });
         Ok(())
     }
 
@@ -390,15 +653,20 @@ where
     /// own worker generation, and stay valid through the claim's deadline;
     /// otherwise the start is refused before P-03 starts anything. A missing
     /// retention refuses as an admission prerequisite (fail-closed: no
-    /// owner-issued process-launch evidence, no effect). The generation and
-    /// window re-checks run at every use — not only at presentation — so a
-    /// generation move or an expired new-start permit after presentation
+    /// owner-issued process-launch evidence, no effect), and so does a
+    /// retention with no linked live lookup (fail-closed: a detached binding
+    /// alone is evidence of a past grant, not live capacity). The generation
+    /// and window re-checks run at every use — not only at presentation — so
+    /// a generation move or an expired new-start permit after presentation
     /// refuses here, and an unknown outcome keeps the actual retained owner
     /// exclusion (not a copied string) until receipted reconciliation or
-    /// release replaces it. A profile-revision move after presentation is not
-    /// checkable here: the claim carries no profile identity, so the
-    /// dispatch contour must bind the current profile revision into the
-    /// admitted material (owner contract, issue #1679).
+    /// release replaces it. The linked lookup additionally re-proves owner,
+    /// generation, profile, and epoch currency at every use, so a
+    /// profile-revision or owner-generation move after presentation refuses
+    /// here even though the claim itself carries no profile identity (the
+    /// data-level profile check stays with the dispatch contour binding the
+    /// current revision into the admitted material: owner contract, issue
+    /// #1679).
     ///
     /// # Errors
     ///
@@ -410,30 +678,51 @@ where
     /// [`WorkerError::DeadlineExpired`] when the retained permit does not
     /// cover the claim's deadline.
     fn require_capacity_for_claim(&self, claim: &NativeWorkerClaim) -> Result<(), WorkerError> {
-        let retained =
-            self.capacity_permit.as_ref().ok_or_else(|| {
-                WorkerError::AdmissionRejected(format!(
-                    "capacity_permit_missing: no owner-issued process-launch permit retained for operation {}",
-                    claim.operation_id.as_str()
-                ))
-            })?;
-        if retained.operation_id != claim.operation_id.as_str() {
+        let retained = self.capacity_permit.as_ref().ok_or_else(|| {
+            WorkerError::AdmissionRejected(format!(
+                "capacity_permit_missing: no owner-issued process-launch permit retained for operation {}",
+                claim.operation_id.as_str()
+            ))
+        })?;
+        let retained_binding = &retained.binding;
+        if retained_binding.operation_id != claim.operation_id.as_str() {
             return Err(WorkerError::AdmissionMismatch("capacity_permit_operation"));
         }
-        if !retained
+        if !retained_binding
             .authority_epoch_ref
             .is_same_authority(&claim.authority_epoch)
         {
             return Err(WorkerError::StaleEpoch);
         }
-        if retained.bottleneck != CapacityBottleneck::ProcessLaunchSlots {
+        if retained_binding.bottleneck != CapacityBottleneck::ProcessLaunchSlots {
             return Err(WorkerError::AdmissionMismatch("capacity_permit_bottleneck"));
         }
-        if retained.requesting_generation_ref.value() != claim.worker_generation {
+        if retained_binding.requesting_generation_ref.value() != claim.worker_generation {
             return Err(WorkerError::AdmissionMismatch("capacity_permit_generation"));
         }
-        if claim.deadline_unix_ms >= retained.expires_at_ms {
+        if claim.deadline_unix_ms >= retained_binding.expires_at_ms {
             return Err(WorkerError::DeadlineExpired);
+        }
+        // Live owner verification at every use (issue #1701, R2-owners/W5):
+        // the retained binding alone is evidence of a past grant, not live
+        // capacity. The linked lookup replays the owner's exact
+        // issuance/currency check against the live holding — a released
+        // holding, a foreign instance, or a moved owner/generation/profile/
+        // epoch refuses here, before P-03 starts anything — and must answer
+        // with the exact identity carried at presentation, so a rotated
+        // handle or substituted record refuses instead of replaying. No
+        // linked lookup means no live authority: fail-closed.
+        let authority = retained.authority.as_ref().ok_or_else(|| {
+            WorkerError::AdmissionRejected(format!(
+                "capacity_authority_unlinked: no live owner lookup is linked for operation {}",
+                claim.operation_id.as_str()
+            ))
+        })?;
+        let identity = authority
+            .verify_live_capacity(retained_binding, &retained.request)
+            .map_err(|error| map_capacity_authority_error(&retained_binding.operation_id, error))?;
+        if retained.verified_identity.as_ref() != Some(&identity) {
+            return Err(WorkerError::AdmissionMismatch("capacity_permit_identity"));
         }
         Ok(())
     }

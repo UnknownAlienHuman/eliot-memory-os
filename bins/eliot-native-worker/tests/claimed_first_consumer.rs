@@ -33,14 +33,15 @@ use eliot_native_worker::{NativeWorker, NativeWorkerError};
 use eliot_native_worker_core::{
     AdmissionLivenessOutcome, AttemptId, AuthorityEnvelope, BudgetEnvelope,
     CapabilityAdmissionFacts, CapabilityAdmissionOutcome, CapabilityAdmissionPort,
-    CapabilityAdmissionRequest, CapabilityLivenessRequest, CheckpointProviderOutcome,
-    CheckpointReceiptFacts, ClaimAdmissionRequest, DurableCheckpointPort, DurableCheckpointRequest,
-    DurableReplayPort, DurableRequestDecision, EXECUTION_UNIT_SCHEMA_VERSION,
-    EffectAdmissionOutcome, EffectAdmissionRequest, EffectCeiling, EffectKind, EventAckReceipt,
-    JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
-    NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId, NativeRegistrationId,
-    NativeRenewalId, NativeWorkerClaim, NativeWorkerExecutableBinding,
-    NativeWorkerExecutableExpectation, NativeWorkerRegistration, PROTOCOL_VERSION, ProviderFailure,
+    CapabilityAdmissionRequest, CapabilityLivenessRequest, CapacityAuthorityError,
+    CapacityAuthorityLink, CheckpointProviderOutcome, CheckpointReceiptFacts,
+    ClaimAdmissionRequest, DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort,
+    DurableRequestDecision, EXECUTION_UNIT_SCHEMA_VERSION, EffectAdmissionOutcome,
+    EffectAdmissionRequest, EffectCeiling, EffectKind, EventAckReceipt, JSON_ENCODING_PROFILE,
+    NATIVE_WORKER_CLAIM_WIRE_VERSION, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+    NativeClaimId, NativeRegistrationId, NativeRenewalId, NativeWorkerClaim,
+    NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation, NativeWorkerRegistration,
+    PROTOCOL_VERSION, ProcessCapacityAuthority, ProviderFailure, VerifiedCapacityIdentity,
     WorkerCore, WorkerError, WorkerEventDraft, WorkerEventEnvelope, WorkerHello, WorkerLifecycle,
 };
 use eliot_process::SessionId as ProcessSessionId;
@@ -372,12 +373,88 @@ impl ClaimedSetup {
     }
 }
 
+/// Test-only live owner lookup behind [`ProcessCapacityAuthority`] (issue
+/// #1701, R2-owners/W5): holds the presented issuance record and replays the
+/// owner's exact issuance/currency check — same instance, exact record,
+/// request match, owner generation / profile / epoch currency — so the
+/// contour proofs exercise the enforced live gate instead of its absence.
+/// The negative taxonomy (released, foreign, stale, swapped) is proved in
+/// `eliot-native-worker-core` unit tests; this lookup stays live because the
+/// fixture never mutates the holding.
+struct TestCapacityAuthority {
+    record: Mutex<TestAuthorityRecord>,
+}
+
+struct TestAuthorityRecord {
+    live: bool,
+    binding: eliot_runtime_contracts::CapacityPermitBinding,
+    owner_generation: ResourceGeneration,
+    profile_id: String,
+    profile_revision: String,
+    epoch: EpochId,
+}
+
+impl TestCapacityAuthority {
+    fn mint(permit: &eliot_runtime_contracts::CapacityPermitBinding) -> CapacityAuthorityLink {
+        Arc::new(Self {
+            record: Mutex::new(TestAuthorityRecord {
+                live: true,
+                binding: permit.clone(),
+                owner_generation: permit.capacity_owner_generation_ref,
+                profile_id: permit.profile_id.clone(),
+                profile_revision: permit.profile_revision.clone(),
+                epoch: permit.authority_epoch_ref.clone(),
+            }),
+        })
+    }
+}
+
+impl ProcessCapacityAuthority for TestCapacityAuthority {
+    fn verify_live_capacity(
+        &self,
+        binding: &eliot_runtime_contracts::CapacityPermitBinding,
+        request: &eliot_runtime_contracts::CapacityRequest,
+    ) -> Result<VerifiedCapacityIdentity, CapacityAuthorityError> {
+        let record = lock(&self.record);
+        if !record.live {
+            return Err(CapacityAuthorityError::NotHeld);
+        }
+        if *binding != record.binding {
+            return Err(CapacityAuthorityError::Conflict);
+        }
+        if !binding.matches_request(request) {
+            return Err(CapacityAuthorityError::Conflict);
+        }
+        if binding.capacity_owner_generation_ref != record.owner_generation {
+            return Err(CapacityAuthorityError::StaleOwner);
+        }
+        if binding.profile_id != record.profile_id
+            || binding.profile_revision != record.profile_revision
+        {
+            return Err(CapacityAuthorityError::StaleOwner);
+        }
+        if !binding.authority_epoch_ref.is_same_authority(&record.epoch) {
+            return Err(CapacityAuthorityError::StaleEpoch);
+        }
+        Ok(VerifiedCapacityIdentity {
+            permit_id: binding.permit_id.clone(),
+            operation_id: binding.operation_id.clone(),
+            bottleneck: binding.bottleneck,
+            capacity_owner_ref: binding.capacity_owner_ref.clone(),
+            owner_generation: binding.capacity_owner_generation_ref,
+            profile_id: binding.profile_id.clone(),
+            profile_revision: binding.profile_revision.clone(),
+            authority_epoch: binding.authority_epoch_ref.clone(),
+        })
+    }
+}
+
 /// Presents the owner-capacity evidence the claimed gates require (issue
 /// #1701, R2-owners/W5): a self-consistent process-launch pair bound to the
 /// fixture claim's operation identity, authority epoch, and worker
-/// generation. Test-only presentation — the production dispatch contour
-/// carries the owner-issued pair — so the contour proofs exercise the
-/// enforced gate instead of its absence.
+/// generation, presented with its live owner lookup. Test-only presentation —
+/// the production dispatch contour carries the owner-issued pair — so the
+/// contour proofs exercise the enforced gate instead of its absence.
 fn present_test_capacity(
     core: &mut WorkerCore<WindowsProcessExecutor, TestAdmission, TestReplay, TestReplay>,
     claim: &NativeWorkerClaim,
@@ -425,7 +502,8 @@ fn present_test_capacity(
         expires_at_ms: 10_000,
         owner_evidence_refs: vec!["test-evidence-1".to_owned()],
     };
-    core.admit_capacity_permit(&permit, &request, 5_000)
+    let authority = TestCapacityAuthority::mint(&permit);
+    core.admit_capacity_permit_verified(&permit, &request, 5_000, authority)
         .unwrap_or_else(|error| panic!("claimed-first-consumer capacity admits: {error:?}"));
 }
 

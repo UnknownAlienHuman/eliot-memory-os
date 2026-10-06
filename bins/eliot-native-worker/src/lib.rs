@@ -156,6 +156,25 @@ where
             .map_err(NativeWorkerError::from)
     }
 
+    /// Consumes one owner-issued process-launch capacity permit with its live
+    /// owner lookup into the core retention (issue #1701, R2-owners/W5). The
+    /// claimed start and claimed recovery gates replay the linked lookup at
+    /// every use; see
+    /// [`eliot_native_worker_core::WorkerCore::admit_capacity_permit_verified`].
+    /// The data-only [`NativeWorker::admit_capacity_permit`] keeps the
+    /// evidence but refuses at the gates until a live lookup is linked.
+    pub fn admit_capacity_permit_verified(
+        &mut self,
+        permit: &CapacityPermitBinding,
+        request: &CapacityRequest,
+        now_ms: u64,
+        authority: eliot_native_worker_core::CapacityAuthorityLink,
+    ) -> Result<(), NativeWorkerError> {
+        self.core
+            .admit_capacity_permit_verified(permit, request, now_ms, authority)
+            .map_err(NativeWorkerError::from)
+    }
+
     /// Performs the claimed admission and process start handshake for one
     /// exact Kernel-issued claim presentation (T2-S05 first consumer).
     ///
