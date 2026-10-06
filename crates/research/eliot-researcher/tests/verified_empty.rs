@@ -207,7 +207,7 @@ fn verified_empty_account_receipts_without_proof() {
 // refuses assembly fail-closed; an acyclic graph assembles. Unknown lineage
 // stays unknown through the independence axes, never counted as support.
 fn w4_record(handle: &str, cites: Vec<String>) -> SourceRecord {
-    SourceRecord::new(SourceRecordParams {
+    match SourceRecord::new(SourceRecordParams {
         handle: handle.to_owned(),
         class: SourceClass::Paper,
         title: format!("title {handle}"),
@@ -244,8 +244,10 @@ fn w4_record(handle: &str, cites: Vec<String>) -> SourceRecord {
             excerpt_digest: DIGEST_VE.to_owned(),
         }],
         data_role: "primary".to_owned(),
-    })
-    .expect("w4 source record")
+    }) {
+        Ok(record) => record,
+        Err(error) => panic!("w4 source record: {error:?}"),
+    }
 }
 
 fn w4_admissible(
@@ -306,8 +308,10 @@ fn citation_closure_holds_acyclic_assembly() {
         w4_admissible(&profile, w4_record("head", vec!["tail".to_owned()])),
         w4_admissible(&profile, w4_record("tail", Vec::new())),
     ];
-    let portfolio =
-        SourcePortfolio::assemble(&profile.inquiry_id, &profile, &chained).expect("acyclic graph");
+    let portfolio = match SourcePortfolio::assemble(&profile.inquiry_id, &profile, &chained) {
+        Ok(portfolio) => portfolio,
+        Err(error) => panic!("acyclic graph must assemble: {error:?}"),
+    };
     assert_eq!(portfolio.primary_sources.len(), 2);
     let dangling = vec![w4_admissible(
         &profile,
@@ -355,16 +359,23 @@ fn coverage_account_digest_rederives_deterministically() {
         w4_admissible(&profile, w4_record("rd-b", Vec::new())),
     ];
     let manifest = w6_manifest(vec!["rd-a".to_owned(), "rd-b".to_owned()]);
-    let first = rederive_coverage_account_digest(&manifest, &admissibility).expect("rederive");
-    let second =
-        rederive_coverage_account_digest(&manifest, &admissibility).expect("rederive again");
+    let first = match rederive_coverage_account_digest(&manifest, &admissibility) {
+        Ok(digest) => digest,
+        Err(error) => panic!("rederive: {error:?}"),
+    };
+    let second = match rederive_coverage_account_digest(&manifest, &admissibility) {
+        Ok(digest) => digest,
+        Err(error) => panic!("rederive again: {error:?}"),
+    };
     assert_eq!(
         first, second,
         "same retained material re-proves the same digest"
     );
     let bare = w6_manifest(Vec::new());
-    rederive_coverage_account_digest(&bare, &admissibility)
-        .expect("empty manifest rebuilds over the examined run evidence");
+    match rederive_coverage_account_digest(&bare, &admissibility) {
+        Ok(_) => (),
+        Err(error) => panic!("empty manifest rebuilds over the examined run evidence: {error:?}"),
+    }
 }
 
 #[test]
@@ -375,10 +386,16 @@ fn coverage_account_digest_observes_substitution() {
         w4_admissible(&profile, w4_record("sub-b", Vec::new())),
     ];
     let manifest = w6_manifest(vec!["sub-a".to_owned(), "sub-b".to_owned()]);
-    let intact = rederive_coverage_account_digest(&manifest, &base).expect("intact");
+    let intact = match rederive_coverage_account_digest(&manifest, &base) {
+        Ok(digest) => digest,
+        Err(error) => panic!("intact: {error:?}"),
+    };
     let mut changed = base.clone();
     changed[0].record.acquisition = SourceDisposition::Partial;
-    let altered = rederive_coverage_account_digest(&manifest, &changed).expect("altered");
+    let altered = match rederive_coverage_account_digest(&manifest, &changed) {
+        Ok(digest) => digest,
+        Err(error) => panic!("altered: {error:?}"),
+    };
     assert_ne!(
         intact, altered,
         "a substituted disposition must move the digest"
@@ -399,25 +416,28 @@ fn w2_receipt_with(source_assurance_digest: Option<String>) -> CoverageReceipt {
         w4_admissible(&profile, w4_record("rep-b", Vec::new())),
         w4_admissible(&profile, w4_record("om-c", Vec::new())),
     ];
-    let mut account = CoverageAccount::open(
+    let mut account = match CoverageAccount::open(
         ["rep-a", "rep-b", "om-c"]
             .into_iter()
             .map(str::to_owned)
             .collect::<BTreeSet<String>>(),
-    )
-    .expect("w2 account");
+    ) {
+        Ok(account) => account,
+        Err(error) => panic!("w2 account: {error:?}"),
+    };
     for record in &admissibility[..2] {
-        account
-            .observe(
-                &record.record.handle,
-                record.record.acquisition,
-                &record.record.content_digest,
-                &record.record.operation_id,
-                DIGEST_VE,
-            )
-            .expect("w2 observe");
+        match account.observe(
+            &record.record.handle,
+            record.record.acquisition,
+            &record.record.content_digest,
+            &record.record.operation_id,
+            DIGEST_VE,
+        ) {
+            Ok(()) => (),
+            Err(error) => panic!("w2 observe: {error:?}"),
+        }
     }
-    CoverageReceipt::compute(CoverageReceiptParams {
+    match CoverageReceipt::compute(CoverageReceiptParams {
         profile: &profile,
         requested_scope: "which valve alloy survives the thermal envelope",
         frozen_scope_digest: DIGEST_VE,
@@ -430,8 +450,10 @@ fn w2_receipt_with(source_assurance_digest: Option<String>) -> CoverageReceipt {
         budget_limitation: None,
         source_assurance_digest,
         assessment_time_ms: 1_800_000_000_000,
-    })
-    .expect("w2 receipt")
+    }) {
+        Ok(receipt) => receipt,
+        Err(error) => panic!("w2 receipt: {error:?}"),
+    }
 }
 
 fn w2_receipt() -> CoverageReceipt {
@@ -462,23 +484,26 @@ fn assurance_link_refuses_malformed() {
 
     let profile = receipt_profile();
     let admissibility = vec![w4_admissible(&profile, w4_record("am-a", Vec::new()))];
-    let mut account = CoverageAccount::open(
+    let mut account = match CoverageAccount::open(
         ["am-a"]
             .into_iter()
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<String>>(),
-    )
-    .expect("link account");
+    ) {
+        Ok(account) => account,
+        Err(error) => panic!("link account: {error:?}"),
+    };
     for record in &admissibility {
-        account
-            .observe(
-                &record.record.handle,
-                record.record.acquisition,
-                &record.record.content_digest,
-                &record.record.operation_id,
-                DIGEST_VE,
-            )
-            .expect("link observe");
+        match account.observe(
+            &record.record.handle,
+            record.record.acquisition,
+            &record.record.content_digest,
+            &record.record.operation_id,
+            DIGEST_VE,
+        ) {
+            Ok(()) => (),
+            Err(error) => panic!("link observe: {error:?}"),
+        }
     }
     let refused = CoverageReceipt::compute(CoverageReceiptParams {
         profile: &profile,

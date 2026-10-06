@@ -54,10 +54,10 @@ use crate::evidence_portfolio::{
     AuthorizedManifest, AuthorizedManifestParams, ClaimConditionSources, ClaimCoverageMap,
     ClaimVerdict, CoverageAccount, EvidencePortfolio, LineageTable, ManifestSource,
     MaterialClaimRoster, NoMatchEvaluation, ObservedOutsideScope, PortfolioError,
-    PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
-    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text, check_citation_graph,
-    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
-    push_field, reject_vague, text,
+    PrecisionAssertion, PrecisionKind, PresentedEvaluation, RiskState, SourceDisposition,
+    SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text,
+    check_citation_graph, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank,
+    push_count, push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -3396,13 +3396,22 @@ impl CoverageReceipt {
         // document behind it, and `AbsencePreconditions::derive` re-proves both
         // on the way in, so a rewritten one is refused before any of its content
         // is believed.
+        // The admitted query has no producer on this route (the retaining
+        // composition owns it, #1762 OPEN), so `None` is passed rather than a
+        // synthesized commitment; the presented evaluation is bound against its
+        // bundle-retained twin, which arrives together with it by the doctrine
+        // above (`None` evidence still derives `None`/`None` exactly as before).
         let absence_preconditions = AbsencePreconditions::derive(
             account,
             &vetted_records(records),
             absence_evidence.map(|evidence| &evidence.manifest),
             assessment_time_ms,
             frozen_scope_digest,
-            absence_evidence.map(|evidence| evidence.evaluation.clone()),
+            PresentedEvaluation {
+                evaluation: absence_evidence.map(|evidence| evidence.evaluation.clone()),
+                admitted_query: None,
+                retained_evaluation: absence_evidence.map(|evidence| &evidence.evaluation),
+            },
         )?;
         let absence_verdict = assess_absence(account, &absence_preconditions);
         // The retained identity and ceiling come from the record the derivation
