@@ -546,11 +546,13 @@ mod tests {
         IMPROVEMENT_PROPOSAL_ENCODING_VERSION, ImprovementDiscriminatorProjection,
     };
     use eliot_maintenance::{
-        IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PIPELINE_WIRE_REVISION, IMPROVEMENT_PROOF_CEILING,
-        IMPROVEMENT_REQUESTED_EFFECT, IMPROVEMENT_RISK_CEILING_BOUNDED,
+        IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_LEGACY_DIGEST_ALGORITHM,
+        IMPROVEMENT_PIPELINE_WIRE_REVISION, IMPROVEMENT_PROOF_CEILING,
+        IMPROVEMENT_REQUESTED_EFFECT, IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementBlockCause,
         ImprovementEvidenceExecution, ImprovementMaterialEquality, ImprovementPulseOutcome,
-        KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT, OP_PROPOSE, PipelineError,
-        ProposalCommitment, TESTD_OWNER, VERIFIER_OWNER_FAMILY, improvement_admission_policy,
+        ImprovementRejectCause, KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT, OP_PROPOSE,
+        PipelineError, ProposalCommitment, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+        improvement_admission_policy,
     };
 
     /// The rollback-contract owner a caller supplies, exactly as
@@ -1262,5 +1264,113 @@ mod tests {
                 relation: "retained-unknown-effect: candidate-identity-mismatch"
             })
         );
+    }
+
+    /// Norm: `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md:76`.
+    /// A7: the daemon consumes the handoff under the identity this build
+    /// checks. The genuinely routed handoff passes; a copy drifted to a stale
+    /// wire revision or a legacy algorithm refuses through the same forwarder
+    /// `check_handoff_consumable` reads, with no substitute digest.
+    #[test]
+    fn daemon_consumer_passes_routed_handoff_while_drift_refuses() {
+        let group = joined_group("a");
+        let handoff = match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::CanaryAdmitted { handoff }) => handoff,
+            other => panic!("must admit, got {other:?}"),
+        };
+        assert_eq!(
+            check_improvement_handoff_identity(&handoff, &group.experiment),
+            Ok(())
+        );
+        // The drift starts from the genuinely produced record and changes one
+        // identity field, so the refusal below proves the consumer reads the
+        // record rather than trusting it.
+        let mut stale_wire = (*handoff).clone();
+        stale_wire.wire_revision = IMPROVEMENT_PIPELINE_WIRE_REVISION - 1;
+        assert!(matches!(
+            check_improvement_handoff_identity(&stale_wire, &group.experiment),
+            Err(PipelineError::UncheckedWireRevision(_))
+        ));
+        let mut legacy_algorithm = (*handoff).clone();
+        legacy_algorithm.proposal_commitment.algorithm =
+            IMPROVEMENT_LEGACY_DIGEST_ALGORITHM.to_string();
+        assert!(matches!(
+            check_improvement_handoff_identity(&legacy_algorithm, &group.experiment),
+            Err(PipelineError::UncheckedRecordIdentity(_))
+        ));
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions, not its own restatement of them (AUD7/A1).
+    #[test]
+    fn routed_stale_closure_blocks_with_typed_cause_and_remedy() {
+        let mut group = joined_group("stale");
+        group.admission_evidence.closure_stale = true;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::Blocked {
+                cause,
+                remedy,
+                owner_id,
+                ..
+            }) => {
+                assert_eq!(cause, ImprovementBlockCause::StaleClosure);
+                assert_eq!(remedy, cause.remedy());
+                assert_eq!(owner_id, group.policy.external_owner_id);
+            }
+            Ok(other) => panic!("a stale closure binding must block, got {other:?}"),
+            Err(error) => panic!("a stale closure binding must block, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions (AUD7/A2).
+    #[test]
+    fn routed_harm_rejects_with_typed_cause() {
+        let mut group = joined_group("harm");
+        group.admission_evidence.harm_observed = true;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::Rejected {
+                cause, owner_id, ..
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::HarmObserved);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+            }
+            Ok(other) => panic!("observed harm must reject, got {other:?}"),
+            Err(error) => panic!("observed harm must reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions (AUD7/A3).
+    #[test]
+    fn routed_pulse_regression_regress_rejects_with_typed_cause() {
+        let mut group = joined_group("regression");
+        group.admission_evidence.pulse = ImprovementPulseOutcome::Regression;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::RegressionRejected {
+                cause, owner_id, ..
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::PulseRegression);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+            }
+            Ok(other) => panic!("a pulse regression must regress-reject, got {other:?}"),
+            Err(error) => panic!("a pulse regression must regress-reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the daemon wrapper returns the pipeline's own
+    /// refusal dispositions (AUD7/A4/A6).
+    #[test]
+    fn routed_unknown_outcome_requires_reconciliation_bound_to_candidate() {
+        let mut group = joined_group("unknown");
+        group.admission_evidence.outcome_unknown = true;
+        match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation }) => {
+                assert_eq!(obligation.candidate_id, group.candidate.candidate_id);
+                assert_eq!(obligation.experiment_id, group.experiment.experiment_id);
+            }
+            Ok(other) => panic!("an unknown outcome must require reconciliation, got {other:?}"),
+            Err(error) => panic!("an unknown outcome must require reconciliation, got {error:?}"),
+        }
     }
 }

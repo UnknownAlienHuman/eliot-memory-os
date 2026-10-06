@@ -198,6 +198,10 @@ verify-list:
 # own 40-zero placeholder SHAs rather than a git-derived or invented value; an
 # unsupplied binding stays visibly unbound in the receipt instead of silently
 # claiming an identity.
+# receipt: optional second positional path receiving the SHA-256-bound lane
+# receipt (eliot-wasm-component-lane-receipt-v1) via --receipt-out; stdout
+# always carries the same receipt JSON (--format json). Example:
+#   just wasm-build <module> "C:/temp/receipt-build.json"
 wasm_registry := "scripts/testdata/wasm-component-lane/registry.json"
 wasm_base_sha := "0000000000000000000000000000000000000000"
 wasm_head_sha := "0000000000000000000000000000000000000000"
@@ -205,11 +209,11 @@ wasm_head_sha := "0000000000000000000000000000000000000000"
 # Exact-manifest build of one registered component under the helper's isolated
 # lane target root for #870's wasm32-wasip2 target.
 #
-wasm-build module:
-    python scripts/wasm_component_lane.py --build {{quote(module)}} --registry {{quote(wasm_registry)}} --base-sha {{quote(wasm_base_sha)}} --head-sha {{quote(wasm_head_sha)}}
+wasm-build module receipt="":
+    python scripts/wasm_component_lane.py --build {{quote(module)}} --registry {{quote(wasm_registry)}} --base-sha {{quote(wasm_base_sha)}} --head-sha {{quote(wasm_head_sha)}} --format json {{if receipt == "" { "" } else { "--receipt-out " + quote(receipt) } }}
 
 # Declared-capsule-only test of one registered component; never the workspace
 # gate, never a second package list.
 #
-wasm-test module:
-    python scripts/wasm_component_lane.py --test {{quote(module)}} --registry {{quote(wasm_registry)}} --base-sha {{quote(wasm_base_sha)}} --head-sha {{quote(wasm_head_sha)}}
+wasm-test module receipt="":
+    python scripts/wasm_component_lane.py --test {{quote(module)}} --registry {{quote(wasm_registry)}} --base-sha {{quote(wasm_base_sha)}} --head-sha {{quote(wasm_head_sha)}} --format json {{if receipt == "" { "" } else { "--receipt-out " + quote(receipt) } }}

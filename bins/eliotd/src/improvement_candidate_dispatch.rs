@@ -291,23 +291,29 @@
 //!   `NotExecuted`, which is the I12.24:76 refusal, and
 //!   `check_rollback_contract` refuses the absent reopen, expiry and
 //!   forward-repair references. The privacy class is the FIRST of three, and it
-//!   is the only one this daemon could clear by itself — which it does not.
+//!   is the only one an owner-supplied dispatch input could clear — which the
+//!   live dispatch does not supply.
 //! - [`admit_improvement_candidate_without_execution_evidence`] is wired and
 //!   live on this path: `dispatch_improvement_candidate_route` has one call
 //!   site, `daemon_runtime::route_and_reconcile_improvement_candidate`, which
-//!   `maybe_start_improvement_intake` drives from the daemon's live run loop. It
-//!   propagates that same typed refusal today, because it commits the same
-//!   proposal bytes through the same owner producer. An owner privacy class is
-//!   NECESSARY but not SUFFICIENT for the `Rejected` disposition it would
-//!   otherwise return: the wrapper builds its fourth input through
-//!   `current_proposal_of`, whose commitment profile at
-//!   `improvement_pipeline.rs:3880` bounds `privacy_class` among the other
-//!   required fields, so an owner value there still has to survive that profile
-//!   and the identity/join checks ahead of it before the gate's own
-//!   `closure_valid` rejection at `improvement_admission.rs:651` is reached. On
-//!   this workspace `admitting_pipeline_refusal` is therefore always `None`,
-//!   because that refusal propagates as this call's own `Err` rather than as a
-//!   disposition plus the field.
+//!   `maybe_start_improvement_intake` drives from the daemon's live run loop.
+//!   It is reached ONLY for the typed [`PipelineError::EvidenceNotExecuted`]
+//!   refusal — the one case the gate exists to close — and reads the one
+//!   validated input set both owner decisions share. Every other admitting
+//!   refusal (a malformed proposal, an identity conflict, an unbound owner or
+//!   relation, a stale revision, a compatibility failure) returns as itself
+//!   without reaching the gate, so the gate can never reinterpret it into a
+//!   terminal disposition. An owner privacy class is NECESSARY but not
+//!   SUFFICIENT for the `Rejected` disposition the gate would otherwise return:
+//!   the wrapper builds its fourth input through `current_proposal_of`, whose
+//!   commitment profile at `improvement_pipeline.rs:3880` bounds `privacy_class`
+//!   among the other required fields, so an owner value there still has to
+//!   survive that profile and the identity/join checks ahead of it before the
+//!   gate's own `closure_valid` rejection at `improvement_admission.rs:651` is
+//!   reached. On this workspace `admitting_pipeline_refusal` is therefore
+//!   always `None`, because the absent privacy class refuses before the only
+//!   refusal the gate may close, and that refusal propagates as this call's own
+//!   `Err` rather than as a disposition plus the field.
 //!
 //! Nothing here promotes, activates, installs, completes or issues authority,
 //! and the advisory application-class ceiling (I12.24:81) is enforced upstream
@@ -747,6 +753,17 @@ pub struct ImprovementRouteDispatch<'a> {
     /// evidence lineage was built over. It is a borrowed read of committed
     /// in-process state: no exchange, no store client, no extra lock.
     pub observed_closure: &'a ObservedClosure,
+    /// The owner-issued privacy classification of this proposal's inputs, when
+    /// the owner supplied one.
+    ///
+    /// `None` on the live path: this daemon holds no owner vocabulary for
+    /// classifying a maintenance proposal (see the module documentation), so
+    /// the proposal carries no class and the pipeline refuses it as
+    /// `MissingField("privacy_class")`. `None` is explicit absence — never a
+    /// literal, an empty default, or another owner's ceiling standing in as
+    /// issued — and `Some` is bound into the same proposal commitment and
+    /// terminal-decision identity the pipeline commits for every other field.
+    pub privacy_class: Option<&'a str>,
 }
 
 /// What one bounded route step actually produced.
@@ -909,6 +926,53 @@ fn route_operation_owner(
         })
 }
 
+/// The one validated input set both owner decisions read.
+///
+/// Built once per pass from the records this dispatch bound above, then handed
+/// whole to the admitting pipeline AND to the closed-admission gate. The gate
+/// therefore reads the very same proposal bytes, plan, evidence, contract,
+/// candidate view, admission evidence and policy the admitting path saw — never
+/// a second construction that could carry weaker shape or join checks. A
+/// fallback disposition over different records would be a second opinion about
+/// a different pass; this type makes that unrepresentable.
+struct ValidatedImprovementPipelineInputs<'a> {
+    proposal: &'a ImprovementProposal,
+    experiment: &'a ExperimentPlan,
+    evidence: &'a ActivationEvidence,
+    rollback: &'a RollbackContract,
+    candidate: &'a ImprovementCandidateView,
+    admission_evidence: &'a ImprovementEvidenceView,
+    policy: &'a ImprovementAdmissionPolicy,
+}
+
+impl ValidatedImprovementPipelineInputs<'_> {
+    /// The admitting pipeline over these records: the only call that can reach
+    /// `CanaryAdmitted`.
+    fn admitting(&self) -> Result<ImprovementTerminalDisposition, PipelineError> {
+        route_improvement_candidate(ImprovementRouteRequest {
+            proposal: self.proposal,
+            experiment: self.experiment,
+            evidence: self.evidence,
+            rollback: self.rollback,
+            candidate: self.candidate,
+            admission_evidence: self.admission_evidence,
+            policy: self.policy,
+        })
+    }
+
+    /// The closed-admission gate over THE SAME records: it can only refuse or
+    /// return a refusal disposition, never admit.
+    fn gate(&self) -> Result<ImprovementTerminalDisposition, PipelineError> {
+        admit_improvement_candidate_without_execution_evidence(
+            self.proposal,
+            self.experiment,
+            self.candidate,
+            self.admission_evidence,
+            self.policy,
+        )
+    }
+}
+
 /// Routes one real maintenance observation through the Governor-owned
 /// improvement pipeline.
 ///
@@ -1004,6 +1068,7 @@ pub fn dispatch_improvement_candidate_route(
         dispatch.policy,
         dispatch.state_fence,
         dispatch.observed_closure,
+        dispatch.privacy_class,
     );
     // The two records the Governor admission gate consumes are bound here, not
     // inside the request literal, because BOTH the admitting pipeline and the
@@ -1027,16 +1092,21 @@ pub fn dispatch_improvement_candidate_route(
     // The ADMITTING path runs first and stays the primary one: it is the only
     // call that can reach `CanaryAdmitted`, and its typed refusal is a fact
     // about this pass rather than something to be resolved away.
-    let admitting = route_improvement_candidate(ImprovementRouteRequest {
+    //
+    // Both owner decisions below read the ONE validated input set bound above,
+    // so the gate answers about the very records the admitting path refused —
+    // never about a second construction with weaker shape or join checks.
+    let rollback = route_rollback_contract(candidate, &owners);
+    let inputs = ValidatedImprovementPipelineInputs {
         proposal: &proposal,
         experiment: &experiment,
         evidence: &activation_evidence,
-        rollback: &route_rollback_contract(candidate, &owners),
+        rollback: &rollback,
         candidate: &candidate_view,
         admission_evidence: &admission_evidence,
         policy: dispatch.policy,
-    });
-    let (disposition, admitting_pipeline_refusal) = match admitting {
+    };
+    let (disposition, admitting_pipeline_refusal) = match inputs.admitting() {
         Ok(disposition) => {
             // The handoff is consumed under this build's identity BEFORE anything
             // reads its progress out of it, so the record the repeat assessment
@@ -1046,33 +1116,27 @@ pub fn dispatch_improvement_candidate_route(
             check_handoff_consumable(&disposition, &experiment)?;
             (disposition, None)
         }
-        Err(refusal) => {
-            // The admitting path refused before the admission gate, so the
-            // closed disposition for this candidate is read from the gate
-            // itself, over the same checked records and this crate's own
-            // `admit_improvement_candidate_without_execution_evidence`. The two
-            // answers are then reported as two answers: the gate's verdict as the
-            // disposition and the admitting path's typed refusal whole beside it,
-            // never one presented as the other. When the GATE also refuses, its
-            // own typed error is what crosses this boundary — the gate was asked
-            // last and its answer is the one the disposition would have carried,
-            // so it is the one a caller needs; the admitting path's identical
-            // refusal is not re-reported as a second opinion about the same
-            // malformed proposal bytes.
+        // Only the typed "no executed evidence" refusal may reach the gate: it
+        // is the one case the gate exists to close. A malformed proposal, an
+        // identity conflict, an unbound owner or relation, a stale revision, or
+        // a compatibility failure returns here as itself — the gate must never
+        // reinterpret such a refusal into a terminal disposition.
+        Err(refusal @ PipelineError::EvidenceNotExecuted { .. }) => {
+            // The two answers are then reported as two answers: the gate's
+            // verdict as the disposition and the admitting path's typed refusal
+            // whole beside it, never one presented as the other. When the GATE
+            // also refuses, its own typed error is what crosses this boundary —
+            // the gate was asked last and its answer is the one the disposition
+            // would have carried, so it is the one a caller needs.
             //
             // The fallback can only ever produce a refusal disposition — the
             // wrapper refuses an admit verdict outright — so nothing read on
             // this branch can reach an experiment, a canary handoff, an
             // activation, or a record the next pass retains.
-            let disposition = admit_improvement_candidate_without_execution_evidence(
-                &proposal,
-                &experiment,
-                &candidate_view,
-                &admission_evidence,
-                dispatch.policy,
-            )?;
+            let disposition = inputs.gate()?;
             (disposition, Some(refusal))
         }
+        Err(refusal) => return Err(refusal),
     };
 
     // The pipeline publishes its own checked current record inside the canary
@@ -1761,11 +1825,16 @@ fn check_handoff_consumable(
 }
 
 /// The Governor-side proposal this daemon raises over one real observation.
+///
+/// `privacy_class` is the owner-issued classification the dispatch carries, or
+/// `None` when the owner supplied none: absence is carried as the empty value
+/// the pipeline's own shape checks refuse, never as a guessed class.
 fn route_proposal(
     candidate: &ImprovementCandidate,
     policy: &ImprovementAdmissionPolicy,
     state_fence: &StateFence,
     observed_closure: &ObservedClosure,
+    privacy_class: Option<&str>,
 ) -> ImprovementProposal {
     let candidate_id = candidate.candidate_id.as_str();
     // The admitted boundary of this observation. It is the candidate's OWN
@@ -1834,12 +1903,13 @@ fn route_proposal(
         // The candidate's OWN recorded stop condition; see the field note in
         // `route_deadline_ref`.
         deadline_ref: route_deadline_ref(candidate),
-        // No owner privacy-class vocabulary is reachable here; see the module
-        // documentation. Absent, never guessed — and, because the ADMITTING
-        // pipeline validates the proposal shape before anything else, this
-        // absent field is the refusal the admitting path reports today. See
+        // The owner-issued classification the dispatch carries, or nothing when
+        // the owner supplied none (see the module documentation). Absent, never
+        // guessed — and, because the ADMITTING pipeline validates the proposal
+        // shape before anything else, an absent field is the refusal the
+        // admitting path reports. See
         // `ImprovementRouteOutcome::admitting_pipeline_refusal`.
-        privacy_class: String::new(),
+        privacy_class: privacy_class.unwrap_or_default().to_string(),
         // The exact set the rollback contract must cover: the admitted boundary
         // this candidate is valid only within.
         invalidation_set: vec![admitted_scope],

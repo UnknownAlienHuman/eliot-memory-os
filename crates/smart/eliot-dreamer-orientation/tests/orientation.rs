@@ -1997,3 +1997,46 @@ fn no_model_provider_store_authority_effect_finish_path() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("reprojection");
     assert_eq!(packet, replay);
 }
+
+// Issue #2901 W10: model commitment change moves packet_id
+#[test]
+fn model_commitment_change_changes_packet_id() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let packet_a =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("base projection");
+    let (job_b, bundle_b, candidate_b, policy_b, handles_b) = assemble_with(|options| {
+        options.counterevidence = vec!["w10 changed model commitment".into()];
+    });
+    let packet_b = project_orientation(&job_b, &bundle_b, &candidate_b, &handles_b, &policy_b)
+        .expect("changed projection");
+    assert_eq!(packet_a.packet_id.len(), 64);
+    assert_eq!(packet_b.packet_id.len(), 64);
+    assert_ne!(
+        packet_a.packet_id, packet_b.packet_id,
+        "model content change must move packet_id"
+    );
+    assert_ne!(packet_a.output_digest, packet_b.output_digest);
+}
+
+// Issue #2901 A6: packet_id ignores non-content variation. The projection
+// canonicalizes its handle order (`ordered_handles` in `build_projection`),
+// so presenting the same evidence in a different order must not move the id:
+// only the model commitment does (see the W10 probe above).
+#[test]
+fn handle_reorder_keeps_packet_id() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let packet_a =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("base projection");
+    let mut reordered = handles.clone();
+    reordered.reverse();
+    assert_ne!(
+        handles, reordered,
+        "the fixture must carry distinct handles"
+    );
+    let packet_b = project_orientation(&job, &bundle, &candidate, &reordered, &policy)
+        .expect("reordered projection");
+    assert_eq!(
+        packet_a.packet_id, packet_b.packet_id,
+        "handle order is not content and must not move packet_id"
+    );
+}
