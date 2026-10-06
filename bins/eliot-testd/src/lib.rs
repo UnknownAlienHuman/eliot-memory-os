@@ -3804,7 +3804,7 @@ mod tests {
         }
         // Reconcile joins the capture sessions and publishes the terminal
         // evidence into the same collector through the sink port.
-        block_on_drive_test(executor.reconcile(operation))
+        let terminal_evidence = block_on_drive_test(executor.reconcile(operation))
             .expect("live reconcile must publish terminal evidence");
 
         // The admitted terminal bundle resolves to the exact child bytes.
@@ -3853,6 +3853,35 @@ mod tests {
         // assesses nothing: exit status never becomes a verifier result here.
         assert_eq!(binding.parser.status, TestdParsingStatus::NotExecuted);
         assert_eq!(binding.evaluator.status, TestdEvaluationStatus::Unassessed);
+        // Preview-only bytes cannot feed the parser either: a fresh
+        // admission of the same terminal evidence, without resolution,
+        // refuses parsing for lack of a verified readback receipt.
+        let fresh = EvidenceCollector::default();
+        eliot_process::ProcessEvidenceSink::record(&fresh, terminal_evidence)
+            .expect("fresh admission must succeed");
+        let mut fresh_bundle = fresh
+            .typed_bundles()
+            .pop()
+            .expect("one fresh bundle must admit");
+        let fresh_binding = fresh_bundle
+            .stdout
+            .binding
+            .as_mut()
+            .expect("fresh stdout binding");
+        let preview_parse = eliot_testd_core::TestdParsingObservation::new(
+            "parser:test",
+            "parser-rev:test-1",
+            TestdParsingStatus::Parsed,
+            fresh_binding.evidence_identity_sha256.clone(),
+            "testd-readback:unresolved".to_owned(),
+            false,
+            eliot_contracts::ClockReading::default(),
+        )
+        .expect("preview parse observation must construct");
+        assert!(
+            fresh_binding.apply_parsing(&preview_parse).is_err(),
+            "unresolved preview-only bytes must fail parsing"
+        );
 
         // The restart record persists; a reopen over the same file with a
         // fresh retention re-resolves the identical bytes and identities.
