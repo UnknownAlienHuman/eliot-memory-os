@@ -61,6 +61,8 @@ use crate::{
     JobClass, JobState, KERNEL_ADMISSION_REQUIRED, KernelJobAdmission, KernelJobPort,
     run_admitted_pipeline,
 };
+#[cfg(test)]
+use crate::{OrientationDisposition, pulse::PulseStageId};
 use eliot_dreamer_contracts::validation::structured::{
     GroundingValidationInput, ValidatedGroundingCandidate,
 };
@@ -165,10 +167,10 @@ fn validate_through_model(
 }
 
 /// Orientation passes the full owned pipeline: genuine owner calls at every
-/// stage, a native packet out of dispatch, and a single-line JSONL receipt
-/// that round-trips to the identical view.
+/// stage — screen, model, grounding, validation — plus fail-closed
+/// Blocked dispatch with the full mandatory denominator and no packet.
 #[test]
-fn orientation_pipeline_threads_screen_to_packet_receipt() {
+fn orientation_pipeline_blocked_without_supply() {
     let admission = admitted_admission("job-e2e-orientation");
     let job = job_with_handles("job-e2e-orientation", JobClass::Orientation);
     let (grounding, validated) = validate_through_model(&admission, &job);
@@ -192,30 +194,28 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
         Some(&validated),
         Some(PipelineOrientationRecords::new(&grounding, &validated)),
     );
-    let Ok(DreamResult::Packet(packet)) = result else {
-        panic!("orientation dispatch must project, got {result:?}");
+    let Ok(DreamResult::Orientation(blocked)) = result else {
+        panic!("chain without Governor supply must block, got {result:?}");
     };
-    assert_eq!(packet.packet_id.len(), 64);
-    let canonical = admission_of(&admission, &job)
-        .expect("e2e admission must derive")
-        .canonical_id();
-    assert_eq!(packet.job_id, canonical);
-    assert_eq!(packet.question, job.exact_question);
-    assert_eq!(packet.scope_id, SCOPE_E2E);
-    assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
-    assert_eq!(packet.synthesized_interpretations.len(), 1);
-    // G4: exactly the two owner residue markers travel as rival entries.
-    assert_eq!(packet.rival_models_and_dissent.len(), 2);
-    let job_id = packet.job_id.clone();
-    let view = project_result_view(
-        &job_id,
-        JobState::Completed,
-        Some(DreamResult::Packet(packet)),
+    assert_eq!(blocked.disposition, OrientationDisposition::Blocked);
+    assert!(
+        blocked.packet.is_none(),
+        "blocked pulse must carry no packet"
     );
-    let line = render_jsonl(&view).expect("receipt must render");
-    assert!(!line.contains('\n'), "receipt must be exactly one line");
-    let roundtrip: crate::JobView = serde_json::from_str(&line).expect("receipt must round-trip");
-    assert_eq!(roundtrip, view);
+    assert_eq!(blocked.scope_id, SCOPE_E2E);
+    assert_eq!(
+        blocked.stages.len(),
+        PulseStageId::ORDER.len(),
+        "blocked ledger must cover the whole mandatory denominator"
+    );
+    assert!(
+        !blocked.missing_owners.is_empty(),
+        "blocked pulse must name its missing owners"
+    );
+    assert_eq!(
+        blocked.job_id, admission.job_id,
+        "blocked pulse carries the admitted job id verbatim"
+    );
 }
 
 /// Curation routes to the A-31 sole fan-in without class refusal: the screen
@@ -302,32 +302,35 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
 }
 
 /// The exact admitted chain `submit` executes past the bundle plan-factor for
-/// Orientation: one call proves screen, model, grounding, validation, and
-/// native dispatch run in canonical order to a packet result. (`submit`
-/// itself additionally needs the Slice-2 controller/bundle gates and a live
-/// Kernel transport, so the chain — the same function `submit` calls — is
-/// the provable unit in-process.)
+/// Orientation: one call proves screen, model, grounding, validation, plus
+/// fail-closed Blocked dispatch with the full mandatory denominator and no
+/// packet when no Governor supply is injected. (`submit` itself additionally
+/// needs the Slice-2 controller/bundle gates and a live Kernel transport, so
+/// the chain — the same function `submit` calls — is the provable unit
+/// in-process.)
 #[test]
-fn submit_chain_returns_orientation_packet_with_jsonl() {
+fn submit_chain_blocked_without_supply() {
     let admission = admitted_admission("job-e2e-chain-orientation");
     let job = job_with_handles("job-e2e-chain-orientation", JobClass::Orientation);
     let result = run_admitted_pipeline(&admission, &job, None, None);
-    let Ok(DreamResult::Packet(packet)) = result else {
-        panic!("submit chain must project orientation, got {result:?}");
+    let Ok(DreamResult::Orientation(blocked)) = result else {
+        panic!("chain without Governor supply must block, got {result:?}");
     };
-    assert_eq!(packet.scope_id, SCOPE_E2E);
-    assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
-    let job_id = packet.job_id.clone();
-    let view = project_result_view(
-        &job_id,
-        JobState::Completed,
-        Some(DreamResult::Packet(packet)),
+    assert_eq!(blocked.disposition, OrientationDisposition::Blocked);
+    assert!(
+        blocked.packet.is_none(),
+        "blocked pulse must carry no packet"
     );
-    let line = render_jsonl(&view).expect("chain receipt must render");
-    assert!(!line.contains('\n'), "chain receipt must be one JSONL line");
-    let roundtrip: crate::JobView =
-        serde_json::from_str(&line).expect("chain receipt must round-trip");
-    assert_eq!(roundtrip, view);
+    assert_eq!(blocked.scope_id, SCOPE_E2E);
+    assert_eq!(
+        blocked.stages.len(),
+        PulseStageId::ORDER.len(),
+        "blocked ledger must cover the whole mandatory denominator"
+    );
+    assert!(
+        !blocked.missing_owners.is_empty(),
+        "blocked pulse must name its missing owners"
+    );
 }
 
 /// The exact admitted chain `submit` executes, for Curation without an

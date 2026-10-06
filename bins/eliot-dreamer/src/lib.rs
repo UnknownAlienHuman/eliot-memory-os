@@ -1139,6 +1139,11 @@ pub struct OrientationPulseResult {
     reason = "DreamResult is a public serialized protocol surface; boxing would change its wire/API shape"
 )]
 pub enum DreamResult {
+    /// Legacy packet result. No production constructor exists (issue #2901
+    /// A4): the only constructors are the `#[cfg(test)]` `build_result`
+    /// compatibility shim and the `result_stage` test helper, so a live
+    /// Orientation dispatch without Governor supply publishes
+    /// `Orientation` blocked, never this variant.
     Packet(DreamPacket),
     Orientation(OrientationPulseResult),
     Curation {
