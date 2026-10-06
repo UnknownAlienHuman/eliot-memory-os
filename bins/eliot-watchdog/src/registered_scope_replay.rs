@@ -140,7 +140,8 @@ fn replay_one_scope(
     match observe_journal_replay(spool, &volume, scope.root(), max_bytes) {
         JournalReplayOutcome::Replayed { evidence, records } => {
             bind_replayed_scope(scope, membership);
-            match coverage.record_replayed(ObservationChannel::FilesystemJournal, evidence) {
+            match coverage.record_replayed(ObservationChannel::FilesystemJournal, evidence, scope)
+            {
                 RecordOutcome::Recorded => {
                     tracing::debug!(
                         event = "watchdog.registered_scope_replayed",
@@ -256,11 +257,12 @@ mod tests {
         Ok(RegisteredScope::new(root, "disposable-gen-1")?)
     }
 
-    fn window(first: u64, last: u64) -> JournalReplayEvidence {
+    fn window(first: u64, last: u64, record_count: u32) -> JournalReplayEvidence {
         JournalReplayEvidence {
             journal_id: "filesystem-usn-journal:scope-replay".to_owned(),
             first_cursor: first,
             last_cursor: last,
+            record_count,
         }
     }
 
@@ -437,8 +439,14 @@ mod tests {
     fn crash_between_save_and_ack_is_a_named_omission() {
         let cell = IntervalCoverageCell::new(1000);
         assert_eq!(cell.begin_interval(1000), None);
+        let scope = disposable_scope("crash-window")
+            .expect("crash-window scope registers");
         assert_eq!(
-            cell.record_replayed(ObservationChannel::FilesystemJournal, window(50, 59)),
+            cell.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(50, 59, 10),
+                &scope
+            ),
             RecordOutcome::Recorded
         );
         let abandoned = cell
@@ -534,8 +542,14 @@ mod tests {
         ] {
             assert_eq!(cell.record(channel, class), RecordOutcome::Recorded);
         }
+        let scope =
+            disposable_scope("full-window").expect("full-window scope registers");
         assert_eq!(
-            cell.record_replayed(ObservationChannel::FilesystemJournal, window(1, 4)),
+            cell.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(1, 4, 4),
+                &scope
+            ),
             RecordOutcome::Recorded
         );
         let report = close_report(&cell);
@@ -558,7 +572,7 @@ mod tests {
             .expect("journal record present");
         assert_eq!(journal.disposition(), CoverageDisposition::JournalReplayed);
         assert_eq!(journal.observed_replayed_observations(), 4);
-        assert_eq!(journal.replayed_evidence(), Some(&window(1, 4)));
+        assert_eq!(journal.replayed_evidence(), Some(&window(1, 4, 4)));
         for channel in [
             ObservationChannel::ScmServiceState,
             ObservationChannel::ProcessExitIdentity,

@@ -6,11 +6,13 @@
 //!
 //! One call reads one bounded journal page through the spool-retained cursor
 //! for one volume and reports at most one exact dense window. The window is
-//! claimed only over consecutively numbered USNs the page actually returned:
-//! a hole is never papered over, the cursor still advances past it (the
-//! operating system positions the next read there), and the advance is
-//! reported as [`JournalReplayOutcome::AdvancedPastHole`], never as
-//! coverage. A first observation seeds the position at the live journal head
+//! claimed only over byte-contiguous records the page actually returned
+//! (each record starts where its predecessor's bytes end — USNs are stream
+//! offsets, never unit-spaced): a hole is never papered over, the cursor
+//! still advances past it (the operating system positions the next read
+//! there), and the advance is reported as
+//! [`JournalReplayOutcome::AdvancedPastHole`], never as coverage. A first
+//! observation seeds the position at the live journal head
 //! without backfill: history the Watchdog never observed cannot become
 //! replayed coverage for this interval. A recreated journal reseeds rather
 //! than resuming: old USNs name a different journal's history.
@@ -180,7 +182,8 @@ fn reseed_after_recreate(
 ///
 /// The cursor is retained before anything is claimed: a page whose advance
 /// cannot be retained reports [`JournalReplayOutcome::Unavailable`] and the
-/// next call retries the same window instead of double-counting it.
+/// next call retries the same window instead of double-counting it. The
+/// claimed count is the exact records the window holds, never the USN span.
 fn claim_page(
     spool: &WatchdogSpool,
     volume: &str,
@@ -193,7 +196,7 @@ fn claim_page(
             Err(reason) => JournalReplayOutcome::Unavailable(reason),
         };
     }
-    let Some((first, last)) = dense_window(&page.records) else {
+    let Some((first, last, count)) = dense_window(&page.records) else {
         tracing::warn!(
             event = "watchdog.journal_replay_hole",
             observation = "unclaimed",
@@ -207,14 +210,16 @@ fn claim_page(
             Err(reason) => JournalReplayOutcome::Unavailable(reason),
         };
     };
+    let record_count = u32::try_from(count).unwrap_or(u32::MAX);
     match retain_cursor(spool, volume, journal_id, page.next_usn) {
         Ok(()) => JournalReplayOutcome::Replayed {
             evidence: JournalReplayEvidence {
                 journal_id: format!("filesystem-usn-journal:{journal_id:016x}"),
                 first_cursor: first,
                 last_cursor: last,
+                record_count,
             },
-            records: page.records.len(),
+            records: count,
         },
         Err(reason) => JournalReplayOutcome::Unavailable(reason),
     }
@@ -238,21 +243,31 @@ fn retain_cursor(
         .map_err(|_| RETAIN_FAILED)
 }
 
-/// Returns the exact dense USN span the records cover, or `None`.
+/// Returns the exact dense USN window the records cover, with its count, or
+/// `None`.
 ///
-/// A window is claimable only when every record continues its predecessor:
-/// the claimed count then equals the window length exactly, which is what
-/// the channel record requires.
-fn dense_window(records: &[UsnRecordView]) -> Option<(u64, u64)> {
+/// USNs are stream byte offsets and records have variable byte lengths, so a
+/// window is claimable only when every record starts exactly where its
+/// predecessor's bytes end — never when USNs differ by one (issue #1755, CS1
+/// return). The claimed count is the records the window holds, never the
+/// cursor span.
+fn dense_window(records: &[UsnRecordView]) -> Option<(u64, u64, usize)> {
     let first = records.first()?;
-    let mut previous = first.usn;
+    let mut previous_usn = first.usn;
+    let mut previous_len = u64::from(first.record_length);
+    if previous_len == 0 {
+        return None;
+    }
     for record in &records[1..] {
-        if record.usn != previous.checked_add(1).unwrap_or(0) {
+        let length = u64::from(record.record_length);
+        let expected = previous_usn.checked_add(previous_len)?;
+        if length == 0 || record.usn != expected {
             return None;
         }
-        previous = record.usn;
+        previous_usn = record.usn;
+        previous_len = length;
     }
-    Some((first.usn, previous))
+    Some((first.usn, previous_usn, records.len()))
 }
 
 /// Maps a journal state query failure to a stable refusal code.
@@ -298,11 +313,20 @@ mod tests {
         (label, std::path::PathBuf::from(format!("{drive}\\")))
     }
 
-    fn record(usn: u64) -> UsnRecordView {
+    fn record(usn: u64, record_length: u32) -> UsnRecordView {
         UsnRecordView {
             usn,
             reason: 0x100,
             file_name: "t.txt".to_owned(),
+            record_length,
+        }
+    }
+
+    fn page(journal_id: u64, next_usn: u64, records: Vec<UsnRecordView>) -> UsnJournalPage {
+        UsnJournalPage {
+            journal_id,
+            next_usn,
+            records,
         }
     }
 
@@ -371,16 +395,60 @@ mod tests {
         Ok(())
     }
 
-    /// Only consecutively numbered USNs form a claimable window: a hole, an
-    /// empty page, or a single record behave exactly.
+    /// Only byte-contiguous records form a claimable window: each record
+    /// starts where its predecessor's bytes end, and the count is the
+    /// records held, never the cursor span. A hole, a zero length, an empty
+    /// page, or a single record behave exactly.
     #[test]
-    fn dense_window_accepts_consecutive_usns_only() {
+    fn dense_window_accepts_byte_contiguous_records_only() {
         assert_eq!(
-            dense_window(&[record(5), record(6), record(7)]),
-            Some((5, 7))
+            dense_window(&[record(100, 72), record(172, 68), record(240, 80)]),
+            Some((100, 240, 3))
         );
-        assert_eq!(dense_window(&[record(5), record(7)]), None);
+        assert_eq!(dense_window(&[record(100, 72), record(173, 68)]), None);
+        assert_eq!(dense_window(&[record(100, 72), record(172, 0)]), None);
+        assert_eq!(dense_window(&[record(100, 0)]), None);
         assert_eq!(dense_window(&[]), None);
-        assert_eq!(dense_window(&[record(9)]), Some((9, 9)));
+        assert_eq!(dense_window(&[record(9, 64)]), Some((9, 9, 1)));
+    }
+
+    /// An ordinary multi-record page with realistic variable byte lengths
+    /// claims its exact record count: contiguity is byte distance, so real
+    /// journal output is coverage rather than a hole. A gapped page still
+    /// advances past the hole and claims nothing.
+    #[test]
+    fn contiguous_page_claims_exact_count_and_hole_claims_nothing() -> TestResult {
+        let spool = test_spool("contiguous-page")?;
+        let outcome = claim_page(
+            &spool,
+            "\\\\.\\C:",
+            0x2a,
+            &page(
+                0x2a,
+                500,
+                vec![record(100, 72), record(172, 128), record(300, 64)],
+            ),
+        );
+        match outcome {
+            JournalReplayOutcome::Replayed { evidence, records } => {
+                assert_eq!(records, 3);
+                assert_eq!(evidence.first_cursor, 100);
+                assert_eq!(evidence.last_cursor, 300);
+                assert_eq!(evidence.record_count, 3);
+                assert!(evidence.validate().is_ok());
+            }
+            other => panic!("contiguous page must replay, got {other:?}"),
+        }
+        let holed = claim_page(
+            &spool,
+            "\\\\.\\C:",
+            0x2a,
+            &page(0x2a, 600, vec![record(500, 72), record(900, 64)]),
+        );
+        assert_eq!(
+            holed,
+            JournalReplayOutcome::AdvancedPastHole { resume_usn: 600 }
+        );
+        Ok(())
     }
 }

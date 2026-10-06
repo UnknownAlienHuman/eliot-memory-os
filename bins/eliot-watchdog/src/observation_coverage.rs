@@ -69,6 +69,7 @@ use std::sync::Mutex;
 use eliot_evaluation_contracts::JournalReplayEvidence;
 
 use crate::SpoolError;
+use crate::observation_attribution::RegisteredScope;
 
 /// Revision of the sensor/capability map shape itself.
 ///
@@ -630,6 +631,41 @@ pub struct CoverageInterval {
     pub end_ms: u64,
 }
 
+/// Where one replayed window was gated through: the registered scope root
+/// and generation whose membership admitted it, and the owner-clock start of
+/// the interval it was recorded in.
+///
+/// Stamped at the single membership-gated call site
+/// (`registered_scope_replay::replay_registered_scopes`), so the window is
+/// bound to the declared interval and the admitted scope that produced it —
+/// never a span replayed for another window or another registration (issue
+/// #1755, CS1 return).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayProvenance {
+    /// Registered scope root the window was read for.
+    pub scope_root: String,
+    /// Generation of that registered scope.
+    pub scope_generation: String,
+    /// Owner-clock start of the interval the window was recorded in.
+    pub interval_start_ms: u64,
+}
+
+impl ReplayProvenance {
+    /// Stamps the provenance of one window replayed for `scope` in the
+    /// interval that started at `interval_start_ms`.
+    #[must_use]
+    pub fn stamped(
+        scope: &RegisteredScope,
+        interval_start_ms: u64,
+    ) -> Self {
+        Self {
+            scope_root: scope.root().display().to_string(),
+            scope_generation: scope.scope_generation().to_owned(),
+            interval_start_ms,
+        }
+    }
+}
+
 /// Published coverage of one I8.2 channel over one declared interval.
 ///
 /// Observation mode ([`disposition`](Self::disposition)) is preserved
@@ -645,6 +681,7 @@ pub struct ChannelIntervalCoverage {
     observed_classes: Vec<ObservationClass>,
     observed_replayed_observations: u32,
     replayed_evidence: Option<JournalReplayEvidence>,
+    replayed_provenance: Option<ReplayProvenance>,
     dropped_samples: u32,
     /// Whether the tick that opened this interval reached its close.
     ///
@@ -685,7 +722,8 @@ impl ChannelIntervalCoverage {
     ///
     /// Always zero until the journal-replay adapter (W3) reports a replayed
     /// window through [`IntervalCoveragePublisher::record_replayed`]; the
-    /// count then equals the evidence window length exactly.
+    /// count then equals the evidence record count exactly, never the USN
+    /// cursor span.
     #[must_use]
     pub const fn observed_replayed_observations(&self) -> u32 {
         self.observed_replayed_observations
@@ -696,6 +734,13 @@ impl ChannelIntervalCoverage {
     #[must_use]
     pub fn replayed_evidence(&self) -> Option<&JournalReplayEvidence> {
         self.replayed_evidence.as_ref()
+    }
+
+    /// Where the replayed window was gated through, if one was recorded: the
+    /// registered scope and interval its membership admitted.
+    #[must_use]
+    pub fn replayed_provenance(&self) -> Option<&ReplayProvenance> {
+        self.replayed_provenance.as_ref()
     }
 
     /// Live samples this owner offered for this channel and then dropped
@@ -823,17 +868,19 @@ impl IntervalCoverageReport {
     /// `dropped_samples` is indexed the same way and counts the offers that
     /// channel lost. `replayed` is indexed the same way and carries the exact
     /// journal-replay evidence the replay adapter reported for that channel, if
-    /// any. `interval_closed` is `false` for a window a tick opened and
-    /// did not finish; that window is reported as a named omission on every
-    /// wired channel instead of being discarded. The record set is always
-    /// exactly one record per I8.2 channel, in map order, so an unobserved
-    /// channel is a named gap rather than a missing term.
+    /// any; `replay_provenance` is indexed the same way and carries where that
+    /// window was gated through. `interval_closed` is `false` for a window a
+    /// tick opened and did not finish; that window is reported as a named
+    /// omission on every wired channel instead of being discarded. The record
+    /// set is always exactly one record per I8.2 channel, in map order, so an
+    /// unobserved channel is a named gap rather than a missing term.
     #[must_use]
     pub fn publish(
         interval: CoverageInterval,
         observed: &[Vec<ObservationClass>; ObservationChannel::COUNT],
         dropped_samples: &[u32; ObservationChannel::COUNT],
         replayed: &[Option<JournalReplayEvidence>; ObservationChannel::COUNT],
+        replay_provenance: &[Option<ReplayProvenance>; ObservationChannel::COUNT],
         interval_closed: bool,
     ) -> Self {
         let records = SENSOR_CHANNEL_MAP
@@ -843,6 +890,7 @@ impl IntervalCoverageReport {
                 let classes = &observed[index];
                 let dropped = dropped_samples[index];
                 let evidence = &replayed[index];
+                let provenance = &replay_provenance[index];
                 let (disposition, gaps) = ChannelIntervalCoverage::derive_disposition(
                     capability,
                     classes,
@@ -855,10 +903,11 @@ impl IntervalCoverageReport {
                     expected_source: capability.competent_source,
                     expected_classes: capability.supported_classes,
                     observed_classes: classes.clone(),
-                    observed_replayed_observations: evidence.as_ref().map_or(0, |window| {
-                        u32::try_from(window.window_len()).unwrap_or(u32::MAX)
-                    }),
+                    observed_replayed_observations: evidence
+                        .as_ref()
+                        .map_or(0, |window| window.record_count),
                     replayed_evidence: evidence.clone(),
+                    replayed_provenance: provenance.clone(),
                     dropped_samples: dropped,
                     interval_closed,
                     disposition,
@@ -965,9 +1014,16 @@ impl IntervalCoverageReport {
             record.disposition == disposition
                 && record.gaps == gaps
                 && record.observed_replayed_observations
-                    == record.replayed_evidence.as_ref().map_or(0, |window| {
-                        u32::try_from(window.window_len()).unwrap_or(u32::MAX)
-                    })
+                    == record
+                        .replayed_evidence
+                        .as_ref()
+                        .map_or(0, |window| window.record_count)
+                && record.replayed_evidence.is_some() == record.replayed_provenance.is_some()
+                && record.replayed_provenance.as_ref().map_or(true, |provenance| {
+                    provenance.interval_start_ms == self.interval.start_ms
+                        && !provenance.scope_root.trim().is_empty()
+                        && !provenance.scope_generation.trim().is_empty()
+                })
         })
     }
 
@@ -1191,6 +1247,7 @@ pub struct IntervalCoveragePublisher {
     observed: [Vec<ObservationClass>; ObservationChannel::COUNT],
     dropped_samples: [u32; ObservationChannel::COUNT],
     replayed: [Option<JournalReplayEvidence>; ObservationChannel::COUNT],
+    replay_provenance: [Option<ReplayProvenance>; ObservationChannel::COUNT],
 }
 
 impl IntervalCoveragePublisher {
@@ -1202,6 +1259,7 @@ impl IntervalCoveragePublisher {
             observed: std::array::from_fn(|_| Vec::new()),
             dropped_samples: [0; ObservationChannel::COUNT],
             replayed: std::array::from_fn(|_| None),
+            replay_provenance: std::array::from_fn(|_| None),
         }
     }
 
@@ -1236,25 +1294,26 @@ impl IntervalCoveragePublisher {
     }
 
     /// Records one journal-replay window the replay adapter (W3) reported for
-    /// one channel.
+    /// one channel, gated through `scope`.
     ///
     /// The bound is one exact window per channel per interval: a second window
     /// is refused without touching the first, because two windows are two
     /// claims about the same interval and the record can only carry the one
-    /// the adapter stands behind. Malformed evidence and windows that cannot
-    /// fit the projected count are refused the same way. Every refusal is
-    /// traced; `dropped_samples` is untouched because a refused replay is an
-    /// adapter-shape refusal, not dropped live evidence.
+    /// the adapter stands behind. Malformed evidence is refused the same way.
+    /// The window's provenance is stamped here — the registered scope whose
+    /// membership admitted it and this publisher's interval start — so the
+    /// published record is bound to the declared interval and the admitted
+    /// scope that produced it. Every refusal is traced; `dropped_samples` is
+    /// untouched because a refused replay is an adapter-shape refusal, not
+    /// dropped live evidence.
     pub fn record_replayed(
         &mut self,
         channel: ObservationChannel,
         evidence: JournalReplayEvidence,
+        scope: &RegisteredScope,
     ) -> RecordOutcome {
         let index = channel.index();
-        if evidence.validate().is_err()
-            || u32::try_from(evidence.window_len()).is_err()
-            || self.replayed[index].is_some()
-        {
+        if evidence.validate().is_err() || self.replayed[index].is_some() {
             tracing::debug!(
                 event = "watchdog.observation_coverage_replay_not_kept",
                 observation = "not_kept",
@@ -1264,6 +1323,7 @@ impl IntervalCoveragePublisher {
             return RecordOutcome::DroppedDuplicate;
         }
         self.replayed[index] = Some(evidence);
+        self.replay_provenance[index] = Some(ReplayProvenance::stamped(scope, self.start_ms));
         RecordOutcome::Recorded
     }
 
@@ -1299,6 +1359,7 @@ impl IntervalCoveragePublisher {
             &self.observed,
             &self.dropped_samples,
             &self.replayed,
+            &self.replay_provenance,
             interval_closed,
         )
     }
@@ -1452,17 +1513,20 @@ impl IntervalCoverageCell {
     }
 
     /// Records one journal-replay window the replay adapter reported for one
-    /// channel (#1755 W3).
+    /// channel, gated through `scope` (#1755 W3).
     ///
     /// The same closed-interval rule as [`record`](Self::record): an offer
     /// made while no interval is open, or against a poisoned cell, returns
     /// [`RecordOutcome::NotRecorded`]. The one-window-per-channel-per-interval
     /// bound lives in the publisher, so a second window for one channel in
-    /// one interval is refused without touching the first.
+    /// one interval is refused without touching the first. The provenance
+    /// stamped here names the admitted scope, so only the membership-gated
+    /// call site can record a window.
     pub fn record_replayed(
         &self,
         channel: ObservationChannel,
         evidence: JournalReplayEvidence,
+        scope: &RegisteredScope,
     ) -> RecordOutcome {
         self.state
             .lock()
@@ -1470,7 +1534,7 @@ impl IntervalCoverageCell {
                 if !state.interval_open {
                     return RecordOutcome::NotRecorded;
                 }
-                state.publisher.record_replayed(channel, evidence)
+                state.publisher.record_replayed(channel, evidence, scope)
             })
     }
 
@@ -1519,7 +1583,16 @@ mod replay_disposition_tests {
             journal_id: "filesystem-usn-journal".to_owned(),
             first_cursor: first,
             last_cursor: last,
+            record_count: 10,
         }
+    }
+
+    fn test_scope() -> RegisteredScope {
+        RegisteredScope::new(
+            std::env::temp_dir().join("eliot-o5-1755-coverage-scope"),
+            "coverage-scope-gen-1",
+        )
+        .expect("test scope root is absolute with a generation")
     }
 
     fn journal_record(report: &IntervalCoverageReport) -> &ChannelIntervalCoverage {
@@ -1532,13 +1605,19 @@ mod replay_disposition_tests {
 
     /// An exact replayed window substitutes the missing live source on the
     /// journal channel: `JOURNAL_REPLAYED` with the count equal to
-    /// the evidence window length, no gaps, not blocking, internally valid.
+    /// the evidence record count, the gated scope provenance bound to this
+    /// interval, no gaps, not blocking, internally valid.
     /// I8.2 (`docs/architecture/I08-02-independent-observation-routes.md:26`).
     #[test]
     fn exact_window_on_journal_channel_closes_as_journal_replayed() {
         let mut publisher = IntervalCoveragePublisher::new(1_000);
+        let scope = test_scope();
         assert_eq!(
-            publisher.record_replayed(ObservationChannel::FilesystemJournal, window(100, 109)),
+            publisher.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(100, 109),
+                &scope
+            ),
             RecordOutcome::Recorded
         );
         let report = publisher.close(2_000);
@@ -1552,6 +1631,13 @@ mod replay_disposition_tests {
                 .first_cursor,
             100
         );
+        let provenance = record.replayed_provenance().expect("provenance kept");
+        assert_eq!(provenance.interval_start_ms, 1_000);
+        assert_eq!(
+            provenance.scope_root,
+            scope.root().display().to_string()
+        );
+        assert_eq!(provenance.scope_generation, "coverage-scope-gen-1");
         assert!(record.gaps().is_empty());
         assert!(
             !report
@@ -1566,12 +1652,21 @@ mod replay_disposition_tests {
     #[test]
     fn second_window_for_one_channel_is_refused_and_first_stands() {
         let mut publisher = IntervalCoveragePublisher::new(1_000);
+        let scope = test_scope();
         assert_eq!(
-            publisher.record_replayed(ObservationChannel::FilesystemJournal, window(100, 109)),
+            publisher.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(100, 109),
+                &scope
+            ),
             RecordOutcome::Recorded
         );
         assert_eq!(
-            publisher.record_replayed(ObservationChannel::FilesystemJournal, window(200, 209)),
+            publisher.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(200, 209),
+                &scope
+            ),
             RecordOutcome::DroppedDuplicate
         );
         let report = publisher.close(2_000);
@@ -1592,6 +1687,7 @@ mod replay_disposition_tests {
     #[test]
     fn malformed_window_is_refused_and_channel_stays_unknown() {
         let mut publisher = IntervalCoveragePublisher::new(1_000);
+        let scope = test_scope();
         assert_eq!(
             publisher.record_replayed(
                 ObservationChannel::FilesystemJournal,
@@ -1599,12 +1695,18 @@ mod replay_disposition_tests {
                     journal_id: String::new(),
                     first_cursor: 100,
                     last_cursor: 109,
-                }
+                    record_count: 10,
+                },
+                &scope
             ),
             RecordOutcome::DroppedDuplicate
         );
         assert_eq!(
-            publisher.record_replayed(ObservationChannel::FilesystemJournal, window(200, 100)),
+            publisher.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(200, 100),
+                &scope
+            ),
             RecordOutcome::DroppedDuplicate
         );
         let report = publisher.close(2_000);
@@ -1629,8 +1731,13 @@ mod replay_disposition_tests {
     #[test]
     fn replay_on_unclosed_window_is_unknown_not_coverage() {
         let mut publisher = IntervalCoveragePublisher::new(1_000);
+        let scope = test_scope();
         assert_eq!(
-            publisher.record_replayed(ObservationChannel::FilesystemJournal, window(100, 109)),
+            publisher.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(100, 109),
+                &scope
+            ),
             RecordOutcome::Recorded
         );
         let report = publisher.record_unclosed(2_000);
@@ -1703,8 +1810,13 @@ mod replay_disposition_tests {
             ),
             RecordOutcome::Recorded
         );
+        let scope = test_scope();
         assert_eq!(
-            publisher.record_replayed(ObservationChannel::FilesystemJournal, window(100, 109)),
+            publisher.record_replayed(
+                ObservationChannel::FilesystemJournal,
+                window(100, 109),
+                &scope
+            ),
             RecordOutcome::Recorded
         );
         let report = publisher.close(2_000);
