@@ -119,6 +119,25 @@ $targetManifestJson = $targetManifest | ConvertTo-Json -Depth 50
     (New-Object System.Text.UTF8Encoding($false))
 )
 
+# The staged manifest launch argv names an installation-owned client
+# declaration (issue #18 W12/AUD-5848256288-2). The packager must not invent
+# installation authority, so a staged package whose launch declaration is
+# absent fails here with the producer contract instead of shipping a bundle
+# whose entry point cannot launch: the installation side materializes
+# server/agent-bridge/client-declaration-v2.json (agent-bridge profile
+# contract), and the bridge re-validates it (path shape, digest, live Kernel
+# challenge) before serving.
+$launchArgs = @($targetManifest.server.mcp_config.args)
+for ($i = 0; $i -lt $launchArgs.Count; $i++) {
+    if ($launchArgs[$i] -eq '--client-declaration' -and ($i + 1) -lt $launchArgs.Count) {
+        $declaredRelative = [string]$launchArgs[$i + 1] -replace '^\$\{__dirname\}/', ''
+        $stagedDeclaration = Join-Path $targetRoot ($declaredRelative -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-Path -LiteralPath $stagedDeclaration -PathType Leaf)) {
+            throw "refusing to package a Desktop bundle whose launch declaration is absent: $declaredRelative is not staged under $targetRoot. The client declaration is installation-owned (materialized by the installation side under the agent-bridge profile contract); the packager must not invent it. Wire the installer producer before packaging."
+        }
+    }
+}
+
 if (-not $McpbCli) {
     $resolved = Get-Command mcpb -ErrorAction SilentlyContinue
     if ($resolved) {

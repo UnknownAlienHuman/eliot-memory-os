@@ -180,22 +180,22 @@ public static class LegacyOperatorAdapter
     ///    client validates, replacing the `owner_unissued` constant
     ///    (`OperatorResponseBounds.cs:151`). The current owner already computes
     ///    one that this client does not read: `ControlBoardContour.view_fence`
-    ///    (`controlboard_projection.rs:199`) and
-    ///    `RenderedControlBoard.view_fence` (`controlboard_consumer.rs:534`).
+    ///    (`controlboard_projection.rs:200`) and
+    ///    `RenderedControlBoard.view_fence` (`controlboard_consumer.rs:538`).
     /// 3. Mutations no longer ride `eliot_operator_command`. The legacy page is
-    ///    `OperatorProjectionPage` (`crates/eliot-types/src/cognition.rs:1302`
-    ///    -`:1323`; `task_revision` only, no fence or epoch), produced only by
-    ///    `crates/eliot-app/src/mcp_stdio/operator.rs:821` -`:840`, in a crate
+    ///    `OperatorProjectionPage` (`crates/eliot-types/src/cognition.rs:1348`
+    ///    -`:1369`; `task_revision` only, no fence or epoch), produced only by
+    ///    `crates/eliot-app/src/mcp_stdio/operator.rs:821` -`:841`, in a crate
     ///    that calls itself "not a current production composition root"
     ///    (`crates/eliot-app/Cargo.toml:7`) and depends on no `eliot-contracts`.
     /// 4. The UI pipe carries one protocol for this client. It carries two
     ///    today: the broker redeem leg (`BrokerPipeClient.cs:75` -`:134`) and
     ///    the Governor handshake leg, which writes `eliot_ipc_handshake`
-    ///    (`GovernorPipeClient.cs:579` -`:594`) on the pipe the broker's only
+    ///    (`GovernorPipeClient.cs:685` -`:700`) on the pipe the broker's only
     ///    server for that name binds (`bins/eliot-user-broker/src/main.rs:872`)
     ///    and where anything other than `operator_challenge` then
     ///    `redeem_operator_handoff` is answered
-    ///    `BROKER_PROTOCOL_SEQUENCE_REJECTED` (`:941` -`:954`, `:979` -`:990`).
+    ///    `BROKER_PROTOCOL_SEQUENCE_REJECTED` (`:941` -`:954`, `:979` -`:993`).
     /// 5. `Consumer` has no remaining call site of the four legacy
     ///    `eliot_operator_*` tools. The typed user-automation owner route
     ///    (`UserAutomationContract.Route`, served by the current Kernel) is not
