@@ -1271,16 +1271,14 @@ pub fn activation_operation_identity(
 /// receipt, the same owner evidence — returns the original active snapshot
 /// unchanged: the second activation is refused as a same-identity
 /// different-content conflict only when the content actually differs.
-pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecoveryStore + ?Sized>(
-    store: &S,
+/// Requires the caller-supplied activation identities before any store read.
+///
+/// The reservation, work item, proposed attempt and operation identities are
+/// all caller inputs, so a blank one refuses here rather than reaching the
+/// row comparison as a mismatch.
+fn require_activation_request_identities(
     request: &AdmissionReservationActivationRequest,
-) -> Result<AdmissionReservationActivatedOutcome, OrsError> {
-    if request.now_ms <= 0 {
-        return Err(OrsError::InvalidField {
-            field: "admission_reservation_activation.now_ms",
-            reason: "activation time must be greater than zero",
-        });
-    }
+) -> Result<(), OrsError> {
     if request.reservation_id.as_str().trim().is_empty()
         || request.work_item_id.as_str().trim().is_empty()
         || request.proposed_attempt_id.as_str().trim().is_empty()
@@ -1291,6 +1289,20 @@ pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecovery
             reason: "reservation, work item, proposed attempt and operation identities must be non-blank",
         });
     }
+    Ok(())
+}
+
+pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecoveryStore + ?Sized>(
+    store: &S,
+    request: &AdmissionReservationActivationRequest,
+) -> Result<AdmissionReservationActivatedOutcome, OrsError> {
+    if request.now_ms <= 0 {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation_activation.now_ms",
+            reason: "activation time must be greater than zero",
+        });
+    }
+    require_activation_request_identities(request)?;
     // The immutable binding is validated BEFORE the write with the existing
     // validators, by value, against the ORIGINAL recorded fence and epoch.
     request.claims.validate()?;
@@ -1298,17 +1310,9 @@ pub fn activate_admission_reservation_from_owner_evidence<S: OperationalRecovery
     request
         .state_fence
         .validate_against_lineage(&request.authority_epoch)?;
-    // The profile revision is required at activation, never defaulted: it is
-    // the composition-retained CURRENT revision the saga read, so a reservation
-    // can never be activated without binding the capacity view it was admitted
-    // under. The check runs before any store read so a blank revision refuses
+    // Required at activation, before any store read: a blank revision refuses
     // without touching durable state.
-    if request.capacity_profile_revision.trim().is_empty() {
-        return Err(OrsError::InvalidField {
-            field: "admission_reservation_activation.capacity_profile_revision",
-            reason: "activation must bind the current control-reserve profile revision, never a blank default",
-        });
-    }
+    request.validate_capacity_profile_revision()?;
     AdmissionReservationActivationEvidence {
         canonical_admission_receipt: request.canonical_admission_receipt.clone(),
         activation_receipt: request.activation_receipt.clone(),

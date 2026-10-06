@@ -35482,16 +35482,9 @@ impl RedbRecoveryStore {
                 disposition.evidence.validate()?;
             }
             AdmissionReservationTransitionSpec::Activation { request } => {
-                // The write boundary re-checks the required revision itself:
-                // the evidence shape check below stays legacy-tolerant so rows
-                // activated before profile binding kept reading back, while no
-                // NEW activation can commit without the current revision.
-                if request.capacity_profile_revision.trim().is_empty() {
-                    return Err(OrsError::InvalidField {
-                        field: "admission_reservation_activation.capacity_profile_revision",
-                        reason: "activation must bind the current control-reserve profile revision, never a blank default",
-                    });
-                }
+                // The write boundary re-checks the required revision: the
+                // evidence shape check below stays legacy-tolerant.
+                request.validate_capacity_profile_revision()?;
                 AdmissionReservationActivationEvidence {
                     canonical_admission_receipt: request.canonical_admission_receipt.clone(),
                     activation_receipt: request.activation_receipt.clone(),
@@ -35602,7 +35595,9 @@ impl RedbRecoveryStore {
                 // #1679 W11: commit the capacity view this activation was
                 // admitted under. The non-blank requirement above guarantees a
                 // real owner revision lands here, never a default.
-                record.capacity_profile_revision = request.capacity_profile_revision.clone();
+                record
+                    .capacity_profile_revision
+                    .clone_from(&request.capacity_profile_revision);
             }
         }
         record.operation_id = spec.operation_id().clone();

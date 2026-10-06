@@ -320,6 +320,9 @@ fn ors_error_tag(error: &OrsError) -> &'static str {
 /// when the expected profile revision is blank. The row's own state is NOT an
 /// error here: it is the owner's typed
 /// [`AdmissionReservationLaunchPrerequisite`] variant.
+/// The eight parameters mirror the owner verifier's own gate one by one; a
+/// params struct would invent a second signature beside the owner's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_admission_reservation_launch_prerequisite<
     S: OperationalRecoveryStore + ?Sized,
 >(
@@ -445,6 +448,9 @@ pub(crate) fn find_admission_reservation_for_launch<S: OperationalRecoveryStore 
 /// current work item, attempt, Authority Epoch lineage, State Fence, current
 /// profile revision and unexpired deadline, and naming the typed ORS refusal
 /// when the durable row itself is unreadable or violates its own validator.
+/// The eight parameters mirror the owner verifier's own gate one by one; a
+/// params struct would invent a second signature beside the owner's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn require_admission_reservation_launch<S: OperationalRecoveryStore + ?Sized>(
     store: &S,
     reservation_id: &OperationIdentity,
@@ -602,6 +608,9 @@ pub(crate) fn require_bound_admission_reservation_launch<S: OperationalRecoveryS
 /// when the reservation is not an exact `Active` row under the current profile
 /// revision, and naming the typed ORS refusal when the durable row is
 /// unreadable or violates its validator.
+/// The eight parameters mirror the owner verifier's own gate one by one; a
+/// params struct would invent a second signature beside the owner's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn require_active_admission_reservation<S: OperationalRecoveryStore + ?Sized>(
     store: &S,
     reservation_id: &OperationIdentity,

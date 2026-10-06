@@ -431,17 +431,10 @@ impl AdmissionReservationRecord {
                             // of owner receipts that authorized it.
                             || transition.reason.is_some()
                             || transition.evidence.is_some()
-                            || transition
-                                .activation
-                                .as_ref()
-                                .is_none_or(|activation| {
-                                    Some(&activation.canonical_admission_receipt)
-                                        != self.canonical_admission_receipt.as_ref()
-                                        || Some(&activation.activation_receipt)
-                                            != self.activation_receipt.as_ref()
-                                        || activation.capacity_profile_revision
-                                            != self.capacity_profile_revision
-                                })
+                            || activation_evidence_mismatches_row(
+                                transition.activation.as_ref(),
+                                self,
+                            )
                     })
                 {
                     return Err(OrsError::InvalidTransition);
@@ -622,6 +615,52 @@ pub struct AdmissionReservationTransitionRequest {
     /// decidable by comparing this whole request.
     #[serde(default)]
     pub activation: Option<AdmissionReservationActivationEvidence>,
+}
+
+impl AdmissionReservationActivationRequest {
+    /// Requires the bound control-reserve profile revision (#1679 W11).
+    ///
+    /// The revision is the composition-retained CURRENT revision the activator
+    /// read, never a default and never recomputed: a blank revision refuses
+    /// here, before any store read or mutation, so a reservation can never be
+    /// activated without binding the capacity view it was admitted under.
+    /// Legacy rows activated before profile binding existed keep reading back
+    /// (their empty revision verifies as stale); only NEW activations pass
+    /// through this gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidField`] naming
+    /// `admission_reservation_activation.capacity_profile_revision` when the
+    /// revision is blank.
+    pub(crate) fn validate_capacity_profile_revision(&self) -> Result<(), OrsError> {
+        if self.capacity_profile_revision.trim().is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "admission_reservation_activation.capacity_profile_revision",
+                reason: "activation must bind the current control-reserve profile revision, never a blank default",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Whether one activation's retained evidence disagrees with the row that
+/// committed it (#1679 W11).
+///
+/// The receipts AND the bound profile revision must all agree: a row whose
+/// evidence names a different revision than the row itself is refused on
+/// readback instead of being served as one truth. An absent evidence block
+/// passes here — the `Active` arm requires its presence through the receipt
+/// slots — so legacy rows without any evidence keep their existing shape.
+fn activation_evidence_mismatches_row(
+    activation: Option<&AdmissionReservationActivationEvidence>,
+    record: &AdmissionReservationRecord,
+) -> bool {
+    activation.is_none_or(|evidence| {
+        Some(&evidence.canonical_admission_receipt) != record.canonical_admission_receipt.as_ref()
+            || Some(&evidence.activation_receipt) != record.activation_receipt.as_ref()
+            || evidence.capacity_profile_revision != record.capacity_profile_revision
+    })
 }
 
 /// Required owner evidence for one exact `StagedInactive`/`Reconciling` →
@@ -1029,6 +1068,7 @@ pub fn verify_admission_reservation_launch_prerequisite(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod profile_revision_tests {
     //! Profile-revision binding proofs that need no store (#1679 W11).
     //!

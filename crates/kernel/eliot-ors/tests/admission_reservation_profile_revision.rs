@@ -1,4 +1,6 @@
 #![cfg(feature = "test-support")]
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 //! Control-reserve profile revision binding for admission reservations
 //! (issues #1679 W11, #1701 R2-owners).
 //!
