@@ -568,6 +568,36 @@ impl WatchdogComposition {
                                     kernel.allowed_manifest_digest(),
                                     &closed,
                                 );
+                            // Issue #1755 (W7): gate every channel's
+                            // downstream absence/compliance claim on the
+                            // exact active profile the admitted port
+                            // supplies, if any. The verdicts are operator
+                            // evidence on the same tick, like the gap
+                            // verdict above: a channel without a named
+                            // competent sensor keeps its gap and earns no
+                            // claim downstream (#1756/#1758), and a port
+                            // that resolved no profile disables every
+                            // claim rather than substituting one.
+                            let gated_claims =
+                                crate::observation_coverage::gate_downstream_claims(
+                                    &closed,
+                                    kernel.active_coverage_profile().as_ref(),
+                                );
+                            tracing::debug!(
+                                event = "watchdog.downstream_claims_gated",
+                                observation = "gated",
+                                gated_allowed = gated_claims
+                                    .iter()
+                                    .filter(|claim| claim.claim_allowed)
+                                    .count(),
+                                gated_blocked = gated_claims
+                                    .iter()
+                                    .filter(|claim| !claim.claim_allowed)
+                                    .map(|claim| claim.channel.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                "downstream absence/compliance claims gated on the active coverage profile for this interval"
+                            );
                             // The payload reaches the owner spool on this
                             // tick (#1755 W6); the log keeps the summary
                             // only. A retain miss is warned: evidence that

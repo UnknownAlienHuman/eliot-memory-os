@@ -982,6 +982,163 @@ impl IntervalCoverageReport {
     }
 }
 
+/// One competent sensor the active coverage profile names for downstream
+/// gating (#1755 W7).
+///
+/// The profile — never this owner — decides which sensors are competent for
+/// the observed subject and generation; the gate below only checks that a
+/// sensor is named here AND that it actually delivered this interval. A
+/// sensor a newer profile revision stops naming is expired by removal: no
+/// separate expiry flag can disagree with the profile about what is current.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompetentSensor {
+    /// The I8.2 channel this sensor is competent for.
+    pub channel: ObservationChannel,
+    /// Exact identity of the competent source, in the map's
+    /// `competent_source` wording (never blank).
+    pub sensor_identity: String,
+    /// Approved installation/target under watch (never blank).
+    pub observed_subject: String,
+    /// Installer-approved generation the naming is valid for (never blank).
+    pub observed_generation: String,
+}
+
+/// The exact active coverage profile downstream gating consults (#1755 W7).
+///
+/// This is the consumption shape, not either producer vocabulary: both
+/// `IntegrationCoverageProfile` types on main (`eliot-integration-coverage`,
+/// `eliot-context-contracts`) name neither sensor nor channel, so whichever
+/// one feeds the Watchdog maps to these named sensors by this owner's own
+/// [`ObservationChannel`] wire names. Which producer type feeds it is the
+/// open CS1 contract question; the gate and the tick below already consult
+/// exactly this shape through
+/// [`KernelWatchdogPort::active_coverage_profile`](crate::KernelWatchdogPort::active_coverage_profile).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveCoverageProfile {
+    /// Revision of the active profile (never blank).
+    pub profile_revision: String,
+    /// Digest binding the revision, so a mutated profile cannot substitute
+    /// for the one the producer resolved (never blank).
+    pub profile_digest: String,
+    /// The competent sensors this revision names, at most one per channel.
+    pub competent_sensors: Vec<CompetentSensor>,
+}
+
+impl ActiveCoverageProfile {
+    /// The sensor this profile names for `channel`, if any.
+    ///
+    /// The first match wins so a profile that names one channel twice cannot
+    /// smuggle a second identity past the gate; the producer owns
+    /// deduplication.
+    #[must_use]
+    pub fn sensor_for(&self, channel: ObservationChannel) -> Option<&CompetentSensor> {
+        self.competent_sensors
+            .iter()
+            .find(|sensor| sensor.channel == channel)
+    }
+
+    /// True when the revision and digest are both usable bindings.
+    fn well_formed(&self) -> bool {
+        !self.profile_revision.trim().is_empty() && !self.profile_digest.trim().is_empty()
+    }
+}
+
+/// True when every observed binding of one named sensor is usable.
+fn sensor_well_formed(sensor: &CompetentSensor) -> bool {
+    !sensor.sensor_identity.trim().is_empty()
+        && !sensor.observed_subject.trim().is_empty()
+        && !sensor.observed_generation.trim().is_empty()
+}
+
+/// What the downstream gate decided for one channel over one interval.
+///
+/// This is the W7 supply shape for #1756/#1758: the exact active profile
+/// revision and digest, the named sensor identity with its observed
+/// subject/generation, the declared interval, and whether an
+/// absence/compliance claim about this channel is allowed downstream.
+/// `I08-06-bypass-detection.md:16`: detections exist only where the active
+/// profile names a competent sensor; missing coverage is a supervision gap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DownstreamChannelClaim {
+    /// The I8.2 channel this claim is about.
+    pub channel: ObservationChannel,
+    /// Revision of the active profile consulted, when one was supplied.
+    pub profile_revision: Option<String>,
+    /// Identity of the sensor the profile named for this channel, if any.
+    pub sensor_identity: Option<String>,
+    /// Subject the named sensor observes, if one was named.
+    pub observed_subject: Option<String>,
+    /// Generation the naming is valid for, if one was named.
+    pub observed_generation: Option<String>,
+    /// The declared interval the claim is about.
+    pub interval: CoverageInterval,
+    /// Whether downstream may treat this channel as competently covered for
+    /// absence/compliance claims.
+    pub claim_allowed: bool,
+    /// Bounded reason code for the verdict.
+    pub reason: &'static str,
+}
+
+/// Gates every channel's downstream absence/compliance claim on the exact
+/// active profile (#1755 W7).
+///
+/// One claim per I8.2 channel, in map order, each decided alone: a missing
+/// or expired sensor disables only its own channel's claim, never an
+/// unrelated independent observation. A claim is allowed only when the
+/// report is internally consistent, the interval was closed, the profile is
+/// supplied and well-formed, it names a well-formed sensor for the channel,
+/// and that sensor actually delivered this interval (`CONTINUOUS` live or
+/// `JOURNAL_REPLAYED`). Anything less is a named disabled reason, never a
+/// silent omission.
+#[must_use]
+pub fn gate_downstream_claims(
+    report: &IntervalCoverageReport,
+    profile: Option<&ActiveCoverageProfile>,
+) -> Vec<DownstreamChannelClaim> {
+    let interval = report.interval();
+    let report_usable = report.valid();
+    let interval_closed = report
+        .records()
+        .iter()
+        .all(ChannelIntervalCoverage::interval_closed);
+    ObservationChannel::ALL
+        .iter()
+        .map(|channel| {
+            let record = report
+                .records()
+                .iter()
+                .find(|record| record.channel() == *channel);
+            let (allowed, reason) = match (report_usable, interval_closed, record, profile) {
+                (false, _, _, _) => (false, "REPORT_INVALID"),
+                (true, false, _, _) => (false, "INTERVAL_NOT_CLOSED"),
+                (_, _, _, None) => (false, "NO_ACTIVE_PROFILE"),
+                (_, _, _, Some(profile)) if !profile.well_formed() => (false, "NO_ACTIVE_PROFILE"),
+                (_, _, _, Some(profile)) => match profile.sensor_for(*channel) {
+                    None => (false, "SENSOR_NOT_NAMED"),
+                    Some(sensor) if !sensor_well_formed(sensor) => (false, "SENSOR_BINDING_BLANK"),
+                    Some(_) => match record.map(ChannelIntervalCoverage::disposition) {
+                        Some(
+                            CoverageDisposition::Continuous | CoverageDisposition::JournalReplayed,
+                        ) => (true, "ALLOWED"),
+                        _ => (false, "CHANNEL_NOT_OBSERVED"),
+                    },
+                },
+            };
+            let named = profile.and_then(|profile| profile.sensor_for(*channel));
+            DownstreamChannelClaim {
+                channel: *channel,
+                profile_revision: profile.map(|profile| profile.profile_revision.clone()),
+                sensor_identity: named.map(|sensor| sensor.sensor_identity.clone()),
+                observed_subject: named.map(|sensor| sensor.observed_subject.clone()),
+                observed_generation: named.map(|sensor| sensor.observed_generation.clone()),
+                interval,
+                claim_allowed: allowed,
+                reason,
+            }
+        })
+        .collect()
+}
+
 /// What one offered live sample did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordOutcome {
@@ -1464,7 +1621,8 @@ mod replay_disposition_tests {
     /// covered (#1755 A7, first half): the wired channel the tick observed
     /// nothing for stays `UNKNOWN` with `NO_ESTABLISHABLE_SAMPLE`, blocks
     /// full coverage, and the report stays internally valid. The downstream
-    /// profile gate (second half) lands with W7.
+    /// profile gate (second half) is [`gate_downstream_claims`], proved in
+    /// `profile_gate_tests` below.
     #[test]
     fn removed_competent_sensor_is_a_named_hole_blocking_full_coverage() {
         let mut publisher = IntervalCoveragePublisher::new(1_000);
@@ -1526,5 +1684,227 @@ mod replay_disposition_tests {
                 .contains(&ObservationClass::PathChange)
         );
         assert!(report.valid());
+    }
+}
+
+/// Downstream profile gate (#1755 W7, second half of A7).
+///
+/// Each test gates one closed interval against an explicit active profile:
+/// naming alone earns nothing without this-interval delivery, and one
+/// channel's disabled claim never touches its siblings.
+#[cfg(test)]
+mod profile_gate_tests {
+    use super::*;
+
+    fn sensor(channel: ObservationChannel) -> CompetentSensor {
+        CompetentSensor {
+            channel,
+            sensor_identity: format!("{}-competent-source", channel.as_str()),
+            observed_subject: "installation-1755".to_owned(),
+            observed_generation: "generation-7".to_owned(),
+        }
+    }
+
+    fn profile(channels: &[ObservationChannel]) -> ActiveCoverageProfile {
+        ActiveCoverageProfile {
+            profile_revision: "profile-rev-3".to_owned(),
+            profile_digest: "digest-abc".to_owned(),
+            competent_sensors: channels.iter().map(|channel| sensor(*channel)).collect(),
+        }
+    }
+
+    fn wired_observed_report() -> IntervalCoverageReport {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in [
+            ObservationChannel::ScmServiceState,
+            ObservationChannel::ProcessExitIdentity,
+            ObservationChannel::KernelHeartbeat,
+        ] {
+            let capability = channel_capability(channel);
+            for class in capability.supported_classes {
+                assert_eq!(publisher.record(channel, *class), RecordOutcome::Recorded);
+            }
+        }
+        publisher.close(2_000)
+    }
+
+    fn claim_for(
+        claims: &[DownstreamChannelClaim],
+        channel: ObservationChannel,
+    ) -> &DownstreamChannelClaim {
+        claims
+            .iter()
+            .find(|claim| claim.channel == channel)
+            .unwrap_or_else(|| panic!("claim for {} present", channel.as_str()))
+    }
+
+    /// A named, wired, observed sensor earns its downstream claim, carrying
+    /// the exact profile revision, sensor identity, subject, generation and
+    /// interval I08-06 hands #1756/#1758.
+    #[test]
+    fn named_wired_observed_sensor_earns_absence_claim() {
+        let report = wired_observed_report();
+        assert!(report.valid());
+        let active = profile(&[
+            ObservationChannel::ScmServiceState,
+            ObservationChannel::KernelHeartbeat,
+        ]);
+        let claims = gate_downstream_claims(&report, Some(&active));
+        assert_eq!(claims.len(), ObservationChannel::COUNT);
+        let claim = claim_for(&claims, ObservationChannel::ScmServiceState);
+        assert!(claim.claim_allowed);
+        assert_eq!(claim.reason, "ALLOWED");
+        assert_eq!(claim.profile_revision.as_deref(), Some("profile-rev-3"));
+        assert_eq!(
+            claim.sensor_identity.as_deref(),
+            Some("scm_service_state-competent-source")
+        );
+        assert_eq!(claim.observed_subject.as_deref(), Some("installation-1755"));
+        assert_eq!(claim.observed_generation.as_deref(), Some("generation-7"));
+        assert_eq!(claim.interval.start_ms, 1_000);
+        assert_eq!(claim.interval.end_ms, 2_000);
+        let heartbeat = claim_for(&claims, ObservationChannel::KernelHeartbeat);
+        assert!(heartbeat.claim_allowed);
+        assert_eq!(heartbeat.reason, "ALLOWED");
+    }
+
+    /// A removed competent sensor named by the profile but unobserved this
+    /// interval earns no claim — while its observed siblings keep theirs, so
+    /// one hole disables exactly one claim.
+    #[test]
+    fn removed_sensor_named_but_unobserved_disables_only_its_claim() {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            if channel == ObservationChannel::ScmServiceState {
+                continue;
+            }
+            let capability = channel_capability(channel);
+            for class in capability.supported_classes {
+                assert_eq!(publisher.record(channel, *class), RecordOutcome::Recorded);
+            }
+        }
+        let report = publisher.close(2_000);
+        let active = profile(&ObservationChannel::ALL);
+        let claims = gate_downstream_claims(&report, Some(&active));
+        let removed = claim_for(&claims, ObservationChannel::ScmServiceState);
+        assert!(!removed.claim_allowed);
+        assert_eq!(removed.reason, "CHANNEL_NOT_OBSERVED");
+        assert_eq!(
+            removed.sensor_identity.as_deref(),
+            Some("scm_service_state-competent-source")
+        );
+        let sibling = claim_for(&claims, ObservationChannel::KernelHeartbeat);
+        assert!(sibling.claim_allowed);
+        assert_eq!(sibling.reason, "ALLOWED");
+    }
+
+    /// Naming is not observing: a `MissingAdapter` channel the profile names
+    /// stays blind and earns no claim.
+    #[test]
+    fn missing_adapter_named_but_blind_earns_no_claim() {
+        let report = wired_observed_report();
+        let active = profile(&[ObservationChannel::FilesystemJournal]);
+        let claims = gate_downstream_claims(&report, Some(&active));
+        let journal = claim_for(&claims, ObservationChannel::FilesystemJournal);
+        assert!(!journal.claim_allowed);
+        assert_eq!(journal.reason, "CHANNEL_NOT_OBSERVED");
+    }
+
+    /// With no active profile supplied every claim is disabled, even for
+    /// channels the tick observed: detections exist only where the active
+    /// profile names a competent sensor.
+    #[test]
+    fn no_active_profile_disables_every_claim() {
+        let report = wired_observed_report();
+        let claims = gate_downstream_claims(&report, None);
+        assert_eq!(claims.len(), ObservationChannel::COUNT);
+        for claim in &claims {
+            assert!(!claim.claim_allowed);
+            assert_eq!(claim.reason, "NO_ACTIVE_PROFILE");
+            assert_eq!(claim.profile_revision, None);
+        }
+        let observed = claim_for(&claims, ObservationChannel::ScmServiceState);
+        assert_eq!(observed.sensor_identity, None);
+    }
+
+    /// Expiry by supersession: a sensor the current revision stops naming
+    /// earns no claim under it, while it earned one under the revision that
+    /// named it.
+    #[test]
+    fn superseded_profile_disables_dropped_sensor() {
+        let report = wired_observed_report();
+        let current = profile(&[ObservationChannel::KernelHeartbeat]);
+        let claims = gate_downstream_claims(&report, Some(&current));
+        let dropped = claim_for(&claims, ObservationChannel::ScmServiceState);
+        assert!(!dropped.claim_allowed);
+        assert_eq!(dropped.reason, "SENSOR_NOT_NAMED");
+        let kept = claim_for(&claims, ObservationChannel::KernelHeartbeat);
+        assert!(kept.claim_allowed);
+        let previous = profile(&[
+            ObservationChannel::ScmServiceState,
+            ObservationChannel::KernelHeartbeat,
+        ]);
+        let before = gate_downstream_claims(&report, Some(&previous));
+        assert!(claim_for(&before, ObservationChannel::ScmServiceState).claim_allowed);
+    }
+
+    /// A named sensor with a blank identity earns no claim; its well-formed
+    /// sibling is unaffected.
+    #[test]
+    fn blank_sensor_identity_disables_only_its_claim() {
+        let report = wired_observed_report();
+        let mut active = profile(&[
+            ObservationChannel::ScmServiceState,
+            ObservationChannel::KernelHeartbeat,
+        ]);
+        if let Some(sensor) = active
+            .competent_sensors
+            .iter_mut()
+            .find(|sensor| sensor.channel == ObservationChannel::ScmServiceState)
+        {
+            sensor.sensor_identity = "  ".to_owned();
+        }
+        let claims = gate_downstream_claims(&report, Some(&active));
+        let blank = claim_for(&claims, ObservationChannel::ScmServiceState);
+        assert!(!blank.claim_allowed);
+        assert_eq!(blank.reason, "SENSOR_BINDING_BLANK");
+        let sibling = claim_for(&claims, ObservationChannel::KernelHeartbeat);
+        assert!(sibling.claim_allowed);
+    }
+
+    /// An interval no tick closed establishes no claim on any channel: the
+    /// window has no declared end to be a claim about.
+    #[test]
+    fn unclosed_interval_disables_every_claim() {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        let capability = channel_capability(ObservationChannel::ScmServiceState);
+        for class in capability.supported_classes {
+            assert_eq!(
+                publisher.record(ObservationChannel::ScmServiceState, *class),
+                RecordOutcome::Recorded
+            );
+        }
+        let report = publisher.record_unclosed(2_000);
+        let active = profile(&[ObservationChannel::ScmServiceState]);
+        let claims = gate_downstream_claims(&report, Some(&active));
+        for claim in &claims {
+            assert!(!claim.claim_allowed);
+            assert_eq!(claim.reason, "INTERVAL_NOT_CLOSED");
+        }
+    }
+
+    /// An inconsistent report establishes no claim: the gate never consults
+    /// the profile past a report that disagrees with its own evidence.
+    #[test]
+    fn inconsistent_report_disables_every_claim() {
+        let publisher = IntervalCoveragePublisher::new(2_000);
+        let report = publisher.close(1_000);
+        assert!(!report.valid());
+        let active = profile(&ObservationChannel::ALL);
+        let claims = gate_downstream_claims(&report, Some(&active));
+        for claim in &claims {
+            assert!(!claim.claim_allowed);
+            assert_eq!(claim.reason, "REPORT_INVALID");
+        }
     }
 }

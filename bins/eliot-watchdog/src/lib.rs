@@ -108,6 +108,9 @@ pub use observation_attribution::{
     AttributionError, EventOrigin, FileChangeEvidence, RegisteredScope, ScopeMembership,
     TaskAttribution, resolve_scope_membership,
 };
+pub use observation_coverage::{
+    ActiveCoverageProfile, CompetentSensor, DownstreamChannelClaim, gate_downstream_claims,
+};
 pub use store_endpoint_observation::{
     StoreEndpointObservation, StoreEndpointTarget, observe_store_endpoint, store_endpoint_target,
 };
@@ -1658,6 +1661,22 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     /// `None` and the interval projects no manifest at all - a named omission,
     /// never a substituted or default digest.
     fn allowed_manifest_digest(&self) -> Option<&str> {
+        None
+    }
+
+    /// The exact active coverage profile this port's owner resolved for the
+    /// observed installation, when it knows one (#1755 W7).
+    ///
+    /// Downstream absence/compliance claims (#1756/#1758) exist only where
+    /// this profile names a competent sensor (`I08-06-bypass-detection.md:16`).
+    /// A port whose owner resolved no profile returns `None` and the tick
+    /// disables every such claim - a named supervision gap, never a
+    /// substituted or default profile. The profile names sensors by this
+    /// owner's own observation-channel wire names, so either
+    /// `IntegrationCoverageProfile` shape on main (`eliot-integration-coverage`,
+    /// `eliot-context-contracts`) maps to it without this crate depending on
+    /// either; which producer type feeds it is the open CS1 contract question.
+    fn active_coverage_profile(&self) -> Option<ActiveCoverageProfile> {
         None
     }
 
