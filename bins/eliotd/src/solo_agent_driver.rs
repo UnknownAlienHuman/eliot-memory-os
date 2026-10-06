@@ -3506,6 +3506,44 @@ mod solo_enqueue_push_tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+mod solo_intake_consume_chain_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Issue #2567 W2: the admitted intake queued by `push_validated_intake`
+    /// is the exact item the drive leg consumes, and the direct-entry drive
+    /// settles it with a typed daemon refusal before any fabric effect. The
+    /// unconnected test kernel fails every exchange as an unestablished
+    /// outcome, so the refusal names the kernel seam rather than inventing
+    /// an answer.
+    #[tokio::test]
+    async fn queued_intake_drives_to_typed_refusal() {
+        let (_, intake, now) = solo_test_pair();
+        let mut state = SoloDriverState::new();
+        push_validated_intake(&mut state, intake.clone(), now).expect("valid intake queues");
+        assert_eq!(state.queue.len(), 1);
+        let consumed = state
+            .queue
+            .pop_front()
+            .expect("queued intake is consumable");
+        assert!(intake_revisions_match(&consumed, &intake));
+        let fence = consumed.claimed.presented_fence.clone();
+        let kernel = Arc::new(
+            crate::daemon_kernel_client::DaemonKernelClient::new_for_test(
+                fence.authority_epoch.clone(),
+                fence,
+            ),
+        );
+        match drive_solo_delegate_async(&kernel, consumed, now).await {
+            Err(DaemonError::Kernel(_) | DaemonError::ProviderAdmission(_)) => {}
+            other => panic!("expected typed drive refusal, got {other:?}"),
+        }
+        assert!(state.queue.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 mod canonical_delegate_tests {
     use super::*;
 
