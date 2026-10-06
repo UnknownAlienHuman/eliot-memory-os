@@ -152,6 +152,8 @@ pub struct ProcessPermit {
     profile_revision: String,
     /// Issuing owner generation bound at issuance.
     owner_generation: ResourceGeneration,
+    /// Exact immutable owner-issued projection authenticated by this handle.
+    issuance: Option<CapacityPermitBinding>,
 }
 
 /// Exactly-once release evidence for one [`ProcessPermit`].
@@ -746,6 +748,7 @@ impl ProcessTreeReserve {
             profile_id: String::new(),
             profile_revision: String::new(),
             owner_generation: ResourceGeneration::genesis(),
+            issuance: None,
         })
     }
 
@@ -883,6 +886,7 @@ impl ProcessTreeReserve {
             binding.matches_request(request),
             "process-tree minted permit binding must match its request"
         );
+        permit.issuance = Some(binding.clone());
         Ok((permit, binding))
     }
 
@@ -937,7 +941,8 @@ impl ProcessTreeReserve {
                 });
             }
         }
-        if binding.permit_id != permit.permit_id
+        if permit.issuance.as_ref() != Some(binding)
+            || binding.permit_id != permit.permit_id
             || binding.operation != permit.operation
             || binding.operation_id != permit.operation_id
             || binding.bottleneck != permit.bottleneck
@@ -1636,6 +1641,31 @@ mod tests {
             owner.verify_process_permit(&permit, &binding, &changed, &live),
             Err(KernelError::InvalidField { .. })
         ));
+        // Two matching public projections cannot relabel the held issuance.
+        let mut two_slots = request.clone();
+        two_slots.requested_limit.quantity =
+            NonZeroU64::new(2).unwrap_or_else(|| panic!("two is nonzero"));
+        let mut two_slot_binding = binding.clone();
+        two_slot_binding.granted_limit = two_slots.requested_limit;
+        let mut new_generation = request.clone();
+        new_generation.requesting_generation_ref = ResourceGeneration::new(2)?;
+        let mut new_generation_binding = binding.clone();
+        new_generation_binding.requesting_generation_ref = new_generation.requesting_generation_ref;
+        let refusals = [
+            (&two_slot_binding, &two_slots),
+            (&new_generation_binding, &new_generation),
+        ]
+        .map(|(changed_binding, changed_request)| {
+            assert!(changed_binding.validate().is_ok());
+            assert!(changed_binding.matches_request(changed_request));
+            owner.verify_process_permit(&permit, changed_binding, changed_request, &live)
+        });
+        assert!(
+            refusals
+                .iter()
+                .all(|result| matches!(result, Err(KernelError::InvalidField { .. }))),
+            "altered amount and requester generation must both be refused: {refusals:?}"
+        );
         Ok(())
     }
 
