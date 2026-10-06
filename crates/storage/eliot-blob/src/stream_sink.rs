@@ -225,6 +225,23 @@ pub struct BlobStreamBoundedPreviewMeasure {
     pub omitted_ranges: Vec<StreamByteRange>,
 }
 
+/// The owner-backed durable admitted prefix retained by one `Partial` abort.
+///
+/// This is boxed inside [`BlobStreamPublication::Partial`] for the same sizing
+/// reason as [`BlobStreamCompleteSource`]: the locator, receipt and identity
+/// fields would otherwise make the variant far larger than `Unavailable`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobStreamPartialPrefix {
+    /// Immutable locator of the retained prefix object.
+    pub locator: String,
+    /// Owner-issued receipt identity that resolves and verifies it.
+    pub ready_receipt_ref: String,
+    /// Exact durable byte length of the retained prefix.
+    pub byte_length: u64,
+    /// SHA-256 over exactly the retained prefix bytes.
+    pub sha256: String,
+}
+
 /// The owner-backed durable expansion source of one `Complete` terminal.
 ///
 /// This is boxed inside [`BlobStreamPublication::Complete`] so the enum stays
@@ -263,21 +280,20 @@ pub enum BlobStreamPublication {
     /// The payload is boxed, and carries the measures of this terminal beside
     /// the owner-backed identity of the object.
     Complete(Box<BlobStreamCompleteSource>),
+    /// The admitted prefix is durable as a real owner-staged object, but the
+    /// source as a whole is not: the abort named an explicit coverage gap, so
+    /// the terminal mints `PartialSource` with the prefix locator, length and
+    /// digest. Only a cancellation, caller-shutdown or transport-failure abort
+    /// with a nonempty admitted prefix lands here: a policy-prohibited or
+    /// failed-redaction abort must never stage raw bytes, and an empty prefix
+    /// retains nothing. The staged object is immutable and content-addressed,
+    /// so a same-identity abort replay resolves the same object, never a
+    /// second one.
+    Partial(Box<BlobStreamPartialPrefix>),
     /// No durable expansion source exists for this terminal.
     ///
     /// `reason` names the exact blocking cause. A policy-prohibited or
     /// failed-redaction session always lands here and never stages raw bytes.
-    ///
-    /// This adapter does not mint a partial-durable-prefix value. A cancelled
-    /// or read-failed session carries its admitted prefix and exact coverage
-    /// in the terminal evidence itself (`StreamPersistenceStatus::
-    /// SourceUnavailable` plus the admitted digest/count and the cancellation
-    /// or read-failure gap), and this adapter stages nothing for it. Claiming
-    /// `Partial` here would require an owner-issued receipt for the prefix,
-    /// which only a publication path can produce; an unbacked prefix value
-    /// would be exactly the "locator substitutes for owner evidence" defect
-    /// the audit rejects. Retaining the admissible prefix as a real durable
-    /// object is the #297 append-only staged-object path named above.
     Unavailable {
         /// Exact reason the source could not be produced.
         reason: BlobStreamUnavailableReason,
@@ -426,6 +442,29 @@ impl StagedPrefix {
     fn clear(&mut self) {
         self.bytes.clear();
     }
+}
+
+/// One validated abort: either a replay of the recorded terminal, or the
+/// snapshot the terminal is minted from after the optional owner stage.
+enum AbortSnapshot {
+    /// The command identity already recorded this terminal.
+    Replayed(ProcessStreamSinkTerminal),
+    /// Validated inputs plus the exact admitted prefix to maybe retain.
+    Prepared(AbortPrepared),
+}
+
+/// Everything `abort_async` needs after the owner stage resolves.
+struct AbortPrepared {
+    session: ProcessStreamSinkSession,
+    request: ProcessStreamSinkAbortRequest,
+    identity: ProcessStreamSinkTerminalCommandIdentity,
+    reason: ProcessStreamSinkAbortReason,
+    staged: Vec<u8>,
+    next_sequence: u64,
+    next_offset: u64,
+    admitted_sha256: String,
+    /// True only for a retaining reason with a nonempty admitted prefix.
+    retain: bool,
 }
 
 struct SinkState {
@@ -1293,16 +1332,24 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
     }
 
-    fn abort_locked(
-        state: &mut SinkState,
-        session: ProcessStreamSinkSession,
-        request: ProcessStreamSinkAbortRequest,
-    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
-        let existing = Self::check_session(state, &session)?;
+    /// Validates one abort against the live session and snapshots everything
+    /// the terminal needs, so the owner stage below can run without holding
+    /// the session lock across its await (AUD2.7). The snapshot is exactly
+    /// the admitted prefix: bytes, digest, sequence and offset under one lock
+    /// hold. A concurrent append between this snapshot and the record faults
+    /// the abort with `TerminalIdentityConflict` instead of minting a
+    /// terminal over bytes it did not observe — the same refusal a racing
+    /// append already earns against the live counters.
+    fn abort_snapshot(
+        state: &SinkState,
+        session: &ProcessStreamSinkSession,
+        request: &ProcessStreamSinkAbortRequest,
+    ) -> Result<AbortSnapshot, ProcessStreamSinkError> {
+        let existing = Self::check_session(state, session)?;
         let identity = request.command_identity()?;
         if let Some(terminal) = &state.terminal {
             return if state.terminal_command.as_ref() == Some(&identity) {
-                Ok(terminal.clone())
+                Ok(AbortSnapshot::Replayed(terminal.clone()))
             } else {
                 Err(ProcessStreamSinkError::TerminalIdentityConflict)
             };
@@ -1313,58 +1360,153 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         if state.finalization.is_some() {
             return Err(ProcessStreamSinkError::TerminalIdentityConflict);
         }
-        existing.validate_abort(&request)?;
+        existing.validate_abort(request)?;
         Self::check_sequence_offset(
             state,
             request.expected_final_sequence(),
             request.expected_final_offset(),
         )?;
         Self::check_observed(state, request.observed_sha256(), request.observed_bytes())?;
-        // An abort never publishes, so it has no durable source and nowhere to
-        // bind a transformation receipt: the same refusal as `plan_finalize`,
-        // with the same truthful cause (W7).
+        // An abort never publishes, so it has nowhere to bind a
+        // transformation receipt: the same refusal as `plan_finalize`, with
+        // the same truthful cause (W7).
         refuse_transformation(request.transformation())?;
-        // Abort never publishes: no stage call for any reason, so a
-        // policy-prohibited or failed-redaction session cannot stage raw
-        // bytes. The staged plaintext is dropped with the terminal.
-        let evidence = ProcessStreamEvidence::new_raw(
-            existing.binding().clone(),
-            existing.stream(),
-            existing.policy().clone(),
-            request.transport(),
-            StreamPersistenceStatus::SourceUnavailable,
-            request.observed_sha256().to_owned(),
-            request.observed_bytes(),
-            request.preview().clone(),
-            None,
-            request.gaps().to_vec(),
-        )?;
+        // Only a cancellation, caller-shutdown or transport-failure abort
+        // retains the admitted prefix, and only when the prefix is nonempty.
+        // A policy-prohibited or failed-redaction abort stages nothing, so a
+        // prohibited session can never stage raw bytes (W8); an empty prefix
+        // retains nothing because there is no prefix to keep.
         let reason = request.reason();
-        let publication = BlobStreamPublication::Unavailable {
-            reason: match reason {
-                ProcessStreamSinkAbortReason::PolicyProhibition => {
-                    BlobStreamUnavailableReason::PolicyProhibited
-                }
-                ProcessStreamSinkAbortReason::RedactionFailure => {
-                    BlobStreamUnavailableReason::RedactionFailed
-                }
-                ProcessStreamSinkAbortReason::TransportFailure
+        let retain = matches!(
+            reason,
+            ProcessStreamSinkAbortReason::TransportFailure
                 | ProcessStreamSinkAbortReason::Cancellation
-                | ProcessStreamSinkAbortReason::CallerShutdown => {
-                    unavailable_reason(request.gaps())
-                }
-            },
+                | ProcessStreamSinkAbortReason::CallerShutdown
+        ) && !state.staged.is_empty();
+        Ok(AbortSnapshot::Prepared(AbortPrepared {
+            session: existing.clone(),
+            request: request.clone(),
+            identity,
+            reason,
+            staged: state.staged.as_bytes().to_vec(),
+            next_sequence: state.next_sequence,
+            next_offset: state.next_offset,
+            admitted_sha256: state.admitted_sha256(),
+            retain,
+        }))
+    }
+
+    /// Mints the abort terminal, retaining the admitted prefix as a real
+    /// durable object when the snapshot asked for it.
+    ///
+    /// Retention stages the exact snapshotted bytes through the owner under
+    /// the bound root lease and reads them back before minting anything, so
+    /// the locator the terminal keeps names an object proven to exist — never
+    /// a memory buffer relabelled as durable. Staging is content-addressed,
+    /// so a same-identity abort replay resolves the same object, never a
+    /// second one.
+    async fn abort_async(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAbortRequest,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        let snapshot = Self::abort_snapshot(&self.lock(), &session, &request)?;
+        let prepared = match snapshot {
+            AbortSnapshot::Replayed(terminal) => return Ok(terminal),
+            AbortSnapshot::Prepared(prepared) => prepared,
         };
+        let retained = if prepared.retain {
+            Some(self.retain_aborted_prefix(&prepared.staged).await?)
+        } else {
+            None
+        };
+        let mut state = self.lock();
+        let (persistence, source, terminal_state, publication) = match retained {
+            Some(ready) => {
+                let byte_length = ready.plaintext_length();
+                let sha256 = ready.plaintext_sha256().to_owned();
+                let locator = format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash);
+                let receipt_ref = ready.receipt().identity.receipt_id.to_string();
+                let source = DurableProcessStreamSource::exact_transport(
+                    DurableStreamLocatorKind::Blob,
+                    locator.clone(),
+                    receipt_ref.clone(),
+                    sha256.clone(),
+                    byte_length,
+                )?;
+                let publication =
+                    BlobStreamPublication::Partial(Box::new(BlobStreamPartialPrefix {
+                        locator,
+                        ready_receipt_ref: receipt_ref,
+                        byte_length,
+                        sha256,
+                    }));
+                (
+                    StreamPersistenceStatus::PartialSource,
+                    Some(source),
+                    ProcessStreamSinkState::PartialSource,
+                    publication,
+                )
+            }
+            None => {
+                let reason = match prepared.reason {
+                    ProcessStreamSinkAbortReason::PolicyProhibition => {
+                        BlobStreamUnavailableReason::PolicyProhibited
+                    }
+                    ProcessStreamSinkAbortReason::RedactionFailure => {
+                        BlobStreamUnavailableReason::RedactionFailed
+                    }
+                    ProcessStreamSinkAbortReason::TransportFailure
+                    | ProcessStreamSinkAbortReason::Cancellation
+                    | ProcessStreamSinkAbortReason::CallerShutdown => {
+                        unavailable_reason(prepared.request.gaps())
+                    }
+                };
+                (
+                    StreamPersistenceStatus::SourceUnavailable,
+                    None,
+                    Self::abort_state(prepared.reason),
+                    BlobStreamPublication::Unavailable { reason },
+                )
+            }
+        };
+        let evidence = ProcessStreamEvidence::new_raw(
+            prepared.session.binding().clone(),
+            prepared.session.stream(),
+            prepared.session.policy().clone(),
+            prepared.request.transport(),
+            persistence,
+            prepared.request.observed_sha256().to_owned(),
+            prepared.request.observed_bytes(),
+            prepared.request.preview().clone(),
+            source,
+            prepared.request.gaps().to_vec(),
+        )?;
         let terminal = ProcessStreamSinkTerminal::from_abort(
-            session,
-            request,
-            Self::abort_state(reason),
-            state.next_sequence,
-            state.next_offset,
-            state.admitted_sha256(),
+            prepared.session,
+            prepared.request,
+            terminal_state,
+            prepared.next_sequence,
+            prepared.next_offset,
+            prepared.admitted_sha256,
             evidence,
         )?;
-        Self::record_locked(state, identity, publication, terminal)
+        Self::record_locked(&mut state, prepared.identity, publication, terminal)
+    }
+
+    /// Stages one aborted prefix through the owner and proves it reads back.
+    async fn retain_aborted_prefix(
+        &self,
+        staged: &[u8],
+    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+        let request = self.stage_request(staged)?;
+        let ready = self
+            .store
+            .stage(request)
+            .await
+            .map_err(|error| map_blob_error(&error))?;
+        self.verify_readback(&ready).await?;
+        Ok(ready)
     }
 
     /// Builds the one exact stage request for these bytes under the bound root
@@ -2253,9 +2395,7 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkAbortRequest,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
-        let mut state = self.lock();
-        let result = Self::abort_locked(&mut state, session, request);
-        Self::ready(result)
+        Box::pin(async move { self.abort_async(session, request).await })
     }
 
     fn readback(

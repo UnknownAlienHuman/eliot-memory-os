@@ -60,12 +60,12 @@ use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_process::{
     DurableStreamLocatorKind, DurableStreamRepresentation, ProcessExecutionBinding,
     ProcessStreamDigestAlgorithm, ProcessStreamKind, ProcessStreamPolicyBinding,
-    ProcessStreamPrefixPreview, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
-    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
-    ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
-    ProcessStreamSinkSession, ProcessStreamSinkSessionId, ProcessStreamSinkSourceId,
-    ProcessStreamSinkState, ProcessStreamSinkTerminalId, StreamPersistenceStatus,
-    StreamTransportStatus,
+    ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest,
+    ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient,
+    ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest, ProcessStreamSinkLimits,
+    ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback, ProcessStreamSinkSession,
+    ProcessStreamSinkSessionId, ProcessStreamSinkSourceId, ProcessStreamSinkState,
+    ProcessStreamSinkTerminalId, StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
 };
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
 
@@ -1633,4 +1633,89 @@ fn nonempty_source_with_complete_preview_publishes_exact_measures() {
         complete.measures.bounded_preview.omitted_ranges
     );
     assert_eq!(complete.measures.bounded_preview.sha256, expected_sha256);
+}
+
+/// Source: the #297 append-only staged-object path (`abort_async` /
+/// `retain_aborted_prefix` in `src/stream_sink.rs`): a cancellation,
+/// caller-shutdown or transport-failure abort with a nonempty admitted prefix
+/// stages the exact prefix through the owner under the bound root lease, reads
+/// it back, and mints `PartialSource` with its locator, length and digest —
+/// never a memory buffer relabelled as durable.
+/// Discovery: before this path the adapter minted no partial-durable-prefix
+/// value at all, so an aborted stream's admitted bytes survived only in the
+/// dying process. A locator that named no owner-staged object would be exactly
+/// the "locator substitutes for owner evidence" defect the audit rejects, so
+/// the locator, length and digest are asserted against the owner-backed
+/// publication AND the terminal evidence, never only that `abort` returned
+/// `Ok`.
+/// Executed-pass: two chunks (17 bytes) are admitted, then a `Cancellation`
+/// abort naming the `CancelledBeforeEof` coverage gap keeps the admitted
+/// prefix: the terminal state, counters, evidence source and recorded
+/// publication below all name the same retained object.
+/// I10-08-05: the append-only temporary raw evidence object outlives the
+/// aborted session as a real immutable object.
+// WORK_UNIT_CASE: 297/W3
+#[test]
+fn cancelled_abort_retains_admitted_prefix_as_durable_partial_source() {
+    const PREFIX: &[u8] = b"abort-partial-297";
+    let prefix_len = PREFIX.len() as u64;
+    let (sink, session) = open_replay_sink("abort-partial");
+
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, &PREFIX[..8])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: 8,
+        },
+    );
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 1, 8, &PREFIX[8..])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 2,
+            next_offset: prefix_len,
+        },
+    );
+
+    let expected_sha256 = format!("{:x}", Sha256::digest(PREFIX));
+    let request = ok(ProcessStreamSinkAbortRequest::new(
+        session.terminal_id().clone(),
+        ProcessStreamSinkAbortReason::Cancellation,
+        2,
+        prefix_len,
+        10,
+        StreamTransportStatus::CancelledBeforeEof,
+        expected_sha256.clone(),
+        prefix_len,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            PREFIX.to_vec(),
+            prefix_len,
+        )),
+        None,
+        vec![StreamEvidenceGap::CancelledBeforeEof],
+    ));
+    let terminal = ok(block_on(sink.abort(session.clone(), request)));
+
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::PartialSource);
+    assert_eq!(terminal.admitted_bytes(), prefix_len);
+    assert_eq!(terminal.admitted_sha256(), expected_sha256);
+
+    // The locator names the owner-staged object: the blob content hash of the
+    // exact admitted bytes, with the same length and digest the terminal
+    // carries. The evidence source and the recorded publication must agree —
+    // either one alone could be an unbacked claim.
+    let expected_locator = format!("blob:{}", blake3::hash(PREFIX).to_hex());
+    let source = terminal
+        .evidence()
+        .source()
+        .expect("a partial terminal keeps its retained source");
+    assert_eq!(source.locator(), expected_locator);
+    assert_eq!(source.sha256(), expected_sha256);
+    assert_eq!(source.byte_length(), prefix_len);
+    let Some(BlobStreamPublication::Partial(partial)) = sink.publication() else {
+        panic!("a retaining abort must record a real prefix object, never `Unavailable`");
+    };
+    assert_eq!(partial.locator, expected_locator);
+    assert_eq!(partial.byte_length, prefix_len);
+    assert_eq!(partial.sha256, expected_sha256);
 }
