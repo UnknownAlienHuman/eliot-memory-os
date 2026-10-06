@@ -309,10 +309,37 @@ fn stop_contour_commits_request_pending_drained_stopped_through_owner() {
         Some(DrainState::Draining),
         "the durable drain record stays at the Draining state the reducer committed"
     );
-    // A second stop is refused: the contour owns exactly one shutdown.
+    // A second stop is refused before the cancellation record: the vacuous
+    // stop emits its request, answers Stopped-as-error with the single
+    // terminal, and never claims a cancellation ran.
+    let (vacuous_captured, vacuous_outcome) = capture_contour(|| fixture.composition.stop());
     assert!(
-        fixture.composition.stop().is_err(),
+        vacuous_outcome.is_err(),
         "a stopped composition must refuse a second stop"
+    );
+    assert_eq!(
+        count_occurrences(
+            &vacuous_captured,
+            &format!("detail=\"{}\"", BOUNDARY_STOP_REQUESTED.event)
+        ),
+        1,
+        "even the vacuous stop observes its request: {vacuous_captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &vacuous_captured,
+            &format!("detail=\"{}\"", BOUNDARY_STOP_CANCELLATION_REQUESTED.event)
+        ),
+        0,
+        "a vacuous stop returns before the cancellation record: {vacuous_captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &vacuous_captured,
+            &format!("code=\"{}\"", BOUNDARY_STOP_TERMINAL.event)
+        ),
+        1,
+        "the refused stop owns exactly one terminal: {vacuous_captured}"
     );
 }
 
@@ -525,6 +552,176 @@ fn liveness_tick_observes_without_readiness_through_owner() {
         snapshot.activation.as_ref().map(|record| record.state),
         Some(ActivationState::Active),
         "a liveness observation must never advance the activation"
+    );
+}
+
+// WORK_UNIT_CASE: 891/A14
+#[test]
+fn start_contour_guard_owns_nested_failure_through_owner() {
+    let mut fixture = contour_fixture("a14-start");
+    // The empty registry holds no approved generation, so the inner
+    // manifest contour never runs: the outer guard owns the single
+    // terminal for the nested failure.
+    let (captured, outcome) = capture_contour(|| {
+        fixture.composition.start_approved_contour(
+            std::path::Path::new("kernel.exe"),
+            std::path::Path::new("store.exe"),
+        )
+    });
+    assert!(
+        outcome.is_err(),
+        "a start with no approved generation must fail"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("detail=\"{}\"", BOUNDARY_START_REQUESTED.event)
+        ),
+        1,
+        "the failed start must observe its request exactly once: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("code=\"{}\"", BOUNDARY_START_TERMINAL.event)
+        ),
+        1,
+        "the nested failure owns exactly one terminal: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("detail=\"{}\"", BOUNDARY_START_STARTED.event)
+        ),
+        0,
+        "a failed start must never observe the started phase: {captured}"
+    );
+}
+
+// WORK_UNIT_CASE: 891/A17
+#[test]
+fn open_suppresses_admitted_without_evidence_through_owner() {
+    // Missing evidence: the installation is real but its Host root was
+    // never provisioned, so the contour fails before any admission.
+    let installation = contour_handle("installation:891-a17-open".to_owned());
+    let options = HostLaunchOptions {
+        config_descriptor_path: std::env::temp_dir().join("eliot-891-a17-config.json"),
+        config_descriptor_digest: contour_handle("0".repeat(64)),
+        installation,
+        transaction_plan_generation: 1,
+        host_state_root: std::env::temp_dir().join("eliot-891-a17-no-such-root"),
+        registration_nonce: None,
+    };
+    let (captured, outcome) = capture_contour(|| HostComposition::open(options));
+    assert!(
+        outcome.is_err(),
+        "an open with no provisioned root must fail"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("detail=\"{}\"", BOUNDARY_OPEN_REQUESTED.event)
+        ),
+        1,
+        "the failed open must observe its request exactly once: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("detail=\"{}\"", BOUNDARY_OPEN_ADMITTED.event)
+        ),
+        0,
+        "missing evidence suppresses the admitted event: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("code=\"{}\"", BOUNDARY_OPEN_TERMINAL.event)
+        ),
+        1,
+        "the failed open owns exactly one terminal: {captured}"
+    );
+    for positive in [BOUNDARY_START_STARTED, BOUNDARY_START_MANIFEST_STARTED] {
+        assert_eq!(
+            count_occurrences(&captured, &format!("detail=\"{}\"", positive.event)),
+            0,
+            "a failed open must never observe the positive phase {:?}: {captured}",
+            positive.event
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 891/A18
+#[test]
+fn sink_outcome_leaves_stop_result_order_cleanup_unchanged_through_owner() {
+    struct FailWriter;
+    impl std::io::Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("891 failing sink"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("891 failing sink"))
+        }
+    }
+    // One stopped composition serves every sink: the vacuous stop is the
+    // failed-stop contour whose result, order and cleanup the sinks must
+    // not disturb.
+    let mut fixture = contour_fixture("a18-sink");
+    seed_active_activation(&mut fixture);
+    fixture
+        .composition
+        .stop()
+        .expect("the clean stop must succeed");
+    let drive_vacuous = |fixture: &mut ContourFixture| fixture.composition.stop();
+    // Sink 1: every write fails. The contour result must be identical and
+    // the failure must not unwind through the observation helpers.
+    let failing = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(|| FailWriter)
+        .finish();
+    let failing_outcome =
+        tracing::subscriber::with_default(failing, || drive_vacuous(&mut fixture));
+    assert!(
+        matches!(failing_outcome, Err(HostError::Stopped)),
+        "a failing sink must leave the refused-stop result unchanged"
+    );
+    // Sink 2: the filter drops every record. Nothing is delivered, but the
+    // contour runs to the same refused result.
+    let dropped = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::new("off"))
+        .with_writer(|| FailWriter)
+        .finish();
+    let dropped_outcome =
+        tracing::subscriber::with_default(dropped, || drive_vacuous(&mut fixture));
+    assert!(
+        matches!(dropped_outcome, Err(HostError::Stopped)),
+        "a filtering sink must leave the refused-stop result unchanged"
+    );
+    // Sink 3: the working sink shows the order the other sinks preserved:
+    // request first, then the single terminal, and no cancellation record.
+    let (captured, working_outcome) = capture_contour(|| drive_vacuous(&mut fixture));
+    assert!(
+        matches!(working_outcome, Err(HostError::Stopped)),
+        "the working sink must agree on the refused-stop result"
+    );
+    let requested_at = captured
+        .find(&format!("detail=\"{}\"", BOUNDARY_STOP_REQUESTED.event))
+        .expect("the refused stop must emit its request");
+    let terminal_at = captured
+        .find(&format!("code=\"{}\"", BOUNDARY_STOP_TERMINAL.event))
+        .expect("the refused stop must emit its terminal");
+    assert!(
+        requested_at < terminal_at,
+        "the request record must precede the terminal record: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &format!("detail=\"{}\"", BOUNDARY_STOP_CANCELLATION_REQUESTED.event)
+        ),
+        0,
+        "the vacuous stop claims no cancellation under any sink: {captured}"
     );
 }
 

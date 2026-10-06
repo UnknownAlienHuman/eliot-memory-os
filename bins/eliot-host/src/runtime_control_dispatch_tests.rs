@@ -380,6 +380,108 @@ fn dispatch_reconcile_replays_committed_receipt_without_recommit() {
     );
 }
 
+// WORK_UNIT_CASE: 891/A13-pending
+#[test]
+fn reconcile_pending_intent_stays_unknown_through_owner() {
+    let mut fixture = dispatch_fixture("a13-pending");
+    let restart = restart_request("a13-pending", "restart");
+    // The pending intent is published through the owner's own writer: a
+    // possible effect whose outcome no one has observed.
+    let publication = persist_runtime_restart_pending(
+        fixture.composition.launch_options.host_state_root(),
+        &restart,
+        &fixture.composition.host,
+    )
+    .expect("the owner must publish the pending intent");
+    assert!(
+        matches!(publication, RuntimeRestartPendingPublication::Created),
+        "the first publication must create, never replay"
+    );
+    // The reconcile carries a fresh request id but the exact mutation
+    // identity of the pending operation.
+    let reconcile = HostRuntimeControlRequest::new_reconcile(
+        dispatch_handle("891-a13-pending-readback".to_owned()),
+        restart.mutation_digest.clone(),
+    )
+    .expect("the 891 reconcile request must validate on the wire");
+    let (captured, response) = capture_dispatch(|| {
+        fixture
+            .composition
+            .handle_kernel_restart_request(&reconcile)
+    });
+    let HostRuntimeControlResponse::Unknown { .. } = response else {
+        panic!("a pending intent must stay Unknown: a timeout proves nothing");
+    };
+    assert!(
+        eliot_host_service::runtime_control::response_matches_request(&reconcile, &response),
+        "the Unknown must still answer the reconcile request identity"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &exact_detail(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING.event)
+        ),
+        1,
+        "the pending arm must observe the unknown-pending exactly once: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &exact_code(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL.event)
+        ),
+        1,
+        "the pending arm owns exactly one terminal: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &exact_detail(BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY.event)
+        ),
+        0,
+        "a pending timeout is never the committed-receipt readback: {captured}"
+    );
+}
+
+// WORK_UNIT_CASE: 891/A13-unknown
+#[test]
+fn reconcile_without_commit_stays_unknown_through_owner() {
+    let mut fixture = dispatch_fixture("a13-unknown");
+    let restart = restart_request("a13-unknown", "restart");
+    let reconcile = HostRuntimeControlRequest::new_reconcile(
+        dispatch_handle("891-a13-unknown-readback".to_owned()),
+        restart.mutation_digest.clone(),
+    )
+    .expect("the 891 reconcile request must validate on the wire");
+    let (captured, response) = capture_dispatch(|| {
+        fixture
+            .composition
+            .handle_kernel_restart_request(&reconcile)
+    });
+    let HostRuntimeControlResponse::Unknown { .. } = response else {
+        panic!("an uncommitted reconcile must stay Unknown");
+    };
+    assert!(
+        eliot_host_service::runtime_control::response_matches_request(&reconcile, &response),
+        "the Unknown must still answer the reconcile request identity"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &exact_detail(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN.event)
+        ),
+        1,
+        "the unknown arm must observe the reconcile-unknown exactly once: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &exact_code(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL.event)
+        ),
+        1,
+        "the unknown arm owns exactly one terminal: {captured}"
+    );
+}
+
 // WORK_UNIT_CASE: 891/A5
 #[test]
 fn dispatch_unsupported_operation_stays_unknown_without_receipt() {
