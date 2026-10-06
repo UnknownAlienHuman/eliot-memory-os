@@ -7780,7 +7780,18 @@ impl KernelComposition {
                     eliot_ipc::BACKPRESSURE_BRIDGE_ENVELOPE_BYTES,
                 ));
             }
-            Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
+            Err(OrsError::ProjectionLimitExceeded) => {
+                // The owner-table bind is the only reachable capacity
+                // failure in this call (issue #2731): every other table
+                // budget on the stage path answers with the typed
+                // `BridgeEventCapacityExceeded` pressure above, so this
+                // residual names the stream-owners dimension instead of
+                // the generic dispatch dimension. The admitted session is
+                // still retained by the front-door backpressure arm.
+                return Err(TransportError::AttributedBackpressure(
+                    eliot_ipc::BACKPRESSURE_BRIDGE_STREAM_OWNERS,
+                ));
+            }
             Err(_) => return Err(TransportError::SessionFenced),
         };
         // An elapsed absolute deadline is staged honestly, then
@@ -8013,7 +8024,19 @@ impl KernelComposition {
                 ));
             }
             Err(OrsError::DuplicateConflict) => return Err(TransportError::IdentityConflict),
-            Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
+            Err(OrsError::ProjectionLimitExceeded) => {
+                // The unscoped-gap owner bind is the only reachable
+                // capacity failure in this call (issue #2731): the
+                // gap-table budget answers with the typed
+                // `BridgeEventCapacityExceeded` pressure above, and scoped
+                // gaps never bind, so this residual names the
+                // stream-owners dimension instead of the generic dispatch
+                // dimension. The admitted session is still retained by the
+                // front-door backpressure arm.
+                return Err(TransportError::AttributedBackpressure(
+                    eliot_ipc::BACKPRESSURE_BRIDGE_STREAM_OWNERS,
+                ));
+            }
             Err(_) => return Err(TransportError::SessionFenced),
         };
         let accepted = outcome
