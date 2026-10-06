@@ -270,6 +270,17 @@ fn owner_port_imports_captured_fence_into_admitted_destination() {
         retained, 2,
         "the destination spool retains exactly the two imported Recovery records"
     );
+    // The import never touches the owner's own spool: the three captured
+    // heartbeats are still all that the source retains.
+    assert_eq!(
+        contour
+            .sensor
+            .retained_spool_entries_for_export_driver_test()
+            .expect("reread source spool")
+            .len(),
+        3,
+        "the source spool is undisturbed by its own export"
+    );
     release_contour(contour);
 }
 
@@ -324,6 +335,15 @@ fn owner_port_import_replay_reconciles_without_duplicate_append() {
         destination_retained(&state_root, destination.installation_key()),
         retained_once,
         "the replay appends nothing behind the retained import"
+    );
+    assert_eq!(
+        contour
+            .sensor
+            .retained_spool_entries_for_export_driver_test()
+            .expect("reread source spool")
+            .len(),
+        3,
+        "the replay never touches the source spool either"
     );
     drop(active);
     drop(admitted);
