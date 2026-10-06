@@ -23,7 +23,7 @@ use eliot_improvement::candidate_bounds::{
 };
 use eliot_improvement::{
     ImprovementCandidate, ImprovementSurface, ReplayPlan,
-    producer::{LearningProduction, produce_learning_candidate},
+    producer::{LearningProduction, produce_learning_candidate, route_overlay_task_policy_change},
 };
 use eliot_receipts::WorkScopeId;
 
@@ -404,6 +404,123 @@ fn task_and_fence_drift_refused() {
     );
 }
 
+#[test]
+fn rejected_task_surface_bridges_to_improvement_draft_1864() {
+    let setup = live_setup();
+    let permit = issue_for(
+        &setup,
+        Some(OVERLAY_1869),
+        Some(&setup.candidate_id.clone()),
+    );
+    let verified = verify_learning_admission(&setup.governor, &permit, &setup.fence)
+        .expect("live owner verifies");
+    let candidate_id = setup.candidate_id.clone();
+    let task_binding = binding(TASK_1869, &setup.fence);
+    let role = provider_role();
+    let measurement_digest = "d".repeat(64);
+    let request = LearningProduction {
+        backlog: &setup.backlog,
+        candidate_id: &candidate_id,
+        closure_ref: "closure-1869-a",
+        owner: "governor-1869",
+        binding: &task_binding,
+        atom_id: "atom-learning-1869",
+        provider_role: &role,
+        source_id: "source-learning-1869",
+        source_owner: "governor-1869",
+        snapshot_id: "snapshot-learning-1869",
+        source_revision: "closure-1869-a",
+        content: "local update: tighten context budget",
+        overlay_id: Some(OVERLAY_1869),
+        expires_at_unix_secs: Some(NOW_1869 + 3600),
+        measurement_digest: &measurement_digest,
+        measurement_serializer: "json-v1",
+        verified: &verified,
+        cross_task: None,
+    };
+    let draft =
+        route_overlay_task_policy_change("TaskLocalContext", "target-1864", "delta-1864", &request)
+            .expect("task-level policy change bridges to improvement draft");
+    assert_eq!(draft.source_overlay_id, OVERLAY_1869);
+    assert_eq!(draft.source_delta_id, "delta-1864");
+    assert_eq!(draft.rejected_surface, "TaskLocalContext");
+    assert_eq!(draft.task_id, TASK_1869);
+    assert!(draft.policy_summary.contains("Task Controller"));
+}
+
+#[test]
+fn local_surface_and_missing_overlay_refused_at_bridge_1864() {
+    let setup = live_setup();
+    let permit = issue_for(
+        &setup,
+        Some(OVERLAY_1869),
+        Some(&setup.candidate_id.clone()),
+    );
+    let verified = verify_learning_admission(&setup.governor, &permit, &setup.fence)
+        .expect("live owner verifies");
+    let candidate_id = setup.candidate_id.clone();
+    let task_binding = binding(TASK_1869, &setup.fence);
+    let role = provider_role();
+    let measurement_digest = "d".repeat(64);
+    let request = LearningProduction {
+        backlog: &setup.backlog,
+        candidate_id: &candidate_id,
+        closure_ref: "closure-1869-a",
+        owner: "governor-1869",
+        binding: &task_binding,
+        atom_id: "atom-learning-1869",
+        provider_role: &role,
+        source_id: "source-learning-1869",
+        source_owner: "governor-1869",
+        snapshot_id: "snapshot-learning-1869",
+        source_revision: "closure-1869-a",
+        content: "local update: tighten context budget",
+        overlay_id: Some(OVERLAY_1869),
+        expires_at_unix_secs: Some(NOW_1869 + 3600),
+        measurement_digest: &measurement_digest,
+        measurement_serializer: "json-v1",
+        verified: &verified,
+        cross_task: None,
+    };
+    assert_eq!(
+        route_overlay_task_policy_change(
+            "VerificationOrder",
+            "target-1864",
+            "delta-1864",
+            &request,
+        ),
+        Err("local_surface")
+    );
+    let request_no_overlay = LearningProduction {
+        backlog: &setup.backlog,
+        candidate_id: &candidate_id,
+        closure_ref: "closure-1869-a",
+        owner: "governor-1869",
+        binding: &task_binding,
+        atom_id: "atom-learning-1869",
+        provider_role: &role,
+        source_id: "source-learning-1869",
+        source_owner: "governor-1869",
+        snapshot_id: "snapshot-learning-1869",
+        source_revision: "closure-1869-a",
+        content: "local update: tighten context budget",
+        overlay_id: None,
+        expires_at_unix_secs: Some(NOW_1869 + 3600),
+        measurement_digest: &measurement_digest,
+        measurement_serializer: "json-v1",
+        verified: &verified,
+        cross_task: None,
+    };
+    assert_eq!(
+        route_overlay_task_policy_change(
+            "TaskLocalContext",
+            "target-1864",
+            "delta-1864",
+            &request_no_overlay,
+        ),
+        Err("missing_overlay")
+    );
+}
 #[test]
 fn foreign_binding_without_carryover_refused() {
     let setup = live_setup();

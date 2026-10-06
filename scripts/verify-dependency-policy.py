@@ -796,6 +796,43 @@ def _consume_standalone_preparation_binding(root: Path, workspace_dir: Path, loc
     return binding
 
 
+def _resolve_tool_executable(name: str, cwd: Path) -> str | None:
+    """Resolve a toolchain tool to the binary that actually executes (issue #1229 A1).
+
+    A rustup proxy shim (`cargo`/`rustc` as a symlink to `rustup.exe`) must
+    never be resolved to the proxy itself: executing `rustup.exe metadata`
+    fails, and probing `rustup.exe --version` records the proxy version as
+    the tool version. When PATH resolution lands on a rustup proxy, ask
+    rustup for the real tool path; otherwise keep the resolved path.
+    """
+
+    found = shutil.which(name)
+    if not found:
+        return None
+    resolved = str(Path(found).resolve())
+    if Path(resolved).stem.casefold() != "rustup":
+        return resolved
+    try:
+        completed = subprocess.run(
+            [resolved, "which", name],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return resolved
+    if completed.returncode != 0:
+        return resolved
+    for line in completed.stdout.splitlines():
+        candidate = line.strip()
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return resolved
+
+
 def _load_nonmember_resolver_metadata(
     root: Path, workspace_dir: Path, lockfile: str
 ) -> tuple[dict, dict | None, str | None]:
@@ -822,8 +859,8 @@ def _load_nonmember_resolver_metadata(
     if not cargo or not rustc:
         evidence["status"] = "tool_unavailable"
         return evidence, None, "Cargo and rustc must both be available to bind resolver/toolchain identity"
-    cargo_path = str(Path(cargo).resolve())
-    rustc_path = str(Path(rustc).resolve())
+    cargo_path = _resolve_tool_executable("cargo", workspace_dir) or cargo
+    rustc_path = _resolve_tool_executable("rustc", workspace_dir) or rustc
     cargo_version = _run_resolver_command([cargo_path, "--version", "--verbose"], workspace_dir, 20)
     rustc_version = _run_resolver_command([rustc_path, "--version", "--verbose"], workspace_dir, 20)
     evidence.update(
@@ -1363,7 +1400,17 @@ def check_direct_inventory_reconciliation(
     observed_direct_names: set[str],
     finding_code: str,
 ) -> list[Finding]:
-    """Require the policy inventory and observed direct roots to agree both ways."""
+    """Require the policy inventory and observed direct roots to agree both ways.
+
+    Presence is not evidence (issue #1229 W4/A2). A row whose disposition
+    fields are present but empty used to reconcile cleanly by name alone and
+    still report PASS, and those empty values were then published into the
+    SBOM as the component disposition -- an unowned, unjustified, unbounded
+    dependency recorded as fully dispositioned. Every row of this ecosystem
+    must therefore carry real consumer/owner/reason/public_exposure/
+    removal_plan values, the same values the cargo inventory check requires
+    of rust rows.
+    """
 
     findings: list[Finding] = []
     inventory = manifest_data.get("direct_dependencies", {})
@@ -1408,6 +1455,21 @@ def check_direct_inventory_reconciliation(
                     )
                 )
             declared[normalized] = name
+            invalid = [
+                field
+                for field in ("consumer", "owner", "reason", "public_exposure", "removal_plan")
+                if not isinstance(entry.get(field), str) or not entry[field].strip()
+            ]
+            if invalid:
+                findings.append(
+                    Finding(
+                        finding_code,
+                        "config/dependency-policy.toml",
+                        1,
+                        f"dependency '{name}' inventory disposition is missing valid fields: "
+                        + ", ".join(sorted(set(invalid))),
+                    )
+                )
 
     for normalized, name in sorted(observed.items()):
         if normalized not in declared:
@@ -4896,6 +4958,34 @@ def _external_receipt_evidence(root: Path, manifest_data: dict) -> dict:
     return evidence
 
 
+def _scanner_output_status(
+    profile: str, returncode: int, combined_output: str, has_advisory_policy_finding: bool
+) -> str | None:
+    """Classify a finished cargo-deny execution that needs a non-pass status (issue #1229 W8/A4).
+
+    Returns STATUS_ADVISORY_SOURCE_UNAVAILABLE when the advisory database
+    could not be fetched, STATUS_STALE when its evidence went stale, or None
+    when the output carries no unavailable/stale signal. A pure predicate so
+    self-tests can cover the stale branch without a live scanner run; the
+    live path below gates on it and then records the matching finding.
+    """
+
+    if profile == "current-advisories" and returncode != 0 and not has_advisory_policy_finding:
+        advisory_unavailable_markers = (
+            "advisory database",
+            "failed to fetch",
+            "could not fetch",
+            "unable to fetch",
+            "network",
+        )
+        if any(marker in combined_output for marker in advisory_unavailable_markers):
+            return STATUS_ADVISORY_SOURCE_UNAVAILABLE
+        stale_markers = ("stale", "out of date", "older than")
+        if any(marker in combined_output for marker in stale_markers):
+            return STATUS_STALE
+    return None
+
+
 def run_cargo_deny(
     root: Path,
     profile: str,
@@ -5255,7 +5345,7 @@ def run_cargo_deny(
     )
     execution["scanner_exit_accepted"] = proc.returncode == 0 or advisory_policy_finding
     execution["advisory_binding_digest"] = _scanner_advisory_binding_digest(execution)
-    if profile == "current-advisories" and proc.returncode != 0 and not advisory_policy_finding:
+    if _scanner_output_status(profile, proc.returncode, combined_output, advisory_policy_finding) is not None:
         advisory_unavailable_markers = (
             "advisory database",
             "failed to fetch",
@@ -6565,7 +6655,144 @@ def run_self_tests() -> int:
             print("SELF_TEST_FAILURE: expected DEP-014 for invalid lock drift path", file=sys.stderr)
             return 1
 
-    print("DEPENDENCY_POLICY_SELF_TEST: PASS (13/13 cases verified)")
+    _CASE14_BARE = {
+        "direct_dependencies": {
+            "bare-nuget": {
+                "ecosystem": "nuget",
+                "consumer": "apps/Eliot.Operator",
+                "owner": "",
+                "reason": "test",
+                "public_exposure": "none",
+                "removal_plan": "none",
+            }
+        },
+    }
+    if not any(
+        f.code == "DEP-007" and "missing valid fields" in f.detail and "owner" in f.detail
+        for f in check_direct_inventory_reconciliation(_CASE14_BARE, "nuget", {"bare-nuget"}, "DEP-007")
+    ):
+        print("SELF_TEST_FAILURE: expected DEP-007 for empty owner disposition", file=sys.stderr)
+        return 1
+    _CASE14_FULL = {
+        "direct_dependencies": {
+            "full-nuget": {
+                "ecosystem": "nuget",
+                "consumer": "apps/Eliot.Operator",
+                "owner": "apps/Eliot.Operator",
+                "reason": "test",
+                "public_exposure": "none",
+                "removal_plan": "none",
+            }
+        },
+    }
+    if check_direct_inventory_reconciliation(_CASE14_FULL, "nuget", {"full-nuget"}, "DEP-007"):
+        print("SELF_TEST_FAILURE: valid disposition must reconcile cleanly", file=sys.stderr)
+        return 1
+
+    # Case 15: wildcard ban diagnostic surfaces as a DEP-004 finding (issue #1229 W8/A4)
+    _CASE15_STREAM = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "diagnostic",
+                    "fields": {
+                        "code": "bans",
+                        "severity": "error",
+                        "message": "crate foo v1.2.3 depends on bar with a wildcard requirement",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "summary",
+                    "fields": {"bans": {"errors": 1, "warnings": 0, "notes": 0, "helps": 0}},
+                }
+            ),
+        ]
+    )
+    _case15_findings: list[Finding] = []
+    _case15_summary: dict = {}
+    _parse_scanner_stream(_CASE15_STREAM, "stderr", _case15_findings, _case15_summary, set())
+    if not any(f.code == "DEP-004" and "wildcard" in f.detail for f in _case15_findings):
+        print("SELF_TEST_FAILURE: expected DEP-004 for wildcard ban diagnostic", file=sys.stderr)
+        return 1
+
+    # Case 16: unknown registry and unknown git sources surface as DEP-005 (issue #1229 W8/A4)
+    _CASE16_STREAM = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "diagnostic",
+                    "fields": {
+                        "code": "sources",
+                        "severity": "error",
+                        "message": "detected unallowed registry source 'https://example.com/index'",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "diagnostic",
+                    "fields": {
+                        "code": "sources",
+                        "severity": "error",
+                        "message": "detected unallowed git source 'https://example.com/dep.git'",
+                    },
+                }
+            ),
+        ]
+    )
+    _case16_findings: list[Finding] = []
+    _parse_scanner_stream(_CASE16_STREAM, "stderr", _case16_findings, {}, set())
+    if not any(f.code == "DEP-005" and "registry" in f.detail for f in _case16_findings):
+        print("SELF_TEST_FAILURE: expected DEP-005 for unknown-registry diagnostic", file=sys.stderr)
+        return 1
+    if not any(f.code == "DEP-005" and "git source" in f.detail for f in _case16_findings):
+        print("SELF_TEST_FAILURE: expected DEP-005 for unknown-git diagnostic", file=sys.stderr)
+        return 1
+
+    # Case 17: unapproved license diagnostic surfaces as a DEP-004 finding (issue #1229 W8/A4)
+    _CASE17_STREAM = json.dumps(
+        {
+            "type": "diagnostic",
+            "fields": {
+                "code": "licenses",
+                "severity": "error",
+                "message": "crate foo v1.2.3 has unapproved license 'GPL-3.0'",
+            },
+        }
+    )
+    _case17_findings: list[Finding] = []
+    _parse_scanner_stream(_CASE17_STREAM, "stderr", _case17_findings, {}, set())
+    if not any(f.code == "DEP-004" and "GPL-3.0" in f.detail for f in _case17_findings):
+        print("SELF_TEST_FAILURE: expected DEP-004 for unapproved license diagnostic", file=sys.stderr)
+        return 1
+
+    # Case 18: stale/unavailable scanner output classifies without a live run (issue #1229 W8/A4)
+    if _scanner_output_status("current-advisories", 1, "cached evidence is stale, older than 7 days", False) != STATUS_STALE:
+        print("SELF_TEST_FAILURE: expected STATUS_STALE for stale advisory output", file=sys.stderr)
+        return 1
+    if (
+        _scanner_output_status("current-advisories", 1, "failed to fetch advisory database: network unreachable", False)
+        != STATUS_ADVISORY_SOURCE_UNAVAILABLE
+    ):
+        print("SELF_TEST_FAILURE: expected STATUS_ADVISORY_SOURCE_UNAVAILABLE for unfetched advisories", file=sys.stderr)
+        return 1
+    if _scanner_output_status("current-advisories", 0, "all checks passed", False) is not None:
+        print("SELF_TEST_FAILURE: clean scanner output must not classify as stale or unavailable", file=sys.stderr)
+        return 1
+
+    # Case 19: toolchain tools resolve past rustup proxy shims (issue #1229 A1)
+    _resolved_cargo = _resolve_tool_executable("cargo", Path("."))
+    if (
+        not isinstance(_resolved_cargo, str)
+        or Path(_resolved_cargo).stem.casefold() == "rustup"
+        or not Path(_resolved_cargo).is_file()
+    ):
+        print("SELF_TEST_FAILURE: expected cargo to resolve past the rustup proxy", file=sys.stderr)
+        return 1
+
+    print("DEPENDENCY_POLICY_SELF_TEST: PASS (19/19 cases verified)")
     return 0
 
 
