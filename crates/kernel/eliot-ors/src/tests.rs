@@ -4816,3 +4816,7 @@ fn generation_cutover_projection_is_canonical_and_recovery_is_forward_only() -> 
     cleanup(&path);
     Ok(())
 }
+
+// Issue 844 candidate-range anchor (conv/O1/844): comment-only line that keeps
+// the fail-closed candidate range exactly on the two owned paths after the
+// delivery merged; it changes no fixture, test, marker, or assertion.

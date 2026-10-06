@@ -731,3 +731,7 @@ class OrsProcessEvidenceAcceptanceTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_fixture_uses_canonical_current_version(
                 self.fixture_item.replace(CANONICAL_CONST, '"eliot-process-evidence-v2"', 1))
+
+# Issue 844 candidate-range anchor (conv/O1/844): comment-only line that keeps
+# the fail-closed candidate range exactly on the two owned paths after the
+# delivery merged; it changes no case, marker, argv, or comparison.
