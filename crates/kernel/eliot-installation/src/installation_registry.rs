@@ -524,8 +524,8 @@ impl RedbInstallationRegistry {
     /// Seeds one physically persisted active generation carrying explicit
     /// installer SCM approvals (issue #958 dispatch fixture).
     ///
-    /// A SystemService generation is invalid without exactly the Host +
-    /// Watchdog approvals; callers that seed a SystemService manifest pass
+    /// A `SystemService` generation is invalid without exactly the Host +
+    /// Watchdog approvals; callers that seed a `SystemService` manifest pass
     /// the pair from
     /// [`crate::issue_test_support_service_registration_approvals`]. The
     /// approvals ride the same Pending stage/commit path as the approval-less

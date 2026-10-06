@@ -7357,6 +7357,16 @@ impl HostComposition {
         admitted_operation: &str,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
     ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
+        // A re-verified pair is the owner retaining the operation; an
+        // admission without a materialisation is durable intent with an
+        // unknown outcome; anything else the registry reports — absence or a
+        // read fault — is answered by `classify_retained_preparation`,
+        // because a read fault is not absence.
+        enum RetainedPreparation {
+            Pair,
+            AdmissionOnly,
+            Unreadable,
+        }
         let Some(operation_id) = eliot_installation::PlatformHandle::new(admitted_operation).ok()
         else {
             return Err(BackupDispatchRefusal::new(
@@ -7370,15 +7380,6 @@ impl HostComposition {
             });
         };
         let capability = self.owner_lease.activation_capability();
-        // A re-verified pair is the owner retaining the operation; an
-        // admission without a materialisation is durable intent with an
-        // unknown outcome; anything else the registry reports — absence or a
-        // read fault — is answered below, because a read fault is not absence.
-        enum RetainedPreparation {
-            Pair,
-            AdmissionOnly,
-            Unreadable,
-        }
         let retained = match store
             .read_prepared_isolated_destination_creation(&capability, &operation_id)
         {

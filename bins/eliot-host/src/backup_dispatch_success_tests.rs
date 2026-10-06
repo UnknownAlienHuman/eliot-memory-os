@@ -1,4 +1,8 @@
+#![allow(clippy::expect_used)]
 //! Successful-open backup-dispatch preparation fixture (issue #958).
+//! TEST ALLOW: `.expect` below is the named fixture-construction expectation,
+//! mirroring the sibling `backup_preparation` integration suite (whose first
+//! line carries the same allow). Production code in this branch adds no allows.
 //!
 //! The directory-only `prepare_isolated_destination` port is proved by the
 //! `backup_preparation` integration suite. These cases prove the ADMITTED
@@ -7,7 +11,7 @@
 //! configuration projection and the delegated preparation against a real
 //! seeded installation registry on a disposable SystemService-shaped contour.
 //!
-//! The contour is SystemService-shaped (never PortableDev: a portable contour
+//! The contour is `SystemService`-shaped (never `PortableDev`: a portable contour
 //! retains no isolated restore root outside the preparation source, so
 //! `resolve_owner_staging_parent` refuses it by contract) under a
 //! thread-local `override_protected_root` pin over a unique temp case root
@@ -18,7 +22,7 @@
 //! owner-issued values back out of the inspected evidence.
 
 use super::*;
-use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
+use eliot_installation::RuntimeStateRoots;
 use eliot_platform_windows::test_support::override_protected_root;
 use std::path::{Path, PathBuf};
 
@@ -129,7 +133,7 @@ fn dispatch_roots(case_root: &Path, key: &str) -> RuntimeStateRoots {
 /// Builds the seeded source manifest for one case: the exact
 /// `liveness_manifest_with_distinct_store_digests` shape (which passes
 /// `manifest.validate`), re-anchored onto the case contour with a
-/// SystemService profile. Only the profile, the roots, the epoch and the
+/// `SystemService` profile. Only the profile, the roots, the epoch and the
 /// path-anchored fields differ; every digest rule keeps the proven binding.
 fn dispatch_manifest(
     roots: &RuntimeStateRoots,
@@ -138,122 +142,115 @@ fn dispatch_manifest(
     case_root: &Path,
     case_bin: &Path,
 ) -> eliot_installation::CandidateManifest {
-    use eliot_installation::InstallationProfile;
-    let path = |name: &str| dispatch_handle(case_bin.join(name).to_string_lossy().into_owned());
-    let generation = dispatch_handle(generation_name);
-    let kernel_digest = dispatch_handle("a".repeat(64));
-    let bridge_digest = dispatch_handle("b".repeat(64));
-    let provider_digest = dispatch_handle("d".repeat(64));
-    let config_digest = dispatch_handle("c".repeat(64));
-    let config_path = path("generation.json");
-    let bootstrap_path = path("store-bootstrap.json");
-    let authority_path = path("authority.json");
-    let bridge_path = path("eliot-store-surreal.exe");
-    let provider_path = path("surreal.exe");
-    let host_path = path("eliot-host.exe");
-    let user_broker_file = case_bin.join("eliot-user-broker.exe");
-    let user_broker_path = path("eliot-user-broker.exe");
-    let user_broker_bytes = b"approved-user-broker-fixture-958";
-    std::fs::write(&user_broker_file, user_broker_bytes).unwrap_or_else(|_| unreachable!());
-    use sha2::Digest as _;
-    let user_broker_digest =
-        dispatch_handle(format!("{:x}", sha2::Sha256::digest(user_broker_bytes)));
-    // I3.1 SystemService table: the durable-data root is `<anchor>\Eliot`
-    // (the installer-owned state contour the per-installation runtime tree
-    // sits strictly below), while binaries and user config/cache keep the
-    // proven liveness layout re-anchored onto the case root.
-    let anchor_eliot = case_root.join("Eliot").to_string_lossy().into_owned();
-    // The I3.1 user root is a sibling of the durable contour (production:
-    // `%LocalAppData%\Eliot` beside `%ProgramData%\Eliot`), so it must not
-    // sit under the durable root the separation rule compares it against.
-    let user_root = case_root.join("user").to_string_lossy().into_owned();
-    let profile_governed_roots = eliot_installation::InstallationRoots {
-        binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
-        immutable_binaries: case_bin
-            .join("eliot")
-            .join("test-version")
-            .to_string_lossy()
-            .into_owned(),
-        durable_data: anchor_eliot,
-        user_config: user_root.clone(),
-        user_cache: user_root,
-        runtime_state_roots: roots.clone(),
-    };
-    let lineage = dispatch_handle(format!("lineage:{installation}"));
-    let epoch = |seq: u64| {
-        eliot_contracts::EpochId::new(
-            eliot_host_state::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                .unwrap_or_else(|_| unreachable!()),
-            std::num::NonZeroU64::new(seq).unwrap_or_else(|| unreachable!()),
-        )
-        .unwrap_or_else(|_| unreachable!())
-    };
-    let mut runtime_launch = eliot_installation::RuntimeLaunchDescriptor {
-        profile: InstallationProfile::SystemService,
-        profile_component: dispatch_handle("eliot"),
-        profile_version: dispatch_handle("test-version"),
-        profile_installation_key: Some(dispatch_handle(
-            roots
-                .installation_root
-                .as_str()
-                .rsplit('\\')
-                .next()
-                .unwrap_or_else(|| unreachable!()),
-        )),
-        profile_governed_roots,
-        portable_root: None,
-        installation_epoch: InstallationEpoch {
-            installation: dispatch_handle(installation),
-            lineage_id: lineage,
-            sequence: 1,
-        },
-        generation: generation.clone(),
-        authority_generation: eliot_contracts::ResourceGeneration::genesis(),
-        authority_state_fence: eliot_contracts::StateFence::new(
-            epoch(1),
-            eliot_contracts::ResourceGeneration::genesis(),
-        ),
-        supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
-            authority: Box::new(test_provisioned_supervision_authority(
-                installation,
-                generation_name,
-                eliot_contracts::ResourceGeneration::genesis(),
-            )),
-        },
-        authority_descriptor_path: authority_path.clone(),
-        authority_descriptor_digest: dispatch_handle("9".repeat(64)),
-        runtime_state_roots: roots.clone(),
-        kernel_work_root: roots.kernel_work_root.clone(),
-        kernel_artifact_digest: kernel_digest.clone(),
-        eliotd_executable_path: path("eliotd.exe"),
-        eliotd_artifact_digest: dispatch_handle("e".repeat(64)),
-        eliotd_config_path: path("eliotd-governor.json"),
-        eliotd_config_digest: dispatch_handle("2".repeat(64)),
-        protected_snapshot_digest: dispatch_handle("a".repeat(64)),
-        eliotd_descriptor_path: path("eliotd.json"),
-        eliotd_descriptor_digest: dispatch_handle("f".repeat(64)),
-        eliotd_launch_nonce: dispatch_handle(format!("eliotd:{}", "1".repeat(32))),
-        store_config_path: config_path.clone(),
-        store_credential_target: dispatch_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-        store_bridge_executable_path: bridge_path.clone(),
-        store_bridge_artifact_digest: bridge_digest.clone(),
-        store_bootstrap_descriptor_path: bootstrap_path.clone(),
-        store_bootstrap_descriptor_digest: dispatch_handle("8".repeat(64)),
-        canonical_store_executable_path: provider_path.clone(),
-        canonical_store_artifact_digest: provider_digest.clone(),
-        kernel_arguments: vec![
+    ManifestSeed {
+        roots,
+        installation,
+        generation_name,
+        case_root,
+        case_bin,
+    }
+    .manifest()
+}
+
+/// Inputs for one seeded case manifest. The seed exists so the manifest
+/// builder stays a composition of small honest helpers instead of one
+/// 200-line literal: each method below builds one named part (paths, governed
+/// roots, argument vectors, launch descriptor) and `manifest` assembles them.
+struct ManifestSeed<'a> {
+    roots: &'a RuntimeStateRoots,
+    installation: &'a str,
+    generation_name: &'a str,
+    case_root: &'a Path,
+    case_bin: &'a Path,
+}
+
+/// Every derived path and digest one case manifest binds.
+struct ManifestPaths {
+    generation: eliot_installation::PlatformHandle,
+    kernel_digest: eliot_installation::PlatformHandle,
+    bridge_digest: eliot_installation::PlatformHandle,
+    provider_digest: eliot_installation::PlatformHandle,
+    config_digest: eliot_installation::PlatformHandle,
+    config_path: eliot_installation::PlatformHandle,
+    bootstrap_path: eliot_installation::PlatformHandle,
+    authority_path: eliot_installation::PlatformHandle,
+    bridge_path: eliot_installation::PlatformHandle,
+    provider_path: eliot_installation::PlatformHandle,
+    host_path: eliot_installation::PlatformHandle,
+    user_broker_path: eliot_installation::PlatformHandle,
+    user_broker_digest: eliot_installation::PlatformHandle,
+}
+
+impl ManifestSeed<'_> {
+    fn path(&self, name: &str) -> eliot_installation::PlatformHandle {
+        dispatch_handle(self.case_bin.join(name).to_string_lossy().into_owned())
+    }
+
+    fn manifest_paths(&self) -> ManifestPaths {
+        let user_broker_file = self.case_bin.join("eliot-user-broker.exe");
+        let user_broker_bytes = b"approved-user-broker-fixture-958";
+        std::fs::write(&user_broker_file, user_broker_bytes).unwrap_or_else(|_| unreachable!());
+        ManifestPaths {
+            generation: dispatch_handle(self.generation_name),
+            kernel_digest: dispatch_handle("a".repeat(64)),
+            bridge_digest: dispatch_handle("b".repeat(64)),
+            provider_digest: dispatch_handle("d".repeat(64)),
+            config_digest: dispatch_handle("c".repeat(64)),
+            config_path: self.path("generation.json"),
+            bootstrap_path: self.path("store-bootstrap.json"),
+            authority_path: self.path("authority.json"),
+            bridge_path: self.path("eliot-store-surreal.exe"),
+            provider_path: self.path("surreal.exe"),
+            host_path: self.path("eliot-host.exe"),
+            user_broker_path: self.path("eliot-user-broker.exe"),
+            user_broker_digest: {
+                use sha2::Digest as _;
+                dispatch_handle(format!("{:x}", sha2::Sha256::digest(user_broker_bytes)))
+            },
+        }
+    }
+
+    fn governed_roots(&self) -> eliot_installation::InstallationRoots {
+        // I3.1 `SystemService` table: the durable-data root is
+        // `<anchor>\Eliot` (the installer-owned state contour the
+        // per-installation runtime tree sits strictly below), while binaries
+        // and user config/cache keep the proven liveness layout re-anchored
+        // onto the case root.
+        let anchor_eliot = self.case_root.join("Eliot").to_string_lossy().into_owned();
+        // The I3.1 user root is a sibling of the durable contour
+        // (production: `%LocalAppData%\Eliot` beside `%ProgramData%\Eliot`),
+        // so it must not sit under the durable root the separation rule
+        // compares it against.
+        let user_root = self.case_root.join("user").to_string_lossy().into_owned();
+        eliot_installation::InstallationRoots {
+            binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: self
+                .case_bin
+                .join("eliot")
+                .join("test-version")
+                .to_string_lossy()
+                .into_owned(),
+            durable_data: anchor_eliot,
+            user_config: user_root.clone(),
+            user_cache: user_root,
+            runtime_state_roots: self.roots.clone(),
+        }
+    }
+
+    fn kernel_arguments(&self, paths: &ManifestPaths) -> Vec<eliot_installation::PlatformHandle> {
+        vec![
             dispatch_handle("--work-root"),
-            roots.kernel_work_root.clone(),
+            self.roots.kernel_work_root.clone(),
             dispatch_handle("--store-bootstrap"),
-            bootstrap_path,
+            paths.bootstrap_path.clone(),
             dispatch_handle("--store-bootstrap-sha256"),
             dispatch_handle("8".repeat(64)),
             dispatch_handle("--authority-descriptor"),
-            authority_path,
+            paths.authority_path.clone(),
             dispatch_handle("--authority-descriptor-sha256"),
             dispatch_handle("9".repeat(64)),
             dispatch_handle("--kernel-artifact-sha256"),
-            kernel_digest.clone(),
+            paths.kernel_digest.clone(),
             dispatch_handle("--doctor-artifact-sha256"),
             dispatch_handle("b".repeat(64)),
             dispatch_handle("--testd-artifact-sha256"),
@@ -261,90 +258,171 @@ fn dispatch_manifest(
             dispatch_handle("--native-worker-artifact-sha256"),
             dispatch_handle("d".repeat(64)),
             dispatch_handle("--user-broker-executable"),
-            user_broker_path.clone(),
+            paths.user_broker_path.clone(),
             dispatch_handle("--user-broker-artifact-sha256"),
-            user_broker_digest.clone(),
+            paths.user_broker_digest.clone(),
             dispatch_handle("--eliotd-descriptor"),
-            path("eliotd.json"),
+            self.path("eliotd.json"),
             dispatch_handle("--eliotd-descriptor-sha256"),
             dispatch_handle("f".repeat(64)),
-        ],
-        store_bridge_arguments: vec![dispatch_handle("--config"), config_path.clone()],
-        canonical_store_arguments: vec![
+        ]
+    }
+
+    fn store_arguments(&self) -> Vec<eliot_installation::PlatformHandle> {
+        vec![
             dispatch_handle("start"),
             dispatch_handle("--no-banner"),
             dispatch_handle("--bind"),
             dispatch_handle("127.0.0.1:8000"),
             dispatch_handle("--temporary-directory"),
-            roots.store_temp_root.clone(),
+            self.roots.store_temp_root.clone(),
             dispatch_handle("--log-file-enabled"),
             dispatch_handle("--log-file-path"),
-            roots.store_work_root.clone(),
+            self.roots.store_work_root.clone(),
             dispatch_handle("--log-file-name"),
             dispatch_handle("surrealdb.log"),
             dispatch_handle(format!(
                 "surrealkv://{}",
-                roots.store_data_root.as_str().replace('\\', "/")
+                self.roots.store_data_root.as_str().replace('\\', "/")
             )),
-        ],
-        host_executable_path: host_path.clone(),
-        host_artifact_digest: dispatch_handle("e".repeat(64)),
-        watchdog_executable_path: path("eliot-watchdog.exe"),
-        watchdog_artifact_digest: dispatch_handle("7".repeat(64)),
-        doctor_artifact_digest: dispatch_handle("b".repeat(64)),
-        testd_artifact_digest: dispatch_handle("c".repeat(64)),
-        native_worker_artifact_digest: dispatch_handle("d".repeat(64)),
-        user_broker_artifact_digest: user_broker_digest.clone(),
-        wasm_host_artifact_digest: dispatch_handle("f".repeat(64)),
-        doctor_executable_path: path("eliot-doctor.exe"),
-        testd_executable_path: path("eliot-testd.exe"),
-        native_worker_executable_path: path("eliot-native-worker.exe"),
-        user_broker_executable_path: user_broker_path,
-        wasm_host_executable_path: path("eliot-wasm-host.exe"),
-        descriptor_digest: dispatch_handle("0".repeat(64)),
-    };
-    runtime_launch = match runtime_launch.with_computed_digest() {
-        Ok(launch) => launch,
-        Err(error) => panic!("case launch descriptor rejected: {error:?}"),
-    };
-    let manifest = eliot_installation::CandidateManifest {
-        generation,
-        components: vec![
-            dispatch_handle("component:kernel"),
-            dispatch_handle("component:store"),
-        ],
-        kernel_artifact_digest: kernel_digest,
-        store_bridge_artifact_digest: bridge_digest,
-        canonical_store_artifact_digest: provider_digest,
-        host_artifact_digest: dispatch_handle("e".repeat(64)),
-        doctor_artifact_digest: dispatch_handle("b".repeat(64)),
-        testd_artifact_digest: dispatch_handle("c".repeat(64)),
-        native_worker_artifact_digest: dispatch_handle("d".repeat(64)),
-        user_broker_artifact_digest: user_broker_digest,
-        wasm_host_artifact_digest: dispatch_handle("f".repeat(64)),
-        kernel_executable_path: path("eliot-kernel.exe"),
-        store_bridge_executable_path: bridge_path,
-        canonical_store_executable_path: provider_path,
-        host_executable_path: host_path,
-        doctor_executable_path: path("eliot-doctor.exe"),
-        testd_executable_path: path("eliot-testd.exe"),
-        native_worker_executable_path: path("eliot-native-worker.exe"),
-        user_broker_executable_path: path("eliot-user-broker.exe"),
-        wasm_host_executable_path: path("eliot-wasm-host.exe"),
-        config_path,
-        dependency_closure_refs: vec![dispatch_handle("evidence:dependency-closure")],
-        license_refs: vec![dispatch_handle("evidence:licenses")],
-        config_digest,
-        store_credential_target: dispatch_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-        supervision_key_slot: dispatch_handle("6".repeat(64)),
-        signature_ref: dispatch_handle("evidence:signature"),
-        runtime_state_roots_digest: roots.roots_digest.clone(),
-        runtime_launch,
-    };
-    manifest
-        .validate()
-        .expect("case manifest validates before seeding");
-    manifest
+        ]
+    }
+
+    fn runtime_launch(&self, paths: &ManifestPaths) -> eliot_installation::RuntimeLaunchDescriptor {
+        use eliot_installation::InstallationProfile;
+        let epoch = |seq: u64| {
+            eliot_contracts::EpochId::new(
+                eliot_host_state::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .unwrap_or_else(|_| unreachable!()),
+                std::num::NonZeroU64::new(seq).unwrap_or_else(|| unreachable!()),
+            )
+            .unwrap_or_else(|_| unreachable!())
+        };
+        let lineage = dispatch_handle(format!("lineage:{}", self.installation));
+        let launch = eliot_installation::RuntimeLaunchDescriptor {
+            profile: InstallationProfile::SystemService,
+            profile_component: dispatch_handle("eliot"),
+            profile_version: dispatch_handle("test-version"),
+            profile_installation_key: Some(dispatch_handle(
+                self.roots
+                    .installation_root
+                    .as_str()
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or_else(|| unreachable!()),
+            )),
+            profile_governed_roots: self.governed_roots(),
+            portable_root: None,
+            installation_epoch: eliot_installation::InstallationEpoch {
+                installation: dispatch_handle(self.installation),
+                lineage_id: lineage,
+                sequence: 1,
+            },
+            generation: paths.generation.clone(),
+            authority_generation: eliot_contracts::ResourceGeneration::genesis(),
+            authority_state_fence: eliot_contracts::StateFence::new(
+                epoch(1),
+                eliot_contracts::ResourceGeneration::genesis(),
+            ),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
+                authority: Box::new(test_provisioned_supervision_authority(
+                    self.installation,
+                    self.generation_name,
+                    eliot_contracts::ResourceGeneration::genesis(),
+                )),
+            },
+            authority_descriptor_path: paths.authority_path.clone(),
+            authority_descriptor_digest: dispatch_handle("9".repeat(64)),
+            runtime_state_roots: self.roots.clone(),
+            kernel_work_root: self.roots.kernel_work_root.clone(),
+            kernel_artifact_digest: paths.kernel_digest.clone(),
+            eliotd_executable_path: self.path("eliotd.exe"),
+            eliotd_artifact_digest: dispatch_handle("e".repeat(64)),
+            eliotd_config_path: self.path("eliotd-governor.json"),
+            eliotd_config_digest: dispatch_handle("2".repeat(64)),
+            protected_snapshot_digest: dispatch_handle("a".repeat(64)),
+            eliotd_descriptor_path: self.path("eliotd.json"),
+            eliotd_descriptor_digest: dispatch_handle("f".repeat(64)),
+            eliotd_launch_nonce: dispatch_handle(format!("eliotd:{}", "1".repeat(32))),
+            store_config_path: paths.config_path.clone(),
+            store_credential_target: dispatch_handle(
+                "eliot/store/v1/0123456789abcdef0123456789abcdef",
+            ),
+            store_bridge_executable_path: paths.bridge_path.clone(),
+            store_bridge_artifact_digest: paths.bridge_digest.clone(),
+            store_bootstrap_descriptor_path: paths.bootstrap_path.clone(),
+            store_bootstrap_descriptor_digest: dispatch_handle("8".repeat(64)),
+            canonical_store_executable_path: paths.provider_path.clone(),
+            canonical_store_artifact_digest: paths.provider_digest.clone(),
+            kernel_arguments: self.kernel_arguments(paths),
+            store_bridge_arguments: vec![dispatch_handle("--config"), paths.config_path.clone()],
+            canonical_store_arguments: self.store_arguments(),
+            host_executable_path: paths.host_path.clone(),
+            host_artifact_digest: dispatch_handle("e".repeat(64)),
+            watchdog_executable_path: self.path("eliot-watchdog.exe"),
+            watchdog_artifact_digest: dispatch_handle("7".repeat(64)),
+            doctor_artifact_digest: dispatch_handle("b".repeat(64)),
+            testd_artifact_digest: dispatch_handle("c".repeat(64)),
+            native_worker_artifact_digest: dispatch_handle("d".repeat(64)),
+            user_broker_artifact_digest: paths.user_broker_digest.clone(),
+            wasm_host_artifact_digest: dispatch_handle("f".repeat(64)),
+            doctor_executable_path: self.path("eliot-doctor.exe"),
+            testd_executable_path: self.path("eliot-testd.exe"),
+            native_worker_executable_path: self.path("eliot-native-worker.exe"),
+            user_broker_executable_path: paths.user_broker_path.clone(),
+            wasm_host_executable_path: self.path("eliot-wasm-host.exe"),
+            descriptor_digest: dispatch_handle("0".repeat(64)),
+        };
+        match launch.with_computed_digest() {
+            Ok(launch) => launch,
+            Err(error) => panic!("case launch descriptor rejected: {error:?}"),
+        }
+    }
+
+    fn manifest(&self) -> eliot_installation::CandidateManifest {
+        let paths = self.manifest_paths();
+        let runtime_launch = self.runtime_launch(&paths);
+        let manifest = eliot_installation::CandidateManifest {
+            generation: paths.generation.clone(),
+            components: vec![
+                dispatch_handle("component:kernel"),
+                dispatch_handle("component:store"),
+            ],
+            kernel_artifact_digest: paths.kernel_digest.clone(),
+            store_bridge_artifact_digest: paths.bridge_digest.clone(),
+            canonical_store_artifact_digest: paths.provider_digest.clone(),
+            host_artifact_digest: dispatch_handle("e".repeat(64)),
+            doctor_artifact_digest: dispatch_handle("b".repeat(64)),
+            testd_artifact_digest: dispatch_handle("c".repeat(64)),
+            native_worker_artifact_digest: dispatch_handle("d".repeat(64)),
+            user_broker_artifact_digest: paths.user_broker_digest.clone(),
+            wasm_host_artifact_digest: dispatch_handle("f".repeat(64)),
+            kernel_executable_path: self.path("eliot-kernel.exe"),
+            store_bridge_executable_path: paths.bridge_path.clone(),
+            canonical_store_executable_path: paths.provider_path.clone(),
+            host_executable_path: paths.host_path.clone(),
+            doctor_executable_path: self.path("eliot-doctor.exe"),
+            testd_executable_path: self.path("eliot-testd.exe"),
+            native_worker_executable_path: self.path("eliot-native-worker.exe"),
+            user_broker_executable_path: self.path("eliot-user-broker.exe"),
+            wasm_host_executable_path: self.path("eliot-wasm-host.exe"),
+            config_path: paths.config_path.clone(),
+            dependency_closure_refs: vec![dispatch_handle("evidence:dependency-closure")],
+            license_refs: vec![dispatch_handle("evidence:licenses")],
+            config_digest: paths.config_digest.clone(),
+            store_credential_target: dispatch_handle(
+                "eliot/store/v1/0123456789abcdef0123456789abcdef",
+            ),
+            supervision_key_slot: dispatch_handle("6".repeat(64)),
+            signature_ref: dispatch_handle("evidence:signature"),
+            runtime_state_roots_digest: self.roots.roots_digest.clone(),
+            runtime_launch,
+        };
+        manifest
+            .validate()
+            .expect("case manifest validates before seeding");
+        manifest
+    }
 }
 
 /// Builds the activation commit fence for one case manifest: the exact
@@ -400,12 +478,47 @@ fn dispatch_commit_fence(
     }
 }
 
-/// Sets up one disposable dispatch contour: temp case root, SystemService
+/// Sets up one disposable dispatch contour: temp case root, `SystemService`
+/// roots, seeded registry with an active generation, an initialised ORS
+/// store, the Host journal epoch and the struct-literal composition (the
+/// `journal_tests` builder pattern: in-crate code sees the private fields,
+/// so no design decision is left to guesswork).
+/// Sets up one disposable dispatch contour: temp case root, `SystemService`
 /// roots, seeded registry with an active generation, an initialised ORS
 /// store, the Host journal epoch and the struct-literal composition (the
 /// `journal_tests` builder pattern: in-crate code sees the private fields,
 /// so no design decision is left to guesswork).
 fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
+    let filesystem = contour_filesystem(case);
+    let seed = contour_seed_registry(&filesystem, case);
+    contour_apply_purge(&filesystem);
+    contour_compose(filesystem, seed)
+}
+
+/// Temp filesystem one contour case owns: roots, binaries, restore area.
+struct ContourFilesystem {
+    unique: String,
+    case_root: PathBuf,
+    key: String,
+    roots: RuntimeStateRoots,
+    bin: PathBuf,
+    staging_parent: PathBuf,
+    pinned: eliot_platform_windows::test_support::ProtectedRootOverride,
+}
+
+/// Seeded installation state one contour case prepares against.
+struct ContourSeed {
+    installation: String,
+    manifest: eliot_installation::CandidateManifest,
+    owner_lease: HostOwnerLease,
+    fence: eliot_installation::ActivationCommitFence,
+    transaction_id: eliot_installation::PlatformHandle,
+    plan_digest: eliot_installation::PlatformHandle,
+    registry_file: PathBuf,
+    registry: eliot_installation::ApprovedGenerationRegistry,
+}
+
+fn contour_filesystem(case: &str) -> ContourFilesystem {
     let unique = format!(
         "{case}-{}-{}",
         std::process::id(),
@@ -446,21 +559,36 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         .join(eliot_platform_windows::ISOLATED_RESTORE_ROOT_DIR);
     std::fs::create_dir_all(&staging_parent).expect("case isolated restore area");
     let pinned = override_protected_root(&case_root);
-    let installation = format!("installation:958-dispatch-{unique}");
+    ContourFilesystem {
+        unique,
+        case_root,
+        key,
+        roots,
+        bin,
+        staging_parent,
+        pinned,
+    }
+}
+
+fn contour_seed_registry(filesystem: &ContourFilesystem, case: &str) -> ContourSeed {
+    let installation = format!("installation:958-dispatch-{}", filesystem.unique);
     let manifest = dispatch_manifest(
-        &roots,
+        &filesystem.roots,
         &installation,
         &format!("generation-958-dispatch-{case}"),
-        &case_root,
-        &bin,
+        &filesystem.case_root,
+        &filesystem.bin,
     );
     let owner_lease =
         HostOwnerLease::acquire(&dispatch_handle(installation.clone())).expect("case owner lease");
     let fence = dispatch_commit_fence(&manifest, &installation);
-    let transaction_id = dispatch_handle(format!("transaction:958-dispatch-{unique}"));
-    let plan_digest = dispatch_handle(dispatch_sha256(&format!("plan:958-dispatch-{unique}")));
+    let transaction_id = dispatch_handle(format!("transaction:958-dispatch-{}", filesystem.unique));
+    let plan_digest = dispatch_handle(dispatch_sha256(&format!(
+        "plan:958-dispatch-{}",
+        filesystem.unique
+    )));
     let registry_file =
-        Path::new(roots.host_state_root.as_str()).join("installation-registry.redb");
+        Path::new(filesystem.roots.host_state_root.as_str()).join("installation-registry.redb");
     // The registry opens through the real lease-bound owner (`open_at` over
     // a retained protected-root lease), never through the leaseless
     // test-support opener: every capability-bound record/read seam the arm
@@ -468,12 +596,12 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
     // without a retained installation Host root, and the contour owns a
     // real one (the T17 override precedent).
     let host_lease = eliot_platform_windows::ProtectedRootLease::open_existing(Path::new(
-        roots.host_state_root.as_str(),
+        filesystem.roots.host_state_root.as_str(),
     ))
     .expect("case Host root lease");
     let store = eliot_installation::RedbInstallationRegistry::open_at(host_lease)
         .expect("case registry store");
-    // A SystemService generation is invalid without exactly the Host +
+    // A `SystemService` generation is invalid without exactly the Host +
     // Watchdog SCM approvals: the issuer derives the pair from this case's
     // own manifest (images, bootstrap, transaction), so the seeded row is
     // the same projection an installer-driven activation would commit.
@@ -499,7 +627,20 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         .expect("case active generation");
     let registry = store.load().expect("case registry projection");
     drop(store);
-    let ors_file = Path::new(roots.kernel_ors_root.as_str()).join("kernel-ors.redb");
+    ContourSeed {
+        installation,
+        manifest,
+        owner_lease,
+        fence,
+        transaction_id,
+        plan_digest,
+        registry_file,
+        registry,
+    }
+}
+
+fn contour_apply_purge(filesystem: &ContourFilesystem) {
+    let ors_file = Path::new(filesystem.roots.kernel_ors_root.as_str()).join("kernel-ors.redb");
     // The contour's ORS owner applies one purge before any preparation runs:
     // the admission seam refuses a zero purge-ledger revision (a destination
     // bound to no purge revision would restore without the current privacy
@@ -513,6 +654,7 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         std::num::NonZeroU64::new(1).unwrap_or_else(|| unreachable!()),
     )
     .unwrap_or_else(|_| unreachable!());
+    let unique = &filesystem.unique;
     let purge = eliot_security_contracts::PurgeLedgerEntry {
         purge_id: format!("purge-958-dispatch-{unique}"),
         subject_ref: format!("subject-958-dispatch-{unique}"),
@@ -537,27 +679,36 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         "the contour's first applied purge consumes ledger revision one"
     );
     drop(ors_store);
-    let journal_file = case_root.join("host-journal.redb");
+}
+
+fn contour_compose(
+    filesystem: ContourFilesystem,
+    seed: ContourSeed,
+) -> (DispatchContour, HostComposition) {
+    let journal_file = filesystem.case_root.join("host-journal.redb");
     let (journal, host, activation_generation, activation_id, _) =
         super::host_epoch_reopen::open_test_support_epoch(
             &journal_file,
-            dispatch_handle(installation.clone()),
+            dispatch_handle(seed.installation.clone()),
             None,
             None,
         )
         .expect("case host epoch");
     let launch_options = HostLaunchOptions {
         config_descriptor_path: PathBuf::from(
-            manifest.runtime_launch.authority_descriptor_path.as_str(),
+            seed.manifest
+                .runtime_launch
+                .authority_descriptor_path
+                .as_str(),
         ),
         config_descriptor_digest: phase_b_scm_selector(
-            &manifest.runtime_launch.authority_descriptor_digest,
+            &seed.manifest.runtime_launch.authority_descriptor_digest,
         )
         .expect("case descriptor selector"),
-        installation: dispatch_handle(installation.clone()),
-        transaction_plan_generation: manifest.runtime_launch.authority_generation.value(),
+        installation: dispatch_handle(seed.installation.clone()),
+        transaction_plan_generation: seed.manifest.runtime_launch.authority_generation.value(),
         host_state_root: PathBuf::from(
-            manifest
+            seed.manifest
                 .runtime_launch
                 .runtime_state_roots
                 .host_state_root
@@ -570,14 +721,14 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         store_rebind_boundary: HostStoreRebindProductionBoundary,
         runtime_control_boundary: HostRuntimeControlProductionBoundary,
         journal,
-        registry_host_root: PathBuf::from(roots.host_state_root.as_str()),
+        registry_host_root: PathBuf::from(filesystem.roots.host_state_root.as_str()),
         // No test-file hook: the arm under proof opens the registry through
         // the production lease-bound path (`open_registry_store` falls
         // through to `open_registry_store_at_profile` when no hook is set),
         // which is the only opener whose retained root passes the
         // capability binding the record/read seams enforce.
         test_registry_file: None,
-        registry,
+        registry: seed.registry,
         launch_options,
         host,
         activation_generation,
@@ -597,24 +748,24 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
         backup_dispatch_queue: crate::HostBackupDispatchQueue::bounded(),
         store_recovery_startup_fence: StoreRecoveryStartupFence::Clear,
         active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind::None,
-        owner_lease,
+        owner_lease: seed.owner_lease,
         pending_record: None,
         durable_finalized: false,
         owner_released: false,
         shutdown_failed: false,
     };
     let contour = DispatchContour {
-        case_root,
-        _override: pinned,
-        roots,
-        manifest,
-        installation,
-        installation_key: key,
-        registry_file,
+        case_root: filesystem.case_root,
+        _override: filesystem.pinned,
+        roots: filesystem.roots,
+        manifest: seed.manifest,
+        installation: seed.installation,
+        installation_key: filesystem.key,
+        registry_file: seed.registry_file,
         journal_file,
-        staging_parent,
-        transaction_id: transaction_id.as_str().to_owned(),
-        plan_digest: plan_digest.as_str().to_owned(),
+        staging_parent: filesystem.staging_parent,
+        transaction_id: seed.transaction_id.as_str().to_owned(),
+        plan_digest: seed.plan_digest.as_str().to_owned(),
     };
     (contour, composition)
 }
@@ -622,7 +773,7 @@ fn dispatch_contour(case: &str) -> (DispatchContour, HostComposition) {
 /// Removes one case contour. The composition (journal backend), the evidence
 /// leases and the override guard must already be dropped: redb files cannot
 /// be removed while a Database handle is open.
-fn release_contour(contour: DispatchContour) {
+fn release_contour(contour: &DispatchContour) {
     let _ = std::fs::remove_dir_all(&contour.case_root);
 }
 
@@ -710,7 +861,7 @@ fn dispatch_journal_port_prepares_and_reconciles() {
         other => panic!("reconcile must resolve Current, got {other:?}"),
     }
     drop(composition);
-    release_contour(contour);
+    release_contour(&contour);
 }
 
 /// Refusal proof on the journal port: a foreign source is refused by the
@@ -721,9 +872,8 @@ fn dispatch_journal_port_refuses_foreign_source_before_effect() {
     let operation = "op-958-dispatch-refusal";
     let request =
         admitted_dispatch_request(&contour, operation, "installation:foreign-958-refusal");
-    let error = match composition.backup_dispatch_prepare(&dispatch_caller_auth(), &request) {
-        Ok(_) => panic!("foreign source refused"),
-        Err(error) => error,
+    let Err(error) = composition.backup_dispatch_prepare(&dispatch_caller_auth(), &request) else {
+        panic!("foreign source refused");
     };
     assert!(
         format!("{error:?}").contains("caller_auth"),
@@ -737,7 +887,7 @@ fn dispatch_journal_port_refuses_foreign_source_before_effect() {
         "refused preparation leaves no destination behind"
     );
     drop(composition);
-    release_contour(contour);
+    release_contour(&contour);
 }
 
 /// Opens one short-lived lease-bound registry handle over a contour's Host
@@ -972,7 +1122,7 @@ fn dispatch_envelope(
 /// Production-path success proof (P2/P3/P4): the live queue arm
 /// (`process_backup_dispatch_requests -> dispatch_backup_owner_operation ->
 /// Prepare`) answers `PossibleEffect` once the effect boundary is crossed,
-/// retains the destination ApprovedGeneration row (inactive, new
+/// retains the destination `ApprovedGeneration` row (inactive, new
 /// installation) with its creation pair naming the created root, and the
 /// status arm resolves the original destination under the same admitted
 /// operation hash.
@@ -1065,11 +1215,11 @@ fn dispatch_arm_admits_and_records_destination() {
         other => panic!("status arm must answer Admitted, got {other:?}"),
     }
     drop(composition);
-    release_contour(contour);
+    release_contour(&contour);
 }
 
 /// T5 installation-identity proof (#958 A2): an admitted preparation on the
-/// production dispatch path allocates a destination ApprovedGeneration row
+/// production dispatch path allocates a destination `ApprovedGeneration` row
 /// whose generation IS the requested owner installation key — inactive, with
 /// pending plan authority — and records the creation pair naming the created
 /// root. The negative half (an arbitrary non-key destination is refused
@@ -1132,7 +1282,7 @@ fn dispatch_t5_admitted_destination_carries_installation_identity() {
     );
     drop(store);
     drop(composition);
-    release_contour(contour);
+    release_contour(&contour);
 }
 
 /// Production-path refusal proof (P2): a destination identity that is not
@@ -1195,7 +1345,7 @@ fn dispatch_arm_refuses_arbitrary_destination_before_effect() {
     );
     drop(store);
     drop(composition);
-    release_contour(contour);
+    release_contour(&contour);
 }
 
 /// First staging proof: the disposable contour inspects into real owner
@@ -1225,5 +1375,5 @@ fn dispatch_contour_inspects_owner_evidence() {
     );
     drop(composition);
     drop(evidence);
-    release_contour(contour);
+    release_contour(&contour);
 }
