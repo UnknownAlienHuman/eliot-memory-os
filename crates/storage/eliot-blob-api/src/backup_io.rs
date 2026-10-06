@@ -446,6 +446,12 @@ impl BlobBackupFence {
         }
         for member in &self.members {
             member.validate()?;
+            if member.root_generation != self.source_root_generation {
+                return Err(BlobError::InvalidField {
+                    field: "backup_fence.member.root_generation",
+                    reason: "member generation must equal the fenced source generation",
+                });
+            }
         }
         for (index, member) in self.members.iter().enumerate() {
             if self.members[..index].contains(member) {
@@ -1043,5 +1049,71 @@ impl BlobBackupCompletionReceipt {
     #[must_use]
     pub fn scope_residency_digest(&self) -> &str {
         &self.scope_residency_digest
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VersionedContentDigest;
+
+    fn test_id(value: &str) -> BlobId {
+        match BlobId::new(value) {
+            Ok(id) => id,
+            Err(error) => panic!("test id: {error}"),
+        }
+    }
+
+    /// A valid member locator carrying `root_generation`. Distinct seeds give
+    /// distinct content identities, so multi-member fences never trip the
+    /// duplicate-identity refusal for the wrong reason.
+    fn test_locator(seed: u8, root_generation: u64) -> BlobLocator {
+        let hex = format!("{seed:02x}").repeat(32);
+        let hash = match BlobHash::new(hex) {
+            Ok(hash) => hash,
+            Err(error) => panic!("test hash: {error}"),
+        };
+        BlobLocator {
+            hash: hash.clone(),
+            residency: ObjectResidencyKey {
+                scope_domain_id: test_id("scope-a"),
+                access_domain_id: test_id("access-a"),
+                confidentiality_domain_id: test_id("conf-a"),
+                encryption_key_domain_id: test_id("key-lineage-a"),
+                retention_domain_id: test_id("retention-a"),
+                erasure_domain_id: test_id("erasure-a"),
+                content_digest: VersionedContentDigest {
+                    algorithm: test_id("blake3"),
+                    version: 1,
+                    digest: hash,
+                },
+            },
+            root_generation,
+            path_generation: 1,
+        }
+    }
+
+    fn test_fence(members: Vec<BlobLocator>) -> Result<BlobBackupFence, BlobError> {
+        BlobBackupFence::fence("backup-op-1".to_owned(), 7, members, 8, 1024, 65536)
+    }
+
+    #[test]
+    fn fence_accepts_members_at_fenced_generation() {
+        let fence = match test_fence(vec![test_locator(0xA1, 7), test_locator(0xB2, 7)]) {
+            Ok(fence) => fence,
+            Err(error) => panic!("members at the fenced generation must be admitted: {error}"),
+        };
+        assert_eq!(fence.member_count(), 2);
+        assert_eq!(fence.source_root_generation(), 7);
+    }
+
+    #[test]
+    fn fence_rejects_member_root_generation_mismatch() {
+        let Err(BlobError::InvalidField { field, .. }) =
+            test_fence(vec![test_locator(0xA1, 7), test_locator(0xB2, 8)])
+        else {
+            panic!("a member generation mismatch must refuse")
+        };
+        assert_eq!(field, "backup_fence.member.root_generation");
     }
 }
