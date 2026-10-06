@@ -367,6 +367,66 @@ source = "scripts/verify-legacy-config-retirement.py"
 path = "docs/notes.md"
 reason = "The self-test fixture uses docs/notes.md as a temporary test path."
 
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/AGENTS.md"
+reason = "The workspace source document observer probes docs/AGENTS.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/ARCHITECTURE.md"
+reason = "The workspace source document observer probes docs/ARCHITECTURE.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/IMPLEMENTATION.md"
+reason = "The workspace source document observer probes docs/IMPLEMENTATION.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/BUILD.md"
+reason = "The workspace source document observer probes docs/BUILD.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/TESTING.md"
+reason = "The workspace source document observer probes docs/TESTING.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/SCHEMA.md"
+reason = "The workspace source document observer probes docs/SCHEMA.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/CHANGELOG.md"
+reason = "The workspace source document observer probes docs/CHANGELOG.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/implementation/README.md"
+reason = "The workspace source document observer probes docs/implementation/README.md as a candidate path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_package_reader_closure.py"
+path = "docs/architecture/A.md"
+reason = "Test fixture uses docs/architecture/A.md as a dummy path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_wasm_component_lane.py"
+path = "docs/unrelated.md"
+reason = "Test fixture uses docs/unrelated.md as a dummy path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/verify-github-workflows.py"
+path = "docs/note.md"
+reason = "Workflow verifier test fixture uses docs/note.md as a dummy path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/work_unit_gate/fixtures/pr_prose_override.md"
+path = "docs/architecture/ARCHITECTURE_CONTRACT.md"
+reason = "Fixture pr_prose_override.md contains sample/test references."
+
 [documentation_pipeline]
 shards_front_door = "scripts/docs_shards.py"
 router_front_door = "scripts/docs_router.py"
