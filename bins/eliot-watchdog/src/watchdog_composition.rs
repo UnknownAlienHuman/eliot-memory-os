@@ -643,6 +643,36 @@ impl WatchdogComposition {
                                 ObservationClass::ArtifactDigest,
                             );
                         }
+                        // I8.2 (#1755 W2): this tick exercises the store-endpoint
+                        // probe that will feed the StoreProcessHealth and
+                        // ListenerInventory channels. The probe call chain is
+                        // live (manifest-shaped target -> OS listener-owner
+                        // table -> typed refusal); samples start flowing when
+                        // the owner-identity surface lands in
+                        // `eliot-platform-windows` (see
+                        // `store_endpoint_observation`). Until then a refused
+                        // probe records no sample, so both channels stay
+                        // UNKNOWN rather than healthy-by-absence.
+                        if let Some(store) = host.observe_store_endpoint() {
+                            tracing::debug!(
+                                event = "watchdog.store_endpoint_observed",
+                                observation = "observed",
+                                endpoint = store.endpoint().to_string(),
+                                process_id = store.process_id(),
+                                readiness = store.readiness().as_str(),
+                                "store loopback listener owned by the approved store image process"
+                            );
+                            record_coverage_sample(
+                                &coverage,
+                                ObservationChannel::StoreProcessHealth,
+                                ObservationClass::ReadOnlyProbe,
+                            );
+                            record_coverage_sample(
+                                &coverage,
+                                ObservationChannel::ListenerInventory,
+                                ObservationClass::ListenerBinding,
+                            );
+                        }
                         let admission = match admission.reload() {
                             Ok(admission) => admission,
                             Err(error) => {

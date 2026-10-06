@@ -255,7 +255,11 @@ fn project_channel_coverage(
             first_expected_cursor: binding.interval_start_ms,
             last_expected_cursor: binding.interval_end_ms,
         });
-        let covered = channel.disposition.as_str() == "CONTINUOUS";
+        // A replayed channel is covered by its evidence window, not live: no
+        // blind interval, but the material detail names the replay so a
+        // replayed stream never reads as live observation.
+        let replayed = channel.disposition.as_str() == "JOURNAL_REPLAYED";
+        let covered = channel.disposition.as_str() == "CONTINUOUS" || replayed;
         if !covered {
             projected.blind_intervals.push(CoverageBlindInterval {
                 stream: stream.clone(),
@@ -271,16 +275,30 @@ fn project_channel_coverage(
                 ));
             }
         }
+        let replay_detail = channel
+            .replay_evidence
+            .as_ref()
+            .map(|evidence| {
+                format!(
+                    "replay {}:{}..={}:{}",
+                    evidence.journal_id,
+                    evidence.first_cursor,
+                    evidence.last_cursor,
+                    channel.observed_replayed_observations
+                )
+            })
+            .unwrap_or_default();
         projected.material.push(MaterialActionCoverage {
             action_or_effect_route: stream,
             covered,
             detail: format!(
-                "source {}; expected [{}]; observed [{}]; disposition {}; dropped {}; sensor_map {}; interval {}..={}",
+                "source {}; expected [{}]; observed [{}]; disposition {}; dropped {}; replay {}; sensor_map {}; interval {}..={}",
                 channel.expected_source,
                 channel.expected_classes.join(","),
                 channel.observed_classes.join(","),
                 channel.disposition,
                 channel.dropped_samples,
+                replay_detail,
                 binding.sensor_map_revision,
                 binding.interval_start_ms,
                 binding.interval_end_ms,
@@ -563,12 +581,15 @@ impl ObservationCoverageManifest {
                 }
             }
         }
-        let mut continuous = 0_u64;
+        // A replayed channel is applied coverage by replay evidence, so it
+        // counts with the live-continuous channels; `unknown` is whatever was
+        // neither, never a conflation of replay with a gap.
+        let mut applied = 0_u64;
         let mut unknown = 0_u64;
         let mut dropped_total = 0_u64;
         for channel in channels {
             match channel.disposition.as_str() {
-                "CONTINUOUS" => continuous += 1,
+                "CONTINUOUS" | "JOURNAL_REPLAYED" => applied += 1,
                 "UNKNOWN" => unknown += 1,
                 _ => {}
             }
@@ -580,7 +601,7 @@ impl ObservationCoverageManifest {
                 })?;
         }
         let received = channels.len() as u64;
-        let completeness = if continuous == received {
+        let completeness = if applied == received {
             CoverageCompleteness::Complete
         } else if unknown == received {
             CoverageCompleteness::Unknown
@@ -611,9 +632,9 @@ impl ObservationCoverageManifest {
             first_and_last_expected_cursors_by_stream: projected.streams,
             counts: EventCounts {
                 received,
-                applied: continuous,
+                applied,
                 rejected: 0,
-                unknown: received - continuous,
+                unknown: received - applied,
             },
             sequence_faults: SequenceFaults {
                 gaps: dropped_total,
@@ -655,12 +676,12 @@ impl ObservationCoverageManifest {
 /// [`ObservationCoverageManifest::for_installation_interval`] uses to bind
 /// one installation window into a manifest fingerprint, so a future
 /// convention change bumps this constant instead of silently reinterpreting
-/// stored fields. Version 1 covers the four dispositions the Watchdog
+/// stored fields. Version 2 covers the five dispositions the Watchdog
 /// interval publisher can produce (`CONTINUOUS`, `PARTIAL`, `BLIND`,
-/// `UNKNOWN`); `JOURNAL_REPLAYED` needs the W3 journal-replay adapter and
-/// arrives with a binding-version bump, never as an unversioned spelling
-/// inside version 1.
-pub const INSTALLATION_COVERAGE_BINDING_VERSION: u32 = 1;
+/// `UNKNOWN`, `JOURNAL_REPLAYED`); the replay disposition is only valid with
+/// exact [`JournalReplayEvidence`], and no producer emits it until the W3
+/// journal-replay adapter reports a replayed window.
+pub const INSTALLATION_COVERAGE_BINDING_VERSION: u32 = 2;
 
 /// Fixed session-scope literal for installation-level coverage.
 ///
@@ -737,11 +758,56 @@ impl InstallationCoverageBinding {
     }
 }
 
+/// Journal-replay evidence backing one `JOURNAL_REPLAYED` channel record.
+///
+/// The replay adapter (W3) covers a contiguous cursor window of one journal
+/// and reports exactly the records it replayed. `first_cursor` and
+/// `last_cursor` are the inclusive window bounds in that journal's cursor
+/// space (USN for the filesystem journal); `observed_replayed_observations`
+/// on the channel record must equal the window length, so a replay claim is
+/// exact coverage of a named window rather than an approximate count.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalReplayEvidence {
+    /// Journal identity the window was replayed from (journal name or id).
+    pub journal_id: String,
+    /// Inclusive first cursor of the replayed window.
+    pub first_cursor: u64,
+    /// Inclusive last cursor of the replayed window.
+    pub last_cursor: u64,
+}
+
+impl JournalReplayEvidence {
+    /// Validates replay evidence shape: the journal is named and the window
+    /// is ordered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationContractError`] when the journal identity is blank
+    /// or the window end precedes its start.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.journal_id, "replay_evidence.journal_id")?;
+        if self.last_cursor < self.first_cursor {
+            return Err(EvaluationContractError::InvalidInterval {
+                field: "replay_evidence.first/last_cursor",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the exact replayed-window length the channel record must carry.
+    #[must_use]
+    pub fn window_len(&self) -> u64 {
+        self.last_cursor - self.first_cursor + 1
+    }
+}
+
 /// One Watchdog channel's interval coverage in owner-neutral form.
 ///
 /// This mirrors the spool owner's per-channel record field for field —
 /// channel, competent source, expected classes, observed live classes,
-/// replayed count (always zero until the W3 replay adapter lands),
+/// replayed count with its replay evidence (binding version 2; always zero
+/// and absent until the W3 replay adapter reports a replayed window),
 /// dropped-sample count, whether the opening tick reached its close, the I8.2
 /// wire disposition, and the named gap reasons — without importing the spool
 /// owner, so the manifest owner gains no new dependency edge. The Watchdog
@@ -759,15 +825,18 @@ pub struct InstallationChannelCoverage {
     pub expected_classes: Vec<String>,
     /// Classes actually observed live in this interval.
     pub observed_classes: Vec<String>,
-    /// Portions of the interval covered by journal replay; refused above
-    /// zero until the replay adapter exists.
+    /// Portions of the interval covered by journal replay; zero with no
+    /// evidence until the replay adapter reports a replayed window.
     pub observed_replayed_observations: u32,
+    /// Replay evidence for a `JOURNAL_REPLAYED` record; `None` otherwise.
+    pub replay_evidence: Option<JournalReplayEvidence>,
     /// Live samples offered for this channel and then dropped.
     pub dropped_samples: u32,
     /// False for a window a tick opened and did not finish: only `UNKNOWN`
     /// may be claimed for it.
     pub interval_closed: bool,
-    /// I8.2 wire disposition: `CONTINUOUS`, `PARTIAL`, `BLIND` or `UNKNOWN`.
+    /// I8.2 wire disposition: `CONTINUOUS`, `PARTIAL`, `BLIND`, `UNKNOWN`,
+    /// or `JOURNAL_REPLAYED` (binding version 2, only with replay evidence).
     pub disposition: String,
     /// Named omission reasons keeping this channel short of full coverage.
     pub gap_reasons: Vec<String>,
@@ -775,16 +844,64 @@ pub struct InstallationChannelCoverage {
 
 impl InstallationChannelCoverage {
     /// Validates one channel record: identities are non-blank, the
-    /// disposition names a version-1 value, every observed class was
-    /// expected exactly once, and the record is internally consistent (no
-    /// replay claim, no gapless non-continuous record, no gapped or dropped
-    /// continuous record, no decided disposition over an unclosed window).
+    /// disposition names a version-2 value, every observed class was
+    /// expected exactly once, and the record is internally consistent (a
+    /// replay claim only with exact replay evidence, no gapless
+    /// non-continuous record, no gapped or dropped continuous record, no
+    /// decided disposition over an unclosed window).
     ///
     /// # Errors
     ///
     /// Returns [`EvaluationContractError`] when any of those checks fails.
-    /// `JOURNAL_REPLAYED` is refused typed: nothing in this binding version
-    /// can produce it.
+    /// `JOURNAL_REPLAYED` is refused without exact evidence: the replayed
+    /// count must equal the evidence window length, and evidence without the
+    /// replay disposition is refused as an inconsistent record.
+    /// Validates the disposition against the replay evidence it requires:
+    /// `JOURNAL_REPLAYED` only with exact evidence whose window length the
+    /// replayed count equals, every other disposition with neither evidence
+    /// nor count. Kept beside [`validate`](Self::validate) so the record
+    /// check stays within its line budget.
+    fn validate_disposition_evidence(&self) -> Result<(), EvaluationContractError> {
+        match self.disposition.as_str() {
+            "CONTINUOUS" | "PARTIAL" | "BLIND" | "UNKNOWN" => {
+                if self.replay_evidence.is_some() {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "installation_channel.replay_evidence",
+                        reason: "replay evidence without the JOURNAL_REPLAYED disposition is an inconsistent record",
+                    });
+                }
+                if self.observed_replayed_observations > 0 {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "installation_channel.observed_replayed_observations",
+                        reason: "replayed observations need the JOURNAL_REPLAYED disposition with exact replay evidence",
+                    });
+                }
+            }
+            "JOURNAL_REPLAYED" => {
+                let Some(evidence) = self.replay_evidence.as_ref() else {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "installation_channel.replay_evidence",
+                        reason: "JOURNAL_REPLAYED needs exact journal-replay evidence",
+                    });
+                };
+                evidence.validate()?;
+                if u64::from(self.observed_replayed_observations) != evidence.window_len() {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "installation_channel.observed_replayed_observations",
+                        reason: "replayed observations must equal the replay evidence window length",
+                    });
+                }
+            }
+            _ => {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "installation_channel.disposition",
+                    reason: "unknown I8.2 disposition; version 2 binds CONTINUOUS, PARTIAL, BLIND, UNKNOWN and JOURNAL_REPLAYED only",
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         text(&self.channel, "installation_channel.channel")?;
         text(
@@ -792,15 +909,7 @@ impl InstallationChannelCoverage {
             "installation_channel.expected_source",
         )?;
         text(&self.disposition, "installation_channel.disposition")?;
-        match self.disposition.as_str() {
-            "CONTINUOUS" | "PARTIAL" | "BLIND" | "UNKNOWN" => {}
-            _ => {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "installation_channel.disposition",
-                    reason: "unknown I8.2 disposition; version 1 binds CONTINUOUS, PARTIAL, BLIND and UNKNOWN only",
-                });
-            }
-        }
+        self.validate_disposition_evidence()?;
         if self.expected_classes.is_empty() {
             return Err(EvaluationContractError::EmptyCollection {
                 field: "installation_channel.expected_classes",
@@ -827,14 +936,12 @@ impl InstallationChannelCoverage {
         for reason in &self.gap_reasons {
             text(reason, "installation_channel.gap_reasons")?;
         }
-        if self.observed_replayed_observations > 0 {
-            return Err(EvaluationContractError::EvidenceState {
-                field: "installation_channel.observed_replayed_observations",
-                reason: "replayed observations need the journal-replay adapter",
-            });
-        }
+        // A replayed channel carries the whole story in its evidence window:
+        // no gaps (the replay closed them) and nothing dropped. A mixed
+        // live-plus-replay interval with losses is PARTIAL, never replayed.
+        let replayed = self.disposition.as_str() == "JOURNAL_REPLAYED";
         let continuous = self.disposition.as_str() == "CONTINUOUS";
-        if continuous {
+        if continuous || replayed {
             if !self.gap_reasons.is_empty() {
                 return Err(EvaluationContractError::EvidenceState {
                     field: "installation_channel.gap_reasons",
@@ -847,7 +954,7 @@ impl InstallationChannelCoverage {
                     reason: "continuous channel cannot carry dropped samples",
                 });
             }
-            if self.observed_classes.is_empty() {
+            if continuous && self.observed_classes.is_empty() {
                 return Err(EvaluationContractError::EvidenceState {
                     field: "installation_channel.observed_classes",
                     reason: "continuous channel needs an observed class",
@@ -1805,5 +1912,105 @@ mod coverage_trace_tests_1936 {
         assert!(trace.validate().is_ok());
         trace.denominator_completeness = CoverageCompleteness::Partial;
         assert!(trace.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod coverage_replay_evidence_tests_1755 {
+    use super::*;
+
+    fn exact_evidence() -> JournalReplayEvidence {
+        JournalReplayEvidence {
+            journal_id: "filesystem-usn-journal".to_owned(),
+            first_cursor: 100,
+            last_cursor: 109,
+        }
+    }
+
+    fn replayed_channel(
+        count: u32,
+        evidence: Option<JournalReplayEvidence>,
+    ) -> InstallationChannelCoverage {
+        InstallationChannelCoverage {
+            channel: "filesystem-journal".to_owned(),
+            expected_source: "filesystem change journal".to_owned(),
+            expected_classes: vec!["path-change".to_owned()],
+            observed_classes: Vec::new(),
+            observed_replayed_observations: count,
+            replay_evidence: evidence,
+            dropped_samples: 0,
+            interval_closed: true,
+            disposition: "JOURNAL_REPLAYED".to_owned(),
+            gap_reasons: Vec::new(),
+        }
+    }
+
+    /// Binding version 2 (#1755 A2): a `JOURNAL_REPLAYED` record with exact
+    /// evidence whose window length equals the replayed count validates.
+    #[test]
+    fn journal_replayed_with_exact_evidence_validates() {
+        assert!(
+            replayed_channel(10, Some(exact_evidence()))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    /// The replay disposition without evidence is a bare claim, refused.
+    #[test]
+    fn journal_replayed_without_evidence_is_refused() {
+        assert!(replayed_channel(10, None).validate().is_err());
+    }
+
+    /// The replayed count must equal the evidence window length exactly:
+    /// an approximate count is not coverage of a named window.
+    #[test]
+    fn replayed_count_must_equal_evidence_window_length() {
+        assert!(
+            replayed_channel(9, Some(exact_evidence()))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            replayed_channel(11, Some(exact_evidence()))
+                .validate()
+                .is_err()
+        );
+    }
+
+    /// Evidence without the replay disposition is an inconsistent record,
+    /// refused on every other disposition.
+    #[test]
+    fn replay_evidence_without_replay_disposition_is_refused() {
+        let mut channel = replayed_channel(0, Some(exact_evidence()));
+        channel.disposition = "CONTINUOUS".to_owned();
+        channel.observed_classes = vec!["path-change".to_owned()];
+        assert!(channel.validate().is_err());
+    }
+
+    /// A bare replayed count without the disposition and evidence proves
+    /// only parsing shape, never coverage (a malformed-text negative is not
+    /// a real refusal leg).
+    #[test]
+    fn replayed_count_without_disposition_is_refused() {
+        let mut channel = replayed_channel(10, None);
+        channel.disposition = "UNKNOWN".to_owned();
+        channel.gap_reasons = vec!["NO_COMPETENT_SOURCE".to_owned()];
+        assert!(channel.validate().is_err());
+    }
+
+    /// Malformed evidence shape (blank journal, inverted window) is refused
+    /// at the evidence layer, before any count comparison.
+    #[test]
+    fn malformed_evidence_shape_is_refused() {
+        let mut blank = exact_evidence();
+        blank.journal_id = String::new();
+        assert!(blank.validate().is_err());
+        let mut inverted = exact_evidence();
+        inverted.first_cursor = 200;
+        inverted.last_cursor = 100;
+        assert!(inverted.validate().is_err());
+        assert!(exact_evidence().validate().is_ok());
+        assert_eq!(exact_evidence().window_len(), 10);
     }
 }

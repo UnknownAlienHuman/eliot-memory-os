@@ -75,6 +75,7 @@ mod runtime_manifest_selection;
 mod scm_launch;
 mod self_admission;
 mod service_registration_projection;
+mod store_endpoint_observation;
 mod supervision_lease_load;
 mod watchdog_admission;
 mod watchdog_composition;
@@ -106,6 +107,9 @@ pub use independent_sensor::{
 pub use observation_attribution::{
     AttributionError, EventOrigin, FileChangeEvidence, RegisteredScope, ScopeMembership,
     TaskAttribution, resolve_scope_membership,
+};
+pub use store_endpoint_observation::{
+    StoreEndpointObservation, StoreEndpointTarget, observe_store_endpoint, store_endpoint_target,
 };
 use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,

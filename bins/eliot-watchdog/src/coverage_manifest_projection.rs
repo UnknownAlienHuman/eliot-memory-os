@@ -57,10 +57,10 @@ pub fn project_interval_coverage(
 ///
 /// Field-for-field: the channel name, expected source and expected classes come
 /// from the owner's capability map, the observed classes are the live samples it
-/// actually recorded, and the disposition, dropped count, replay count, closure
-/// flag and named gap reasons are its own. A channel carrying a replay count is
-/// passed through unchanged and refused by the shared contract's own
-/// `JOURNAL_REPLAYED` rule, because no replay adapter exists yet.
+/// actually recorded, and the disposition, dropped count, replay count with its
+/// exact evidence, closure flag and named gap reasons are its own. A replayed
+/// record projects only with the evidence the shared contract's binding
+/// version 2 requires; anything else is refused by that contract's own rules.
 fn project_channel(record: &ChannelIntervalCoverage) -> InstallationChannelCoverage {
     InstallationChannelCoverage {
         channel: record.channel().as_str().to_owned(),
@@ -76,6 +76,7 @@ fn project_channel(record: &ChannelIntervalCoverage) -> InstallationChannelCover
             .map(|class| class.as_str().to_owned())
             .collect(),
         observed_replayed_observations: record.observed_replayed_observations(),
+        replay_evidence: record.replayed_evidence().cloned(),
         dropped_samples: record.dropped_samples(),
         interval_closed: record.interval_closed(),
         disposition: record.disposition().as_str().to_owned(),
