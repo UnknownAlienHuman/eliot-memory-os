@@ -5890,16 +5890,21 @@ fn seal_inflight_claim(
     claim: &crate::dispatch_material::DeliveryClaim,
     now_ms: u64,
 ) -> Result<(), OrdinaryDriveError> {
-    crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms).map_err(
-        |_| {
+    // Only a fresh or an idempotent re-drive claim executes: a retained
+    // result, a foreign first writer, or unknowable slot state all fail
+    // closed with the staged set left for the owner (issue #2786 AUD3).
+    match crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms) {
+        crate::dispatch_material::InFlightClaimOutcome::Acquired
+        | crate::dispatch_material::InFlightClaimOutcome::ExistingInFlight => Ok(()),
+        _ => {
             let identity = claim.identity();
-            OrdinaryDriveError::DeliveryInProgress {
+            Err(OrdinaryDriveError::DeliveryInProgress {
                 operation_id: identity.operation_id.clone(),
                 generation: identity.generation,
                 claim_id: identity.claim_id.clone(),
-            }
-        },
-    )
+            })
+        }
+    }
 }
 
 /// Seals the durable served evidence for one terminal outcome (#2786 step
@@ -6240,6 +6245,63 @@ fn frame_binds_to_identity(
         && frame.input_digest == identity.input_digest
 }
 
+/// Seals one served loop report and reclaims exactly the claimed generation
+/// (issue #2786 W6): the served marker and the exact retained sequence seal
+/// durably before physical reclaim, and the pre-execution `InFlight`
+/// evidence drops best-effort after. Returns the claimed identity and the
+/// terminal frame the report carried.
+fn seal_and_reclaim_served(
+    directory: &std::path::Path,
+    claim: crate::dispatch_material::DeliveryClaim,
+    report: &RequestLoopReport,
+) -> Result<
+    (
+        crate::dispatch_material::StagedDeliveryIdentity,
+        OrdinaryOutcome,
+    ),
+    OrdinaryDriveError,
+> {
+    // The served terminal is the last event of the sequence this
+    // same report carries, so the frame sealed below and the frame
+    // returned below cannot be a different observation. A served
+    // report without one is the exact refusal the loop has always
+    // reported for a terminal it cannot name.
+    let Some(terminal) = report.served_terminal() else {
+        return Err(OrdinaryDriveError::Loop(denied("no-request")));
+    };
+    // Containment evidence is the loop's own terminal condition:
+    // it only reports served once the operation's effect is
+    // attested as settled, so reclaiming here never races an
+    // unresolved guest child.
+    //
+    // The served marker and the exact retained sequence seal
+    // durably before physical reclaim, so restart reconciles
+    // terminal-unacknowledged state by republishing the original
+    // sequence instead of re-executing.
+    seal_served_outcome(directory, &claim, report.retained(), edge_now_ms())?;
+    let reclamation = consume_delivery_set(&claim);
+    // The served marker is now durable, so the pre-execution
+    // InFlight evidence is redundant: drop it best-effort. A
+    // leftover only replays, never re-executes.
+    let _ = crate::dispatch_material::clear_inflight_marker(directory, claim.identity());
+    // Bounded residual only: a partial reclamation never
+    // overwrites the primary result; retained files stay for
+    // maintenance under the exact claimed identity.
+    let _residual_complete = match &reclamation {
+        crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
+            let _reclaimed_operation = detail.identity.operation_id.len();
+            detail.fully_reclaimed()
+        }
+        crate::dispatch_material::ClaimedReclamation::ReplacementPreserved { claimed }
+        | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
+        | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery { claimed } => {
+            let _preserved_operation = claimed.operation_id.len();
+            false
+        }
+    };
+    Ok((claim.into_identity(), terminal.clone()))
+}
+
 /// Runs the ordinary governed path for this process: binds the owner
 /// delivery set, resolves the authenticated grant into a local admitted port
 /// set, and serves the bounded request loop to its correlated terminal
@@ -6333,6 +6395,24 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 break;
             }
             crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { identity } => {
+                // A legacy pass needs both no owner slot record for this
+                // claim and no durable markers at all (issue #2786 A7): a
+                // slot-recorded set is new-format (the slot gate below
+                // decides), and a slot-less set on a directory whose markers
+                // prove versioned sets ran here is stale — it stays for the
+                // owner instead of resurrecting as legacy.
+                let slot_recorded =
+                    crate::dispatch_material::read_delivery_publication(&directory, &identity)
+                        .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?
+                        .is_some();
+                if !slot_recorded && crate::dispatch_material::versioned_markers_present(&directory)
+                {
+                    return Err(OrdinaryDriveError::DeliveryInProgress {
+                        operation_id: identity.operation_id,
+                        generation: identity.generation,
+                        claim_id: identity.claim_id,
+                    });
+                }
                 // Explicit v1 compatibility: full admission under the staged
                 // identity verbatim, never reinterpreted as a fresh
                 // generation with new identity. Bounded served retention:
@@ -6378,51 +6458,9 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // not a second execution.
         match report.completion() {
             LoopCompletion::Served => {
-                // The served terminal is the last event of the sequence this
-                // same report carries, so the frame sealed below and the frame
-                // returned below cannot be a different observation. A served
-                // report without one is the exact refusal the loop has always
-                // reported for a terminal it cannot name.
-                let Some(terminal) = report.served_terminal() else {
-                    return Err(OrdinaryDriveError::Loop(denied("no-request")));
-                };
-                // Containment evidence is the loop's own terminal condition:
-                // it only reports served once the operation's effect is
-                // attested as settled, so reclaiming here never races an
-                // unresolved guest child.
-                //
-                // The served marker and the exact retained sequence seal
-                // durably before physical reclaim, so restart reconciles
-                // terminal-unacknowledged state by republishing the original
-                // sequence instead of re-executing.
-                seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
-                let reclamation = consume_delivery_set(&claim);
-                // The served marker is now durable, so the pre-execution
-                // InFlight evidence is redundant: drop it best-effort. A
-                // leftover only replays, never re-executes.
-                let _ =
-                    crate::dispatch_material::clear_inflight_marker(&directory, claim.identity());
-                // Bounded residual only: a partial reclamation never
-                // overwrites the primary result; retained files stay for
-                // maintenance under the exact claimed identity.
-                let _residual_complete = match &reclamation {
-                    crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
-                        let _reclaimed_operation = detail.identity.operation_id.len();
-                        detail.fully_reclaimed()
-                    }
-                    crate::dispatch_material::ClaimedReclamation::ReplacementPreserved {
-                        claimed,
-                    }
-                    | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
-                    | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
-                        claimed,
-                    } => {
-                        let _preserved_operation = claimed.operation_id.len();
-                        false
-                    }
-                };
-                served.push(claim.into_identity());
-                outcome = Some(terminal.clone());
+                let (identity, terminal) = seal_and_reclaim_served(&directory, claim, &report)?;
+                served.push(identity);
+                outcome = Some(terminal);
             }
             LoopCompletion::Failed { failure } => {
                 // Nothing about the observation is lost here and nothing is
@@ -6498,8 +6536,9 @@ fn consume_delivery_set(
 /// a ready record naming another delivery, both fail closed here — nothing
 /// executes and nothing is deleted, so the staged set stays for the owner
 /// under its exact identity. No owner record at all is the legacy v1
-/// fixed-name compatibility state, which stays admissible under full
-/// admission with the staged identity verbatim.
+/// fixed-name compatibility state — but only when the directory carries no
+/// durable markers: beside markers that prove versioned sets ran here the
+/// unrecorded set is refused explicitly instead of admitted as legacy.
 ///
 /// # Errors
 ///
@@ -6522,7 +6561,19 @@ fn require_ready_publication(
         Some(_) => Err(OrdinaryDriveError::Publication {
             code: "DELIVERY_IDENTITY_MISMATCH",
         }),
-        None => Ok(()),
+        // No owner record is legacy compatibility only when the directory
+        // carries no durable markers at all; a slot-less set beside markers
+        // that prove versioned sets ran here is a torn publication that
+        // stays for the owner under an explicit migration refusal (issue
+        // #2786 W7).
+        None => {
+            if crate::dispatch_material::versioned_markers_present(directory) {
+                return Err(OrdinaryDriveError::Publication {
+                    code: "DELIVERY_SLOT_UNRECORDED",
+                });
+            }
+            Ok(())
+        }
     }
 }
 

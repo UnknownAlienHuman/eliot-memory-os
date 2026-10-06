@@ -787,6 +787,18 @@ const BRIDGE_EVENT_HANDOFF_HANDED_OFF: &str = "handed_off";
 /// normalization, application, and the host/native cursor stay owned by the
 /// receiver; nothing here may be read as completed downstream consumption.
 const BRIDGE_EVENT_HANDOFF_RECONCILED: &str = "reconciled";
+/// Receiving-owner receipt dispositions (issue #2731, item 1; I7.2
+/// `EventAckReceipt` terminal phases). The receipt records the downstream
+/// durable-acceptance adjudication the producer reconcile tuple never carries:
+/// `APPLIED` (the receiving owner durably accepted and applied the event),
+/// `REJECTED` (it durably refused it), or `UNKNOWN` (it cannot adjudicate
+/// yet). Only `APPLIED` authorizes retirement; the other two keep the handoff
+/// pending with its evidence intact. Intermediate transport phases (RECEIVED,
+/// DURABLE, NORMALIZED) are never recorded here: a transport acknowledgement
+/// cannot impersonate durable application acceptance.
+const BRIDGE_OWNER_RECEIPT_APPLIED: &str = "APPLIED";
+const BRIDGE_OWNER_RECEIPT_REJECTED: &str = "REJECTED";
+const BRIDGE_OWNER_RECEIPT_UNKNOWN: &str = "UNKNOWN";
 /// Durable bridge-stream owner bindings (issue #2729): one authenticated
 /// owner binding per admitted stream namespace plus one per unscoped-gap
 /// reporter occurrence. Keyed by the versioned namespace digest; the row
@@ -1897,6 +1909,41 @@ struct BridgeEventHandoffRow {
     /// request. Zero means no reconcile tuple was recorded.
     #[serde(default)]
     reconcile_owner_incarnation: u64,
+    /// Consumer-leg operation identity that reported durable acceptance
+    /// (issue #2731, item 1; e.g. the Governor intake operation that applied
+    /// the event). Empty means no receiving-owner receipt was recorded: the
+    /// producer reconcile tuple names the presenting owner's frontier, never
+    /// the receiving operation, so nothing else can populate this column.
+    #[serde(default)]
+    receiving_operation: String,
+    /// Receiving-owner adjudication over the handoff (issue #2731, item 1):
+    /// one of the `BRIDGE_OWNER_RECEIPT_*` terminal dispositions. Empty means
+    /// no receipt was recorded. Only `APPLIED` joins retirement; `REJECTED`
+    /// and `UNKNOWN` keep the handoff pending with its source, projection,
+    /// and replay identity intact.
+    #[serde(default)]
+    receipt_disposition: String,
+    /// Millisecond timestamp of the recorded receipt. Zero means no receipt
+    /// was recorded. The three receipt columns are all-or-nothing: a row
+    /// carries either a complete receipt or none of it.
+    #[serde(default)]
+    receipt_recorded_at_ms: u64,
+}
+
+/// Validated receiving-owner receipt request (issue #2731, item 1). Carries
+/// the handoff identity, the presenting owner's expected epoch, the
+/// consumer-leg operation reporting durable acceptance, and one closed
+/// terminal disposition.
+struct BridgeOwnerReceiptRequest {
+    namespace: String,
+    event_id: String,
+    sequence: u64,
+    envelope_sha256: String,
+    expected_revision: u64,
+    expected_incarnation: u64,
+    receiving_operation: String,
+    disposition: String,
+    staging_connection: String,
 }
 
 impl BridgeEventHandoffRow {
@@ -1963,6 +2010,41 @@ impl BridgeEventHandoffRow {
         }
         if !self.owner_namespace.is_empty() {
             crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        }
+        // Receiving-owner receipt columns are all-or-nothing on either
+        // handoff state: acceptance evidence is independent of the producer
+        // reconcile tuple (the receiver adjudicates the DURABLE event, not
+        // the producer frontier), so a handed_off row may already carry a
+        // receipt while retirement still needs both halves. A recorded
+        // receipt always names its consumer-leg operation and one closed
+        // terminal disposition — never an intermediate transport phase, and
+        // never a bare disposition with no operation behind it.
+        let receipt_fields_set = !self.receiving_operation.is_empty()
+            || !self.receipt_disposition.is_empty()
+            || self.receipt_recorded_at_ms != 0;
+        if receipt_fields_set {
+            crate::model::validate_text(&self.receiving_operation, "receiving_operation")?;
+            if self.receiving_operation.trim().is_empty() {
+                return Err(OrsError::InvalidField {
+                    field: "receiving_operation",
+                    reason: "a recorded receipt names a non-blank consumer-leg operation",
+                });
+            }
+            if self.receipt_disposition != BRIDGE_OWNER_RECEIPT_APPLIED
+                && self.receipt_disposition != BRIDGE_OWNER_RECEIPT_REJECTED
+                && self.receipt_disposition != BRIDGE_OWNER_RECEIPT_UNKNOWN
+            {
+                return Err(OrsError::InvalidField {
+                    field: "receipt_disposition",
+                    reason: "a recorded receipt carries a terminal APPLIED, REJECTED, or UNKNOWN disposition",
+                });
+            }
+            if self.receipt_recorded_at_ms == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "receipt_recorded_at_ms",
+                    reason: "a recorded receipt carries its record time",
+                });
+            }
         }
         Ok(())
     }
@@ -2806,6 +2888,16 @@ struct BridgeRecoveryPageBudget {
     gap_byte_limit: usize,
 }
 
+/// Aggregate byte/work policy owner for bridge recovery reads (issue #2731,
+/// item 4). ORS derives the ceiling from the table maxima above and enforces
+/// it on every recovery read through `charge`, `charge_output`, and
+/// `charge_reference`: past the ceiling the read fails with
+/// [`OrsError::ProjectionLimitExceeded`] (typed backpressure), never with
+/// truncation or silent loss. Maintenance legs (retire/repair/owner pages)
+/// are item-bounded per call with continuations instead, and their
+/// `handoff_scan_bytes` reports are non-charge snapshots of retained cursor
+/// bytes (see `bridge_cursor_stable_and_scan_bytes`) that the route joins
+/// without summation - so no second byte-policy owner exists.
 #[derive(Default)]
 struct BridgeRecoveryReadBudget {
     decoded_bytes: usize,
@@ -12786,6 +12878,9 @@ impl RedbRecoveryStore {
                     reconcile_acked_sequence: 0,
                     reconcile_owner_revision: 0,
                     reconcile_owner_incarnation: 0,
+                    receiving_operation: String::new(),
+                    receipt_disposition: String::new(),
+                    receipt_recorded_at_ms: 0,
                 };
                 row.validate()?;
                 {
@@ -17698,6 +17793,9 @@ impl RedbRecoveryStore {
             reconcile_acked_sequence: 0,
             reconcile_owner_revision: 0,
             reconcile_owner_incarnation: 0,
+            receiving_operation: String::new(),
+            receipt_disposition: String::new(),
+            receipt_recorded_at_ms: 0,
         };
         row.validate()?;
         let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
@@ -19147,6 +19245,9 @@ impl RedbRecoveryStore {
                     reconcile_acked_sequence: 0,
                     reconcile_owner_revision: 0,
                     reconcile_owner_incarnation: 0,
+                    receiving_operation: String::new(),
+                    receipt_disposition: String::new(),
+                    receipt_recorded_at_ms: 0,
                 };
                 row.validate()?;
                 let prior_recovery_revision =
@@ -19189,6 +19290,245 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(outcome)
+    }
+
+    /// Records the receiving-owner durable-acceptance receipt for one staged
+    /// handoff (issue #2731, item 1; I7.2 `EventAckReceipt` terminal phases).
+    ///
+    /// The producer reconcile tuple records the presenting owner's frontier
+    /// acknowledgement — transport/durable evidence that never claims
+    /// downstream acceptance. This entry records the other half: the
+    /// downstream adjudication over the same handoff identity, carrying the
+    /// consumer-leg operation that reported it and one closed terminal
+    /// disposition (`APPLIED`, `REJECTED`, or `UNKNOWN`). Intermediate
+    /// transport phases (RECEIVED, DURABLE, NORMALIZED) are refused: a
+    /// transport acknowledgement cannot impersonate durable application
+    /// acceptance, so only a terminal adjudication is recordable.
+    ///
+    /// Authentication matches the reconcile entry: the presenting stream
+    /// owner holds the `Acknowledge` right on the producer namespace at the
+    /// expected revision/incarnation (`StaleWriterEpoch` otherwise), so the
+    /// owner vouches for its own consumer leg's acceptance and names that
+    /// leg's operation. The consumer leg's own apply-and-report behavior
+    /// (Governor intake) is the receiving side's job (issue #2561); this
+    /// entry is the durable recording frontier the kernel route serves, and
+    /// the retirement arm joins exactly what it records.
+    ///
+    /// First durable acceptance wins: re-recording the identical receipt
+    /// replays it (`fresh: false`), while a different operation or
+    /// disposition for the same handoff key conflicts (`DuplicateConflict`)
+    /// instead of overwriting — replay never creates a second logical event
+    /// and a changed adjudication never rewrites history. A receipt for an
+    /// identity with no live handoff answers the retained retired shape when
+    /// the replay commitment or the compacted boundary still binds it, and
+    /// fails closed (`InvalidTransition`) otherwise: the receipt never
+    /// synthesizes intake.
+    pub fn record_bridge_owner_receipt_checked(
+        &self,
+        receipt: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let request = Self::parse_bridge_owner_receipt(receipt)?;
+        let namespace = request.namespace;
+        let event_id = request.event_id;
+        let sequence = request.sequence;
+        let envelope_sha256 = request.envelope_sha256;
+        let expected_revision = request.expected_revision;
+        let expected_incarnation = request.expected_incarnation;
+        let receiving_operation = request.receiving_operation;
+        let disposition = request.disposition;
+        let staging_connection = request.staging_connection;
+        let key = format!("{namespace}::{event_id}");
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let owner = Self::load_bridge_owner_row_in(&write, &namespace)?;
+            let access = Self::check_bridge_stream_access(
+                &owner,
+                expected_revision,
+                expected_incarnation,
+                BridgeStreamRight::Acknowledge,
+            )?;
+            // Read-then-write in separate scopes: the table guard from `get`
+            // cannot stay alive across the `insert` below, so the row is
+            // decoded to an owned value first (the same shape as the handoff
+            // record entry).
+            let existing: Option<BridgeEventHandoffRow> = {
+                let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                handoffs
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+            };
+            match existing {
+                Some(mut row) => {
+                    row.validate()?;
+                    if row.owner_namespace != access.namespace
+                        || row.envelope_sha256 != envelope_sha256
+                        || row.sequence != sequence
+                    {
+                        return Err(OrsError::DuplicateConflict);
+                    }
+                    let receipt_set = !row.receiving_operation.is_empty()
+                        || !row.receipt_disposition.is_empty()
+                        || row.receipt_recorded_at_ms != 0;
+                    if receipt_set {
+                        if row.receiving_operation != receiving_operation
+                            || row.receipt_disposition != disposition
+                        {
+                            return Err(OrsError::DuplicateConflict);
+                        }
+                        json!({
+                            "event_id": row.event_id,
+                            "sequence": row.sequence,
+                            "envelope_sha256": row.envelope_sha256,
+                            "receiving_operation": row.receiving_operation,
+                            "disposition": row.receipt_disposition,
+                            "fresh": false,
+                        })
+                    } else {
+                        row.receiving_operation.clone_from(&receiving_operation);
+                        row.receipt_disposition.clone_from(&disposition);
+                        row.receipt_recorded_at_ms = now_ms;
+                        row.validate()?;
+                        {
+                            let mut handoffs =
+                                write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                            handoffs
+                                .insert(key.as_str(), encode(&row)?.as_str())
+                                .map_err(storage)?;
+                        }
+                        json!({
+                            "event_id": row.event_id,
+                            "sequence": row.sequence,
+                            "envelope_sha256": row.envelope_sha256,
+                            "receiving_operation": row.receiving_operation,
+                            "disposition": row.receipt_disposition,
+                            "fresh": true,
+                        })
+                    }
+                }
+                None => Self::retired_owner_receipt_in(
+                    &write,
+                    &access,
+                    &event_id,
+                    sequence,
+                    &envelope_sha256,
+                    &staging_connection,
+                )?,
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Parses and validates a receiving-owner receipt request (issue #2731,
+    /// item 1). Split from [`Self::record_bridge_owner_receipt_checked`] so
+    /// the entry stays one atomic write-transaction flow under the line
+    /// bound.
+    fn parse_bridge_owner_receipt(
+        receipt: &serde_json::Value,
+    ) -> Result<BridgeOwnerReceiptRequest, OrsError> {
+        let namespace = bridge_text(receipt, "owner_namespace")?;
+        crate::model::validate_digest(&namespace, "owner_namespace")?;
+        let event_id = bridge_key_text(receipt, "event_id")?;
+        let sequence = bridge_sequence(receipt, "sequence")?;
+        let envelope_sha256 = bridge_text(receipt, "envelope_sha256")?;
+        crate::model::validate_digest(&envelope_sha256, "envelope_sha256")?;
+        let expected_revision = receipt
+            .get("expected_revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field: "expected_revision",
+                reason: "owner receipt must carry the expected owner revision",
+            })?;
+        let expected_incarnation = receipt
+            .get("expected_incarnation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field: "expected_incarnation",
+                reason: "owner receipt must carry the expected stream incarnation",
+            })?;
+        if expected_revision == 0 || expected_incarnation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "expected_revision",
+                reason: "expected owner revision and incarnation must be nonzero",
+            });
+        }
+        let receiving_operation = bridge_text(receipt, "receiving_operation")?;
+        if receiving_operation.trim().is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "receiving_operation",
+                reason: "owner receipt must name a non-blank consumer-leg operation",
+            });
+        }
+        let disposition = bridge_text(receipt, "disposition")?;
+        if disposition != BRIDGE_OWNER_RECEIPT_APPLIED
+            && disposition != BRIDGE_OWNER_RECEIPT_REJECTED
+            && disposition != BRIDGE_OWNER_RECEIPT_UNKNOWN
+        {
+            return Err(OrsError::InvalidField {
+                field: "disposition",
+                reason: "owner receipt carries a terminal APPLIED, REJECTED, or UNKNOWN disposition",
+            });
+        }
+        let staging_connection = bridge_text(receipt, "staging_connection")?;
+        Ok(BridgeOwnerReceiptRequest {
+            namespace,
+            event_id,
+            sequence,
+            envelope_sha256,
+            expected_revision,
+            expected_incarnation,
+            receiving_operation,
+            disposition,
+            staging_connection,
+        })
+    }
+
+    /// Answers an owner receipt for an identity with no live handoff row
+    /// (issue #2731, item 1) without writing anything. A retained replay
+    /// commitment or the certified compacted boundary proves the handoff
+    /// already terminalized through its `APPLIED` receipt, so the recording
+    /// replays as retired (`fresh: false`); anything else names a
+    /// never-staged identity, which is an invalid transition — the receipt
+    /// never synthesizes intake.
+    fn retired_owner_receipt_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        event_id: &str,
+        sequence: u64,
+        envelope_sha256: &str,
+        staging_connection: &str,
+    ) -> Result<serde_json::Value, OrsError> {
+        if let Some(commitment) =
+            Self::load_bridge_commitment_in(write, &access.namespace, event_id)?
+        {
+            if commitment.sequence != sequence || commitment.envelope_sha256 != envelope_sha256 {
+                return Err(OrsError::DuplicateConflict);
+            }
+            return Ok(json!({
+                "event_id": event_id,
+                "sequence": sequence,
+                "envelope_sha256": envelope_sha256,
+                "state": BRIDGE_EVENT_DISPOSITION_RETIRED,
+                "staging_connection": staging_connection,
+                "fresh": false,
+            }));
+        }
+        let compacted = Self::load_bridge_cursor_row_in(write, &access.namespace)?
+            .map_or(0, |row| row.last_compacted_sequence);
+        if compacted > 0 && sequence <= compacted {
+            return Ok(json!({
+                "event_id": event_id,
+                "sequence": sequence,
+                "envelope_sha256": envelope_sha256,
+                "state": BRIDGE_EVENT_DISPOSITION_RETIRED,
+                "staging_connection": staging_connection,
+                "fresh": false,
+            }));
+        }
+        Err(OrsError::InvalidTransition)
     }
 
     /// Answers a handoff record for an identity with no live row (issue
@@ -19984,6 +20324,9 @@ impl RedbRecoveryStore {
                 reconcile_acked_sequence: 0,
                 reconcile_owner_revision: 0,
                 reconcile_owner_incarnation: 0,
+                receiving_operation: String::new(),
+                receipt_disposition: String::new(),
+                receipt_recorded_at_ms: 0,
             };
             handoff.validate()?;
             handoffs
@@ -20658,7 +21001,7 @@ impl RedbRecoveryStore {
             None => (Vec::new(), false, None),
         };
         let now_ms = current_unix_ms_u64()?;
-        let retired = 0_u64;
+        let mut retired = 0_u64;
         let mut terminalized = 0_u64;
         let mut terminalized_boundary = compacted;
         let mut earliest_terminalized_sequence = None;
@@ -20702,9 +21045,11 @@ impl RedbRecoveryStore {
             // contiguous prefix instead of skipping past its blocker to free
             // space. Only the exact witnessed owner-bound covering evidence
             // retires; legacy bare-state rows never retire on their state
-            // string, and the receiving-owner terminal disposition stays
-            // BLOCKED-BY #1934/#2561 and is never fabricated here. Saturation
-            // keeps typed Backpressure at admission; cursors are never reset.
+            // string, and only a recorded APPLIED receiving-owner receipt
+            // joins retirement — a missing or non-APPLIED receipt stops the
+            // prefix instead of disposing it, and nothing here fabricates
+            // acceptance. Saturation keeps typed Backpressure at admission;
+            // cursors are never reset.
             if !row.retirement_eligible(&owner, acked) {
                 break;
             }
@@ -20720,16 +21065,21 @@ impl RedbRecoveryStore {
             // disposition is inferred from the reconciled flag or the
             // response digest, so UNKNOWN can never retire as success and a
             // legacy reconciled row never retires on its bare state string.
-            // Join flag for the kernel receipt route: set once the route
-            // records the handoff's receipt and this arm joins it by handoff
-            // key. The handoff row retains no receiving-operation or
-            // disposition columns — reconcile_key is a response digest,
-            // never an owner operation — so no retained row presents the
-            // receipt yet and the flag stays clear. The prefix stops here
+            // Join on the recorded receiving-owner receipt (issue #2731,
+            // item 1): the recorder binds the handoff key, the exact
+            // envelope identity, the consumer-leg operation, and one closed
+            // terminal disposition, all-or-nothing by `validate()`. Only a
+            // complete `APPLIED` receipt joins retirement — a `REJECTED` or
+            // `UNKNOWN` adjudication keeps the handoff pending with its
+            // source, projection, and replay identity intact, so `UNKNOWN`
+            // can never retire as success and a rejection never disposes
+            // the evidence behind it. With no receipt the prefix stops here
             // instead of disposing the handoff: the obligation stays pending
-            // with its source, projection, and replay identity intact.
-            // Nothing here fabricates acceptance.
-            let owner_receipt_joined = false;
+            // and the next bounded entry re-meets the same row. Nothing
+            // here fabricates acceptance.
+            let owner_receipt_joined = !row.receiving_operation.is_empty()
+                && row.receipt_disposition == BRIDGE_OWNER_RECEIPT_APPLIED
+                && row.receipt_recorded_at_ms != 0;
             if !owner_receipt_joined {
                 receipt_blocked_at = Some(row.sequence);
                 break;
@@ -20750,6 +21100,7 @@ impl RedbRecoveryStore {
                     .map_err(storage)?;
                 projections.remove(record_key.as_str()).map_err(storage)?;
             }
+            retired += 1;
             terminalized += 1;
             terminalized_leaves.push((
                 row.sequence,
@@ -41705,5 +42056,484 @@ mod bridge_handoff_retirement_2731 {
         assert_eq!(after.5, before.5, "maintenance must dispose no handoff row");
         let _ = std::fs::remove_file(path);
         Ok(())
+    }
+
+    fn receipt_payload(
+        namespace: &str,
+        sequence: u64,
+        event_tag: &str,
+        disposition: &str,
+        operation: &str,
+    ) -> serde_json::Value {
+        // Rebuilds the staged envelope byte-for-byte (same construction as
+        // `staged_event_payload`) so the receipt binds the exact retained
+        // digest; any construction drift fails the happy-path tests loudly
+        // instead of silently binding a foreign digest.
+        let envelope = json!({
+            "stream_id": "stream-2731",
+            "event_id": event_tag,
+            "sequence": sequence,
+            "producer_id": "producer-2731",
+            "producer_generation": 1,
+            "authority_epoch": {
+                "lineage_id": RETIRE_LINEAGE_2731,
+                "sequence": 1,
+            },
+            "note": format!("delivery-{event_tag}"),
+        });
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&envelope).expect("envelope canonicalizes");
+        let sha = eliot_contracts::sha256_hex(&bytes);
+        json!({
+            "owner_namespace": namespace,
+            "event_id": event_tag,
+            "sequence": sequence,
+            "envelope_sha256": sha,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "receiving_operation": operation,
+            "disposition": disposition,
+            "staging_connection": "conn-2731",
+        })
+    }
+
+    fn stage_ack_reconcile(
+        store: &RedbRecoveryStore,
+        namespace: &mut String,
+        count: u64,
+        tag_prefix: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Stages `count` events, advances the producer ack frontier over all
+        // of them, and reconciles their handoffs under one covering tuple —
+        // the producer half every receipt test builds on. (I7.2: the ack and
+        // reconcile are transport/durable evidence, never acceptance.)
+        for index in 1..=count {
+            let tag = format!("{tag_prefix}-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} must succeed, got {error:?}"))?;
+            *namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        store.acknowledge_bridge_event_batch(&json!({
+            "items": [{
+                "namespace": namespace,
+                "expected_revision": 1,
+                "expected_incarnation": 1,
+                "sequence": count,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+            }],
+        }))?;
+        let reconciled =
+            store.reconcile_bridge_event_handoffs_checked(namespace, count, &"a".repeat(64))?;
+        assert_eq!(
+            reconciled
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64),
+            Some(count),
+            "all {count} handoffs must reconcile under the covering frontier"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn owner_receipt_records_replays_and_conflicts() -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item 1: the recorder binds handoff key, exact digest,
+        // consumer-leg operation, and closed terminal disposition. An
+        // identical re-record replays (`fresh: false`); a different operation
+        // or disposition for the same key conflicts instead of overwriting —
+        // first durable acceptance wins, replay never creates a second event.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        stage_ack_reconcile(&store, &mut namespace, 1, "rcp-2731")?;
+        let recorded = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "rcp-2731-00001",
+            "APPLIED",
+            "governor-intake-op-1",
+        ))?;
+        assert_eq!(
+            recorded.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the first receipt for a handoff must record fresh"
+        );
+        assert_eq!(
+            recorded
+                .get("disposition")
+                .and_then(serde_json::Value::as_str),
+            Some("APPLIED"),
+            "the recorded receipt must carry its terminal disposition"
+        );
+        let replay = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "rcp-2731-00001",
+            "APPLIED",
+            "governor-intake-op-1",
+        ))?;
+        assert_eq!(
+            replay.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "an identical receipt re-record must replay, not duplicate"
+        );
+        let changed_disposition = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "rcp-2731-00001",
+            "REJECTED",
+            "governor-intake-op-1",
+        ));
+        assert!(
+            matches!(changed_disposition, Err(OrsError::DuplicateConflict)),
+            "a changed adjudication must conflict instead of rewriting history, got {changed_disposition:?}"
+        );
+        let changed_operation = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "rcp-2731-00001",
+            "APPLIED",
+            "governor-intake-op-2",
+        ));
+        assert!(
+            matches!(changed_operation, Err(OrsError::DuplicateConflict)),
+            "a changed consumer-leg operation must conflict, got {changed_operation:?}"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_receipt_refuses_unknown_identity_and_transport_phases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item 1 (real negatives): a well-formed receipt for a
+        // never-staged identity fails closed (`InvalidTransition`, never
+        // synthesized); an intermediate transport phase (`DURABLE`) and a
+        // blank consumer-leg operation are refused as fields — a transport
+        // acknowledgement cannot impersonate durable application acceptance.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        stage_ack_reconcile(&store, &mut namespace, 1, "neg-2731")?;
+        let unknown = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            7,
+            "neg-2731-never-staged",
+            "APPLIED",
+            "governor-intake-op-9",
+        ));
+        assert!(
+            matches!(unknown, Err(OrsError::InvalidTransition)),
+            "a receipt for a never-staged identity must fail closed, got {unknown:?}"
+        );
+        let transport_phase = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "neg-2731-00001",
+            "DURABLE",
+            "governor-intake-op-1",
+        ));
+        assert!(
+            matches!(
+                transport_phase,
+                Err(OrsError::InvalidField { field, .. }) if field == "disposition"
+            ),
+            "an intermediate transport phase must be refused, got {transport_phase:?}"
+        );
+        let blank_operation = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "neg-2731-00001",
+            "APPLIED",
+            "   ",
+        ));
+        assert!(
+            matches!(
+                blank_operation,
+                Err(OrsError::InvalidField { field, .. }) if field == "receiving_operation"
+            ),
+            "a blank consumer-leg operation must be refused, got {blank_operation:?}"
+        );
+        // The refused recordings left no receipt behind: a valid receipt
+        // still records fresh on the same handoff.
+        let recorded = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "neg-2731-00001",
+            "APPLIED",
+            "governor-intake-op-1",
+        ))?;
+        assert_eq!(
+            recorded.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "refused recordings must leave no receipt behind"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn applied_receipt_joins_retirement_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item 6: the retirement prefix stops at the first
+        // handoff with no APPLIED receipt and resumes once it arrives. Two
+        // reconciled handoffs, one APPLIED receipt: the first entry retires
+        // exactly the receipted prefix and reports continuation; the second
+        // receipt lets the next entry finish the prefix with no continuation.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        stage_ack_reconcile(&store, &mut namespace, 2, "pre-2731")?;
+        let retire_request = json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        });
+        let blocked = store.retire_bridge_event_handoffs_checked(&retire_request)?;
+        assert_eq!(
+            blocked.get("retired").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "no handoff may retire before its receiving-owner receipt"
+        );
+        store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "pre-2731-00001",
+            "APPLIED",
+            "governor-intake-op-1",
+        ))?;
+        let partial = store.retire_bridge_event_handoffs_checked(&retire_request)?;
+        assert_eq!(
+            partial.get("retired").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the APPLIED prefix must retire exactly its joined handoff"
+        );
+        assert_eq!(
+            partial
+                .get("retirement_continuation")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the receipt-less remainder must keep its continuation"
+        );
+        store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            2,
+            "pre-2731-00002",
+            "APPLIED",
+            "governor-intake-op-2",
+        ))?;
+        let done = store.retire_bridge_event_handoffs_checked(&retire_request)?;
+        assert_eq!(
+            done.get("retired").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the joined remainder must retire on the next entry"
+        );
+        assert_eq!(
+            done.get("terminalized").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the joined remainder must terminalize on the next entry"
+        );
+        assert_eq!(
+            done.get("retirement_continuation")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a fully receipted prefix must leave no continuation"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_and_unknown_receipts_keep_handoff_pending() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Issue #2731 item 1 (APPLIED-only rule): a recorded `REJECTED` or
+        // `UNKNOWN` adjudication is durable evidence, never disposal
+        // authority. Both handoffs stay pending with source, projection, and
+        // replay identity intact; retirement stays a stable no-op and the
+        // receipts themselves replay instead of duplicating.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        stage_ack_reconcile(&store, &mut namespace, 2, "rej-2731")?;
+        store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "rej-2731-00001",
+            "REJECTED",
+            "governor-intake-op-1",
+        ))?;
+        store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            2,
+            "rej-2731-00002",
+            "UNKNOWN",
+            "governor-intake-op-2",
+        ))?;
+        let retire_request = json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        });
+        for _ in 0..2 {
+            let held = store.retire_bridge_event_handoffs_checked(&retire_request)?;
+            assert_eq!(
+                held.get("retired").and_then(serde_json::Value::as_u64),
+                Some(0),
+                "a non-APPLIED receipt must never authorize disposal"
+            );
+            assert_eq!(
+                held.get("terminalized").and_then(serde_json::Value::as_u64),
+                Some(0),
+                "a non-APPLIED receipt must never terminalize"
+            );
+            assert_eq!(
+                held.get("retirement_continuation")
+                    .and_then(serde_json::Value::as_bool),
+                Some(true),
+                "the adjudicated-but-pending prefix must stay resumable"
+            );
+        }
+        // The receipts survived the blocked entries: identical re-records
+        // replay instead of recording again.
+        let replay = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "rej-2731-00001",
+            "REJECTED",
+            "governor-intake-op-1",
+        ))?;
+        assert_eq!(
+            replay.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "blocked entries must not disturb the recorded receipt"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn receipted_path_retires_and_replays_retired() -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 items A1/A3/A5 (cumulative entry-level path):
+        // stage -> producer ack -> reconcile -> APPLIED receipt -> retire
+        // disposes the handoff, and every leg afterwards answers the
+        // retained retired shape instead of a second application: a
+        // re-recorded receipt replays retired, and an exact stage replay
+        // still answers its duplicate outcome with no second record row.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        stage_ack_reconcile(&store, &mut namespace, 1, "cum-2731")?;
+        store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "cum-2731-00001",
+            "APPLIED",
+            "governor-intake-op-1",
+        ))?;
+        let retired = store.retire_bridge_event_handoffs_checked(&json!({
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "budget": 64,
+        }))?;
+        assert_eq!(
+            retired.get("retired").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the fully evidenced handoff must retire"
+        );
+        assert_eq!(
+            retired
+                .get("retirement_continuation")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "nothing may remain behind a fully retired prefix"
+        );
+        let receipt_replay = store.record_bridge_owner_receipt_checked(&receipt_payload(
+            &namespace,
+            1,
+            "cum-2731-00001",
+            "APPLIED",
+            "governor-intake-op-1",
+        ))?;
+        assert_eq!(
+            receipt_replay
+                .get("state")
+                .and_then(serde_json::Value::as_str),
+            Some("retired"),
+            "a post-retire receipt must answer the retained retired shape"
+        );
+        assert_eq!(
+            receipt_replay
+                .get("fresh")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a post-retire receipt must never record twice"
+        );
+        let stage_replay = store
+            .stage_bridge_event_checked(&staged_event_payload(1, "cum-2731-00001"))
+            .map_err(|error| format!("exact stage replay must answer, got {error:?}"))?;
+        assert_eq!(
+            stage_replay
+                .get("fresh")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "exact stage replay after retirement must stay a duplicate"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_read_budget_enforces_the_aggregate_policy() {
+        // Issue #2731 item 4: the aggregate byte/work policy has one
+        // designated owner (ORS, via `BridgeRecoveryReadBudget`) and one
+        // enforcement shape. At the derived ceiling the next work item,
+        // decoded byte, or serialized byte fails with typed
+        // `ProjectionLimitExceeded` - never with truncation or silent loss -
+        // while charges below the ceiling pass.
+        let mut at_work_ceiling = BridgeRecoveryReadBudget {
+            decoded_bytes: 0,
+            serialized_item_bytes: 0,
+            work_items: MAX_BRIDGE_RECOVERY_WORK_ITEMS,
+        };
+        assert!(
+            matches!(
+                at_work_ceiling.charge_work_item(),
+                Err(OrsError::ProjectionLimitExceeded)
+            ),
+            "one work item past the aggregate ceiling must shed typed pressure"
+        );
+        let mut below_work_ceiling = BridgeRecoveryReadBudget {
+            decoded_bytes: 0,
+            serialized_item_bytes: 0,
+            work_items: MAX_BRIDGE_RECOVERY_WORK_ITEMS - 1,
+        };
+        assert!(
+            below_work_ceiling.charge_work_item().is_ok(),
+            "the last work item inside the ceiling must pass"
+        );
+        let mut budget = BridgeRecoveryReadBudget::default();
+        let big_key = vec![0_u8; 8];
+        let big_value = vec![0_u8; MAX_BRIDGE_RECOVERY_DECODED_BYTES];
+        assert!(
+            matches!(
+                budget.charge(&big_key, &big_value),
+                Err(OrsError::ProjectionLimitExceeded)
+            ),
+            "decoded bytes past the 4 MiB ceiling must shed typed pressure"
+        );
+        let mut byte_budget = BridgeRecoveryReadBudget {
+            decoded_bytes: MAX_BRIDGE_RECOVERY_DECODED_BYTES,
+            serialized_item_bytes: 0,
+            work_items: 0,
+        };
+        assert!(
+            matches!(
+                byte_budget.charge_output(MAX_BRIDGE_RECOVERY_REPLY_BYTES + 1),
+                Err(OrsError::ProjectionLimitExceeded)
+            ),
+            "a call past the combined call-bytes ceiling must shed typed pressure"
+        );
     }
 }
