@@ -101,8 +101,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use eliot_contracts::{ArtifactId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ArtifactId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_ipc::ProcessBinding;
+use eliot_kernel_core::{ProcessOwnerBoundary, ProcessPermit, ProcessTreeReserve};
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
@@ -119,6 +122,10 @@ use eliot_ors::{
 };
 use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
+use eliot_runtime_contracts::{
+    CapacityBottleneck, CapacityLimit, CapacityPermitBinding, CapacityRequest, NormalWorkClass,
+    RequestedOperationClass,
+};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope, JobClass,
@@ -818,16 +825,58 @@ pub(crate) struct NativeWorkerProcessStartBinding {
     pub executable_file_identity: (u32, u64),
 }
 
+/// Owner-held process-launch capacity retained by the dispatch contour
+/// (issue #1679, W11/W4/A7 producer side).
+///
+/// The non-clone [`ProcessPermit`] handle is the held slot itself: it stays
+/// in this map from issuance at prepare time until exactly one terminal
+/// transition removes it (prepare/write failure, terminal release, or
+/// reconcile convergence), so the owner exclusion survives unknown spawn
+/// outcomes. The request/binding pair beside it is what the dispatch file
+/// carries and what every later boundary re-verifies. Removing the entry
+/// drops the handle, and the handle's drop backstop releases the slot, so
+/// removal is the single release path: exactly-once by map semantics.
+struct RetainedProcessPermit {
+    /// Live held slot; dropped (released) by the single terminal remover.
+    permit: ProcessPermit,
+    /// Exact request the binding was issued for.
+    request: CapacityRequest,
+    /// Owner-minted binding carried in the dispatch file.
+    binding: CapacityPermitBinding,
+}
+
+/// Contour-owned process-capacity holder (issue #1679, W11/W4/A7).
+///
+/// The reserve is `None` until [`compose_process_capacity_reserve`] lands
+/// with embedding-supplied partition bounds; an uncomposed contour prepares
+/// launches exactly as before (no capacity section), and the consumer
+/// refuses the absent section fail-closed. One lock guards the reserve and
+/// the held map together so issuance and retention are atomic.
+#[derive(Default)]
+struct ProcessCapacityState {
+    /// Issuing owner instance, contour-lifetime once composed.
+    reserve: Option<ProcessTreeReserve>,
+    /// Live held permits by `native-worker/{claim identity}`.
+    held: BTreeMap<String, RetainedProcessPermit>,
+}
+
+/// Returns the retention key for one native-worker claim identity.
+fn retained_permit_key(claim_id: &str) -> String {
+    format!("native-worker/{claim_id}")
+}
+
 /// The composed dispatch contour: the Kernel-owned installation identity, the
 /// Doctor front-door state once its production ledger lands, the installed
-/// testd/native-worker digests once their production sides compose, and the
-/// retained launch records.
+/// testd/native-worker digests once their production sides compose, the
+/// process-capacity holder once its bounds are composed, and the retained
+/// launch records.
 pub struct ComposedDispatchContour {
     principal_owner: String,
     doctor: Mutex<Option<DoctorFrontDoorState>>,
     testd_installed_digest: Mutex<Option<String>>,
     native_worker_installed_digest: Mutex<Option<String>>,
     launches: Mutex<LaunchRecords>,
+    process_capacity: Mutex<ProcessCapacityState>,
 }
 
 impl ComposedDispatchContour {
@@ -957,8 +1006,54 @@ pub fn compose_dispatch_contour(installation_id: String) -> Result<(), DispatchL
             testd_installed_digest: Mutex::new(None),
             native_worker_installed_digest: Mutex::new(None),
             launches: Mutex::new(LaunchRecords::default()),
+            process_capacity: Mutex::new(ProcessCapacityState::default()),
         })
         .map_err(|_| DispatchLaunchError::AlreadyComposed("dispatch contour"))?;
+    Ok(())
+}
+
+/// Composes the contour-owned process-capacity reserve (issue #1679,
+/// W11/W4/A7 producer side).
+///
+/// Every bound arrives from the embedding composition: normal and protected
+/// launch-slot partitions plus normal and protected cancellation partitions.
+/// This contour never invents a bound, so an uncomposed contour issues
+/// nothing and the dispatch file carries no capacity section. Set-once per
+/// process: a second composition is refused instead of replacing live held
+/// capacity. Requires the contour cell from [`compose_dispatch_contour`].
+pub fn compose_process_capacity_reserve(
+    launch_normal_capacity: usize,
+    launch_protected_capacity: usize,
+    cancel_normal_capacity: usize,
+    cancel_protected_capacity: usize,
+) -> Result<(), DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "compose the dispatch contour before its capacity side",
+        ))?;
+    let mut state = contour
+        .process_capacity
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("process capacity lock poisoned".to_owned()))?;
+    if state.reserve.is_some() {
+        return Err(DispatchLaunchError::AlreadyComposed(
+            "process capacity reserve",
+        ));
+    }
+    state.reserve = Some(
+        ProcessTreeReserve::partitioned(
+            launch_normal_capacity,
+            launch_protected_capacity,
+            cancel_normal_capacity,
+            cancel_protected_capacity,
+        )
+        .map_err(|error| {
+            DispatchLaunchError::InvalidMaterial(format!(
+                "process capacity partition bound is not admissible: {error}"
+            ))
+        })?,
+    );
     Ok(())
 }
 
@@ -2440,7 +2535,8 @@ fn testd_material_bytes(
 /// Writes the native-worker dispatch file carrying the admitted claim plus
 /// the Kernel-issued launch grant.
 ///
-/// JSON shape for the native child (all keys required):
+/// JSON shape for the native child (`capacity_permit` only when the contour
+/// issued owner capacity for this launch):
 /// ```json
 /// {
 ///   "request": NativeWorkerClaimRequest,
@@ -2448,7 +2544,8 @@ fn testd_material_bytes(
 ///   "epoch": EpochId,
 ///   "generation": 1,
 ///   "nonce": "native-worker-dispatch-<hex>",
-///   "grant": DispatchGrant
+///   "grant": DispatchGrant,
+///   "capacity_permit": {"request": CapacityRequest, "binding": CapacityPermitBinding}
 /// }
 /// ```
 /// * `request` — the exact `NativeWorkerClaimRequest` the contour admitted
@@ -2464,6 +2561,190 @@ fn testd_material_bytes(
 /// The concrete `ProcessRequest` plus the composed provider ports arrive
 /// only with the execution context the child builds in-process from `grant`
 /// (same broker pattern as Doctor/Testd); validated claim bytes alone never
+/// Owner-issued process-launch capacity evidence for one dispatch file
+/// (issue #1679, W11/W4/A7 producer side).
+///
+/// The pair is what the consumer's `capacity_permit` section carries: the
+/// exact request the owner issued for plus the owner-minted binding. Both
+/// are frozen vocabulary; the non-clone permit handle itself is never
+/// serialized and stays retained contour-side.
+pub struct NativeWorkerCapacitySection<'a> {
+    /// Exact capacity request the owner issued the binding for.
+    pub request: &'a CapacityRequest,
+    /// Owner-issued binding matching the request.
+    pub binding: &'a CapacityPermitBinding,
+}
+
+/// Currency of one retained launch permit against the live boundary.
+enum PermitCurrency {
+    /// The retained handle verifies live and current.
+    Current,
+    /// The retained handle no longer verifies; carries the refusal.
+    Stale(String),
+    /// No permit is retained for the identity (prepared while uncomposed).
+    Absent,
+}
+
+/// Resolves the live process-capacity boundary for one issuance or lookup
+/// (issue #1679, W11 producer boundary).
+///
+/// Profile identity and revision come from the composition's own retained
+/// compiled profile, never from caller bytes; the epoch is the live
+/// authority the admission just bound. The owner generation is the live
+/// kernel activation generation mapped into a resource generation (the same
+/// mapping this module already uses to fence Governor-issued material):
+/// the contour-held owner instance is fenced to the kernel activation, so a
+/// restart or re-activation advances the generation and stale bindings fail
+/// instead of issuing against a copied string.
+fn process_capacity_boundary(
+    kernel: &KernelComposition,
+    epoch: &EpochId,
+    generation: Generation,
+    now_ms: i64,
+) -> Result<ProcessOwnerBoundary, DispatchLaunchError> {
+    let profile = kernel.control_reserve_profile();
+    let owner_generation = ResourceGeneration::new(generation.get()).map_err(|error| {
+        DispatchLaunchError::Gate(format!(
+            "live activation generation is not a resource generation: {error}"
+        ))
+    })?;
+    Ok(ProcessOwnerBoundary {
+        owner_generation,
+        current_epoch: epoch.clone(),
+        profile_id: profile.profile_id.clone(),
+        profile_revision: profile.profile_revision.clone(),
+        now_ms,
+    })
+}
+
+/// Issues, verifies and retains one process-launch permit for the admitted
+/// claim (issue #1679, W11/W4/A7).
+///
+/// Returns `None` when no capacity reserve is composed: the contour issues
+/// nothing and the file carries no section. Otherwise the request names the
+/// claim's own operation identity, the claiming registration at its worker
+/// generation, the live epoch and the current profile under ordinary
+/// background work (a launch is ordinary background execution; the tag only
+/// selects the normal partition and is recorded for audit), and exactly one
+/// launch slot. Saturation maps to the owner's typed exhaustion refusal
+/// (backpressure the caller may retry); anything else fails closed as
+/// inconsistent and is never retried under the same terms.
+fn acquire_native_worker_capacity(
+    contour: &'static ComposedDispatchContour,
+    request: &NativeWorkerClaimRequest,
+    boundary: &ProcessOwnerBoundary,
+) -> Result<Option<(CapacityRequest, CapacityPermitBinding)>, DispatchLaunchError> {
+    let mut state = contour
+        .process_capacity
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("process capacity lock poisoned".to_owned()))?;
+    let Some(reserve) = state.reserve.as_ref() else {
+        return Ok(None);
+    };
+    let key = retained_permit_key(&request.claim_id);
+    if state.held.contains_key(&key) {
+        return Err(DispatchLaunchError::Inconsistent(
+            "process capacity is already held under this claim identity".to_owned(),
+        ));
+    }
+    let capacity_request = CapacityRequest {
+        operation: RequestedOperationClass::Normal(NormalWorkClass::NormalBackground),
+        operation_id: request.operation_id.clone(),
+        requested_bottleneck: CapacityBottleneck::ProcessLaunchSlots,
+        requested_limit: CapacityLimit {
+            unit: CapacityBottleneck::ProcessLaunchSlots.unit(),
+            quantity: std::num::NonZeroU64::MIN,
+        },
+        requesting_owner_ref: request.registration_id.clone(),
+        requesting_generation_ref: ResourceGeneration::new(request.worker_generation).map_err(
+            |error| {
+                DispatchLaunchError::Inconsistent(format!(
+                    "claim worker generation is not a resource generation: {error}"
+                ))
+            },
+        )?,
+        authority_epoch_ref: request.authority_epoch.clone(),
+        profile_id: boundary.profile_id.clone(),
+        profile_revision: boundary.profile_revision.clone(),
+        deadline_ms: request.deadline_unix_ms,
+    };
+    let (permit, binding) = reserve
+        .issue_process_permit(&capacity_request, boundary)
+        .map_err(|error| match error {
+            eliot_kernel_core::KernelError::NormalCapacityExhausted { .. }
+            | eliot_kernel_core::KernelError::ProtectedReserveExhausted { .. } => {
+                DispatchLaunchError::Gate(error.to_string())
+            }
+            other => DispatchLaunchError::Inconsistent(other.to_string()),
+        })?;
+    reserve
+        .verify_process_permit(&permit, &binding, &capacity_request, boundary)
+        .map_err(|error| {
+            DispatchLaunchError::Inconsistent(format!(
+                "freshly issued process permit does not verify: {error}"
+            ))
+        })?;
+    state.held.insert(
+        key,
+        RetainedProcessPermit {
+            permit,
+            request: capacity_request.clone(),
+            binding: binding.clone(),
+        },
+    );
+    Ok(Some((capacity_request, binding)))
+}
+
+/// Re-verifies one retained permit against the live boundary without
+/// consuming it (issue #1679, W11/W4/A7).
+fn check_retained_native_worker_capacity(
+    contour: &'static ComposedDispatchContour,
+    claim_id: &str,
+    boundary: &ProcessOwnerBoundary,
+) -> Result<PermitCurrency, DispatchLaunchError> {
+    let state = contour
+        .process_capacity
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("process capacity lock poisoned".to_owned()))?;
+    let Some(retained) = state.held.get(&retained_permit_key(claim_id)) else {
+        return Ok(PermitCurrency::Absent);
+    };
+    let Some(reserve) = state.reserve.as_ref() else {
+        return Err(DispatchLaunchError::Inconsistent(
+            "retained process permit without its issuing reserve".to_owned(),
+        ));
+    };
+    match reserve.verify_process_permit(
+        &retained.permit,
+        &retained.binding,
+        &retained.request,
+        boundary,
+    ) {
+        Ok(()) => Ok(PermitCurrency::Current),
+        Err(error) => Ok(PermitCurrency::Stale(error.to_string())),
+    }
+}
+
+/// Releases one retained permit exactly once (issue #1679, A7).
+///
+/// Removal from the map is the single release path: whoever removes the
+/// entry drops the handle, and the handle's drop backstop releases the
+/// slot. A second release finds no entry and is a no-op, never a double
+/// release. Identities that never held a permit (other worker kinds,
+/// uncomposed prepares) miss the namespaced key and do nothing.
+fn release_retained_native_worker_capacity(
+    contour: &'static ComposedDispatchContour,
+    identity: &str,
+) {
+    let removed = contour
+        .process_capacity
+        .lock()
+        .map(|mut state| state.held.remove(&retained_permit_key(identity)))
+        .ok()
+        .flatten();
+    drop(removed);
+}
+
 /// drive. Binds to the existing `NativeWorkerClaimRecord` durably
 /// kernel-side (the ORS claim table stages/loads it; see
 /// `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`): the
@@ -2476,6 +2757,7 @@ pub fn native_worker_material_bytes(
     generation: u64,
     nonce: &str,
     grant: &DispatchGrant,
+    capacity: Option<NativeWorkerCapacitySection<'_>>,
 ) -> Result<Vec<u8>, DispatchLaunchError> {
     // The child-side 1911 contract consumes these exact operation names. The
     // Kernel is the only owner of the admitted claim/fence/grant projection;
@@ -2566,7 +2848,7 @@ pub fn native_worker_material_bytes(
             }))
         })
         .collect::<Result<Vec<_>, DispatchLaunchError>>()?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "request": request,
         "receipt": receipt,
         "epoch": epoch,
@@ -2575,6 +2857,16 @@ pub fn native_worker_material_bytes(
         "grant": grant,
         "action_envelopes": action_envelopes,
     });
+    // The capacity section is the exact owner-issued pair the launch
+    // boundary acquired and verified (issue #1679, W11/W4/A7). Absent until
+    // the contour composes its reserve, so files written while uncomposed
+    // keep the previous closed shape.
+    if let Some(section) = capacity {
+        body["capacity_permit"] = serde_json::json!({
+            "request": section.request,
+            "binding": section.binding,
+        });
+    }
     let bytes =
         serde_json::to_vec(&body).map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > 256 * 1024 {
@@ -2920,6 +3212,9 @@ fn release_launch(contour: &'static ComposedDispatchContour, identity: &str) {
         false
     };
     if released {
+        // The dropped reservation also drops its retained launch capacity,
+        // if any: one removal releases the slot exactly once (#1679 A7).
+        release_retained_native_worker_capacity(contour, identity);
         NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
     }
 }
@@ -4298,6 +4593,9 @@ fn mark_reconciled(
     if let Some(record) = launches.by_identity.get_mut(identity) {
         record.phase = LaunchPhase::Reconciled;
     }
+    // The converged slot is closed: its retained launch capacity, if any,
+    // releases here exactly once (#1679 A7).
+    release_retained_native_worker_capacity(contour, identity);
     launches.native_worker_process_receipts.remove(identity);
     let pending = launches
         .native_worker_pending_starts
@@ -4929,6 +5227,9 @@ pub fn release_launched_attempt(
     }
     drop(launches);
     if release {
+        // The freed slot also frees its retained launch capacity, if any:
+        // one removal releases the slot exactly once (#1679 A7).
+        release_retained_native_worker_capacity(contour, identity);
         NATIVE_WORKER_PROCESS_START_CHANGED.notify_all();
     }
     if release && let Some(path) = material_path {
@@ -5231,6 +5532,30 @@ pub fn prepare_native_worker_launch(
                 )));
             }
             if let Some(retained) = existing.native_receipt.clone() {
+                // A replay still needs live current capacity: the retained
+                // permit is re-verified against the live boundary, and a
+                // stale permit fails closed here (reconcile owns recovery)
+                // rather than relaunching on dead authority (#1679 W11/W4/A7).
+                let replay_now_ms = i64::try_from(now_unix_ms).map_err(|_| {
+                    DispatchLaunchError::Gate(
+                        "admission time overflows millisecond clock".to_owned(),
+                    )
+                })?;
+                let replay_boundary =
+                    process_capacity_boundary(kernel, &authority_epoch, generation, replay_now_ms)?;
+                match check_retained_native_worker_capacity(
+                    contour,
+                    &receipt.claim_id,
+                    &replay_boundary,
+                ) {
+                    Ok(PermitCurrency::Current | PermitCurrency::Absent) => {}
+                    Ok(PermitCurrency::Stale(refusal)) => {
+                        return Err(DispatchLaunchError::Inconsistent(format!(
+                            "retained launch capacity is no longer current: {refusal}"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
                 return Ok(PreparedNativeWorkerLaunch::ReplayOriginal {
                     receipt: Box::new(retained),
                 });
@@ -5273,6 +5598,26 @@ pub fn prepare_native_worker_launch(
     .inspect_err(|_| {
         release_launch(contour, &receipt.claim_id);
     })?;
+    // Owner-held launch capacity is acquired at this effect boundary under
+    // the claim's own operation/admission/attempt identity and verified
+    // before anything is written: the file carries the authenticated pair
+    // and the handle stays retained contour-side (#1679 W11/W4/A7).
+    let capacity_now_ms = i64::try_from(now_unix_ms).map_err(|_| {
+        DispatchLaunchError::Gate("admission time overflows millisecond clock".to_owned())
+    })?;
+    let capacity_boundary =
+        process_capacity_boundary(kernel, &authority_epoch, generation, capacity_now_ms)?;
+    let capacity =
+        match acquire_native_worker_capacity(contour, material.request, &capacity_boundary) {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                release_launch(contour, &receipt.claim_id);
+                return Err(error);
+            }
+        };
+    let capacity_section = capacity
+        .as_ref()
+        .map(|(request, binding)| NativeWorkerCapacitySection { request, binding });
     let bytes = native_worker_material_bytes(
         material.request,
         &receipt,
@@ -5280,6 +5625,7 @@ pub fn prepare_native_worker_launch(
         generation.get(),
         &nonce,
         &grant,
+        capacity_section,
     );
     let bytes = match bytes {
         Ok(bytes) => bytes,
@@ -5322,6 +5668,41 @@ pub async fn start_ready_native_worker_launch(
     kernel: &KernelComposition,
     ready: &ReadyNativeWorkerLaunch,
 ) -> Result<ChildStartOutcome, DispatchLaunchError> {
+    // Currency at the spawn boundary: the retained permit is re-verified
+    // against live authority immediately before any child effect, so a
+    // prepare that went stale (epoch, generation or profile moved) fails
+    // closed here instead of spawning on dead capacity (#1679 W11/W4/A7).
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let (live_epoch, live_generation_value) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        (
+            service.authority_epoch(),
+            service
+                .activation_receipt()
+                .map_or(0, |receipt| receipt.generation.value()),
+        )
+    };
+    let live_generation = Generation::new(live_generation_value)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let start_now_ms = i64::try_from(super::unix_ms()).map_err(|_| {
+        DispatchLaunchError::Gate("spawn clock overflows millisecond clock".to_owned())
+    })?;
+    let start_boundary =
+        process_capacity_boundary(kernel, &live_epoch, live_generation, start_now_ms)?;
+    match check_retained_native_worker_capacity(contour, &ready.receipt.claim_id, &start_boundary) {
+        Ok(PermitCurrency::Current | PermitCurrency::Absent) => {}
+        Ok(PermitCurrency::Stale(refusal)) => {
+            return Err(DispatchLaunchError::Inconsistent(format!(
+                "launch capacity is no longer current at spawn: {refusal}"
+            )));
+        }
+        Err(error) => return Err(error),
+    }
     match spawn_ready_child(
         kernel,
         &SpawnInputs {
@@ -5603,8 +5984,44 @@ pub fn reconcile_launched_native_worker_attempt(
         .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?
         .reconcile_native_worker_claim_admission(&receipt, &request)
         .map_err(gate_error)?;
+    // Owner-held launch capacity must still be live and current to
+    // converge: a stale, released or foreign permit keeps the attempt
+    // unreconciled (excluded until its owner reconciles) instead of
+    // converging on dead authority (#1679 W11/W4/A7, A8).
+    let (permit_epoch, permit_generation_value) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        (
+            service.authority_epoch(),
+            service
+                .activation_receipt()
+                .map_or(0, |receipt| receipt.generation.value()),
+        )
+    };
+    let permit_generation = Generation::new(permit_generation_value)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let permit_now_ms = i64::try_from(super::unix_ms()).map_err(|_| {
+        DispatchLaunchError::Gate("reconcile clock overflows millisecond clock".to_owned())
+    })?;
+    let permit_boundary =
+        process_capacity_boundary(kernel, &permit_epoch, permit_generation, permit_now_ms)?;
+    match check_retained_native_worker_capacity(contour, claim_id, &permit_boundary) {
+        Ok(PermitCurrency::Current | PermitCurrency::Absent) => {}
+        Ok(PermitCurrency::Stale(_)) => {
+            return Ok(ReconcileLaunchedOutcome::Unreconciled {
+                kind: DispatchedWorkerKind::NativeWorker,
+                identity: claim_id.to_owned(),
+            });
+        }
+        Err(error) => return Err(error),
+    }
     if binds {
         if retained.phase == LaunchPhase::Launched {
+            // Converged with a live child: the closed slot releases its
+            // retained capacity here exactly once (#1679 A7).
+            release_retained_native_worker_capacity(contour, claim_id);
             return Ok(ReconcileLaunchedOutcome::Reconciled {
                 kind: DispatchedWorkerKind::NativeWorker,
                 identity: claim_id.to_owned(),
