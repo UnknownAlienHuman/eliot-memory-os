@@ -6240,10 +6240,10 @@ fn runtime_roots_reject_system_escape_and_portable_system_alias() {
     );
 }
 
-/// A SystemService installation binding validates with the installation
+/// A `SystemService` installation binding validates with the installation
 /// tree strictly below the I3.1 durable-data root, and refuses a durable
 /// root that is not the profile's own anchor child (issue #958: the
-/// admitted dispatch contour seeds a SystemService manifest, which can only
+/// admitted dispatch contour seeds a `SystemService` manifest, which can only
 /// validate when this join compares the installation root rather than the
 /// profile root, which is the durable root itself).
 #[cfg(windows)]

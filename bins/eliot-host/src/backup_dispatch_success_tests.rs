@@ -1068,6 +1068,73 @@ fn dispatch_arm_admits_and_records_destination() {
     release_contour(contour);
 }
 
+/// T5 installation-identity proof (#958 A2): an admitted preparation on the
+/// production dispatch path allocates a destination ApprovedGeneration row
+/// whose generation IS the requested owner installation key — inactive, with
+/// pending plan authority — and records the creation pair naming the created
+/// root. The negative half (an arbitrary non-key destination is refused
+/// before any effect, allocating no row) is proved by
+/// `dispatch_arm_refuses_arbitrary_destination_before_effect` below.
+/// Red on pre-A2 code by construction: the `read_prepared_destination_...`
+/// seams and the isolated-destination allocation they read do not exist on
+/// `main` (new `isolated_destination.rs` allocation path).
+/// Norm: `docs/architecture/I05-13-backup-and-restore.md` Restore
+/// ("restore to isolated root;").
+#[test]
+fn dispatch_t5_admitted_destination_carries_installation_identity() {
+    use eliot_host_service::runtime_control::BackupOwnerOutcome;
+    use eliot_protocol::backup::BackupOperationKind;
+    let (contour, composition) = dispatch_contour("t5-identity");
+    let dest_key = dispatch_sha256(&format!("destination-identity:{}", contour.installation));
+    let canonical_request_hash =
+        dispatch_sha256(&format!("canonical-request-t5:{}", contour.installation));
+    let identity = dispatch_identity(
+        &contour,
+        BackupOperationKind::PrepareIsolatedRestore,
+        &dest_key,
+        "prepare-958-t5",
+        &canonical_request_hash,
+    );
+    let prepare = dispatch_envelope(dispatch_prepare_body(identity, &dest_key), "prepare-958-t5");
+    match composition.dispatch_backup_owner_operation(&prepare) {
+        Ok(BackupOwnerOutcome::PossibleEffect { .. }) => {}
+        other => panic!("prepare arm must answer PossibleEffect, got {other:?}"),
+    }
+    let store = open_case_registry(&contour);
+    let capability = composition.owner_lease.activation_capability();
+    let operation_id =
+        eliot_installation::PlatformHandle::new(&canonical_request_hash).expect("operation handle");
+    let row = store
+        .read_prepared_destination_generation(&capability, &operation_id)
+        .expect("destination row recorded");
+    assert_eq!(
+        row.manifest.generation.as_str(),
+        dest_key,
+        "destination row generation is the requested installation key"
+    );
+    assert!(
+        !row.active,
+        "prepared destination never activates at preparation"
+    );
+    assert!(
+        matches!(
+            row.manifest.runtime_launch.supervision_authority,
+            eliot_installation::SupervisionAuthorityBinding::Pending { .. }
+        ),
+        "destination row carries pending plan authority, not the source receipt"
+    );
+    let (_, materialisation) = store
+        .read_prepared_isolated_destination_creation(&capability, &operation_id)
+        .expect("creation pair recorded");
+    assert!(
+        Path::new(&materialisation.destination_installation_root).exists(),
+        "recorded root exists on disk"
+    );
+    drop(store);
+    drop(composition);
+    release_contour(contour);
+}
+
 /// Production-path refusal proof (P2): a destination identity that is not
 /// an owner installation key is refused by the installation authority
 /// before any effect — no directory appears and no row is retained.
