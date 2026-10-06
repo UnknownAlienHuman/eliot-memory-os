@@ -6021,4 +6021,367 @@ mod tests {
         assert_eq!(decision.candidate_revision, 3);
         assert_eq!(decision.disposition, disposition);
     }
+
+    /// Norm: `I05-27:18` - fields affecting authority, scope, ordering, privacy
+    /// or effect cannot be omitted from the canonical bytes.
+    #[test]
+    fn envelope_canonical_bytes_vector_and_single_field_mutations_change_the_digest() {
+        let normalized = match canonical_proposal(&proposal("a")) {
+            Ok(normalized) => normalized,
+            Err(error) => panic!("the fixture proposal must normalize, got {error:?}"),
+        };
+        // T2: the envelope is rebuilt through the PUBLIC commitment type and
+        // the public canonical serializer, never through `commitment_of`, so a
+        // divergence between the two writers cannot pass unnoticed.
+        let envelope = ImprovementProposalCommitmentEnvelope {
+            domain: IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN.to_string(),
+            encoding_version: IMPROVEMENT_PROPOSAL_ENCODING_VERSION.to_string(),
+            algorithm: IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM.to_string(),
+            proposal: normalized.clone(),
+        };
+        let bytes = match canonical_json_bytes(&envelope) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("the envelope must serialize, got {error}"),
+        };
+        // The vector: canonical JSON sorts keys, so the envelope opens with the
+        // fixed identity fields in this exact order ahead of the proposal.
+        let prefix = format!(
+            "{{\"algorithm\":\"{IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM}\",\"domain\":\"{IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN}\",\"encoding_version\":\"{IMPROVEMENT_PROPOSAL_ENCODING_VERSION}\",\"proposal\":"
+        );
+        assert!(
+            bytes.starts_with(prefix.as_bytes()),
+            "the envelope must open with the canonical identity vector"
+        );
+        let commitment = match commitment_of(&normalized) {
+            Ok(commitment) => commitment,
+            Err(error) => panic!("the fixture proposal must commit, got {error:?}"),
+        };
+        assert_eq!(commitment.digest, sha256_hex(&bytes));
+        assert_eq!(commitment.canonical_bytes, bytes.len());
+        // T1: one mutation per significant content field. The operation and
+        // idempotency identities are held constant, so every difference below
+        // is content, never an identity swap in disguise. `risk_ceiling` is
+        // deliberately absent: it is a closed typed value whose only member is
+        // the bounded one, so no second valid value exists to mutate to.
+        let mutations: [(&str, fn(&mut ImprovementProposal)); 21] = [
+            ("proposal_id", |proposal| {
+                proposal.proposal_id = "proposal-2702-mut".to_string();
+            }),
+            ("candidate_id", |proposal| {
+                proposal.candidate_id = "cand-2702-mut".to_string();
+            }),
+            ("campaign_id", |proposal| {
+                proposal.campaign_id = "campaign-2702-mut".to_string();
+            }),
+            ("closure_id", |proposal| {
+                proposal.closure_id = "closure-2702-mut".to_string();
+            }),
+            ("closure_digest", |proposal| {
+                proposal.closure_digest = "sha256-closure-2702-mut".to_string();
+            }),
+            ("target_capability", |proposal| {
+                proposal.target_capability = "capability-2702-mut".to_string();
+            }),
+            ("target_generation", |proposal| {
+                proposal.target_generation = "generation-2702-mut".to_string();
+            }),
+            ("mechanism_id", |proposal| {
+                proposal.mechanism.mechanism_id = "mechanism-2702-mut".to_string();
+            }),
+            ("hypothesis", |proposal| {
+                proposal.mechanism.hypothesis = "hypothesis-2702-mut".to_string();
+            }),
+            ("causal_link", |proposal| {
+                proposal.mechanism.causal_link = "causal-link-2702-mut".to_string();
+            }),
+            ("declared_ref", |proposal| {
+                proposal.mechanism.declared_ref = "declared-ref-2702-mut".to_string();
+            }),
+            ("expected_delta", |proposal| {
+                proposal.expected_delta = "expected-delta-2702-mut".to_string();
+            }),
+            ("effect_ceiling", |proposal| {
+                proposal.effect_ceiling = "advisory-only-mut".to_string();
+            }),
+            ("budget_ref", |proposal| {
+                proposal.budget_ref = "budget-2702-mut".to_string();
+            }),
+            ("deadline_ref", |proposal| {
+                proposal.deadline_ref = "deadline-2702-mut".to_string();
+            }),
+            ("privacy_class", |proposal| {
+                proposal.privacy_class = "restricted".to_string();
+            }),
+            ("source_identity", |proposal| {
+                proposal.source_identity = "source-2702-mut".to_string();
+            }),
+            ("runtime_identity", |proposal| {
+                proposal.runtime_identity = "runtime-2702-mut".to_string();
+            }),
+            ("data_identity", |proposal| {
+                proposal.data_identity = "data-2702-mut".to_string();
+            }),
+            ("evidence_refs", |proposal| {
+                proposal.evidence_refs = vec!["evidence-2702-mut".to_string()];
+            }),
+            ("invalidation_set", |proposal| {
+                proposal.invalidation_set = vec!["invalidation-2702-mut".to_string()];
+            }),
+        ];
+        for (field, mutate) in mutations {
+            let mut mutated = proposal("a");
+            mutate(&mut mutated);
+            let mutated_normalized = match canonical_proposal(&mutated) {
+                Ok(normalized) => normalized,
+                Err(error) => panic!("the mutated proposal must normalize, got {error:?}"),
+            };
+            let mutated_commitment = match commitment_of(&mutated_normalized) {
+                Ok(commitment) => commitment,
+                Err(error) => panic!("the mutated proposal must commit, got {error:?}"),
+            };
+            assert_eq!(mutated_commitment.operation_ref, commitment.operation_ref);
+            assert_eq!(
+                mutated_commitment.idempotency_key,
+                commitment.idempotency_key
+            );
+            assert_ne!(
+                mutated_commitment.digest, commitment.digest,
+                "mutating {field} must change the digest"
+            );
+        }
+    }
+
+    /// Norm: `I05-27:3` - idempotency is defined over canonical bytes, so a
+    /// permutation of the declared set is the same bytes while a repeated
+    /// identity is a typed refusal, never a silent collapse.
+    #[test]
+    fn evidence_permutation_preserves_while_duplicate_refuses() {
+        let digest_of = |refs: Vec<String>| {
+            let mut offer = proposal("a");
+            offer.evidence_refs = refs;
+            let normalized = match canonical_proposal(&offer) {
+                Ok(normalized) => normalized,
+                Err(error) => panic!("the reordered proposal must normalize, got {error:?}"),
+            };
+            match commitment_of(&normalized) {
+                Ok(commitment) => commitment.digest,
+                Err(error) => panic!("the reordered proposal must commit, got {error:?}"),
+            }
+        };
+        assert_eq!(
+            digest_of(vec![
+                "evidence-2702-a-alpha".to_string(),
+                "evidence-2702-a-beta".to_string()
+            ]),
+            digest_of(vec![
+                "evidence-2702-a-beta".to_string(),
+                "evidence-2702-a-alpha".to_string()
+            ]),
+            "a permutation of the declared set must preserve the digest"
+        );
+        let mut duplicated = proposal("a");
+        duplicated.evidence_refs =
+            vec!["evidence-2702-a".to_string(), "evidence-2702-a".to_string()];
+        assert!(
+            matches!(
+                canonical_proposal(&duplicated),
+                Err(PipelineError::DuplicateSetMember("evidence_refs"))
+            ),
+            "a duplicated evidence identity must refuse as DuplicateSetMember"
+        );
+        let mut duplicated_invalidation = proposal("a");
+        duplicated_invalidation.invalidation_set = vec![
+            "invalidation-cache".to_string(),
+            "invalidation-cache".to_string(),
+        ];
+        assert!(
+            matches!(
+                canonical_proposal(&duplicated_invalidation),
+                Err(PipelineError::DuplicateSetMember("invalidation_set"))
+            ),
+            "a duplicated invalidation identity must refuse as DuplicateSetMember"
+        );
+    }
+
+    /// Norm: `I05-27:3` - a retained record written under the retired FNV
+    /// identity is a historical observation only, never matched against a
+    /// current proposal, even on the same operation.
+    #[test]
+    fn legacy_algorithm_retained_record_is_unestablished() {
+        let group = fixture("a");
+        let handoff = group.admitted();
+        let current = ImprovementCurrentProposal {
+            candidate_id: handoff.candidate_id.clone(),
+            commitment: handoff.proposal_commitment.clone(),
+            discriminator: handoff.proposal_discriminator.clone(),
+            material_equality: handoff.proposal_material_equality.clone(),
+            experiment_plan: group.experiment.clone(),
+        };
+        assert_eq!(check_checked_record_identity(&current), Ok(()));
+        let mut legacy = retained_prior("a");
+        legacy.commitment.operation_ref = current.commitment.operation_ref.clone();
+        legacy.commitment.idempotency_key = current.commitment.idempotency_key.clone();
+        legacy.commitment.algorithm = IMPROVEMENT_LEGACY_DIGEST_ALGORITHM.to_string();
+        match compare_improvement_commitments(&legacy, &current) {
+            Ok(ImprovementReplayAssessment::UnestablishedPrior {
+                cause,
+                prior_algorithm,
+                ..
+            }) => {
+                assert!(
+                    matches!(cause, UnestablishedPriorCause::UnknownCommitmentEncoding),
+                    "a legacy algorithm must be an unknown commitment encoding, got {cause:?}"
+                );
+                assert_eq!(prior_algorithm, IMPROVEMENT_LEGACY_DIGEST_ALGORITHM);
+            }
+            other => {
+                panic!("a legacy-algorithm retained record must be unestablished, got {other:?}")
+            }
+        }
+    }
+
+    /// A7: the handoff consumer checks the versioned content identity this
+    /// build stamps. The admitted handoff passes; a drifted domain, encoding
+    /// revision, algorithm, or wire revision is a typed refusal, never a
+    /// reinterpreted record.
+    #[test]
+    fn admitted_handoff_passes_consumer_identity_while_drift_refuses() {
+        let handoff = fixture("a").admitted();
+        assert_eq!(check_handoff_wire_revision(&handoff), Ok(()));
+        let current_of = |handoff: &ImprovementCanaryHandoff| ImprovementCurrentProposal {
+            candidate_id: handoff.candidate_id.clone(),
+            commitment: handoff.proposal_commitment.clone(),
+            discriminator: handoff.proposal_discriminator.clone(),
+            material_equality: handoff.proposal_material_equality.clone(),
+            experiment_plan: plan("a"),
+        };
+        assert_eq!(check_checked_record_identity(&current_of(&handoff)), Ok(()));
+        let mut drifted_encoding = current_of(&handoff);
+        drifted_encoding.commitment.encoding_version = "0".to_string();
+        match check_checked_record_identity(&drifted_encoding) {
+            Err(refusal) => assert_eq!(refusal.component, "commitment.encoding_version"),
+            Ok(()) => panic!("a drifted encoding version must refuse"),
+        }
+        let mut drifted_algorithm = current_of(&handoff);
+        drifted_algorithm.commitment.algorithm = IMPROVEMENT_LEGACY_DIGEST_ALGORITHM.to_string();
+        match check_checked_record_identity(&drifted_algorithm) {
+            Err(refusal) => assert_eq!(refusal.component, "commitment.algorithm"),
+            Ok(()) => panic!("a legacy algorithm must refuse"),
+        }
+        let mut drifted_domain = current_of(&handoff);
+        drifted_domain.commitment.domain = "foreign.domain".to_string();
+        match check_checked_record_identity(&drifted_domain) {
+            Err(refusal) => assert_eq!(refusal.component, "commitment.domain"),
+            Ok(()) => panic!("a foreign domain must refuse"),
+        }
+        let mut stale_wire = handoff.clone();
+        stale_wire.wire_revision = IMPROVEMENT_PIPELINE_WIRE_REVISION - 1;
+        match check_handoff_wire_revision(&stale_wire) {
+            Err(refusal) => {
+                assert_eq!(refusal.found, IMPROVEMENT_PIPELINE_WIRE_REVISION - 1);
+                assert_eq!(refusal.expected, IMPROVEMENT_PIPELINE_WIRE_REVISION);
+            }
+            Ok(()) => panic!("a stale wire revision must refuse"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (AUD7).
+    #[test]
+    fn stale_closure_binding_maps_to_blocked_with_typed_cause_owner_and_remedy() {
+        let mut group = fixture("stale");
+        group.admission_evidence.closure_stale = true;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::Blocked {
+                cause,
+                remedy,
+                reason,
+                owner_id,
+            }) => {
+                // The typed cause, not the reason wording, carries the verdict:
+                // the remedy is derived from the cause, so a reworded reason
+                // cannot change what the owner must do. The reason is asserted
+                // non-empty only, never by text.
+                assert_eq!(cause, ImprovementBlockCause::StaleClosure);
+                assert_eq!(remedy, cause.remedy());
+                assert_eq!(owner_id, group.policy.external_owner_id);
+                assert!(!reason.trim().is_empty());
+            }
+            Ok(other) => panic!("a stale closure binding must block, got {other:?}"),
+            Err(error) => panic!("a stale closure binding must block, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (A2).
+    #[test]
+    fn observed_harm_maps_to_rejected_with_typed_cause() {
+        let mut group = fixture("harm");
+        group.admission_evidence.harm_observed = true;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::Rejected {
+                cause,
+                reason,
+                owner_id,
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::HarmObserved);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+                assert!(!reason.trim().is_empty());
+            }
+            Ok(other) => panic!("observed harm must reject, got {other:?}"),
+            Err(error) => panic!("observed harm must reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (A3).
+    #[test]
+    fn pulse_regression_maps_to_regression_rejected_with_typed_cause() {
+        let mut group = fixture("regression");
+        group.admission_evidence.pulse = ImprovementPulseOutcome::Regression;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::RegressionRejected {
+                cause,
+                reason,
+                owner_id,
+            }) => {
+                assert_eq!(cause, ImprovementRejectCause::PulseRegression);
+                assert_eq!(owner_id, group.policy.external_owner_id);
+                assert!(!reason.trim().is_empty());
+            }
+            Ok(other) => panic!("a pulse regression must regress-reject, got {other:?}"),
+            Err(error) => panic!("a pulse regression must regress-reject, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - the mapper's refusal branches on the real path (A4/A6).
+    #[test]
+    fn unknown_outcome_maps_to_reconciliation_obligation_bound_to_candidate() {
+        let mut group = fixture("unknown");
+        group.admission_evidence.outcome_unknown = true;
+        match group.run() {
+            Ok(ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation }) => {
+                // The obligation is a value bound to the checked records, not a
+                // sentence: it names the exact candidate, experiment and owner
+                // this run checked.
+                assert_eq!(obligation.candidate_id, "cand-2702-unknown");
+                assert_eq!(obligation.experiment_id, group.experiment.experiment_id);
+                assert_eq!(obligation.owner_id, group.policy.external_owner_id);
+                assert!(!obligation.commitment.digest.trim().is_empty());
+            }
+            Ok(other) => panic!("an unknown outcome must require reconciliation, got {other:?}"),
+            Err(error) => panic!("an unknown outcome must require reconciliation, got {error:?}"),
+        }
+    }
+
+    /// Norm: `I00-09:7` - only the typed no-executed-evidence refusal may reach
+    /// the gate (AUD3 trigger).
+    #[test]
+    fn unexecuted_evidence_refuses_as_typed_not_executed_before_any_disposition() {
+        let mut group = fixture("unexecuted");
+        group.evidence.execution = ImprovementEvidenceExecution::NotExecuted;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "not-executed",
+            }
+        );
+    }
 }

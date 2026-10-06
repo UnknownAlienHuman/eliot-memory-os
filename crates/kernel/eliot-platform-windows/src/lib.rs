@@ -116,6 +116,7 @@ mod supervision_authority_key;
 mod tcp_listener_owner;
 mod terminal_containment;
 mod user_owned_leases;
+mod usn_journal;
 
 use crate::service_registration::{exact_path_text, utf16_text};
 
@@ -238,12 +239,14 @@ use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};
 /// unsafe stays inside this crate's identity owner; Host calls it under
 /// `#![forbid(unsafe_code)]`.
 pub use process_identity::directory_identity_for_path;
-pub use process_identity::{FileIdentity, ProcessIdentity, is_process_builtin_administrator};
+pub use process_identity::{
+    FileIdentity, ProcessIdentity, ProcessIdentityError, is_process_builtin_administrator,
+    observe_process_identity, same_process_image_path,
+};
 pub(crate) use process_identity::{
     file_identity, file_identity_from_handle, inspect_process_handle, inspect_process_identity,
     process_token_identity, process_token_is_builtin_administrator, same_process_identity,
-    same_process_image_path, same_windows_path, thread_token_is_builtin_administrator,
-    valid_process_image_path,
+    same_windows_path, thread_token_is_builtin_administrator, valid_process_image_path,
 };
 #[cfg(windows)]
 pub use process_job::OuterKillDomain;
@@ -328,6 +331,10 @@ pub use user_owned_leases::{
     UserOwnedPathLease, UserOwnedRootLease, UserOwnedRootReadLease, UserSelectedResourceError,
     UserSelectedResourceKind, UserSelectedResourceLease, UserSelectedResourceMeasurement,
     UserSelectedResourceNodeMeasurement,
+};
+pub use usn_journal::{
+    UsnCursor, UsnJournalError, UsnJournalPage, UsnJournalState, UsnRecordView,
+    query_usn_journal_state, read_usn_journal_page,
 };
 
 /// Failure returned by a Windows-only primitive before it can be projected

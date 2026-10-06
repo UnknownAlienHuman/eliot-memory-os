@@ -68,13 +68,18 @@ mod host_identity_observation;
 /// reconciliation, and the correlated dual audit record. Private cell: it
 /// performs no SCM effect and opens no Host journal.
 pub mod host_recovery;
+#[cfg(test)]
+mod import_positive_tests;
 mod independent_sensor;
+mod journal_replay_observation;
 mod observation_attribution;
 mod observation_coverage;
+mod registered_scope_replay;
 mod runtime_manifest_selection;
 mod scm_launch;
 mod self_admission;
 mod service_registration_projection;
+mod store_endpoint_observation;
 mod supervision_lease_load;
 mod watchdog_admission;
 mod watchdog_composition;
@@ -107,6 +112,12 @@ pub use observation_attribution::{
     AttributionError, EventOrigin, FileChangeEvidence, RegisteredScope, ScopeMembership,
     TaskAttribution, resolve_scope_membership,
 };
+pub use observation_coverage::{
+    ActiveCoverageProfile, CompetentSensor, DownstreamChannelClaim, gate_downstream_claims,
+};
+pub use store_endpoint_observation::{
+    StoreEndpointObservation, StoreEndpointTarget, observe_store_endpoint, store_endpoint_target,
+};
 use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
@@ -131,7 +142,8 @@ pub use watchdog_spool::intent::{
     IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentClass,
 };
 pub use watchdog_spool::{
-    CaptureFenceParams, SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
+    CaptureFenceParams, RetainedGatedChannelClaim, RetainedGatedDownstreamClaims,
+    SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
     SpoolImportReplayDisposition, SpoolImportReplayLedger, SpoolMarkerDetail, SpoolObservedDigest,
     SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits, WatchdogSpoolEntry,
     WatchdogSpoolExportLimits, WatchdogSpoolFence, WatchdogSpoolHeader, WatchdogSpoolPayload,
@@ -1446,6 +1458,17 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         Some(self.installation_id.as_str())
     }
 
+    /// Serves this owner's measured sensor map as the active coverage
+    /// profile: the competent sensors are exactly this crate's wired
+    /// adapters, bound to the admitted installation identity and the
+    /// installer-approved generation retained at construction (#1755 W7).
+    fn active_coverage_profile(&self) -> Option<ActiveCoverageProfile> {
+        crate::observation_coverage::owner_active_coverage_profile(
+            &self.installation_id,
+            self.watchdog_generation,
+        )
+    }
+
     fn spool_backup_port(&self) -> Option<Arc<WatchdogBackupPort>> {
         Some(Arc::clone(&self.backup_port))
     }
@@ -1654,6 +1677,25 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     /// `None` and the interval projects no manifest at all - a named omission,
     /// never a substituted or default digest.
     fn allowed_manifest_digest(&self) -> Option<&str> {
+        None
+    }
+
+    /// The exact active coverage profile this port's owner resolved for the
+    /// observed installation, when it knows one (#1755 W7).
+    ///
+    /// Downstream absence/compliance claims (#1756/#1758) exist only where
+    /// this profile names a competent sensor (`I08-06-bypass-detection.md:16`).
+    /// A port whose owner resolved no profile returns `None` and the tick
+    /// disables every such claim - a named supervision gap, never a
+    /// substituted or default profile. The profile names sensors by this
+    /// owner's own observation-channel wire names. The admitted producer is
+    /// the Watchdog owner itself (its measured sensor map with the admitted
+    /// installation identity and generation); the `IntegrationCoverageProfile`
+    /// shapes on main (`eliot-integration-coverage`, `eliot-context-contracts`)
+    /// name neither sensor nor channel and feed nothing here, so no sensor
+    /// competence is synthesized from lifecycle events (issue #1755, CS1
+    /// return).
+    fn active_coverage_profile(&self) -> Option<ActiveCoverageProfile> {
         None
     }
 

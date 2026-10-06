@@ -593,6 +593,7 @@ fn delta(
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     delta.seal().expect("delta seal");
@@ -2544,6 +2545,7 @@ fn oversized_delta(fixture: &Fixture, operation: ChangeOperation) -> AttemptLear
         dependencies: vec![],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
     oversized.inverses = oversized

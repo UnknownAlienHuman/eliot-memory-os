@@ -65,7 +65,7 @@ pub use typed_evidence::{
     TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
     TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
     TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
-    TestdStreamResolution, TestdStreamSlot,
+    TestdStreamResolution, TestdStreamSlot, TypedEvidenceRestartRecord,
 };
 
 // ---- Closed testd profile to executable binding registry (issue #20) ----
@@ -954,6 +954,10 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1")
 /// rewriting job payloads.
 const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("testd_admitted_identities_v1");
+/// Typed-evidence restart records (issue #456, WD1), keyed by durable job
+/// id. Additive owner table: existing stores migrate idempotently without
+/// rewriting job payloads.
+const TYPED_RESTART: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_typed_restart_v1");
 
 /// Persistent daemon failures.
 #[derive(Debug, Error)]
@@ -2961,6 +2965,26 @@ impl EvidenceCollector {
             .map_or_else(|_| Vec::new(), |items| items.clone())
     }
 
+    /// Snapshots the admitted typed bundles into a durable restart record.
+    ///
+    /// Issue #456 (WD1): the daemon persists the returned record with the
+    /// durable job row at admit time, so a restart reconstructs the same
+    /// evidence identities without operation memory. The record carries
+    /// bindings only, never source bytes.
+    pub fn checkpoint_typed_evidence(
+        &self,
+        job_id: &str,
+        invocation_id: &str,
+        fence: &eliot_contracts::StateFence,
+    ) -> Result<TypedEvidenceRestartRecord, TestdError> {
+        let bundles = self
+            .typed
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        TypedEvidenceRestartRecord::capture(job_id, invocation_id, fence, bundles.clone())
+            .map_err(|error| TestdError::Contract(error.to_string()))
+    }
+
     /// Resolves every pending typed bundle through the injected immutable-
     /// source readback port.
     ///
@@ -3394,10 +3418,12 @@ impl TestdStore {
             drop(write.open_table(META).map_err(database)?);
             write.commit().map_err(database)?;
         }
-        // Additive owner table for authenticated task identity. Existing
-        // stores migrate idempotently without rewriting job payloads.
+        // Additive owner tables for authenticated task identity and
+        // typed-evidence restart records. Existing stores migrate
+        // idempotently without rewriting job payloads.
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
+        drop(write.open_table(TYPED_RESTART).map_err(database)?);
         write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
@@ -4937,6 +4963,60 @@ impl TestdStore {
         Ok(job)
     }
 
+    /// Persists a validated typed-evidence restart record under its job id.
+    ///
+    /// Issue #456 (WD1): blank or foreign identities are refused, never
+    /// repaired; re-validation runs on the stored copy, not the caller's.
+    pub fn persist_typed_evidence_restart(
+        &self,
+        record: &TypedEvidenceRestartRecord,
+    ) -> Result<(), TestdError> {
+        let validated = TypedEvidenceRestartRecord::capture(
+            record.job_id.as_str(),
+            record.invocation_id.as_str(),
+            &record.fence,
+            record.bundles.clone(),
+        )
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let encoded = serde_json::to_vec(&validated)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let write = self.database.begin_write().map_err(database)?;
+        let mut table = write.open_table(TYPED_RESTART).map_err(database)?;
+        table
+            .insert(validated.job_id.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        write.commit().map_err(database)?;
+        Ok(())
+    }
+
+    /// Reopens the persisted typed-evidence restart record for a job id.
+    ///
+    /// Issue #456 (WD2): `None` means no restart evidence was ever
+    /// persisted; malformed durable bytes fail closed instead.
+    pub fn load_typed_evidence_restart(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<TypedEvidenceRestartRecord>, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(TYPED_RESTART).map_err(database)?;
+        table
+            .get(job_id)
+            .map_err(database)?
+            .map_or(Ok(None), |value| {
+                TypedEvidenceRestartRecord::reopen(std::str::from_utf8(value.value()).map_err(
+                    |_| {
+                        TestdError::Corrupt(
+                            "durable typed-evidence restart record is not valid text".to_owned(),
+                        )
+                    },
+                )?)
+                .map(Some)
+                .map_err(|error| TestdError::Corrupt(error.to_string()))
+            })
+    }
+
     /// Completes an attempt, or durably schedules a bounded retry.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
@@ -5027,6 +5107,26 @@ impl TestdStore {
             .insert(job.job_id.as_str(), encoded.as_slice())
             .map_err(database)?;
         drop(table);
+        // Issue #456 (WD1): the finished attempt's typed-evidence restart
+        // record commits atomically with the job row, so a daemon restart
+        // after process cleanup reopens the same identities without
+        // operation memory. Attempts with no typed bundles persist nothing.
+        if !receipt.typed_evidence.is_empty() {
+            let restart = TypedEvidenceRestartRecord::capture(
+                job.job_id.as_str(),
+                job.invocation.request.request_id.as_str(),
+                &job.invocation.request.state_fence,
+                receipt.typed_evidence.clone(),
+            )
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+            let encoded = serde_json::to_vec(&restart)
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let mut restarts = write.open_table(TYPED_RESTART).map_err(database)?;
+            restarts
+                .insert(job.job_id.as_str(), encoded.as_slice())
+                .map_err(database)?;
+            drop(restarts);
+        }
         append_event(
             &write,
             &job,
@@ -5718,6 +5818,20 @@ mod tests {
             declared_scope: "scope".to_owned(),
             requested_at: ClockReading::default(),
         };
+        // Root identity validation (#1806) requires absolute existing
+        // directories, so the fixture materializes real roots under a unique
+        // temp dir instead of the historical relative placeholders.
+        let roots_base =
+            std::env::temp_dir().join(format!("eliot-testd-provider-roots-{}.d", Uuid::new_v4()));
+        let contour_root = roots_base.join("contour");
+        // The build target nests strictly inside the allowed contour while
+        // the source root stays disjoint from it.
+        let source_root = roots_base.join("source");
+        let target_root = contour_root.join("target");
+        for dir in [&source_root, &target_root] {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
         let job = TestJob {
             job_id: "job".to_owned(),
             project_id: "project".to_owned(),
@@ -5732,10 +5846,13 @@ mod tests {
                 invocation_digest: "invocation-digest".to_owned(),
             },
             target_roots: TargetRoots {
-                allowed_contour_root: "contour".to_owned(),
-                source_root: "source".to_owned(),
-                target_root: "target".to_owned(),
-                cache_root: "target".to_owned(),
+                allowed_contour_root: contour_root.to_string_lossy().into_owned(),
+                source_root: source_root.to_string_lossy().into_owned(),
+                // The active profile pins the cache root to the canonical
+                // target root, mirroring the historical fixture where both
+                // were the same placeholder.
+                target_root: target_root.to_string_lossy().into_owned(),
+                cache_root: target_root.to_string_lossy().into_owned(),
             },
             target_layout: None,
             work_envelope: None,
@@ -5765,6 +5882,12 @@ mod tests {
             let mut table = write.open_table(JOBS)?;
             table.insert(job.job_id.as_str(), encoded.as_slice())?;
         }
+        // The reopen path replays the durable project-sequence inventory, so
+        // the fixture records the same metadata a production submit would.
+        {
+            let mut meta = write.open_table(META)?;
+            meta.insert("project:project", b"1".as_slice())?;
+        }
         write.commit()?;
         Ok((store, path))
     }
@@ -5784,6 +5907,9 @@ mod tests {
     fn provider_test_registry_artifact(
         profile: &str,
         parser: &str,
+        source_root: &str,
+        target_root: &str,
+        cache_root: &str,
     ) -> Result<RawArtifact, TestdError> {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "job_id": "job",
@@ -5791,9 +5917,9 @@ mod tests {
             "profile": profile,
             "invocation_target": "target",
             "invocation_arguments": [],
-            "source_root": "source",
-            "target_root": "target",
-            "cache_root": "target",
+            "source_root": source_root,
+            "target_root": target_root,
+            "cache_root": cache_root,
             "original": { "parser_image_sha256": "a".repeat(64) },
             "metadata": {
                 "profile": eliot_instrument_nextest::NEXTEST_INSTRUMENT,
@@ -5893,7 +6019,13 @@ mod tests {
         let mut job = store
             .get("job")?
             .ok_or_else(|| std::io::Error::other("provider test job missing"))?;
-        let registry = provider_test_registry_artifact(TESTD_PRODUCTIVE_PROFILE, parser_id)?;
+        let registry = provider_test_registry_artifact(
+            TESTD_PRODUCTIVE_PROFILE,
+            parser_id,
+            job.target_roots.source_root.as_str(),
+            job.target_roots.target_root.as_str(),
+            job.target_roots.cache_root.as_str(),
+        )?;
         job.provider_registry_snapshot = Some(registry.clone());
         let encoded = serde_json::to_vec(&job)?;
         let write = store.database.begin_write()?;
@@ -5928,6 +6060,137 @@ mod tests {
             epoch: 3,
             expires_at_ms: 200,
         }
+    }
+
+    #[test]
+    fn typed_restart_persisted_at_finish_and_reopened_after_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RUN_EVENTS: &[u8] = br#"{"type":"test","event":"started","name":"package::works"}
+{"type":"test","event":"ok","name":"package::works"}
+"#;
+        let (store, job, receipt, path) = provider_receipt_fixture(
+            RUN_EVENTS,
+            false,
+            eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+        )?;
+        assert!(!receipt.typed_evidence.is_empty());
+        store.finish(
+            "job",
+            &lease(),
+            ExecutionStatus::Unknown,
+            None,
+            &receipt,
+            20,
+            None,
+        )?;
+        let record = store
+            .load_typed_evidence_restart("job")?
+            .ok_or_else(|| std::io::Error::other("restart record missing after durable finish"))?;
+        assert_eq!(record.job_id, "job");
+        assert_eq!(
+            record.invocation_id,
+            job.invocation.request.request_id.as_str()
+        );
+        assert_eq!(record.fence, job.invocation.request.state_fence);
+        assert_eq!(record.bundles.len(), receipt.typed_evidence.len());
+        // A daemon restart reopens the same identities from durable bytes
+        // only: drop all memory state, reopen the store, and compare.
+        let expected = serde_json::to_vec(&record)?;
+        drop(store);
+        let restarted = TestdStore::open(&path, RetryPolicy::default())?;
+        let reopened = restarted
+            .load_typed_evidence_restart("job")?
+            .ok_or_else(|| std::io::Error::other("restart record missing after store reopen"))?;
+        assert_eq!(serde_json::to_vec(&reopened)?, expected);
+        // Unknown job ids stay absent; blank ids are refused, never probed.
+        assert!(
+            restarted
+                .load_typed_evidence_restart("absent-job")?
+                .is_none()
+        );
+        assert!(restarted.load_typed_evidence_restart("").is_err());
+        drop(restarted);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn typed_restart_absent_without_typed_evidence() -> Result<(), Box<dyn std::error::Error>> {
+        const RUN_EVENTS: &[u8] = br#"{"type":"test","event":"started","name":"package::works"}
+{"type":"test","event":"ok","name":"package::works"}
+"#;
+        let (store, _job, mut receipt, path) = provider_receipt_fixture(
+            RUN_EVENTS,
+            false,
+            eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+        )?;
+        receipt.typed_evidence.clear();
+        store.finish(
+            "job",
+            &lease(),
+            ExecutionStatus::Unknown,
+            None,
+            &receipt,
+            20,
+            None,
+        )?;
+        assert!(store.load_typed_evidence_restart("job")?.is_none());
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn typed_restart_malformed_bytes_and_foreign_identities_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RUN_EVENTS: &[u8] = br#"{"type":"test","event":"started","name":"package::works"}
+{"type":"test","event":"ok","name":"package::works"}
+"#;
+        let (store, job, receipt, path) = provider_receipt_fixture(
+            RUN_EVENTS,
+            false,
+            eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+        )?;
+        store.finish(
+            "job",
+            &lease(),
+            ExecutionStatus::Unknown,
+            None,
+            &receipt,
+            20,
+            None,
+        )?;
+        // Corrupt durable bytes fail closed instead of reopening.
+        let write = store.database.begin_write()?;
+        {
+            let mut table = write.open_table(TYPED_RESTART)?;
+            table.insert("job", b"not-json".as_slice())?;
+        }
+        write.commit()?;
+        assert!(store.load_typed_evidence_restart("job").is_err());
+        // Restore a valid record through the persist gate, then reopen the
+        // store: refusal probes below run against durable bytes only.
+        let valid = TypedEvidenceRestartRecord::capture(
+            "job",
+            job.invocation.request.request_id.as_str(),
+            &job.invocation.request.state_fence,
+            receipt.typed_evidence.clone(),
+        )?;
+        store.persist_typed_evidence_restart(&valid)?;
+        drop(store);
+        // A record bound to another job is refused at persist time.
+        let store = TestdStore::open(&path, RetryPolicy::default())?;
+        let mut record = store
+            .load_typed_evidence_restart("job")?
+            .ok_or_else(|| std::io::Error::other("restart record missing for refusal probe"))?;
+        record.job_id = "foreign-job".to_owned();
+        assert!(store.persist_typed_evidence_restart(&record).is_err());
+        record.job_id = job.job_id.clone();
+        record.invocation_id = String::new();
+        assert!(store.persist_typed_evidence_restart(&record).is_err());
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     fn contour_grant_fixture() -> ExecutionContourGrant {
@@ -6108,7 +6371,7 @@ mod tests {
             concat!(
                 r#"{"outcome":"DENIED","wire_id":"eliot.kernel.testd-owner-submit","#,
                 r#""wire_version":2,"request_digest":""#,
-                r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+                r#"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
                 r#""operation_id":"operation-owner-submit-1","#,
                 r#""directive":"TASK_SELECTION_REQUIRED"}"#,
             )
@@ -6401,6 +6664,9 @@ mod tests {
         foreign_job.provider_registry_snapshot = Some(provider_test_registry_artifact(
             TESTD_PRODUCTIVE_PROFILE,
             "foreign.parser",
+            foreign_job.target_roots.source_root.as_str(),
+            foreign_job.target_roots.target_root.as_str(),
+            foreign_job.target_roots.cache_root.as_str(),
         )?);
         assert!(readback.validate(&foreign_job).is_err());
         let mut forged = readback.clone();

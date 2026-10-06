@@ -1,0 +1,1 @@
+{"format":"eliot-blob-backup-io-fixture-v1","issue":956,"members":[{"plaintext":"member-0000.plain","staged":"member-0000.sealed","scope_domain":"scope-fixture-a"},{"plaintext":"member-0001.plain","staged":"member-0001.sealed","scope_domain":"scope-fixture-a"},{"plaintext":"member-0002.plain","staged":"member-0002.sealed","scope_domain":"scope-fixture-b"}]}
