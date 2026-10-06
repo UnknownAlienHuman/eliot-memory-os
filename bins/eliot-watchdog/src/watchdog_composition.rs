@@ -243,10 +243,8 @@ fn retain_gated_downstream_claims(
     let Some(port) = port else {
         return false;
     };
-    let gated = crate::watchdog_spool::RetainedGatedDownstreamClaims::gated(
-        profile_revision,
-        claims,
-    );
+    let gated =
+        crate::watchdog_spool::RetainedGatedDownstreamClaims::gated(profile_revision, claims);
     port.retain_gated_downstream_claims(&gated).is_ok()
 }
 
@@ -1905,6 +1903,27 @@ impl WatchdogBackupPort {
         self.spool.retain_gated_downstream_claims(gated)
     }
 
+    /// Reads the latest retained gated downstream verdicts (#1755 W7).
+    ///
+    /// Thin delegation to
+    /// [`WatchdogSpool::read_gated_downstream_claims`](crate::watchdog_spool::WatchdogSpool::read_gated_downstream_claims):
+    /// the consumer handoff for the typed profile/sensor/subject/generation/interval
+    /// verdicts the tick retains — downstream absence/compliance readers (#1756/#1758)
+    /// take the latest complete interval here instead of reconstructing it from the
+    /// debug-log summary. `Ok(None)` when no interval has retained one yet; a stored
+    /// row that no longer parses or validates is refused as corrupt, never served
+    /// best-effort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the owner database cannot be read or the stored
+    /// row is corrupt.
+    pub fn read_gated_downstream_claims(
+        &self,
+    ) -> Result<Option<crate::watchdog_spool::RetainedGatedDownstreamClaims>, SpoolError> {
+        self.spool.read_gated_downstream_claims()
+    }
+
     /// Binds one capture request against the owner's retained identity.
     ///
     /// The requested source installation and watchdog generation are compared
@@ -2331,5 +2350,212 @@ mod shared_manifest_tick_tests {
         let outcome = published_outcome();
         assert!(matches!(outcome, CoverageManifestOutcome::Published { .. }));
         assert!(!retain_published_shared_manifest(None, &outcome));
+    }
+}
+
+#[cfg(test)]
+mod gated_claims_tick_tests {
+    use super::*;
+    use crate::observation_coverage::{
+        ActiveCoverageProfile, IntervalCoveragePublisher, IntervalCoverageReport,
+        ObservationChannel, channel_capability, gate_downstream_claims,
+        owner_active_coverage_profile,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_port(name: &str) -> Result<WatchdogBackupPort, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-watchdog-gated-port-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let spool = Arc::new(crate::watchdog_spool::WatchdogSpool::open_test(&path)?);
+        Ok(WatchdogBackupPort::new(
+            Arc::clone(&spool),
+            "installation-1755".to_owned(),
+            7,
+            WatchdogSpoolBackupLimits::default(),
+            Arc::new(IntervalCoverageCell::new(1_000)),
+        )?)
+    }
+
+    /// Every channel observed once: the closed report the tick gates over.
+    fn closed_report(start_ms: u64, end_ms: u64) -> IntervalCoverageReport {
+        let mut publisher = IntervalCoveragePublisher::new(start_ms);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        publisher.close(end_ms)
+    }
+
+    /// The admitted sensor-profile source: the owner's own measured sensor
+    /// map, never a test-local profile.
+    fn admitted_profile() -> Result<ActiveCoverageProfile, Box<dyn std::error::Error>> {
+        let Some(profile) = owner_active_coverage_profile("installation-1755", 7) else {
+            return Err("a bound sensor resolves the admitted owner profile".into());
+        };
+        Ok(profile)
+    }
+
+    /// The tick's gated verdicts on the admitted owner profile reach the
+    /// owner spool through the port, typed per channel: a named competent
+    /// sensor allows exactly its own channel's claim, bound to the admitted
+    /// subject and generation (#1755 W7).
+    #[test]
+    fn gated_verdicts_reach_owner_spool_through_port() -> TestResult {
+        let port = test_port("tick")?;
+        let profile = admitted_profile()?;
+        let report = closed_report(1_000, 2_000);
+        let claims = gate_downstream_claims(&report, Some(&profile));
+        let revision = Some(profile.profile_revision.clone());
+        assert!(retain_gated_downstream_claims(
+            Some(&port),
+            revision.clone(),
+            &claims
+        ));
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the tick retained one interval".into());
+        };
+        assert_eq!(
+            read,
+            crate::watchdog_spool::RetainedGatedDownstreamClaims::gated(revision, &claims)
+        );
+        for claim in &claims {
+            let named = profile.sensor_for(claim.channel).is_some();
+            assert_eq!(
+                claim.claim_allowed,
+                named,
+                "channel {}",
+                claim.channel.as_str()
+            );
+        }
+        assert!(claims.iter().any(|claim| claim.claim_allowed));
+        for kept in &read.claims {
+            if kept.claim_allowed {
+                assert_eq!(kept.observed_subject.as_deref(), Some("installation-1755"));
+                assert_eq!(
+                    kept.observed_generation.as_deref(),
+                    Some("watchdog-generation-7")
+                );
+                assert!(kept.profile_revision == read.profile_revision);
+            }
+        }
+        Ok(())
+    }
+
+    /// Without a bound owner spool nothing is retained and nothing fails:
+    /// the miss is for the tick to trace, not a refusal.
+    #[test]
+    fn missing_port_retains_nothing() -> TestResult {
+        let profile = admitted_profile()?;
+        let report = closed_report(1_000, 2_000);
+        let claims = gate_downstream_claims(&report, Some(&profile));
+        assert!(!retain_gated_downstream_claims(
+            None,
+            Some(profile.profile_revision.clone()),
+            &claims
+        ));
+        Ok(())
+    }
+
+    /// No admitted profile disables every claim in the retained row itself:
+    /// the fail-closed verdict is durable evidence, not only tick-local.
+    #[test]
+    fn no_profile_disables_every_claim_in_retained_row() -> TestResult {
+        let port = test_port("no-profile")?;
+        let report = closed_report(1_000, 2_000);
+        let claims = gate_downstream_claims(&report, None);
+        assert!(claims.iter().all(|claim| !claim.claim_allowed));
+        assert!(
+            claims
+                .iter()
+                .all(|claim| claim.reason == "NO_ACTIVE_PROFILE")
+        );
+        assert!(retain_gated_downstream_claims(Some(&port), None, &claims));
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the refused interval still retains its verdicts".into());
+        };
+        assert_eq!(read.profile_revision, None);
+        assert!(read.claims.iter().all(|claim| !claim.claim_allowed));
+        Ok(())
+    }
+
+    /// A sensor a newer revision stops naming expires by removal: exactly
+    /// its channel flips to SENSOR_NOT_NAMED while every other retained
+    /// verdict stands unchanged.
+    #[test]
+    fn removed_sensor_disables_only_its_channel() -> TestResult {
+        let port = test_port("removal")?;
+        let profile = admitted_profile()?;
+        let Some(dropped) = profile.competent_sensors.first().cloned() else {
+            return Err("the admitted profile names at least one sensor".into());
+        };
+        let mut narrowed = profile.clone();
+        narrowed
+            .competent_sensors
+            .retain(|sensor| sensor.channel != dropped.channel);
+        let report = closed_report(1_000, 2_000);
+        let before = gate_downstream_claims(&report, Some(&profile));
+        let after = gate_downstream_claims(&report, Some(&narrowed));
+        assert!(retain_gated_downstream_claims(
+            Some(&port),
+            Some(narrowed.profile_revision.clone()),
+            &after
+        ));
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the narrowed interval retains its verdicts".into());
+        };
+        assert_eq!(read.claims.len(), before.len());
+        for (old, kept) in before.iter().zip(read.claims.iter()) {
+            assert_eq!(kept.channel, old.channel.as_str());
+            if kept.channel == dropped.channel.as_str() {
+                assert!(!kept.claim_allowed);
+                assert_eq!(kept.reason, "SENSOR_NOT_NAMED");
+            } else {
+                assert_eq!(kept.claim_allowed, old.claim_allowed);
+                assert_eq!(kept.reason, old.reason);
+            }
+        }
+        let Some(dropped_before) = before.iter().find(|claim| claim.channel == dropped.channel)
+        else {
+            return Err("the dropped channel is gated".into());
+        };
+        assert!(dropped_before.claim_allowed);
+        Ok(())
+    }
+
+    /// A newer interval replaces the older row whole through the same port
+    /// path the tick retains through: the reader never sees a merged
+    /// interval.
+    #[test]
+    fn newer_interval_supersedes_older() -> TestResult {
+        let port = test_port("supersede")?;
+        let profile = admitted_profile()?;
+        for (start, end) in [(1_000_u64, 2_000_u64), (2_000_u64, 3_000_u64)] {
+            let report = closed_report(start, end);
+            let claims = gate_downstream_claims(&report, Some(&profile));
+            assert!(retain_gated_downstream_claims(
+                Some(&port),
+                Some(profile.profile_revision.clone()),
+                &claims
+            ));
+        }
+        let Some(read) = port.read_gated_downstream_claims()? else {
+            return Err("the newer interval retains its verdicts".into());
+        };
+        assert!(
+            read.claims
+                .iter()
+                .all(|claim| claim.interval_start_ms == 2_000)
+        );
+        assert!(
+            read.claims
+                .iter()
+                .all(|claim| claim.interval_end_ms == 3_000)
+        );
+        Ok(())
     }
 }

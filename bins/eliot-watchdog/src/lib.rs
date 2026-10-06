@@ -142,7 +142,8 @@ pub use watchdog_spool::intent::{
     IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentClass,
 };
 pub use watchdog_spool::{
-    CaptureFenceParams, SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
+    CaptureFenceParams, RetainedGatedChannelClaim, RetainedGatedDownstreamClaims,
+    SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
     SpoolImportReplayDisposition, SpoolImportReplayLedger, SpoolMarkerDetail, SpoolObservedDigest,
     SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits, WatchdogSpoolEntry,
     WatchdogSpoolExportLimits, WatchdogSpoolFence, WatchdogSpoolHeader, WatchdogSpoolPayload,

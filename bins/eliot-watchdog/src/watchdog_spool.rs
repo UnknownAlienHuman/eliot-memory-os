@@ -4164,3 +4164,124 @@ mod shared_manifest_retention_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod gated_claims_retention_tests_1755 {
+    use super::*;
+    use crate::observation_coverage::{
+        IntervalCoveragePublisher, ObservationChannel, channel_capability, gate_downstream_claims,
+        owner_active_coverage_profile,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_spool(name: &str) -> Result<WatchdogSpool, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-watchdog-gated-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        Ok(WatchdogSpool::open_test(&path)?)
+    }
+
+    /// One closed interval, gated on the admitted owner profile through the
+    /// same pure gate the tick calls, snapshotted for the owner spool.
+    fn gated_row(
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<RetainedGatedDownstreamClaims, Box<dyn std::error::Error>> {
+        let mut publisher = IntervalCoveragePublisher::new(start_ms);
+        for channel in ObservationChannel::ALL {
+            for class in channel_capability(channel).supported_classes {
+                publisher.record(channel, *class);
+            }
+        }
+        let report = publisher.close(end_ms);
+        let Some(profile) = owner_active_coverage_profile("installation-1755", 7) else {
+            return Err("a bound sensor resolves the admitted owner profile".into());
+        };
+        let revision = Some(profile.profile_revision.clone());
+        let claims = gate_downstream_claims(&report, Some(&profile));
+        Ok(RetainedGatedDownstreamClaims::gated(revision, &claims))
+    }
+
+    /// A retained interval reads back identical: the typed verdicts reach
+    /// durable owner evidence (#1755 W7).
+    #[test]
+    fn gated_claims_round_trip_through_owner_spool() -> TestResult {
+        let spool = test_spool("round-trip")?;
+        let gated = gated_row(1_000, 2_000)?;
+        spool.retain_gated_downstream_claims(&gated)?;
+        assert_eq!(spool.read_gated_downstream_claims()?, Some(gated));
+        Ok(())
+    }
+
+    /// No interval retained yet reads as none, never as empty verdicts.
+    #[test]
+    fn absent_gated_claims_read_none() -> TestResult {
+        let spool = test_spool("absent")?;
+        assert_eq!(spool.read_gated_downstream_claims()?, None);
+        Ok(())
+    }
+
+    /// An empty verdict set is refused whole and the previously retained row
+    /// stands untouched: refusal repairs nothing and invents nothing.
+    #[test]
+    fn empty_gated_claims_are_refused_and_prior_row_stands() -> TestResult {
+        let spool = test_spool("refused")?;
+        let gated = gated_row(1_000, 2_000)?;
+        spool.retain_gated_downstream_claims(&gated)?;
+        let empty = RetainedGatedDownstreamClaims {
+            profile_revision: None,
+            claims: Vec::new(),
+        };
+        assert!(spool.retain_gated_downstream_claims(&empty).is_err());
+        assert_eq!(spool.read_gated_downstream_claims()?, Some(gated));
+        Ok(())
+    }
+
+    /// A stored row that no longer parses is refused as corrupt rather than
+    /// served as evidence: fail closed, never best-effort verdicts.
+    #[test]
+    fn corrupt_gated_claims_row_is_refused() -> TestResult {
+        let spool = test_spool("corrupt")?;
+        let write = spool
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_GATED_CLAIMS_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(SPOOL_GATED_CLAIMS_KEY, b"not-json".as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        assert!(spool.read_gated_downstream_claims().is_err());
+        Ok(())
+    }
+
+    /// A newer interval replaces the older one whole: the reader never sees
+    /// a merged interval, and the verdicts stay bound to one interval.
+    #[test]
+    fn newer_interval_supersedes_older() -> TestResult {
+        let spool = test_spool("supersede")?;
+        let first = gated_row(1_000, 2_000)?;
+        spool.retain_gated_downstream_claims(&first)?;
+        let second = gated_row(2_000, 3_000)?;
+        spool.retain_gated_downstream_claims(&second)?;
+        let Some(read) = spool.read_gated_downstream_claims()? else {
+            return Err("the second interval retains its verdicts".into());
+        };
+        assert_eq!(read, second);
+        assert!(
+            read.claims
+                .iter()
+                .all(|claim| claim.interval_start_ms == 2_000)
+        );
+        Ok(())
+    }
+}

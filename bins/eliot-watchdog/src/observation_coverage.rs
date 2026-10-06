@@ -654,10 +654,7 @@ impl ReplayProvenance {
     /// Stamps the provenance of one window replayed for `scope` in the
     /// interval that started at `interval_start_ms`.
     #[must_use]
-    pub fn stamped(
-        scope: &RegisteredScope,
-        interval_start_ms: u64,
-    ) -> Self {
+    pub fn stamped(scope: &RegisteredScope, interval_start_ms: u64) -> Self {
         Self {
             scope_root: scope.root().display().to_string(),
             scope_generation: scope.scope_generation().to_owned(),
@@ -1019,11 +1016,14 @@ impl IntervalCoverageReport {
                         .as_ref()
                         .map_or(0, |window| window.record_count)
                 && record.replayed_evidence.is_some() == record.replayed_provenance.is_some()
-                && record.replayed_provenance.as_ref().map_or(true, |provenance| {
-                    provenance.interval_start_ms == self.interval.start_ms
-                        && !provenance.scope_root.trim().is_empty()
-                        && !provenance.scope_generation.trim().is_empty()
-                })
+                && record
+                    .replayed_provenance
+                    .as_ref()
+                    .is_none_or(|provenance| {
+                        provenance.interval_start_ms == self.interval.start_ms
+                            && !provenance.scope_root.trim().is_empty()
+                            && !provenance.scope_generation.trim().is_empty()
+                    })
         })
     }
 
@@ -1701,10 +1701,7 @@ mod replay_disposition_tests {
         );
         let provenance = record.replayed_provenance().expect("provenance kept");
         assert_eq!(provenance.interval_start_ms, 1_000);
-        assert_eq!(
-            provenance.scope_root,
-            scope.root().display().to_string()
-        );
+        assert_eq!(provenance.scope_root, scope.root().display().to_string());
         assert_eq!(provenance.scope_generation, "coverage-scope-gen-1");
         assert!(record.gaps().is_empty());
         assert!(
@@ -2157,9 +2154,7 @@ mod owner_profile_tests {
         assert_eq!(profile.competent_sensors.len(), wired.len());
         for channel in wired {
             let capability = channel_capability(channel);
-            let sensor = profile
-                .sensor_for(channel)
-                .expect("wired channel is named");
+            let sensor = profile.sensor_for(channel).expect("wired channel is named");
             assert_eq!(sensor.sensor_identity, capability.competent_source);
             assert_eq!(sensor.observed_subject, "installation-1755");
             assert_eq!(sensor.observed_generation, "watchdog-generation-7");
@@ -2262,13 +2257,9 @@ mod owner_profile_tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("owner-profile sensor dir exists");
-        let sensor = IndependentKernelSensor::open_for_export_driver_test(
-            &dir,
-            "installation-1755",
-            7,
-            3,
-        )
-        .expect("admission-bound test sensor opens");
+        let sensor =
+            IndependentKernelSensor::open_for_export_driver_test(&dir, "installation-1755", 7, 3)
+                .expect("admission-bound test sensor opens");
         let profile = sensor
             .active_coverage_profile()
             .expect("production sensor serves its owner profile");
@@ -2280,10 +2271,7 @@ mod owner_profile_tests {
             .sensor_for(ObservationChannel::KernelHeartbeat)
             .expect("heartbeat adapter is wired and named");
         assert_eq!(sensor_entry.observed_subject, "installation-1755");
-        assert_eq!(
-            sensor_entry.observed_generation,
-            "watchdog-generation-7"
-        );
+        assert_eq!(sensor_entry.observed_generation, "watchdog-generation-7");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
