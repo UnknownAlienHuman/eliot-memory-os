@@ -1988,11 +1988,16 @@ def verify_all(root: Path) -> list[Finding]:
 # Workflow YAML: every repository workflow file.
 ORACLE_PATH_PREFIXES = (".github/workflows/",)
 # This verifier, the profile definitions, lock validation and the
-# repository-policy denominator inputs this issue governs. The merge-gate
+# repository-policy denominator inputs this issue governs, plus the executable
+# merge-gate owner itself (dispatcher and evidence module: a candidate that
+# rewrites its own judge is an oracle change). The merge-gate
 # owner mirrors this set for the blind-reviewer decision; keep the two
 # identical.
 ORACLE_PATH_FILES = (
     "scripts/verify-github-workflows.py",
+    "scripts/verify-retired-authority-surfaces.py",
+    "scripts/work_unit_gate/__main__.py",
+    "scripts/work_unit_gate/doc_read_evidence.py",
     "scripts/verify.ps1",
     "scripts/verify-dependency-policy.py",
     "scripts/requirements-verification.txt",
@@ -2801,6 +2806,20 @@ def run_self_tests() -> int:
                     )
                     return 1
 
+    # Oracle-denominator membership (issue #1225 step 10): the executable
+    # merge-gate owner is oracle itself, so its dispatcher and evidence
+    # module must stay inside the protected set. A silent removal would let
+    # a candidate rewrite its own judge without tripping GWF-022.
+    for _gate_path in (
+        "scripts/work_unit_gate/__main__.py",
+        "scripts/work_unit_gate/doc_read_evidence.py",
+    ):
+        if _gate_path not in ORACLE_PATH_FILES:
+            print(
+                f"SELF_TEST_FAILURE: merge-gate owner {_gate_path} missing from the oracle set",
+                file=sys.stderr,
+            )
+            return 1
     # Oracle-change tripwire (issue #1225 step 10). The guard compares two
     # materialized trees, so its fixtures build a base/candidate pair: an
     # unchanged pair stays clean, any mutated oracle path (verifier,
@@ -2872,6 +2891,42 @@ def run_self_tests() -> int:
                     )
                     return 1
 
+    # Merge-gate tripwire (issue #1225 step 10): a candidate that weakens or
+    # deletes its own judge trips GWF-022 under the base oracle, before any
+    # candidate-owned check runs.
+    gate_base_files = {
+        "scripts/work_unit_gate/doc_read_evidence.py": "# base gate\n",
+        "docs/note.md": "base note\n",
+    }
+    gate_cases = [
+        (
+            "oracle_gate_weakened_rejected",
+            {
+                **gate_base_files,
+                "scripts/work_unit_gate/doc_read_evidence.py": "# weakened gate\n",
+            },
+            "GWF-022",
+        ),
+        (
+            "oracle_gate_deleted_rejected",
+            {"docs/note.md": "base note\n"},
+            "GWF-022",
+        ),
+    ]
+    for name, candidate_files, expected_code in gate_cases:
+        with tempfile.TemporaryDirectory() as base_tmp:
+            with tempfile.TemporaryDirectory() as candidate_tmp:
+                write_tree(Path(base_tmp), gate_base_files)
+                write_tree(Path(candidate_tmp), candidate_files)
+                guard_findings = check_oracle_change_protection(
+                    Path(base_tmp), Path(candidate_tmp)
+                )
+                if not any(f.code == expected_code for f in guard_findings):
+                    print(
+                        f"SELF_TEST_FAILURE in {name}: expected {expected_code}, got {guard_findings}",
+                        file=sys.stderr,
+                    )
+                    return 1
     # 31 single-file workflow cases + 2 cross-workflow divergence cases
     # + 1 derived-identity case + 7 rule-level cases below, plus the two
     # cache-key groups (issue #1923). The reported count is derived from the
@@ -2891,6 +2946,7 @@ def run_self_tests() -> int:
         + 1
         + len(dispatch_cases)
         + len(oracle_cases)
+        + len(gate_cases)
     )
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")
     return 0

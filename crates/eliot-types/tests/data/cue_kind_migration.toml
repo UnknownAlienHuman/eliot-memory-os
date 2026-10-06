@@ -199,8 +199,8 @@ inputs = ["", "unknown", "FilePath", "FILE_PATH", "file-path", "file path", "cue
 
 [wire_strings]
 final_disposition = "legacy-preserved"
-disposition_evidence = "the frozen wire-consumer inventory is unchanged; every listed file still carries its historical V1 wire key, and no new wire consumer appeared"
-files = ["crates/eliot-app/src/mcp_stdio/verification.rs", "crates/eliot-app/src/ul_cross_agent_runner.rs", "crates/eliot-app/tests/ul_contract_errors.rs", "crates/eliot-app/tests/ul_mvp_done.rs", "crates/eliot-store/src/canonical_store.rs", "crates/eliot-types/tests/cue_kind_legacy_boundary.rs", "crates/eliot-types/tests/ul_cue_normalize.rs"]
+disposition_evidence = "the frozen wire-consumer inventory is unchanged except the #835 retirement-test addition recorded here; every listed file still carries its historical V1 wire key (serde_t12_ul_rest.rs carries cue_kind dependency in its T12_C1 fixture)"
+files = ["crates/eliot-app/src/mcp_stdio/verification.rs", "crates/eliot-app/src/ul_cross_agent_runner.rs", "crates/eliot-app/tests/ul_contract_errors.rs", "crates/eliot-app/tests/ul_mvp_done.rs", "crates/eliot-store/src/canonical_store.rs", "crates/eliot-types/tests/cue_kind_legacy_boundary.rs", "crates/eliot-types/tests/serde_t12_ul_rest.rs", "crates/eliot-types/tests/ul_cue_normalize.rs"]
 
 [api]
 final_disposition = "legacy-preserved"
@@ -729,6 +729,21 @@ expiry = "retirement-regression-under-#835; invalid-on-test-change"
 risk = "none"
 match_count = 35
 matched_digest = "4e603eebd05cfb3b827e4b7294e28fb803b587902c563de138dc1e396775e751"
+variants = []
+
+[type_row."crates/eliot-types/tests/serde_t12_ul_rest.rs"]
+final_disposition = "legacy-preserved"
+disposition_evidence = "every match names LegacyCueKindV1 explicitly; the file carries zero transitional-alias spellings (pub type CueKind, eliot_types::CueKind) and zero extra current owners"
+named_migration = "eliot_types::ul::cue::LegacyCueKindV1MigrationDescriptor (crates/eliot-types/src/ul/cue.rs line 63) - the named migration for the retained historical V1 meaning: SOURCE_SCHEMA eliot-types.ul.cue.LegacyCueKindV1, SOURCE_GENERATION v1, SOURCE_SEAM_ISSUE 706, pinned TARGET_FILE and TARGET_REVISION 2.0.0"
+baseline_digest_state = "reproduces"
+baseline_digest_basis = "no frozen #706 row exists for this path (test file added 1c1e5bfc8, after the baseline); derived on the #835 branch tree at origin/main abd68cbb4 with the row_digest_oracle_rule CueKind lens: count 22, digest c0f3e7f30e664d9b4e88f31aa4937c92b1e1a3adf70275f93fc11ac39d73cafb; rule output reproduced byte for byte against the frozen memory_retrieval.rs row before writing"
+role = "test"
+owner = "#835"
+migration = 835
+expiry = "retirement-regression-under-#835; invalid-on-test-change"
+risk = "none"
+match_count = 22
+matched_digest = "c0f3e7f30e664d9b4e88f31aa4937c92b1e1a3adf70275f93fc11ac39d73cafb"
 variants = []
 
 [field_row."crates/eliot-types/tests/cue_kind_retirement.rs"]

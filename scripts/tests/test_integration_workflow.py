@@ -328,8 +328,9 @@ def _extract_cache_blocks(text: str) -> list[dict[str, str]]:
 
 
 def _validate_cache_block(block_text: str) -> list[str]:
+    text = "\n".join(l for l in block_text.splitlines() if not l.strip().startswith("#"))
     violations: list[str] = []
-    path_region = block_text.split("key:")[0]
+    path_region = text.split("key:")[0]
     for candidate in re.findall(r"[~.\w/${}()\"'\\:-]+", path_region):
         token = candidate.strip().strip("|").strip("'\"")
         if not token or token in {"path", "with", "uses", "name"} or ":" in token \
@@ -340,9 +341,9 @@ def _validate_cache_block(block_text: str) -> list[str]:
             violations.append(f"cache path outside registry/git/target allowlist: '{token}'")
         elif token.startswith("~/") and not any(rx.search(token) for rx in CACHE_PATH_ALLOW):
             violations.append(f"cache path outside registry/git allowlist: '{token}'")
-    if "hashFiles('Cargo.lock')" not in block_text and 'hashFiles("Cargo.lock")' not in block_text:
+    if "hashFiles('Cargo.lock')" not in text and 'hashFiles("Cargo.lock")' not in text:
         violations.append("cache key does not bind Cargo.lock")
-    if "runner.os" not in block_text:
+    if "runner.os" not in text:
         violations.append("cache key does not bind runner OS")
     return violations
 
