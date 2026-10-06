@@ -3271,6 +3271,52 @@ mod tests {
     }
 
     #[test]
+    fn admitted_one_shot_persists_typed_restart_record_on_promotion() {
+        // Issue #456 (WD1): the production finish path persists the
+        // admitted typed bundles with the durable job row, so a daemon
+        // restart reopens the same evidence identities without operation
+        // memory. This drive admits no typed bundles (the executor takes
+        // the unknown path without recording), so the persisted record
+        // carries the job/attempt identities with zero bundles; the
+        // non-empty bundle round-trip is proven in eliot-testd-core's
+        // restart_readback suite.
+        let fixture = admitted_drive_fixture("admitted-restart-persist");
+        let presented = presented_for(&fixture, false);
+        let executor = OneShotTestExecutor {
+            starts: Mutex::new(0),
+        };
+        let contour = worker::GovernedContour::new(&executor, None);
+        let receipt = run_admitted_one_shot(
+            &fixture.composition,
+            presented,
+            &contour,
+            SERVICE_NAME,
+            ADMITTED_WORKER_LEASE_MS,
+            unix_ms(),
+        )
+        .unwrap();
+        assert_eq!(receipt.job_id, "job-1");
+        assert_eq!(receipt.state, "RetryWait");
+        let record = fixture
+            .composition
+            .store()
+            .load_typed_evidence_restart("job-1")
+            .unwrap();
+        let record = record.expect("promotion persists a restart record");
+        assert_eq!(record.job_id, "job-1");
+        assert_eq!(record.invocation_id, "operation-1");
+        assert_eq!(record.fence, fixture.invocation.request.state_fence);
+        assert!(record.bundles.is_empty(), "no bundles were admitted");
+        let serialized = serde_json::to_string(&record).unwrap();
+        let reopened = eliot_testd_core::TypedEvidenceRestartRecord::reopen(&serialized).unwrap();
+        assert_eq!(reopened.job_id, record.job_id);
+        assert_eq!(reopened.invocation_id, record.invocation_id);
+        assert_eq!(reopened.fence, record.fence);
+        assert_eq!(reopened.bundles.len(), record.bundles.len());
+        std::fs::remove_dir_all(fixture.base).unwrap();
+    }
+
+    #[test]
     fn admitted_cancelled_presentation_projects_cancel_without_start() {
         let fixture = admitted_drive_fixture("admitted-cancel");
         let presented = presented_for(&fixture, true);
