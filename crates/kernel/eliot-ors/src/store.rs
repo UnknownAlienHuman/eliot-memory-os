@@ -2888,6 +2888,16 @@ struct BridgeRecoveryPageBudget {
     gap_byte_limit: usize,
 }
 
+/// Aggregate byte/work policy owner for bridge recovery reads (issue #2731,
+/// item 4). ORS derives the ceiling from the table maxima above and enforces
+/// it on every recovery read through `charge`, `charge_output`, and
+/// `charge_reference`: past the ceiling the read fails with
+/// [`OrsError::ProjectionLimitExceeded`] (typed backpressure), never with
+/// truncation or silent loss. Maintenance legs (retire/repair/owner pages)
+/// are item-bounded per call with continuations instead, and their
+/// `handoff_scan_bytes` reports are non-charge snapshots of retained cursor
+/// bytes (see `bridge_cursor_stable_and_scan_bytes`) that the route joins
+/// without summation - so no second byte-policy owner exists.
 #[derive(Default)]
 struct BridgeRecoveryReadBudget {
     decoded_bytes: usize,
@@ -42472,5 +42482,58 @@ mod bridge_handoff_retirement_2731 {
         );
         let _ = std::fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn recovery_read_budget_enforces_the_aggregate_policy() {
+        // Issue #2731 item 4: the aggregate byte/work policy has one
+        // designated owner (ORS, via `BridgeRecoveryReadBudget`) and one
+        // enforcement shape. At the derived ceiling the next work item,
+        // decoded byte, or serialized byte fails with typed
+        // `ProjectionLimitExceeded` - never with truncation or silent loss -
+        // while charges below the ceiling pass.
+        let mut at_work_ceiling = BridgeRecoveryReadBudget {
+            decoded_bytes: 0,
+            serialized_item_bytes: 0,
+            work_items: MAX_BRIDGE_RECOVERY_WORK_ITEMS,
+        };
+        assert!(
+            matches!(
+                at_work_ceiling.charge_work_item(),
+                Err(OrsError::ProjectionLimitExceeded)
+            ),
+            "one work item past the aggregate ceiling must shed typed pressure"
+        );
+        let mut below_work_ceiling = BridgeRecoveryReadBudget {
+            decoded_bytes: 0,
+            serialized_item_bytes: 0,
+            work_items: MAX_BRIDGE_RECOVERY_WORK_ITEMS - 1,
+        };
+        assert!(
+            below_work_ceiling.charge_work_item().is_ok(),
+            "the last work item inside the ceiling must pass"
+        );
+        let mut budget = BridgeRecoveryReadBudget::default();
+        let big_key = vec![0_u8; 8];
+        let big_value = vec![0_u8; MAX_BRIDGE_RECOVERY_DECODED_BYTES];
+        assert!(
+            matches!(
+                budget.charge(&big_key, &big_value),
+                Err(OrsError::ProjectionLimitExceeded)
+            ),
+            "decoded bytes past the 4 MiB ceiling must shed typed pressure"
+        );
+        let mut byte_budget = BridgeRecoveryReadBudget {
+            decoded_bytes: MAX_BRIDGE_RECOVERY_DECODED_BYTES,
+            serialized_item_bytes: 0,
+            work_items: 0,
+        };
+        assert!(
+            matches!(
+                byte_budget.charge_output(MAX_BRIDGE_RECOVERY_REPLY_BYTES + 1),
+                Err(OrsError::ProjectionLimitExceeded)
+            ),
+            "a call past the combined call-bytes ceiling must shed typed pressure"
+        );
     }
 }
