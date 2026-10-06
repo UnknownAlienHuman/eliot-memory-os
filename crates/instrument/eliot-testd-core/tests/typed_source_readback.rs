@@ -248,7 +248,7 @@ impl ProcessStreamSourceReadbackPort for TestPort {
                 reason: "the readback names an unknown job or attempt",
             });
         }
-        let served = self.table.get(&request.locator).ok_or_else(|| {
+        let served = self.table.get(&request.locator).ok_or({
             TestdEvidenceError::SourceUnavailable {
                 stream: request.stream,
                 reason: "the test port serves no source under this locator",
