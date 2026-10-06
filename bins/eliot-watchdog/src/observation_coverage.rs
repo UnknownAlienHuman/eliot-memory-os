@@ -1071,11 +1071,12 @@ pub struct CompetentSensor {
 ///
 /// This is the consumption shape, not either producer vocabulary: both
 /// `IntegrationCoverageProfile` types on main (`eliot-integration-coverage`,
-/// `eliot-context-contracts`) name neither sensor nor channel, so whichever
-/// one feeds the Watchdog maps to these named sensors by this owner's own
-/// [`ObservationChannel`] wire names. Which producer type feeds it is the
-/// open CS1 contract question; the gate and the tick below already consult
-/// exactly this shape through
+/// `eliot-context-contracts`) name neither sensor nor channel, so neither can
+/// feed it without synthesizing sensor competence from unrelated lifecycle
+/// events (issue #1755, CS1 return). The producer is this owner itself — see
+/// [`owner_active_coverage_profile`] — projecting the measured
+/// [`SENSOR_CHANNEL_MAP`] by this owner's own [`ObservationChannel`] wire
+/// names. The gate and the tick below consult exactly this shape through
 /// [`KernelWatchdogPort::active_coverage_profile`](crate::KernelWatchdogPort::active_coverage_profile).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveCoverageProfile {
@@ -1105,6 +1106,73 @@ impl ActiveCoverageProfile {
     fn well_formed(&self) -> bool {
         !self.profile_revision.trim().is_empty() && !self.profile_digest.trim().is_empty()
     }
+}
+
+/// Projects this owner's measured sensor map into the active coverage
+/// profile downstream gating consults (#1755 W7).
+///
+/// The admitted sensor-profile source is the Watchdog owner itself: the
+/// competent sensors are exactly the channels [`SENSOR_CHANNEL_MAP`]
+/// measures as wired — production runtime callers in this crate that perform
+/// the read — named in the map's own `competent_source` wording. The observed
+/// subject is the admitted installation identity and the generation is the
+/// installer-approved authority generation the sensor bound at construction;
+/// both arrive through the admitted port, never through lifecycle-event
+/// profiles that name neither sensor nor channel. Returns `None` for an
+/// unbound sensor (blank installation or zero generation), so a sensor
+/// without admitted identities disables every downstream claim instead of
+/// gating on a default. `profile_revision` names the map revision the
+/// projection was derived under, so a wiring change supersedes the profile;
+/// `profile_digest` binds that revision to its exact sensor set, so a mutated
+/// profile cannot substitute for the one the producer resolved.
+#[must_use]
+pub fn owner_active_coverage_profile(
+    installation_id: &str,
+    watchdog_generation: u64,
+) -> Option<ActiveCoverageProfile> {
+    if installation_id.trim().is_empty() || watchdog_generation == 0 {
+        return None;
+    }
+    let observed_generation = format!("watchdog-generation-{watchdog_generation}");
+    let competent_sensors: Vec<CompetentSensor> = SENSOR_CHANNEL_MAP
+        .iter()
+        .filter(|capability| capability.wiring.is_wired())
+        .map(|capability| CompetentSensor {
+            channel: capability.channel,
+            sensor_identity: capability.competent_source.to_owned(),
+            observed_subject: installation_id.to_owned(),
+            observed_generation: observed_generation.clone(),
+        })
+        .collect();
+    let profile_revision = format!("sensor-map-rev-{SENSOR_MAP_REVISION}");
+    let profile_digest = active_profile_digest(&profile_revision, &competent_sensors);
+    Some(ActiveCoverageProfile {
+        profile_revision,
+        profile_digest,
+        competent_sensors,
+    })
+}
+
+/// Binds one profile revision to its exact sensor set.
+///
+/// The digest runs over the revision and, per sensor in map order, the
+/// channel wire name with its identity, subject and generation — so it
+/// changes exactly when the named set changes, and a profile that drops or
+/// renames a sensor never validates against the digest of another set.
+fn active_profile_digest(revision: &str, sensors: &[CompetentSensor]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(revision.as_bytes());
+    for sensor in sensors {
+        hasher.update(b"\0");
+        hasher.update(sensor.channel.as_str().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(sensor.sensor_identity.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(sensor.observed_subject.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(sensor.observed_generation.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// True when every observed binding of one named sensor is usable.
@@ -2051,5 +2119,171 @@ mod profile_gate_tests {
             assert!(!claim.claim_allowed);
             assert_eq!(claim.reason, "REPORT_INVALID");
         }
+    }
+}
+
+/// Owner-served active profile (#1755 W7, the admitted producer).
+///
+/// Each test projects the owner's own measured sensor map: the competent
+/// sensors are exactly the wired adapters, bound to the admitted
+/// installation identity and generation — never synthesized from
+/// lifecycle-event profiles that name neither sensor nor channel.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "the profile tests build the owner's own admission-bound sensor; a binding that cannot open is a test failure"
+)]
+mod owner_profile_tests {
+    use super::*;
+    use crate::{IndependentKernelSensor, KernelWatchdogPort};
+
+    fn wired_channels() -> Vec<ObservationChannel> {
+        ObservationChannel::ALL
+            .iter()
+            .copied()
+            .filter(|channel| channel_capability(*channel).wiring.is_wired())
+            .collect()
+    }
+
+    /// The owner profile names exactly the wired adapters, each in the map's
+    /// own competent-source wording and bound to the admitted subject and
+    /// generation, under the map revision it was derived from.
+    #[test]
+    fn owner_profile_names_exactly_the_wired_adapters() {
+        let profile = owner_active_coverage_profile("installation-1755", 7)
+            .expect("bound sensor serves its owner profile");
+        let wired = wired_channels();
+        assert!(!wired.is_empty());
+        assert_eq!(profile.competent_sensors.len(), wired.len());
+        for channel in wired {
+            let capability = channel_capability(channel);
+            let sensor = profile
+                .sensor_for(channel)
+                .expect("wired channel is named");
+            assert_eq!(sensor.sensor_identity, capability.competent_source);
+            assert_eq!(sensor.observed_subject, "installation-1755");
+            assert_eq!(sensor.observed_generation, "watchdog-generation-7");
+        }
+        for channel in ObservationChannel::ALL {
+            if !channel_capability(channel).wiring.is_wired() {
+                assert_eq!(profile.sensor_for(channel), None);
+            }
+        }
+        assert_eq!(
+            profile.profile_revision,
+            format!("sensor-map-rev-{SENSOR_MAP_REVISION}")
+        );
+        assert!(!profile.profile_digest.trim().is_empty());
+    }
+
+    /// An unbound sensor serves no profile: blank installation or zero
+    /// generation disables every downstream claim instead of gating on one.
+    #[test]
+    fn unbound_sensor_serves_no_profile() {
+        assert_eq!(owner_active_coverage_profile("", 7), None);
+        assert_eq!(owner_active_coverage_profile("  ", 7), None);
+        assert_eq!(owner_active_coverage_profile("installation-1755", 0), None);
+    }
+
+    /// The digest binds the revision to its exact sensor set: stable for one
+    /// set, different when the named generation changes.
+    #[test]
+    fn profile_digest_binds_revision_and_sensor_set() {
+        let first = owner_active_coverage_profile("installation-1755", 7)
+            .expect("bound sensor serves its owner profile");
+        let second = owner_active_coverage_profile("installation-1755", 7)
+            .expect("same binding serves the same profile");
+        assert_eq!(first.profile_digest, second.profile_digest);
+        let rotated = owner_active_coverage_profile("installation-1755", 8)
+            .expect("rotated generation serves its owner profile");
+        assert_ne!(first.profile_digest, rotated.profile_digest);
+    }
+
+    /// The admitted source reaches the gate: a fully live-observed interval
+    /// gated on the owner profile allows exactly the wired channels, each
+    /// carrying the profile revision, sensor identity, subject and
+    /// generation — while the measured-missing adapters stay blocked.
+    #[test]
+    fn owner_profile_through_gate_allows_only_delivered_wired_channels() {
+        let mut publisher = IntervalCoveragePublisher::new(1_000);
+        for channel in ObservationChannel::ALL {
+            let capability = channel_capability(channel);
+            for class in capability.supported_classes {
+                assert_eq!(publisher.record(channel, *class), RecordOutcome::Recorded);
+            }
+        }
+        let report = publisher.close(2_000);
+        assert!(report.valid());
+        let profile = owner_active_coverage_profile("installation-1755", 7)
+            .expect("bound sensor serves its owner profile");
+        let claims = gate_downstream_claims(&report, Some(&profile));
+        assert_eq!(claims.len(), ObservationChannel::COUNT);
+        for channel in wired_channels() {
+            let claim = claims
+                .iter()
+                .find(|claim| claim.channel == channel)
+                .expect("wired channel has a claim");
+            assert!(claim.claim_allowed, "wired channel {channel:?} allowed");
+            assert_eq!(claim.reason, "ALLOWED");
+            assert_eq!(
+                claim.profile_revision.as_deref(),
+                Some(profile.profile_revision.as_str())
+            );
+            assert_eq!(
+                claim.sensor_identity.as_deref(),
+                Some(channel_capability(channel).competent_source)
+            );
+            assert_eq!(claim.observed_subject.as_deref(), Some("installation-1755"));
+            assert_eq!(
+                claim.observed_generation.as_deref(),
+                Some("watchdog-generation-7")
+            );
+        }
+        for channel in ObservationChannel::ALL {
+            if channel_capability(channel).wiring.is_wired() {
+                continue;
+            }
+            let claim = claims
+                .iter()
+                .find(|claim| claim.channel == channel)
+                .expect("missing channel has a claim");
+            assert!(!claim.claim_allowed);
+            assert_eq!(claim.reason, "SENSOR_NOT_NAMED");
+        }
+    }
+
+    /// The admitted production sensor serves the owner profile through the
+    /// port the composition consults: the installation identity and
+    /// generation bound at construction reach the gate, not `None`.
+    #[test]
+    fn production_sensor_serves_owner_profile_through_port() {
+        let dir = std::env::temp_dir().join(format!(
+            "eliot-watchdog-owner-profile-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("owner-profile sensor dir exists");
+        let sensor = IndependentKernelSensor::open_for_export_driver_test(
+            &dir,
+            "installation-1755",
+            7,
+            3,
+        )
+        .expect("admission-bound test sensor opens");
+        let profile = sensor
+            .active_coverage_profile()
+            .expect("production sensor serves its owner profile");
+        assert_eq!(
+            profile.profile_revision,
+            format!("sensor-map-rev-{SENSOR_MAP_REVISION}")
+        );
+        let sensor_entry = profile
+            .sensor_for(ObservationChannel::KernelHeartbeat)
+            .expect("heartbeat adapter is wired and named");
+        assert_eq!(sensor_entry.observed_subject, "installation-1755");
+        assert_eq!(
+            sensor_entry.observed_generation,
+            "watchdog-generation-7"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

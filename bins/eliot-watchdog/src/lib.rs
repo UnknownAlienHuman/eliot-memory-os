@@ -1457,6 +1457,17 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         Some(self.installation_id.as_str())
     }
 
+    /// Serves this owner's measured sensor map as the active coverage
+    /// profile: the competent sensors are exactly this crate's wired
+    /// adapters, bound to the admitted installation identity and the
+    /// installer-approved generation retained at construction (#1755 W7).
+    fn active_coverage_profile(&self) -> Option<ActiveCoverageProfile> {
+        crate::observation_coverage::owner_active_coverage_profile(
+            &self.installation_id,
+            self.watchdog_generation,
+        )
+    }
+
     fn spool_backup_port(&self) -> Option<Arc<WatchdogBackupPort>> {
         Some(Arc::clone(&self.backup_port))
     }
@@ -1676,10 +1687,13 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     /// A port whose owner resolved no profile returns `None` and the tick
     /// disables every such claim - a named supervision gap, never a
     /// substituted or default profile. The profile names sensors by this
-    /// owner's own observation-channel wire names, so either
-    /// `IntegrationCoverageProfile` shape on main (`eliot-integration-coverage`,
-    /// `eliot-context-contracts`) maps to it without this crate depending on
-    /// either; which producer type feeds it is the open CS1 contract question.
+    /// owner's own observation-channel wire names. The admitted producer is
+    /// the Watchdog owner itself (its measured sensor map with the admitted
+    /// installation identity and generation); the `IntegrationCoverageProfile`
+    /// shapes on main (`eliot-integration-coverage`, `eliot-context-contracts`)
+    /// name neither sensor nor channel and feed nothing here, so no sensor
+    /// competence is synthesized from lifecycle events (issue #1755, CS1
+    /// return).
     fn active_coverage_profile(&self) -> Option<ActiveCoverageProfile> {
         None
     }
