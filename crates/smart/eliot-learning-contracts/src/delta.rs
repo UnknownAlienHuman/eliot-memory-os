@@ -288,9 +288,11 @@ pub struct AttemptLearningDeltaCandidate {
     /// Candidate is always bounded by this closed ceiling.
     pub proof_ceiling: ProofCeiling,
     /// Digest binding the frozen pre-evaluation fields to this candidate.
-    /// Covered by the canonical seal; `None` when the source revision froze
-    /// nothing. A plain digest (never the overlay `freeze` bundle type, which
-    /// this crate must not depend on).
+    /// Covered by the canonical seal; `None` only for a legacy revision that
+    /// froze nothing. Lineage validation recomputes
+    /// [`AttemptLearningDeltaCandidate::frozen_digest`] and rejects a missing
+    /// or drifted binding. A plain digest (never the overlay `freeze` bundle
+    /// type, which this crate must not depend on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_pre_evaluation_digest: Option<String>,
     /// Canonical candidate shape digest, excluding this field.
@@ -407,6 +409,25 @@ impl AttemptLearningDeltaCandidate {
     pub fn seal(&mut self) -> Result<(), LearningContractError> {
         self.canonical_digest = digest_without_field(self, "canonical_digest")?;
         Ok(())
+    }
+
+    /// Digest binding the frozen pre-evaluation source content to this delta.
+    ///
+    /// Covers the delta identity and every content field except the two
+    /// digests themselves, through the same canonicalization as the seal, so
+    /// the recorded value is stable across seals: the seal covers the
+    /// recorded value while validators recompute it from the presented
+    /// candidate. Acyclic by construction: the overlay admits the sealed
+    /// delta (its seal covers this value) and the overlay digest commits the
+    /// overlay seal, so the delta never carries the overlay digest back.
+    /// The producer records this at derivation, before evaluation.
+    /// Norm: `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md:209`
+    /// (frozen before evaluation) and `:307` (`HarnessChangeManifest` merged
+    /// onto the source delta).
+    pub fn frozen_digest(&self) -> Result<String, LearningContractError> {
+        let mut unbound = self.clone();
+        unbound.frozen_pre_evaluation_digest = None;
+        digest_without_field(&unbound, "canonical_digest")
     }
 }
 

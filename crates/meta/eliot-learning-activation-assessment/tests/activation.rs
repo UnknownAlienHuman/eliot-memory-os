@@ -478,6 +478,7 @@ fn fixture() -> Result<
         frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    delta.frozen_pre_evaluation_digest = Some(delta.frozen_digest()?);
     delta.seal()?;
     let mut overlay = CampaignHarnessOverlayCandidate {
         binding: binding.clone(),

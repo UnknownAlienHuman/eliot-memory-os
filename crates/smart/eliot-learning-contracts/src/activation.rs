@@ -487,9 +487,11 @@ pub struct HarnessActivationReceiptCandidate {
     /// Invalidation, expiry and missingness notes.
     pub invalidation_expiry_and_missingness: Vec<String>,
     /// Digest binding the frozen pre-evaluation fields to this receipt.
-    /// Covered by the canonical seal; `None` when the source revision froze
-    /// nothing. A plain digest (never the overlay `freeze` bundle type, which
-    /// this crate must not depend on).
+    /// Covered by the canonical seal. Carries the assessed overlay's
+    /// [`CampaignHarnessOverlayCandidate::frozen_digest`]; lineage validation
+    /// recomputes it from the presented overlay and rejects a missing or
+    /// drifted binding. A plain digest (never the overlay `freeze` bundle
+    /// type, which this crate must not depend on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_pre_evaluation_digest: Option<String>,
     /// Canonical receipt candidate digest, excluding this field.
@@ -726,6 +728,34 @@ impl HarnessActivationReceiptCandidate {
             return Err(LearningContractError::ScopeMismatch {
                 field: "activation.lineage",
             });
+        }
+        let expected_overlay = overlay.frozen_digest();
+        match &self.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_overlay => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "activation.frozen_pre_evaluation_digest",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "activation.frozen_pre_evaluation_digest",
+                });
+            }
+        }
+        let expected_delta = delta.frozen_digest()?;
+        match &delta.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_delta => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "activation.delta_frozen_lineage",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "activation.delta_frozen_lineage",
+                });
+            }
         }
         Ok(())
     }

@@ -762,6 +762,7 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
         frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    delta.frozen_pre_evaluation_digest = Some(delta.frozen_digest()?);
     delta.seal()?;
     delta.validate_against_view(&view)?;
     let mut overlay = CampaignHarnessOverlayCandidate {
@@ -882,6 +883,7 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
         frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    receipt.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
     receipt.seal()?;
     receipt.validate_against_lineage(&view, &delta, &overlay)?;
     let mut assessment = LearningAssessmentCandidate {
@@ -913,7 +915,7 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
         binding: view.binding,
         target: view.target,
         delta_id: delta.delta_id.clone(),
-        overlay_id: overlay.overlay_id,
+        overlay_id: overlay.overlay_id.clone(),
         assessment_id: assessment.assessment_receipt.clone(),
         assessment_digest: assessment.canonical_digest.clone(),
         required_owner_proofs: vec![OwnerProof {
@@ -931,7 +933,359 @@ fn linked_candidate_flow_preserves_lineage() -> Result<(), Box<dyn std::error::E
         frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    handoff.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
     handoff.seal()?;
-    handoff.validate_against_assessment_and_delta(&assessment, &delta)?;
+    handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay)?;
+    Ok(())
+}
+
+/// Sealed source/receipt/closure chain sharing one coherent frozen binding.
+type FrozenChain = (
+    CampaignLearningStateView,
+    AttemptLearningDeltaCandidate,
+    CampaignHarnessOverlayCandidate,
+    HarnessActivationReceiptCandidate,
+    LearningAssessmentCandidate,
+    ClosureHandoff,
+);
+
+/// Minimal valid [`FrozenChain`]: the delta carries its recomputable
+/// [`AttemptLearningDeltaCandidate::frozen_digest`], the receipt and the
+/// handoff carry the overlay digest. Every negative test below starts from
+/// this chain and tampers exactly one binding.
+#[allow(clippy::too_many_lines)]
+fn frozen_chain() -> Result<FrozenChain, Box<dyn std::error::Error>> {
+    let (recipe, view) = recipe_and_view()?;
+    let target = view.target.clone();
+    let proposed = ValueState {
+        present: true,
+        digest: Some(digest("frozen-proposed")),
+    };
+    let mut delta = AttemptLearningDeltaCandidate {
+        binding: view.binding.clone(),
+        attempt_id: AgentAttemptId::new("frozen-attempt")?,
+        delta_id: aid("frozen-delta")?,
+        target: target.clone(),
+        base_view_digest: view.canonical_digest.clone(),
+        pre_observation_discriminator: aid("frozen-discriminator")?,
+        intended_strategy: aid("frozen-intended")?,
+        attempted_strategy: aid("frozen-attempted")?,
+        changes: vec![ChangeOperation::Add {
+            target: target.clone(),
+            surface: ChangeSurface::Strategy,
+            after: proposed.clone(),
+        }],
+        inverses: vec![InverseChange {
+            forward_target: target.clone(),
+            inverse: ChangeOperation::Remove {
+                target: target.clone(),
+                surface: ChangeSurface::Strategy,
+                before: proposed.clone(),
+            },
+        }],
+        evidence: vec![aid("frozen-evidence")?],
+        evaluator_receipts: vec![aid("frozen-evaluator")?],
+        baseline: vec![aid("frozen-baseline")?],
+        control: vec![aid("frozen-control")?],
+        confounders: vec![],
+        dependencies: vec![],
+        equivalent_retry: None,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
+        canonical_digest: String::new(),
+    };
+    delta.frozen_pre_evaluation_digest = Some(delta.frozen_digest()?);
+    delta.seal()?;
+    delta.validate_against_view(&view)?;
+    let mut overlay = CampaignHarnessOverlayCandidate {
+        binding: view.binding.clone(),
+        overlay_id: OverlayId::from_artifact(aid("frozen-overlay")?),
+        campaign_id: view.campaign_id.clone(),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
+        base_view_digest: view.canonical_digest.clone(),
+        parent_revision: TaskRevision::genesis(),
+        admitted_delta_ids: vec![delta.delta_id.clone()],
+        admitted_delta_digests: vec![delta.canonical_digest.clone()],
+        changes: vec![OverlayChange {
+            target: target.clone(),
+            surface: ChangeSurface::Strategy,
+            base: ValueState {
+                present: false,
+                digest: None,
+            },
+            proposed,
+            inverse: InverseChange {
+                forward_target: target.clone(),
+                inverse: ChangeOperation::Remove {
+                    target: target.clone(),
+                    surface: ChangeSurface::Strategy,
+                    before: ValueState {
+                        present: true,
+                        digest: Some(digest("frozen-proposed")),
+                    },
+                },
+            },
+            origin: OverlayOrigin::Overlay,
+        }],
+        dependencies: vec![],
+        application_order: vec![target.clone()],
+        protected_surface_base_digest: digest("frozen-protected"),
+        protected_surface_proposed_digest: digest("frozen-protected"),
+        fixed_before_observation_discriminator: aid("frozen-fixed")?,
+        intended_mechanism: "frozen-mechanism".to_owned(),
+        prediction: "frozen-prediction".to_owned(),
+        expected_observable: "frozen-observable".to_owned(),
+        possible_regressions: "frozen-regressions".to_owned(),
+        confounders: "frozen-confounders".to_owned(),
+        preserved_success_constraint: "frozen-preserved".to_owned(),
+        next_discriminator_text: "frozen-next".to_owned(),
+        rollback_condition: "frozen-rollback".to_owned(),
+        expires_at_ms: 3_000,
+        invalidated: false,
+        canonical_digest: String::new(),
+    };
+    overlay.seal()?;
+    overlay.validate_against_view_and_deltas(&view, std::slice::from_ref(&delta))?;
+    let mut receipt = HarnessActivationReceiptCandidate {
+        binding: view.binding.clone(),
+        activation_id: aid("frozen-activation-receipt")?,
+        target: target.clone(),
+        view_digest: view.canonical_digest.clone(),
+        delta_id: delta.delta_id.clone(),
+        overlay_id: overlay.overlay_id.clone(),
+        admission_receipt: aid("frozen-admission")?,
+        activation_request_receipt: aid("frozen-activation")?,
+        stages: vec![StageObservation {
+            stage: LifecycleStage::CandidateProduced,
+            disposition: StageDisposition::Observed,
+            predecessor: None,
+            owner_receipt: Some(aid("frozen-stage-receipt")?),
+            evidence: vec![aid("frozen-stage-evidence")?],
+            denominator: SourceDenominator {
+                declared: 1,
+                observed: 1,
+            },
+        }],
+        member_denominator: SourceDenominator {
+            declared: 1,
+            observed: 1,
+        },
+        metrics: vec![],
+        attrition: vec![],
+        confounders: vec![],
+        independent_evaluator_receipt: Some(aid("frozen-independent")?),
+        compiled_view_ref: aid("frozen-compiled-view")?,
+        context_compiler_revision: "compiler-rev-1".to_owned(),
+        render_profile_revision: "render-profile-rev-1".to_owned(),
+        stable_harness_refs: vec![aid("frozen-stable-harness")?],
+        task_family_harness_refs: vec![aid("frozen-task-family-harness")?],
+        skill_refs: vec![aid("frozen-skill")?],
+        memory_refs: vec![aid("frozen-memory")?],
+        procedure_refs: vec![aid("frozen-procedure")?],
+        preserved_success_ref: Some(aid("frozen-preserved-success")?),
+        eligibility_and_retrieval_reason: Some("eligible and retrieved".to_owned()),
+        retrieval: eliot_learning_contracts::activation::RetrievalSection {
+            status: eliot_learning_contracts::activation::RetrievalStatus::Retrieved,
+            expansion_or_tool_query_refs: vec![],
+        },
+        delivery: eliot_learning_contracts::activation::DeliverySection {
+            status: eliot_learning_contracts::activation::DeliveryStatus::Full,
+            packet_position: Some(0),
+            serialized_digest: Some(digest("frozen-packet")),
+            bytes: Some(128),
+            actual_tokens: Some(32),
+        },
+        activation: eliot_learning_contracts::activation::ActivationSection {
+            status: eliot_learning_contracts::activation::ActivationStatus::NotObserved,
+            acknowledgement_ref: Some(aid("frozen-ack")?),
+            observation_limit_reason: None,
+            first_qualifying_observable_use_ref: None,
+        },
+        adherence: eliot_learning_contracts::activation::AdherenceSection {
+            status: eliot_learning_contracts::activation::AdherenceStatus::NotAssessed,
+            early_mid_final_checkpoint_refs: vec![],
+            prescribed_or_avoided_action_and_required_verifier_refs: vec![],
+        },
+        conflicts_suppression_or_compaction_loss: vec![],
+        downstream_decision_action_artifact_and_verifier_refs: vec![],
+        receipt_completeness_and_missing_fields: vec![],
+        invalidation_expiry_and_missingness: vec![],
+        frozen_pre_evaluation_digest: None,
+        canonical_digest: String::new(),
+    };
+    receipt.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
+    receipt.seal()?;
+    receipt.validate_against_lineage(&view, &delta, &overlay)?;
+    let mut assessment = LearningAssessmentCandidate {
+        binding: view.binding.clone(),
+        target: target.clone(),
+        overlay_id: overlay.overlay_id.clone(),
+        activation_id: receipt.activation_id.clone(),
+        activation_digest: receipt.canonical_digest.clone(),
+        assessment_receipt: aid("frozen-assessment")?,
+        dimensions: vec![DimensionAssessment {
+            dimension: AssessmentDimension::Adherence,
+            status: DimensionStatus::Unknown,
+            evidence: vec![],
+            owner_receipt: None,
+            denominator: SourceDenominator {
+                declared: 1,
+                observed: 0,
+            },
+            metric_ids: vec![],
+            causal_ceiling: CausalCeiling::Observational,
+        }],
+        causal_ceiling: CausalCeiling::Observational,
+        external_review_refs: vec![aid("frozen-review")?],
+        canonical_digest: String::new(),
+    };
+    assessment.seal()?;
+    assessment.validate_against_activation(&receipt)?;
+    let mut handoff = ClosureHandoff {
+        binding: view.binding.clone(),
+        target: target.clone(),
+        delta_id: delta.delta_id.clone(),
+        overlay_id: overlay.overlay_id.clone(),
+        assessment_id: assessment.assessment_receipt.clone(),
+        assessment_digest: assessment.canonical_digest.clone(),
+        required_owner_proofs: vec![OwnerProof {
+            owner: OwnerId::from_artifact(aid("frozen-owner")?),
+            receipt: aid("frozen-owner-receipt")?,
+            scope: recipe.binding.scope.clone(),
+            state_fence: recipe.binding.state_fence.clone(),
+            evidence: vec![aid("frozen-owner-evidence")?],
+            proof_ceiling: ProofCeiling::CandidateArtifact,
+        }],
+        debts: vec![AssessmentDimension::Adherence],
+        rollback_refs: vec![aid("frozen-rollback-ref")?],
+        external_promotion_refs: vec![],
+        requested_decision: ExternalDecisionClass::ClosureReview,
+        frozen_pre_evaluation_digest: None,
+        canonical_digest: String::new(),
+    };
+    handoff.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
+    handoff.seal()?;
+    handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay)?;
+    Ok((view, delta, overlay, receipt, assessment, handoff))
+}
+
+/// Re-admit a rebound delta so a tampered frozen binding is the ONLY lineage
+/// difference: the overlay commits the rebound seal and the receipt carries
+/// the rebound overlay digest. Without this, the overlay's admitted-digest
+/// check would fire before the frozen check under test.
+fn readmit_over_mutated_delta(
+    view: &CampaignLearningStateView,
+    delta: &AttemptLearningDeltaCandidate,
+    overlay: &CampaignHarnessOverlayCandidate,
+    receipt: &HarnessActivationReceiptCandidate,
+) -> Result<
+    (
+        CampaignHarnessOverlayCandidate,
+        HarnessActivationReceiptCandidate,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let mut overlay = overlay.clone();
+    overlay.admitted_delta_digests = vec![delta.canonical_digest.clone()];
+    overlay.seal()?;
+    overlay.validate_against_view_and_deltas(view, std::slice::from_ref(delta))?;
+    let mut receipt = receipt.clone();
+    receipt.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
+    receipt.seal()?;
+    Ok((overlay, receipt))
+}
+
+#[test]
+fn activation_lineage_rejects_missing_and_drifted_frozen_bindings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (view, delta, overlay, receipt, _, _) = frozen_chain()?;
+    // Fabricated well-formed digest on the source delta: format checks pass,
+    // the recomputed frozen binding disagrees.
+    let mut forged_delta = delta.clone();
+    forged_delta.frozen_pre_evaluation_digest = Some("a".repeat(64));
+    forged_delta.seal()?;
+    let (forged_overlay, forged_receipt) =
+        readmit_over_mutated_delta(&view, &forged_delta, &overlay, &receipt)?;
+    assert!(matches!(
+        forged_receipt.validate_against_lineage(&view, &forged_delta, &forged_overlay),
+        Err(LearningContractError::DigestMismatch { .. })
+    ));
+    // Another material's digest resealed onto this delta is still drift.
+    let mut drifted_delta = delta.clone();
+    drifted_delta.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
+    drifted_delta.seal()?;
+    let (drifted_overlay, drifted_receipt) =
+        readmit_over_mutated_delta(&view, &drifted_delta, &overlay, &receipt)?;
+    assert!(matches!(
+        drifted_receipt.validate_against_lineage(&view, &drifted_delta, &drifted_overlay),
+        Err(LearningContractError::DigestMismatch { .. })
+    ));
+    // Missing bindings on either carrier fail closed.
+    let mut unbound_delta = delta.clone();
+    unbound_delta.frozen_pre_evaluation_digest = None;
+    unbound_delta.seal()?;
+    let (unbound_overlay, unbound_receipt) =
+        readmit_over_mutated_delta(&view, &unbound_delta, &overlay, &receipt)?;
+    assert!(matches!(
+        unbound_receipt.validate_against_lineage(&view, &unbound_delta, &unbound_overlay),
+        Err(LearningContractError::Missing { .. })
+    ));
+    let mut unbound_receipt = receipt.clone();
+    unbound_receipt.frozen_pre_evaluation_digest = None;
+    unbound_receipt.seal()?;
+    assert!(matches!(
+        unbound_receipt.validate_against_lineage(&view, &delta, &overlay),
+        Err(LearningContractError::Missing { .. })
+    ));
+    // Drifted receipt binding: well-formed but not this overlay's digest.
+    let mut drifted_receipt = receipt.clone();
+    drifted_receipt.frozen_pre_evaluation_digest = Some("b".repeat(64));
+    drifted_receipt.seal()?;
+    assert!(matches!(
+        drifted_receipt.validate_against_lineage(&view, &delta, &overlay),
+        Err(LearningContractError::DigestMismatch { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn closure_lineage_rejects_missing_and_drifted_frozen_bindings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, delta, overlay, _, assessment, handoff) = frozen_chain()?;
+    // Sealed delta carrying 64 `a`s with a resealed handoff carrying 64
+    // `b`s: otherwise valid matching lineage must still fail.
+    let mut forged_delta = delta.clone();
+    forged_delta.frozen_pre_evaluation_digest = Some("a".repeat(64));
+    forged_delta.seal()?;
+    let mut drifted_handoff = handoff.clone();
+    drifted_handoff.frozen_pre_evaluation_digest = Some("b".repeat(64));
+    drifted_handoff.seal()?;
+    assert!(matches!(
+        drifted_handoff.validate_against_assessment_and_delta(&assessment, &forged_delta, &overlay),
+        Err(LearningContractError::DigestMismatch { .. })
+    ));
+    // Forged delta binding fails even with a bound handoff.
+    assert!(matches!(
+        handoff.validate_against_assessment_and_delta(&assessment, &forged_delta, &overlay),
+        Err(LearningContractError::DigestMismatch { .. })
+    ));
+    // Missing handoff binding fails closed even with a bound delta.
+    let mut unbound_handoff = handoff.clone();
+    unbound_handoff.frozen_pre_evaluation_digest = None;
+    unbound_handoff.seal()?;
+    assert!(matches!(
+        unbound_handoff.validate_against_assessment_and_delta(&assessment, &delta, &overlay),
+        Err(LearningContractError::Missing { .. })
+    ));
+    // Missing delta binding fails closed even with a bound handoff.
+    let mut unbound_delta = delta.clone();
+    unbound_delta.frozen_pre_evaluation_digest = None;
+    unbound_delta.seal()?;
+    assert!(matches!(
+        handoff.validate_against_assessment_and_delta(&assessment, &unbound_delta, &overlay),
+        Err(LearningContractError::Missing { .. })
+    ));
     Ok(())
 }

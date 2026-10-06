@@ -102,9 +102,12 @@ pub struct ClosureHandoff {
     /// Requested decision class, without recording its result.
     pub requested_decision: ExternalDecisionClass,
     /// Digest binding the frozen pre-evaluation fields to this handoff.
-    /// Covered by the canonical seal; `None` when the source revision froze
-    /// nothing. A plain digest (never the overlay `freeze` bundle type, which
-    /// this crate must not depend on).
+    /// Covered by the canonical seal. Carries the assessed overlay's
+    /// [`CampaignHarnessOverlayCandidate::frozen_digest`], the same coherent
+    /// binding the activation receipt carries; lineage validation recomputes
+    /// it from the presented overlay and rejects a missing or drifted
+    /// binding. A plain digest (never the overlay `freeze` bundle type,
+    /// which this crate must not depend on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_pre_evaluation_digest: Option<String>,
     /// Canonical handoff digest, excluding this field.
@@ -191,11 +194,19 @@ impl ClosureHandoff {
         Ok(())
     }
 
-    /// Validate exact assessment and delta lineage together before handoff.
+    /// Validate exact assessment, delta and frozen lineage together before handoff.
+    ///
+    /// The handoff must carry the same coherent frozen binding as the
+    /// activation receipt: the assessed overlay's frozen digest, recomputed
+    /// from the presented overlay. The presented delta's own frozen binding
+    /// must be recomputable from its sealed content. A fabricated digest,
+    /// another material's digest or a missing binding fails here, not at the
+    /// external review.
     pub fn validate_against_assessment_and_delta(
         &self,
         assessment: &crate::assessment::LearningAssessmentCandidate,
         delta: &crate::delta::AttemptLearningDeltaCandidate,
+        overlay: &crate::overlay::CampaignHarnessOverlayCandidate,
     ) -> Result<(), LearningContractError> {
         self.validate_against_assessment(assessment)?;
         delta.validate()?;
@@ -206,6 +217,39 @@ impl ClosureHandoff {
             return Err(LearningContractError::ScopeMismatch {
                 field: "closure.delta_lineage",
             });
+        }
+        if self.overlay_id != overlay.overlay_id {
+            return Err(LearningContractError::ScopeMismatch {
+                field: "closure.overlay_lineage",
+            });
+        }
+        let expected_overlay = overlay.frozen_digest();
+        match &self.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_overlay => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "closure.frozen_pre_evaluation_digest",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "closure.frozen_pre_evaluation_digest",
+                });
+            }
+        }
+        let expected_delta = delta.frozen_digest()?;
+        match &delta.frozen_pre_evaluation_digest {
+            Some(recorded) if recorded == &expected_delta => {}
+            Some(_) => {
+                return Err(LearningContractError::DigestMismatch {
+                    field: "closure.delta_frozen_lineage",
+                });
+            }
+            None => {
+                return Err(LearningContractError::Missing {
+                    field: "closure.delta_frozen_lineage",
+                });
+            }
         }
         Ok(())
     }

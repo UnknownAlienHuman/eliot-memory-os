@@ -3817,6 +3817,7 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
         frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    delta.frozen_pre_evaluation_digest = Some(must(delta.frozen_digest()));
     must(delta.seal());
     consumer_delta(&view, &delta);
     let mut overlay = CampaignHarnessOverlayCandidate {
@@ -3937,6 +3938,7 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
         frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    activation.frozen_pre_evaluation_digest = Some(overlay.frozen_digest());
     must(activation.seal());
     must(activation.validate_against_lineage(&view, &delta, &overlay));
     let mut assessment = LearningAssessmentCandidate {
