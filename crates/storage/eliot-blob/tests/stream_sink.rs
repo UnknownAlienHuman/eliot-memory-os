@@ -2560,3 +2560,112 @@ fn seam_matrix_stages_and_reads_through_a_real_directory() {
 
     ok(std::fs::remove_dir_all(&dir));
 }
+
+/// Source: `BoundedPreviewDigest::absorb` + `check_preview`
+/// (`src/stream_sink.rs`): a source longer than the session preview ceiling
+/// finalizes with an HONEST truncated preview — the retained head window the
+/// accumulator kept, the full represented length, and the explicit omitted
+/// suffix range — never a refused finalize and never a preview that claims
+/// bytes it does not hold.
+/// Discovery: the accumulator used to release the retained bytes the moment
+/// the ceiling was hit while its digest kept growing over everything, so the
+/// only preview that could ever finalize was the complete one — and any
+/// source longer than the ceiling (which `max_total_admitted_bytes` allows to
+/// be far longer than `max_preview_bytes`) was unfinalizable. The port model
+/// already describes exactly this shape (`omitted_suffix`: retained head plus
+/// an explicit omitted suffix), so the adapter keeps the head window and its
+/// digest covers exactly that window; `check_preview` then matches the
+/// request against the kept window, and the measures state the omission
+/// instead of hiding it.
+/// Executed-pass: 64 bytes are admitted under a 16-byte preview ceiling, then
+/// finalized with the 16-byte head preview for all 64: the terminal is
+/// `CompleteSource`, the measures retain 16, represent 64, omit exactly
+/// `[16, 64)`, and digest exactly the retained head — while the transport and
+/// the published object still cover all 64.
+/// I05-12: one active root owner; the ceiling comes from the pinned session
+/// limits, so the window the caller must present is the window the session
+/// states.
+// WORK_UNIT_CASE: 297/A5
+#[test]
+fn truncated_preview_finalizes_with_honest_omitted_suffix() {
+    const ALL: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(ALL.len(), 64);
+    const HEAD: usize = 16;
+    let root = unique_test_root();
+    let platform = FixturePlatform::default();
+    let store = store_with_platform(platform, &root);
+    let limits = ok(ProcessStreamSinkLimits::new(
+        64, 8192, 256, 16, 8, 8192, 10, 20, 20,
+    ));
+    let (sink, session) = open_sink_on_store_with_limits("truncated-preview", &root, store, limits);
+    for sequence in 0..8 {
+        let start = (sequence * 8) as usize;
+        assert_disposition(
+            ok(append_chunk(
+                &sink,
+                &session,
+                sequence as u64,
+                (start) as u64,
+                &ALL[start..start + 8],
+            )),
+            ProcessStreamSinkAppendDisposition::Accepted {
+                next_sequence: sequence as u64 + 1,
+                next_offset: (start + 8) as u64,
+            },
+        );
+    }
+
+    let expected_sha256 = format!("{:x}", Sha256::digest(ALL));
+    let expected_head_sha256 = format!("{:x}", Sha256::digest(&ALL[..HEAD]));
+    let finalize = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        8,
+        64,
+        10,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        64,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            ALL[..HEAD].to_vec(),
+            64,
+        )),
+        None,
+        Vec::new(),
+    ));
+    let terminal = ok(block_on(sink.finalize(session.clone(), finalize)));
+    assert!(terminal.validate().is_ok());
+    assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+
+    // The published object still covers all 64 admitted bytes: truncation
+    // touches the preview measures only, never the source.
+    let complete = match sink.publication() {
+        Some(BlobStreamPublication::Complete(complete)) => complete,
+        other => panic!("a truncated preview still publishes its source, got {other:?}"),
+    };
+    assert_eq!(complete.byte_length, 64);
+    assert_eq!(complete.sha256, expected_sha256);
+    assert_eq!(
+        complete.locator,
+        format!("blob:{}", blake3::hash(ALL).to_hex()),
+        "the published locator is the content hash of all admitted bytes"
+    );
+
+    // The measures state the omission instead of hiding it: 16 retained of 64
+    // represented, exactly the suffix [16, 64) omitted, digested over exactly
+    // the retained head.
+    assert_eq!(complete.measures.bounded_preview.retained_byte_count, 16);
+    assert_eq!(complete.measures.bounded_preview.represented_byte_count, 64);
+    assert_eq!(complete.measures.bounded_preview.omitted_ranges.len(), 1);
+    assert_eq!(
+        complete.measures.bounded_preview.omitted_ranges[0].start(),
+        16
+    );
+    assert_eq!(
+        complete.measures.bounded_preview.omitted_ranges[0].end_exclusive(),
+        64
+    );
+    assert_eq!(
+        complete.measures.bounded_preview.sha256,
+        expected_head_sha256
+    );
+}

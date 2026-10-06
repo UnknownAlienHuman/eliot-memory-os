@@ -798,24 +798,30 @@ impl BoundedPreviewDigest {
 
     /// Folds one admitted chunk into the bounded preview.
     ///
-    /// While the retained prefix is still within the ceiling the bytes are kept
-    /// as well as hashed; once the ceiling is reached the retained bytes are
-    /// released and only the digest keeps growing. The digest therefore always
-    /// covers exactly the retained bytes the preview ends up representing, and
-    /// the accumulated preview cost never exceeds the session ceiling.
+    /// Only the head window fits: the first `ceiling` admitted bytes are kept
+    /// as well as hashed, and everything past the ceiling is dropped on the
+    /// floor — never retained, never digested. The digest therefore always
+    /// covers exactly the retained head the preview ends up representing (the
+    /// port's `omitted_suffix` model: retained head plus an explicit omitted
+    /// suffix range), and the accumulated preview cost never exceeds the
+    /// session ceiling. A caller that presents a shorter honest head is still
+    /// refused by `check_preview`: the terminal preview must name the exact
+    /// window this accumulator kept, so two finalizes can never describe the
+    /// same bytes with different retained lengths.
     fn absorb(&mut self, bytes: &[u8], ceiling: u64) {
-        self.state.update(bytes);
-        let admitted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if self.truncated_at_ceiling {
             return;
         }
-        if self.retained_bytes.saturating_add(admitted) > ceiling {
+        let room = ceiling.saturating_sub(self.retained_bytes);
+        let take = usize::try_from(room.min(u64::try_from(bytes.len()).unwrap_or(u64::MAX)))
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        self.state.update(&bytes[..take]);
+        self.retained.extend_from_slice(&bytes[..take]);
+        self.retained_bytes = self.retained_bytes.saturating_add(take as u64);
+        if take < bytes.len() {
             self.truncated_at_ceiling = true;
-            self.retained = Vec::new();
-            return;
         }
-        self.retained.extend_from_slice(bytes);
-        self.retained_bytes = self.retained_bytes.saturating_add(admitted);
     }
 
     fn digest(&self) -> String {
