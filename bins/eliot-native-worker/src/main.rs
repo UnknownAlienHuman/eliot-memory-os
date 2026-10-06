@@ -144,12 +144,10 @@ fn run() -> i32 {
             ));
         }
     };
-    let working_directory = match executable.parent() {
-        Some(directory) => directory.to_path_buf(),
-        None => {
-            return deny_invalid_material("dispatch executable has no parent directory");
-        }
+    let Some(directory) = executable.parent() else {
+        return deny_invalid_material("dispatch executable has no parent directory");
     };
+    let working_directory = directory.to_path_buf();
     let intent =
         match derive_admitted_intent(&material, &selection, &executable, &working_directory) {
             Ok(intent) => intent,
@@ -216,19 +214,14 @@ fn run() -> i32 {
     // presentation denies. An absent section keeps the gates' missing-permit
     // refusal — no permit is ever minted or caller-shaped here.
     if let Some(carried) = material.capacity_permit.as_ref() {
-        match KernelSessionCapacityAuthority::new(shared.clone(), claim) {
-            Ok(session) => {
+        let (binding, request) = (&carried.binding, &carried.request);
+        let admission =
+            KernelSessionCapacityAuthority::new(shared.clone(), claim).and_then(|session| {
                 let authority: CapacityAuthorityLink = Arc::new(session);
-                if let Err(error) = worker.admit_capacity_permit_verified(
-                    &carried.binding,
-                    &carried.request,
-                    now,
-                    authority,
-                ) {
-                    return deny_invalid_material(&error.to_string());
-                }
-            }
-            Err(error) => return deny_invalid_material(&error.to_string()),
+                worker.admit_capacity_permit_verified(binding, request, now, authority)
+            });
+        if let Err(error) = admission {
+            return deny_invalid_material(&error.to_string());
         }
     }
     drive_admitted_material(&mut lifecycle, &mut worker, &material, process, &admission)
@@ -1969,7 +1962,7 @@ mod tests {
     /// R2-owners/W5): the operation, requester generation, and epoch bind
     /// the presenting claim; the owner generation/profile name the issuing
     /// owner facts the live lookup checks currency against. The window
-    /// strictly covers the claim deadline (4_000_000_000_000), mirroring
+    /// strictly covers the claim deadline (`4_000_000_000_000`), mirroring
     /// the executable-binding deadline-before-expiry rule.
     fn capacity_pair_for(
         operation: &str,
@@ -2190,7 +2183,8 @@ mod tests {
             "profile_id": binding.profile_id.as_str(),
             "profile_revision": binding.profile_revision.as_str(),
             "authority_epoch": 1,
-            "bottleneck": serde_json::to_value(&binding.bottleneck).expect("bottleneck wire"),
+            "bottleneck": serde_json::to_value(binding.bottleneck)
+                .unwrap_or_else(|error| panic!("bottleneck wire: {error}")),
         })
     }
 
@@ -2736,14 +2730,10 @@ mod tests {
                 process,
             ))
         };
-        let (actions, error) = match failure {
-            Ok(_) => panic!("a refused readiness submit must fail the drive"),
-            Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) => {
-                (actions, error)
-            }
-            Err(eliot_native_worker::GovernedDriveFailure::RefusedBeforeDrive(error)) => {
-                panic!("admission must precede the drive, got {error:?}")
-            }
+        let Err(eliot_native_worker::GovernedDriveFailure::PartialDrive { actions, error }) =
+            failure
+        else {
+            panic!("readiness must fail after admission, got {failure:?}");
         };
         assert!(
             matches!(
