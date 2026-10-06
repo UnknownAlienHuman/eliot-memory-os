@@ -41602,4 +41602,108 @@ mod bridge_handoff_retirement_2731 {
         let _ = std::fs::remove_file(path);
         Ok(())
     }
+
+    #[test]
+    fn maintenance_scans_without_resetting_or_disposing() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Issue #2731 item I4: maintenance over a stalled cursor (staged
+        // handoffs, no acknowledgement, nothing reconciled) runs its
+        // bounded retire/repair slices, reports continuation, and moves no
+        // cursor sequence backward while disposing nothing.
+        let (store, path) = temp_retire_store();
+        let mut namespace = String::new();
+        for index in 1..=3_u64 {
+            let tag = format!("mnt-2731-{index:05}");
+            let outcome = store
+                .stage_bridge_event_checked(&staged_event_payload(index, &tag))
+                .map_err(|error| format!("stage {index} must succeed, got {error:?}"))?;
+            namespace = outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("staged outcome must carry its owner namespace")?
+                .to_owned();
+        }
+        let snapshot =
+            |store: &RedbRecoveryStore| -> Result<(u64, u64, u64, u64, u64, u64), OrsError> {
+                let read = store.database.begin_write().map_err(storage)?;
+                let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+                let cursor: BridgeEventCursorRow = cursors
+                    .get(namespace.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_cursor",
+                        reason: "staged stream must retain its position cursor".to_owned(),
+                    })?;
+                let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                Ok((
+                    cursor.last_observed_sequence,
+                    cursor.last_durable_sequence,
+                    cursor.last_acked_sequence,
+                    cursor.last_compacted_sequence,
+                    records.len().map_err(storage)?,
+                    handoffs.len().map_err(storage)?,
+                ))
+            };
+        let before = snapshot(&store)?;
+        assert_eq!(
+            before.0, 3,
+            "three staged events must observe sequence 3 before maintenance"
+        );
+        let maintained = store.maintain_bridge_event_handoffs_for_owner_checked(&json!({
+            "owner_authority_lineage": RETIRE_LINEAGE_2731,
+            "owner_principal": "principal-2731",
+        }))?;
+        assert_eq!(
+            maintained
+                .get("owner_maintenance_continuation")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "one idle owner must complete with no continuation"
+        );
+        let processed = maintained
+            .get("owners_processed")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("maintenance must report its processed owners")?;
+        let item = processed
+            .iter()
+            .find(|entry| {
+                entry.get("namespace").and_then(serde_json::Value::as_str)
+                    == Some(namespace.as_str())
+            })
+            .ok_or("maintenance must process the staged stream namespace")?;
+        assert!(
+            item.get("retired")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+                && item
+                    .get("repaired")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+            "the per-owner item must carry its bounded retire/repair slice counts"
+        );
+        let after = snapshot(&store)?;
+        assert_eq!(
+            after.0, before.0,
+            "maintenance must never reset last_observed_sequence"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "maintenance must never reset last_durable_sequence"
+        );
+        assert_eq!(
+            after.2, before.2,
+            "maintenance must never reset last_acked_sequence"
+        );
+        assert_eq!(
+            after.3, before.3,
+            "maintenance must never advance last_compacted_sequence"
+        );
+        assert_eq!(after.4, before.4, "maintenance must dispose no record row");
+        assert_eq!(after.5, before.5, "maintenance must dispose no handoff row");
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }
