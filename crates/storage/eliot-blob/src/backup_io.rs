@@ -14,9 +14,10 @@
 
 use eliot_blob_api::{
     BLOB_BACKUP_GENESIS, BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage,
-    BlobBackupPartial, BlobBackupScope, BlobError, BlobId, BlobLocator, BlobRootLease,
-    CryptoDescriptor, ObjectResidencyKey, PageCompletion, SealedBlobCaptureRecord,
+    BlobBackupPartial, BlobBackupScope, BlobError, BlobId, BlobLocator, BlobReadRequest,
+    BlobRootLease, CryptoDescriptor, ObjectResidencyKey, PageCompletion, SealedBlobCaptureRecord,
 };
+use std::collections::BTreeMap;
 
 use super::{AeadOpenRequest, AeadSealRequest, BlobAeadPort, BlobKeyPort, BlobKeySelection};
 use sha2::{Digest, Sha256};
@@ -306,6 +307,30 @@ pub struct CapturePorts<'a> {
     pub key_port: &'a mut dyn BlobKeyPort,
     /// Envelope seal/open owner proving key possession per member.
     pub aead: &'a mut dyn BlobAeadPort,
+}
+
+/// One store-driven backup capture: every input [`run_capture`] needs, with
+/// the caller-held verified-read requests keyed by locator hash.
+///
+/// The [`BlobStoreService`](super::BlobStoreService) production entry builds
+/// this from the fence plus the read requests its caller assembled at stage
+/// time. The store never scans for members: a fenced locator without a
+/// request refuses as not found.
+pub struct BackupCaptureRequest<'a> {
+    /// Exact finite member set to account for.
+    pub fence: &'a BlobBackupFence,
+    /// Retained source lease the denominator is read under.
+    pub source_lease: &'a BlobRootLease,
+    /// Admitted isolated destination the evidence binds to.
+    pub scope: &'a BlobBackupScope,
+    /// Live destination lease re-verified against the scope.
+    pub lease: &'a BlobRootLease,
+    /// Destination crypto binding re-verified against the scope.
+    pub crypto: &'a CryptoDescriptor,
+    /// Destination residency identity re-verified against the scope.
+    pub residency: &'a ObjectResidencyKey,
+    /// Caller-held verified-read requests by locator hash hex.
+    pub reads: &'a BTreeMap<String, BlobReadRequest>,
 }
 
 /// Mid-page interruption: the completed member prefix is preserved with the

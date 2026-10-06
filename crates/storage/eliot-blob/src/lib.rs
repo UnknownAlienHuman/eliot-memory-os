@@ -45,12 +45,12 @@ pub use eliot_blob_api::{
 };
 pub mod backup_io;
 pub use backup_io::{
-    BACKUP_MAX_PLAINTEXT_BYTES, BackupCleanupPort, BackupMemberState, BackupPlaintextSource,
-    BackupSealedSink, CaptureOutcome, CapturePorts, ConsumerEvidencePack, DispositionCleanup,
-    DispositionDurability, DispositionValidation, ExportedPage, MemberDisposition, PageInterrupt,
-    ResidencyDisposition, RestoreBinding, SealedMember, bind_restore_set, complete_export,
-    export_page, open_member, run_capture, seal_associated_data, seal_member, seal_nonce_context,
-    verify_capture_record, verify_destination_scope,
+    BACKUP_MAX_PLAINTEXT_BYTES, BackupCaptureRequest, BackupCleanupPort, BackupMemberState,
+    BackupPlaintextSource, BackupSealedSink, CaptureOutcome, CapturePorts, ConsumerEvidencePack,
+    DispositionCleanup, DispositionDurability, DispositionValidation, ExportedPage,
+    MemberDisposition, PageInterrupt, ResidencyDisposition, RestoreBinding, SealedMember,
+    bind_restore_set, complete_export, export_page, open_member, run_capture, seal_associated_data,
+    seal_member, seal_nonce_context, verify_capture_record, verify_destination_scope,
 };
 pub mod demand;
 pub mod key_ports;
@@ -5593,6 +5593,137 @@ where
     pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
         self.core.reconcile(lease)
     }
+
+    /// Production backup-capture entry: walks the fenced denominator through
+    /// the live store (issue #956).
+    ///
+    /// Reads each member's plaintext through the core's verified read path
+    /// under the retained source lease, seals it through the service's own
+    /// key/AEAD owners with operation-bound seal context, verifies every
+    /// sealed member by opening it, stages verified members into the
+    /// admitted destination `sink`, and publishes the completion receipt on
+    /// the completed path only. This is the live caller of the backup seam
+    /// ([`run_capture`]): the kernel restore lane drives it with the read
+    /// requests it assembled at stage time and its isolated-destination
+    /// sink — the store never scans for members.
+    pub fn run_backup_capture(
+        &self,
+        request: &BackupCaptureRequest<'_>,
+        sink: &mut dyn BackupSealedSink,
+        cleanup: &mut dyn BackupCleanupPort,
+    ) -> CaptureOutcome {
+        let mut keys = CoreBackupKeys {
+            keys: &self.core.keys,
+        };
+        let mut aead = CoreBackupAead {
+            aead: &self.core.aead,
+        };
+        let mut ports = CapturePorts {
+            key_port: &mut keys,
+            aead: &mut aead,
+        };
+        let mut source = StoreBackupSource {
+            core: &self.core,
+            reads: request.reads,
+        };
+        run_capture(
+            &mut ports,
+            request.fence,
+            request.source_lease,
+            request.scope,
+            request.lease,
+            request.crypto,
+            request.residency,
+            &mut source,
+            sink,
+            cleanup,
+        )
+    }
+}
+
+/// Per-call locking key owner over the service core for one backup capture.
+///
+/// The backup seal proves live lineage possession through the same injected
+/// port the store reads through. Locks are held per call — never across the
+/// capture walk — so verified reads inside the walk cannot deadlock against
+/// the seal.
+struct CoreBackupKeys<'a, K> {
+    keys: &'a RwLock<K>,
+}
+
+impl<K: BlobKeyPort> BlobKeyPort for CoreBackupKeys<'_, K> {
+    fn current(&mut self) -> Result<BlobKeySelection, BlobError> {
+        self.keys
+            .write()
+            .map_err(|_| BlobError::Provider("blob backup key lock".to_owned()))?
+            .current()
+    }
+
+    fn resolve(&self, descriptor: &CryptoDescriptor) -> Result<BlobKeySelection, BlobError> {
+        self.keys
+            .read()
+            .map_err(|_| BlobError::Provider("blob backup key lock".to_owned()))?
+            .resolve(descriptor)
+    }
+}
+
+/// Per-call locking envelope owner over the service core for one backup
+/// capture. Same per-call discipline as [`CoreBackupKeys`].
+struct CoreBackupAead<'a, A> {
+    aead: &'a RwLock<A>,
+}
+
+impl<A: BlobAeadPort> BlobAeadPort for CoreBackupAead<'_, A> {
+    fn seal(&mut self, request: AeadSealRequest<'_>) -> Result<Vec<u8>, BlobError> {
+        self.aead
+            .write()
+            .map_err(|_| BlobError::Provider("blob backup AEAD lock".to_owned()))?
+            .seal(request)
+    }
+
+    fn open(&self, request: AeadOpenRequest<'_>) -> Result<Vec<u8>, BlobError> {
+        self.aead
+            .read()
+            .map_err(|_| BlobError::Provider("blob backup AEAD lock".to_owned()))?
+            .open(request)
+    }
+}
+
+/// Store-backed admitted plaintext source for one backup capture.
+///
+/// Resolves fenced locators to live plaintext through the service core's
+/// verified read path. A request whose lease generation moved past the
+/// retained source lease refuses as stale instead of serving replaced
+/// bytes; a fenced locator without a caller-held request refuses as not
+/// found.
+struct StoreBackupSource<'a, P, C, K, A, L> {
+    core: &'a BlobStoreCore<P, C, K, A, L>,
+    reads: &'a BTreeMap<String, BlobReadRequest>,
+}
+
+impl<P, C, K, A, L> BackupPlaintextSource for StoreBackupSource<'_, P, C, K, A, L>
+where
+    P: BlobPlatformPort,
+    C: BlobCompressionPort,
+    K: BlobKeyPort,
+    A: BlobAeadPort,
+    L: BlobLiveSetPort,
+{
+    fn fetch(
+        &mut self,
+        lease: &BlobRootLease,
+        locator: &BlobLocator,
+    ) -> Result<Vec<u8>, BlobError> {
+        locator.validate()?;
+        let Some(request) = self.reads.get(locator.hash.as_str()) else {
+            return Err(BlobError::NotFound);
+        };
+        if request.root_lease.root_generation != lease.root_generation {
+            return Err(BlobError::StaleFence);
+        }
+        let (_, plaintext, _) = self.core.read_verified(request)?;
+        Ok(plaintext)
+    }
 }
 
 impl<P, C, K, A, L> BlobStoreClient for BlobStoreService<P, C, K, A, L>
@@ -5715,7 +5846,10 @@ fn map_resolve_key_error(
 mod tests {
     use super::*;
     use eliot_blob_api::LiveSetCompleteness;
-    use eliot_blob_api::{ObjectResidencyKey, VersionedContentDigest};
+    use eliot_blob_api::{
+        BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupScope, ObjectResidencyKey,
+        VersionedContentDigest,
+    };
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::pin::Pin;
@@ -7075,6 +7209,105 @@ mod tests {
             },
         )
         .expect("owner-bound store")
+    }
+
+    struct BackupTestSink {
+        staged: usize,
+        published: usize,
+    }
+
+    impl BackupSealedSink for BackupTestSink {
+        fn stage(
+            &mut self,
+            scope: &BlobBackupScope,
+            binding: &RestoreBinding,
+            _sealed: &[u8],
+        ) -> Result<(), BlobError> {
+            if binding.residency_digest() != scope.residency_digest() {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            self.staged += 1;
+            Ok(())
+        }
+
+        fn publish_completion(
+            &mut self,
+            _scope: &BlobBackupScope,
+            _receipt: &BlobBackupCompletionReceipt,
+        ) -> Result<(), BlobError> {
+            self.published += 1;
+            Ok(())
+        }
+    }
+
+    struct BackupTestCleanup;
+
+    impl BackupCleanupPort for BackupTestCleanup {
+        fn discard_unverified(&mut self, _sealed: &[u8]) -> Result<(), BlobError> {
+            Ok(())
+        }
+    }
+
+    /// Production path for issue #956: the live store seals its own staged
+    /// bytes into the backup envelope and issues the completion receipt.
+    ///
+    /// Entry chain: [`BlobStoreService::run_backup_capture`] -> the store's
+    /// verified read path -> [`run_capture`] -> the service's own key/AEAD
+    /// owners -> the admitted sink. No helper in this chain runs without
+    /// this caller.
+    #[test]
+    fn backup_capture_walks_the_live_store_to_a_receipt() {
+        let root = unique_test_root();
+        let store = store_on(&root);
+        let ready = block_on(store.stage(stage_request("backup-stage", b"backup-member", &root)))
+            .expect("stage");
+        let read_back = read_request(&ready, "backup-read", &root);
+        let locator = read_back.locator.clone();
+        let crypto = test_key(3).crypto;
+        let lease = lease_on(&read_back.context, &root);
+        let scope = BlobBackupScope::issue(&lease, &crypto, &locator.residency).expect("scope");
+        let fence = BlobBackupFence::fence(
+            "backup-op-1".to_owned(),
+            locator.root_generation,
+            vec![locator.clone()],
+            8,
+            1 << 20,
+            1 << 30,
+        )
+        .expect("fence");
+        let mut requests = BTreeMap::new();
+        requests.insert(locator.hash.as_str().to_owned(), read_back);
+        let request = BackupCaptureRequest {
+            fence: &fence,
+            source_lease: &lease,
+            scope: &scope,
+            lease: &lease,
+            crypto: &crypto,
+            residency: &locator.residency,
+            reads: &requests,
+        };
+        let mut sink = BackupTestSink {
+            staged: 0,
+            published: 0,
+        };
+        let mut cleanup = BackupTestCleanup;
+        match store.run_backup_capture(&request, &mut sink, &mut cleanup) {
+            CaptureOutcome::Completed {
+                receipt,
+                evidence,
+                staged_members,
+                ..
+            } => {
+                assert_eq!(receipt.member_count(), 1);
+                assert_eq!(staged_members, 1);
+                assert_eq!(evidence.bindings().len(), 1);
+                assert_eq!(sink.staged, 1);
+                assert_eq!(sink.published, 1);
+            }
+            CaptureOutcome::Interrupted { cause, .. } => {
+                panic!("live capture must complete: {cause:?}")
+            }
+        }
     }
 
     #[test]
