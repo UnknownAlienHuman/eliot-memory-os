@@ -235,12 +235,37 @@ fn matrix() -> Value {
     ])
 }
 
-fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransition {
+/// Admissible canonical-payload subjects (issue #10, W2/A2): the retained
+/// historical truncation inputs and outputs plus adversarial variants. Every
+/// entry is admissible `Subject` text (non-blank, no control characters), so
+/// each one travels the full canonical write/read/export path below.
+/// Inadmissible matrix values (blank, control characters, non-strings) stay
+/// at the transport codec level in [`assert_codec`]: they are refused by the
+/// closed `Subject` shape, never smuggled through another parameter.
+fn matrix_subjects() -> [&'static str; 13] {
+    [
+        "memory:operator-runtime-proof",
+        "observation:f31e5b3f-7f0b-4ca2-9a4e-1f7c6d89b240",
+        "observation:f31e5b3f",
+        "memory:operator",
+        "sha256:abc-def-0123456789",
+        "sha256:abc",
+        "collective:550e8400-e29b-41d4-a716-446655440000:message-with-suffix",
+        "scope:scope",
+        "https://example.test/a-b?q=x:y",
+        r"C:\test\path-with-hyphen",
+        "雪🦀",
+        "\"; THROW 'injected'; --",
+        "[record:value]",
+    ]
+}
+
+fn transition(ctx: &RequestMeta, index: usize, authority: &ExactJsonBytes) -> PreparedTransition {
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
-            operation_id: OperationId::new("issue10-write").expect("operation"),
-            idempotency_key: "issue10-idempotency".into(),
+            operation_id: OperationId::new(format!("issue10-write-{index}")).expect("operation"),
+            idempotency_key: format!("issue10-idempotency-{index}"),
             canonical_request_hash: "a".repeat(64),
         },
         state_fence: ctx.state_fence.clone(),
@@ -283,6 +308,7 @@ fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransiti
 async fn assert_readback(
     adapter: &SurrealStoreAdapter,
     ctx: &RequestMeta,
+    subject: &str,
     authority: &ExactJsonBytes,
     receipt: &WriteReceipt,
 ) {
@@ -307,8 +333,8 @@ async fn assert_readback(
             consistency: ReadConsistency::ExactFence,
             state_fence: ctx.state_fence.clone(),
             parameters: BTreeMap::from([
-                ("subject".into(), json!("memory:operator-runtime-proof")),
-                ("max_records".into(), json!("8")),
+                ("subject".into(), json!(subject)),
+                ("max_records".into(), json!("16")),
             ]),
         })
         .await
@@ -454,46 +480,63 @@ async fn real_surreal_payload_commit_exact_read_reopen_and_export() {
         )
         .await
         .expect("baseline schema");
-    let raw = " {\n  \"subject\": \"memory:operator-runtime-proof\"\n } ";
-    let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw.as_bytes())
-        .expect("exact authority");
-    let transition = transition(&ctx, &authority);
-    let receipt = harness
-        .adapter()
-        .apply_prepared_with_authority(
-            &ctx,
-            transition.clone(),
-            Vec::new(),
-            Vec::new(),
-            &[Some(authority.clone())],
-        )
-        .await
-        .expect("real canonical transaction");
-    assert_eq!(receipt.status, WriteReceiptStatus::Committed);
-    assert_readback(harness.adapter(), &ctx, &authority, &receipt).await;
-    assert_eq!(
-        harness
+    // W2/A2: every admissible historical/adversarial subject travels the full
+    // canonical write/commit/direct-read/evidence-pack path with exact
+    // equality, not just the transport codec matrix above.
+    let mut committed: Vec<(&str, ExactJsonBytes, WriteReceipt)> = Vec::new();
+    for (index, subject) in matrix_subjects().into_iter().enumerate() {
+        let raw =
+            serde_json::to_string(&serde_json::json!({"subject": subject})).expect("subject json");
+        let authority =
+            ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw.as_bytes())
+                .expect("exact authority");
+        let transition = transition(&ctx, index, &authority);
+        let receipt = harness
             .adapter()
             .apply_prepared_with_authority(
                 &ctx,
-                transition,
+                transition.clone(),
                 Vec::new(),
                 Vec::new(),
-                &[Some(authority.clone())]
+                &[Some(authority.clone())],
             )
             .await
-            .expect("exact replay"),
-        receipt
-    );
+            .expect("real canonical transaction");
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        if index == 0 {
+            assert_eq!(
+                harness
+                    .adapter()
+                    .apply_prepared_with_authority(
+                        &ctx,
+                        transition,
+                        Vec::new(),
+                        Vec::new(),
+                        &[Some(authority.clone())]
+                    )
+                    .await
+                    .expect("exact replay"),
+                receipt
+            );
+        }
+        committed.push((subject, authority, receipt));
+    }
+    for (subject, authority, receipt) in &committed {
+        assert_readback(harness.adapter(), &ctx, subject, authority, receipt).await;
+    }
     harness.close().await;
     harness.open().await;
-    assert_readback(harness.adapter(), &ctx, &authority, &receipt).await;
+    for (subject, authority, receipt) in &committed {
+        assert_readback(harness.adapter(), &ctx, subject, authority, receipt).await;
+    }
     harness.transfer("export", "original").await;
     harness.transfer("import", "restored").await;
     harness.close().await;
     harness.config.database = "restored".into();
     harness.open().await;
-    assert_readback(harness.adapter(), &ctx, &authority, &receipt).await;
+    for (subject, authority, receipt) in &committed {
+        assert_readback(harness.adapter(), &ctx, subject, authority, receipt).await;
+    }
     harness.close().await;
     std::fs::remove_dir_all(&harness.root).expect("remove isolated test root");
 }
