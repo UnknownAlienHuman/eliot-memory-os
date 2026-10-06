@@ -65,7 +65,8 @@ use eliot_process::{
     ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest, ProcessStreamSinkLimits,
     ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback, ProcessStreamSinkSession,
     ProcessStreamSinkSessionId, ProcessStreamSinkSourceId, ProcessStreamSinkState,
-    ProcessStreamSinkTerminalId, StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
+    ProcessStreamSinkTerminalId, ProcessStreamSinkUnknownOutcome, StreamEvidenceGap,
+    StreamPersistenceStatus, StreamTransportStatus,
 };
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
 
@@ -1029,38 +1030,55 @@ fn replay_limits() -> ProcessStreamSinkLimits {
 /// three times. Only the labels differ, so each case owns a disjoint root and a
 /// disjoint session/source/terminal identity.
 fn open_replay_sink(case: &str) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
-    let (_, sink, session) = open_observed_sink(case);
+    let (_, _, sink, session) = open_observed_sink(case);
     (sink, session)
 }
 
 /// The store, binding, sink and open request the replay cases share, plus the
-/// platform handle behind the store so a case can observe durable effects.
+/// platform and store handles behind the sink.
 ///
 /// `FixturePlatform` clones over one shared `Arc<Mutex<FaultState>>`, so the
 /// returned handle observes every durable write the sink's store performs —
-/// including writes the sink was never supposed to make. `open_replay_sink`
-/// is this same construction without the observation handle.
+/// including writes the sink was never supposed to make. The store handle
+/// lets a case attach a SECOND adapter to the same owner (a restart without
+/// retained proof), which `open_replay_sink` cannot express. Both helpers
+/// build on `open_sink_on_store`, so no case restates the construction.
 fn open_observed_sink(
     case: &str,
 ) -> (
     FixturePlatform,
+    FixtureStore,
     BlobStoreStreamSink<FixtureStore>,
     ProcessStreamSinkSession,
 ) {
     let root = unique_test_root();
     let platform = FixturePlatform::default();
     let platform_handle = platform.clone();
-    // The ONE active root owner of this case; the sink receives a clone of this
-    // shared handle, never a second construction on the same root.
+    // The ONE active root owner of this case; every sink below receives a
+    // clone of this shared handle, never a second construction on the same
+    // root.
     let store = store_with_platform(platform, &root);
+    let (sink, session) = open_sink_on_store(case, &root, store.clone());
+    (platform_handle, store, sink, session)
+}
 
+/// Binds one sink session to an existing store and opens it.
+///
+/// The binding lease names the store's own root, so a second adapter on the
+/// same store observes the same owner without claiming the root twice. Only
+/// the labels differ per `case`, so each session owns disjoint identities.
+fn open_sink_on_store(
+    case: &str,
+    root: &str,
+    store: FixtureStore,
+) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
     let stage_context = receipt_context(&format!("sink-{case}-stage"));
     let read_context: BlobReceiptContext = ok(serde_json::from_str(&context_json(
         "READ",
         &format!("sink-{case}-read"),
         &format!("request-sink-{case}-read"),
     )));
-    let root_lease = lease_for(&stage_context, &root);
+    let root_lease = lease_for(&stage_context, root);
     let (_, residency_template) = residency(b"");
     let binding = ok(BlobStreamSinkStoreBinding::new(
         root_lease,
@@ -1124,7 +1142,7 @@ fn open_observed_sink(
         ProcessStreamDigestAlgorithm::Sha256,
     ));
     let session = ok(block_on(sink.open(open)));
-    (platform_handle, sink, session)
+    (sink, session)
 }
 
 /// Counts every durable write the platform has performed.
@@ -1778,7 +1796,7 @@ fn prohibition_and_redaction_failure_stage_nothing() {
     let expected_sha256 = format!("{:x}", Sha256::digest(SECRET));
 
     // Finalize half: a policy-prohibited finalize withholds, never publishes.
-    let (platform, sink, session) = open_observed_sink("policy-deny");
+    let (platform, _, sink, session) = open_observed_sink("policy-deny");
     assert_disposition(
         ok(append_chunk(&sink, &session, 0, 0, &SECRET[..8])),
         ProcessStreamSinkAppendDisposition::Accepted {
@@ -1823,7 +1841,7 @@ fn prohibition_and_redaction_failure_stage_nothing() {
     );
 
     // Abort half: a failed-redaction abort mints its terminal, stages nothing.
-    let (platform, sink, session) = open_observed_sink("redaction-deny");
+    let (platform, _, sink, session) = open_observed_sink("redaction-deny");
     assert_disposition(
         ok(append_chunk(&sink, &session, 0, 0, SECRET)),
         ProcessStreamSinkAppendDisposition::Accepted {
@@ -1863,5 +1881,125 @@ fn prohibition_and_redaction_failure_stage_nothing() {
         durable_write_counts(&platform),
         before,
         "a failed-redaction abort issues no durable write: no stage ran"
+    );
+}
+
+/// Source: `reconcile_async` + `record_locked` (`src/stream_sink.rs`): a
+/// same-identity finalize replay resolves the recorded terminal instead of
+/// minting a second object, and a reconcile without the retained reservation
+/// proof refuses instead of inventing a terminal.
+/// Discovery: after an interruption the only honest resume is the retained
+/// command re-driven against the retained proof. Re-running the same finalize
+/// must therefore settle on the SAME object (same locator, same terminal
+/// digest, no second stage), while a brand-new adapter — same owner, same
+/// store, but no reservation and no uncertainty proof — must never answer
+/// `COMPLETE_SOURCE`: its readback is a session view and its reconcile is a
+/// refusal.
+/// Executed-pass: one session publishes, then finalizes the identical request
+/// again (same terminal, same locator, no new durable write); a second
+/// adapter on the same store then opens a fresh session, reads back a bare
+/// session view, and fails a fabricated-uncertainty reconcile with
+/// `ProviderUnavailable`.
+/// I05-12: one active root owner; the owner still holds the object, but the
+/// adapter claims only what it retained.
+// WORK_UNIT_CASE: 297/A7
+#[test]
+fn repeat_finalize_reuses_object_and_fresh_adapter_holds_no_proof() {
+    const ALL: &[u8] = b"a7-restart";
+    let all_len = ALL.len() as u64;
+    let expected_sha256 = format!("{:x}", Sha256::digest(ALL));
+
+    // Half one: publish through the first adapter on its own owner.
+    let root = unique_test_root();
+    let platform = FixturePlatform::default();
+    let platform_handle = platform.clone();
+    let store = store_with_platform(platform, &root);
+    let (sink, session) = open_sink_on_store("restart-pub", &root, store.clone());
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, &ALL[..4])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: 4,
+        },
+    );
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 1, 4, &ALL[4..])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 2,
+            next_offset: all_len,
+        },
+    );
+    let finalize = || {
+        ok(ProcessStreamSinkFinalizeRequest::new(
+            session.terminal_id().clone(),
+            2,
+            all_len,
+            10,
+            StreamTransportStatus::Complete,
+            expected_sha256.clone(),
+            all_len,
+            ok(ProcessStreamPrefixPreview::from_transport_prefix(
+                ALL.to_vec(),
+                all_len,
+            )),
+            None,
+            Vec::new(),
+        ))
+    };
+    let first = ok(block_on(sink.finalize(session.clone(), finalize())));
+    assert_eq!(first.state(), ProcessStreamSinkState::CompleteSource);
+    let locator = match sink.publication() {
+        Some(BlobStreamPublication::Complete(complete)) => complete.locator.clone(),
+        other => panic!("a published source records its object, got {other:?}"),
+    };
+
+    // The identical finalize replays the recorded terminal: same digest, same
+    // locator, and — observed on the shared platform — no second stage.
+    let before = durable_write_counts(&platform_handle);
+    let second = ok(block_on(sink.finalize(session.clone(), finalize())));
+    assert_eq!(
+        durable_write_counts(&platform_handle),
+        before,
+        "a same-identity replay stages nothing: the object already exists"
+    );
+    assert_eq!(
+        second.terminal_sha256(),
+        first.terminal_sha256(),
+        "a same-identity finalize replay resolves the recorded terminal"
+    );
+    match sink.publication() {
+        Some(BlobStreamPublication::Complete(complete)) => assert_eq!(
+            complete.locator, locator,
+            "the replay reuses the one published object, never a second one"
+        ),
+        other => panic!("the publication still names its object, got {other:?}"),
+    }
+
+    // Half two: a brand-new adapter on the SAME store holds no proof. Its
+    // session is bare, its readback is a session view, and a reconcile
+    // carrying a fabricated uncertainty — well-formed and bound to this
+    // session, but never issued by any reservation — is refused instead of
+    // inventing a `COMPLETE_SOURCE` terminal.
+    let (fresh_sink, fresh_session) = open_sink_on_store("restart-clean", &root, store.clone());
+    assert!(
+        fresh_sink.publication().is_none(),
+        "a new adapter retains no publication outcome"
+    );
+    let ProcessStreamSinkReadback::Session { view } =
+        ok(block_on(fresh_sink.readback(fresh_session.clone())))
+    else {
+        panic!("a proof-less session reads back as its session view, never a terminal");
+    };
+    assert_eq!(view.admitted_bytes(), 0);
+    let fabricated = ok(ProcessStreamSinkUnknownOutcome::new(
+        fresh_session.session_id().clone(),
+        fresh_session.terminal_id().clone(),
+        fresh_session.open_request_sha256().to_owned(),
+        "e".repeat(64),
+    ));
+    assert_eq!(
+        block_on(fresh_sink.reconcile(fresh_session.clone(), fabricated)),
+        Err(ProcessStreamSinkError::ProviderUnavailable),
+        "no retained reservation means no reconcile, never a synthesized terminal"
     );
 }
