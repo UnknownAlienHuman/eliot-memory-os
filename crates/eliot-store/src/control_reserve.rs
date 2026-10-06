@@ -832,3 +832,707 @@ impl StoreReserve {
         Ok(row)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    /// Saturating the single normal connection slot leaves the protected
+    /// partition untouched (issue #1679). The positive control comes FIRST and
+    /// its permit is held across the assertions: a reserve that refused
+    /// everything would also refuse normal work, so only an admitted
+    /// cancellation proves the protected slot is genuinely still available
+    /// while ordinary Store writes are being shed. The shedding refusal then
+    /// names the exact bottleneck, so exhaustion of one dimension is never
+    /// reported as global exhaustion.
+    #[test]
+    fn store_normal_connection_saturation_leaves_protected_slot_available() {
+        let reserve = StoreReserve::partitioned(
+            1,
+            2,
+            4,
+            4,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-fill-1",
+            )
+            .expect("first slot");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // slot while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-ctl-1",
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_connections(), 1);
+
+        let err = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-shed-1",
+            )
+            .expect_err("saturated normal partition must refuse");
+        assert!(
+            matches!(err, StoreReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == STORE_CONNECTION_BOTTLENECK)
+        );
+    }
+
+    /// Store pending-write memory is the third Store dimension, so saturating
+    /// the normal pending-write byte partition leaves the protected
+    /// pending-write path available (issue #1679). The positive control comes
+    /// FIRST and its permit is held across the assertions: a reserve that
+    /// refused everything would also refuse normal work, so only an admitted
+    /// cancellation proves the protected byte budget is genuinely still
+    /// available while ordinary Store writes are being shed. The shedding
+    /// refusal then names the exact bottleneck, so exhaustion of one dimension
+    /// is never reported as global exhaustion.
+    #[test]
+    fn store_normal_pending_saturation_leaves_protected_bytes_available() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            4,
+            4,
+            NonZeroU64::new(2).expect("bytes"),
+            NonZeroU64::new(4).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_pending_write_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-pend-fill-1",
+                NonZeroU64::new(2).expect("bytes"),
+            )
+            .expect("normal pending bytes");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // bytes while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_pending_write_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-pend-ctl-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_pending_write_bytes(), 3);
+
+        let err = reserve
+            .try_acquire_normal_pending_write_bytes(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-pend-shed-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect_err("saturated normal pending bytes must refuse");
+        assert!(
+            matches!(err, StoreReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == STORE_PENDING_WRITE_BOTTLENECK)
+        );
+    }
+
+    /// Store transaction slots are the second Store dimension, so saturating
+    /// the normal transaction-slot partition leaves the protected transaction
+    /// path available (issue #1679). The positive control comes FIRST and its
+    /// permit is held across the assertions: a reserve that refused everything
+    /// would also refuse normal work, so only an admitted cancellation proves
+    /// the protected slot is genuinely still available while ordinary Store
+    /// transactions are being shed. The shedding refusal then names the exact
+    /// bottleneck, so exhaustion of one dimension is never reported as global
+    /// exhaustion.
+    #[test]
+    fn store_normal_transaction_saturation_leaves_protected_slot_available() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-fill-1",
+            )
+            .expect("first slot");
+
+        // Positive control, also held: the admitted cancellation keeps its
+        // slot while the normal partition is saturated.
+        let _ctl = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-ctl-1",
+            )
+            .expect("protected path stays open");
+        assert_eq!(reserve.available_protected_transactions(), 1);
+
+        let err = reserve
+            .try_acquire_normal_transaction(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-tx-shed-1",
+            )
+            .expect_err("saturated normal partition must refuse");
+        assert!(
+            matches!(err, StoreReserveError::NormalCapacityExhausted { bottleneck, .. } if bottleneck == STORE_TRANSACTION_BOTTLENECK)
+        );
+    }
+
+    /// The Store owner must publish a live, validated
+    /// [`BottleneckCapacityProfile`] row for the Kernel profile composition to
+    /// join (issue #1679): the row names exactly
+    /// [`STORE_CONNECTION_BOTTLENECK`] with the frozen-map owner, so the
+    /// composition joins real owner evidence rather than a borrowed or
+    /// invented capacity story.
+    #[test]
+    fn store_publish_claimed_row_names_frozen_connection_owner() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // A returned row already passed `row.validate()`, so a contract
+        // failure here would be the fail-closed property itself.
+        let row = reserve
+            .publish_claimed_row(
+                StoreDimension::ConnectionSlots,
+                "gen-7",
+                "proof-store-1",
+                "ev-store-1",
+                "inv-store-1",
+            )
+            .expect("claimed row");
+
+        assert_eq!(row.bottleneck, STORE_CONNECTION_BOTTLENECK);
+        assert_eq!(row.coverage_state, BottleneckCoverageState::Claimed);
+
+        // The owner string is read from the frozen contract rather than
+        // restated here: a hard-coded owner would only prove that the test
+        // agrees with itself.
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|b| b.bottleneck == STORE_CONNECTION_BOTTLENECK)
+            .expect("frozen connection owner");
+        assert_eq!(row.owner_ref, bound.owner);
+
+        // This owner claims no emergency partition.
+        assert!(row.emergency_limit.is_none());
+    }
+
+    /// The Store owner must publish a live, validated
+    /// [`BottleneckCapacityProfile`] row for the Kernel profile composition to
+    /// join (issue #1679): the row names exactly
+    /// [`STORE_TRANSACTION_BOTTLENECK`] with the frozen-map owner, so the
+    /// composition joins real owner evidence rather than a borrowed or
+    /// invented capacity story.
+    #[test]
+    fn store_publish_claimed_row_names_frozen_transaction_owner() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // A returned row already passed `row.validate()`, so a contract
+        // failure here would be the fail-closed property itself.
+        let row = reserve
+            .publish_claimed_row(
+                StoreDimension::TransactionSlots,
+                "gen-7",
+                "proof-store-2",
+                "ev-store-2",
+                "inv-store-2",
+            )
+            .expect("claimed row");
+
+        assert_eq!(row.bottleneck, STORE_TRANSACTION_BOTTLENECK);
+        assert_eq!(row.coverage_state, BottleneckCoverageState::Claimed);
+
+        // The owner string is read from the frozen contract rather than
+        // restated here: a hard-coded owner would only prove that the test
+        // agrees with itself.
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|b| b.bottleneck == STORE_TRANSACTION_BOTTLENECK)
+            .expect("frozen transaction owner");
+        assert_eq!(row.owner_ref, bound.owner);
+
+        // This owner claims no emergency partition.
+        assert!(row.emergency_limit.is_none());
+    }
+
+    /// The Store owner must publish a live, validated
+    /// [`BottleneckCapacityProfile`] row for the Kernel profile composition to
+    /// join (issue #1679): the row names exactly
+    /// [`STORE_PENDING_WRITE_BOTTLENECK`] with the frozen-map owner, so the
+    /// composition joins real owner evidence rather than a borrowed or
+    /// invented capacity story.
+    #[test]
+    fn store_publish_claimed_row_names_frozen_pending_owner() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // A returned row already passed `row.validate()`, so a contract
+        // failure here would be the fail-closed property itself.
+        let row = reserve
+            .publish_claimed_row(
+                StoreDimension::PendingWriteMemory,
+                "gen-7",
+                "proof-store-3",
+                "ev-store-3",
+                "inv-store-3",
+            )
+            .expect("claimed row");
+
+        assert_eq!(row.bottleneck, STORE_PENDING_WRITE_BOTTLENECK);
+        assert_eq!(row.coverage_state, BottleneckCoverageState::Claimed);
+
+        // The owner string is read from the frozen contract rather than
+        // restated here: a hard-coded owner would only prove that the test
+        // agrees with itself.
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|b| b.bottleneck == STORE_PENDING_WRITE_BOTTLENECK)
+            .expect("frozen pending owner");
+        assert_eq!(row.owner_ref, bound.owner);
+
+        // This owner claims no emergency partition.
+        assert!(row.emergency_limit.is_none());
+    }
+
+    /// The Store constructor floor (issue #1679): a reserve with no
+    /// normal connection partition can never admit Store work, so
+    /// building one must fail at build (I14.3: partitions are
+    /// non-borrowable; zero capacity is a build error, not a
+    /// runtime surprise).
+    #[test]
+    fn store_partitioned_zero_normal_connections_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            0,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero normal connections must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.normal_connection_slots",
+                ..
+            }
+        ));
+    }
+
+    /// The protected-partition complement of the Store constructor floor
+    /// (issue #1679): a reserve with no protected connection partition can
+    /// never admit protected Store work, so building one must fail at build
+    /// (I14.3: partitions are non-borrowable; zero capacity is a build
+    /// error, not a runtime surprise).
+    #[test]
+    fn store_partitioned_zero_protected_connections_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            4,
+            0,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero protected connections must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.protected_connection_slots",
+                ..
+            }
+        ));
+    }
+
+    /// The Store constructor floor (issue #1679) applies to the transaction
+    /// partition exactly as it does to the connection partition: a reserve
+    /// with no normal transaction partition can never admit Store work, so
+    /// building one must fail at build (I14.3: partitions are non-borrowable;
+    /// zero capacity is a build error, not a runtime surprise).
+    #[test]
+    fn store_partitioned_zero_normal_transactions_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            4,
+            4,
+            0,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero normal transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.normal_transaction_slots",
+                ..
+            }
+        ));
+    }
+
+    /// The protected transaction partition obeys the same constructor floor
+    /// (issue #1679) as its normal counterpart: a reserve with no protected
+    /// transaction partition can never admit protected Store work, so building
+    /// one must fail at build (I14.3: partitions are non-borrowable; zero
+    /// capacity is a build error, not a runtime surprise).
+    #[test]
+    fn store_partitioned_zero_protected_transactions_fails_closed() {
+        let Err(err) = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            0,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        ) else {
+            panic!("zero protected transactions must fail at build");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_reserve.protected_transaction_slots",
+                ..
+            }
+        ));
+    }
+
+    /// Owner-identity validation at acquisition (issue #1679 A10): every
+    /// permit binds owner and operation identity, so a blank owner is
+    /// refused by name at acquisition instead of yielding a permit that
+    /// carries no accountable owner (I14.3).
+    #[test]
+    fn store_acquire_rejects_blank_owner() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let Err(err) = reserve.try_acquire_normal_connection(
+            NormalWorkClass::CanonicalWrite,
+            "",
+            "op-owner-1",
+        ) else {
+            panic!("blank owner must never hold a permit");
+        };
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_permit.owner",
+                ..
+            }
+        ));
+    }
+
+    /// Owner-identity validation at publication (issue #1679 A10/W1): a claimed
+    /// row is never published under a blank owner-generation reference, because
+    /// the evidence row would name no accountable generation once it became
+    /// visible to readers (I14.3).
+    #[test]
+    fn store_publish_claimed_row_rejects_blank_generation() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        let err = reserve
+            .publish_claimed_row(
+                StoreDimension::ConnectionSlots,
+                "",
+                "proof-store-1",
+                "ev-store-1",
+                "inv-store-1",
+            )
+            .expect_err("blank generation must never publish a row");
+        assert!(matches!(
+            err,
+            StoreReserveError::InvalidField {
+                field: "store_evidence.owner_generation_ref",
+                ..
+            }
+        ));
+    }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679 A6/W4).
+    /// The single protected connection slot is filled first and its permit is
+    /// held across the assertions, so the refusal observes a live saturated
+    /// partition rather than a released one. The refusal names
+    /// `STORE_CONNECTION_BOTTLENECK`: exhaustion of one dimension is a local
+    /// disposition, never a global one (I14.3).
+    #[test]
+    fn store_protected_connection_exhaustion_names_bottleneck() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            1,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-fill-1",
+            )
+            .expect("protected slot");
+        assert_eq!(reserve.available_protected_connections(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_connection(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-conn-shed-1",
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_CONNECTION_BOTTLENECK)
+        );
+    }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679 A6/W4).
+    /// The single protected transaction slot is filled first and its permit
+    /// is held across the assertions, so the refusal observes a live
+    /// saturated partition rather than a released one. The refusal names
+    /// `STORE_TRANSACTION_BOTTLENECK`: exhaustion of one dimension is a
+    /// local disposition, never a global one (I14.3).
+    #[test]
+    fn store_protected_transaction_exhaustion_names_bottleneck() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_transaction(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-tx-fill-1",
+            )
+            .expect("protected slot");
+        assert_eq!(reserve.available_protected_transactions(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_transaction(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-tx-shed-1",
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_TRANSACTION_BOTTLENECK)
+        );
+    }
+
+    /// Protected-partition exhaustion names its dimension (issue #1679 A6/W4).
+    /// The single protected pending-write byte is filled first and its permit
+    /// is held across the assertions, so the refusal observes a live
+    /// saturated partition rather than a released one. The refusal names
+    /// `STORE_PENDING_WRITE_BOTTLENECK`: exhaustion of one dimension is a
+    /// local disposition, never a global one (I14.3).
+    #[test]
+    fn store_protected_pending_exhaustion_names_bottleneck() {
+        let reserve = StoreReserve::partitioned(
+            4,
+            4,
+            1,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(1).expect("bytes"),
+        )
+        .expect("reserve");
+
+        // Held for the whole test: the permit releases on drop.
+        let _held = reserve
+            .try_acquire_protected_pending_write_bytes(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-pend-fill-1",
+                NonZeroU64::new(1).expect("bytes"),
+            )
+            .expect("protected bytes");
+        assert_eq!(reserve.available_protected_pending_write_bytes(), 0);
+
+        let Err(err) = reserve.try_acquire_protected_pending_write_bytes(
+            ControlOperationClass::CancelOperation,
+            "owner-a",
+            "op-pend-shed-1",
+            NonZeroU64::new(1).expect("bytes"),
+        ) else {
+            panic!("saturated protected partition must refuse");
+        };
+        assert!(
+            matches!(err, StoreReserveError::ProtectedReserveExhausted { bottleneck, .. } if bottleneck == STORE_PENDING_WRITE_BOTTLENECK)
+        );
+    }
+
+    /// No-scaling construction (issue #1679): a fresh reserve reports
+    /// exactly its configured partition capacities (I14.3: quantities
+    /// are copied from configuration, never derived or scaled).
+    #[test]
+    fn store_reserve_reports_configured_capacities() {
+        let reserve = StoreReserve::partitioned(
+            3,
+            5,
+            7,
+            9,
+            NonZeroU64::new(11).expect("bytes"),
+            NonZeroU64::new(13).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_connections(), 3);
+        assert_eq!(reserve.available_protected_connections(), 5);
+        assert_eq!(reserve.available_normal_transactions(), 7);
+        assert_eq!(reserve.available_protected_transactions(), 9);
+        assert_eq!(reserve.available_normal_pending_write_bytes(), 11);
+        assert_eq!(reserve.available_protected_pending_write_bytes(), 13);
+    }
+
+    /// A dropped normal permit returns its slot exactly once (issue
+    /// #1679): `StorePermit` has no release method, so `Drop` is the
+    /// only release path. Dropping the permit restores exactly the
+    /// pre-acquire availability, and a fresh operation can then
+    /// re-acquire the returned slot (I14.3).
+    #[test]
+    fn store_dropped_normal_permit_returns_slot_exactly_once() {
+        let reserve = StoreReserve::partitioned(
+            1,
+            2,
+            1,
+            2,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_normal_connections(), 1);
+
+        let permit = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-rel-1",
+            )
+            .expect("normal connection slot");
+        assert_eq!(reserve.available_normal_connections(), 0);
+
+        // `StorePermit` exposes no release method: drop is the only
+        // release path, and it returns the slot exactly once.
+        drop(permit);
+        assert_eq!(reserve.available_normal_connections(), 1);
+
+        let _permit = reserve
+            .try_acquire_normal_connection(
+                NormalWorkClass::CanonicalWrite,
+                "owner-a",
+                "op-conn-rel-2",
+            )
+            .expect("returned slot");
+        assert_eq!(reserve.available_normal_connections(), 0);
+    }
+
+    /// A dropped protected permit returns its slot exactly once (issue
+    /// #1679): the `Drop` match routes by capacity class, so a protected
+    /// connection permit restores the protected partition - never the normal
+    /// one - and a fresh control operation can then re-acquire the returned
+    /// slot (A7 release-at-most-once on the protected path).
+    #[test]
+    fn store_dropped_protected_permit_returns_slot_exactly_once() {
+        let reserve = StoreReserve::partitioned(
+            2,
+            1,
+            2,
+            1,
+            NonZeroU64::new(8).expect("bytes"),
+            NonZeroU64::new(8).expect("bytes"),
+        )
+        .expect("reserve");
+        assert_eq!(reserve.available_protected_connections(), 1);
+
+        let permit = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-prel-1",
+            )
+            .expect("protected connection slot");
+        assert_eq!(reserve.available_protected_connections(), 0);
+
+        // `StorePermit` exposes no release method: drop is the only
+        // release path, and it returns the protected slot exactly once.
+        drop(permit);
+        assert_eq!(reserve.available_protected_connections(), 1);
+
+        let _permit = reserve
+            .try_acquire_protected_connection(
+                ControlOperationClass::CancelOperation,
+                "owner-a",
+                "op-conn-prel-2",
+            )
+            .expect("returned slot");
+        assert_eq!(reserve.available_protected_connections(), 0);
+    }
+}
