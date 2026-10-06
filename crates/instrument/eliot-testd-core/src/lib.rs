@@ -65,7 +65,7 @@ pub use typed_evidence::{
     TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
     TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
     TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
-    TestdStreamResolution, TestdStreamSlot,
+    TestdStreamResolution, TestdStreamSlot, TypedEvidenceRestartRecord,
 };
 
 // ---- Closed testd profile to executable binding registry (issue #20) ----
@@ -2959,6 +2959,26 @@ impl EvidenceCollector {
         self.typed
             .lock()
             .map_or_else(|_| Vec::new(), |items| items.clone())
+    }
+
+    /// Snapshots the admitted typed bundles into a durable restart record.
+    ///
+    /// Issue #456 (WD1): the daemon persists the returned record with the
+    /// durable job row at admit time, so a restart reconstructs the same
+    /// evidence identities without operation memory. The record carries
+    /// bindings only, never source bytes.
+    pub fn checkpoint_typed_evidence(
+        &self,
+        job_id: &str,
+        invocation_id: &str,
+        fence: &eliot_contracts::StateFence,
+    ) -> Result<TypedEvidenceRestartRecord, TestdError> {
+        let bundles = self
+            .typed
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        TypedEvidenceRestartRecord::capture(job_id, invocation_id, fence, bundles.clone())
+            .map_err(|error| TestdError::Contract(error.to_string()))
     }
 
     /// Resolves every pending typed bundle through the injected immutable-
