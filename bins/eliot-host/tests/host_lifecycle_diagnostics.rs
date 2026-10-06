@@ -974,8 +974,8 @@ fn case_2_service_start_request_is_distinct_from_result() {
     );
     assert_eq!(
         count_occurrences(&lib, requested),
-        1,
-        "the start request record has exactly one emission site"
+        2,
+        "the start request record has exactly two disjoint emission sites (exported direct-start contour and live open manifest-start contour); each operation fires exactly one"
     );
     assert_eq!(
         count_occurrences(&lib, started),
@@ -1303,6 +1303,28 @@ fn case_3_startup_ready_requires_real_readiness_evidence() {
         assert!(
             details.iter().any(|detail| detail.as_str() == Some(event)),
             "the fixture must pin the frozen readiness event {event:?}"
+        );
+    }
+    // Owner binding: the three emitted spellings must be byte-identical to
+    // the `event` of their table rows, selected by `name` and not by `event`
+    // (the case_1 pattern), so the Executed records below carry owner
+    // spellings rather than literals that could drift from the table.
+    let rows3 = case1_parse_boundary_table(&lib);
+    for (name, event) in [
+        ("readiness.requested-proof", request_event),
+        ("readiness.ready-proof", ready_event),
+        ("readiness.degraded", degraded_event),
+    ] {
+        let row = rows3
+            .iter()
+            .find(|row| case1_field(row.as_slice(), "name") == name)
+            .unwrap_or_else(|| {
+                panic!("the frozen table must carry the `{name}` row this case emits")
+            });
+        assert_eq!(
+            case1_field(row.as_slice(), "event"),
+            event,
+            "the emitted spelling must be byte-identical to the `{name}` row event this test parsed out of `src/lib.rs`: {event:?}"
         );
     }
     assert!(
