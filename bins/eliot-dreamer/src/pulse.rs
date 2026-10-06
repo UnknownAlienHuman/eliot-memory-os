@@ -1040,3 +1040,38 @@ mod pulse_conflict_stage_owner_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod pulse_error_mapping_tests {
+    use super::*;
+    use eliot_dreamer_orientation::OrientationError;
+
+    /// Cancellation, deadline expiry, and packet refusal stay distinguishable
+    /// through dispatch (issue #2901 A9): each converts to its own
+    /// `OrientationError`, and the packet owner's inner error passes through
+    /// untouched instead of collapsing into a generic failure.
+    #[test]
+    fn terminal_errors_stay_distinguishable() {
+        assert_eq!(
+            PulseError::Cancelled.into_orientation_error(),
+            OrientationError::Cancelled,
+            "cancellation keeps its own error"
+        );
+        assert_eq!(
+            PulseError::DeadlineExceeded.into_orientation_error(),
+            OrientationError::RevalidationRequired,
+            "deadline expiry asks for revalidation, never cancellation"
+        );
+        assert_eq!(
+            PulseError::Packet(OrientationError::Encoding("packet output"))
+                .into_orientation_error(),
+            OrientationError::Encoding("packet output"),
+            "the packet owner's inner error passes through verbatim"
+        );
+        assert_ne!(
+            PulseError::Cancelled.into_orientation_error(),
+            PulseError::DeadlineExceeded.into_orientation_error(),
+            "cancelled and expired never read as one outcome"
+        );
+    }
+}

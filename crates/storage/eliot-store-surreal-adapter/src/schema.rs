@@ -827,15 +827,18 @@ pub(crate) const TX_CREATE_RECEIPT: &str =
 /// Terminal allocation proof of one canonical transaction (S-CONC-TX, #989).
 ///
 /// Second-to-last statement of the assembled transaction, immediately before
-/// [`TX_COMMIT`]: binds the exact operation identity plus the allocation this
+/// [`TX_COMMIT`]: returns the exact operation identity plus the allocation this
 /// attempt consumed (`commit_sequence`, `next_commit_sequence`,
-/// `next_outbox_sequence`) into one typed result slot owned by the same
-/// transaction. The writer validates this slot's operation binding and
-/// allocation equality on every error-free RPC: a missing, duplicate,
-/// malformed, or mismatched slot is a possible-commit outcome for
-/// same-operation reconciliation, never a local success. Adds no `CREATE`,
-/// so receipt/event/outbox row counts are unchanged.
-pub(crate) const TX_ALLOC_PROOF: &str = "LET $alloc_proof = { operation_id: $alloc_operation_id, commit_sequence: $alloc_commit_sequence, next_commit_sequence: $alloc_next_commit_sequence, next_outbox_sequence: $alloc_next_outbox_sequence };";
+/// `next_outbox_sequence`) as one typed result slot owned by the same
+/// transaction. It is `RETURN`, not `LET`: on the pinned provider (`SurrealDB`
+/// 3.1.4) a `LET` result slot decodes as null, so a `LET` proof can never
+/// satisfy the writer's equality check (issue #10, live commit proof). The
+/// writer validates this slot's operation binding and allocation equality on
+/// every error-free RPC: a missing, duplicate, malformed, or mismatched slot
+/// is a possible-commit outcome for same-operation reconciliation, never a
+/// local success. Adds no `CREATE`, so receipt/event/outbox row counts are
+/// unchanged.
+pub(crate) const TX_ALLOC_PROOF: &str = "RETURN { operation_id: $alloc_operation_id, commit_sequence: $alloc_commit_sequence, next_commit_sequence: $alloc_next_commit_sequence, next_outbox_sequence: $alloc_next_outbox_sequence };";
 
 /// Fenced upsert of the Governor finish-owner snapshot.  The outer recovery
 /// record is the only storage-owned part of a finish decision: its payload is

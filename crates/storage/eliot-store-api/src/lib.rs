@@ -132,9 +132,11 @@ pub use notification_state::{
 
 pub use payload_authority::{
     CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, HISTORICAL_TRUNCATION_SIGNATURE,
-    HistoricalRecordDisposition, HistoricalRecordProvenance, MAX_EXACT_JSON_BYTES,
+    HistoricalInventoryReport, HistoricalRecordDisposition, HistoricalRecordInventoryEntry,
+    HistoricalRecordProvenance, HistoricalRecordReport, MAX_EXACT_JSON_BYTES,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, dispose_historical_record,
-    json_shape_name, number_token_would_narrow, reject_control_parameter_name,
+    inventory_historical_payloads, json_shape_name, number_token_would_narrow,
+    reject_control_parameter_name,
 };
 
 pub use problem_owner_state::{

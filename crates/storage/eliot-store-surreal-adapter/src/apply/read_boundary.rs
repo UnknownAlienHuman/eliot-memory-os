@@ -17,11 +17,13 @@ use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
-    FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    FencedProjectionPublication, HistoricalInventoryReport, HistoricalRecordInventoryEntry,
+    HistoricalRecordProvenance, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
     PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey, ScopeId,
     ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
-    audit_heads_digest, generated_operation_manifests, named_mutation_operation_name,
+    audit_heads_digest, generated_operation_manifests,
+    inventory_historical_payloads as inventory_payload_population, named_mutation_operation_name,
 };
 
 use super::{
@@ -1401,11 +1403,23 @@ async fn read_authority_records(
 ///
 /// The writer bound the exact bytes to version/encoding/digest/length; any
 /// durable mismatch fails closed here instead of serving a lossy projection.
-/// Returns the decoded admitted parameters on success.
+/// Decode is operation-aware (issue #10, W6): the bytes decode without the
+/// generic control check, the closed (class, parameters) shape infers the
+/// operation, and the inferred operation re-validates every name — declared
+/// operation parameters (`task_id`, `idempotency_key`, ...) pass, any other
+/// control name fails closed. Returns the decoded admitted parameters and
+/// the inferred operation on success.
 fn validate_authority_record(
     row: &AuthorityReceiptRow,
     record: &AuthorityRecordRow,
-) -> Result<BTreeMap<String, Value>, StoreError> {
+    transition_class: eliot_store_api::TransitionClass,
+) -> Result<
+    (
+        BTreeMap<String, Value>,
+        eliot_store_api::NamedMutationOperation,
+    ),
+    StoreError,
+> {
     if record.version != PAYLOAD_AUTHORITY_VERSION {
         return Err(StoreError::Serialization(
             "authority record version mismatch".to_owned(),
@@ -1430,9 +1444,11 @@ fn validate_authority_record(
             "authority record digest mismatch".to_owned(),
         ));
     }
-    let parameters = bound.decode_object_parameters()?;
+    let loose = bound.decode_object_parameters_without_control_check()?;
+    let operation = infer_authority_operation(transition_class, &loose)?;
+    let parameters = bound.decode_object_parameters_for(operation)?;
     let _ = record_operation_count(row, record)?;
-    Ok(parameters)
+    Ok((parameters, operation))
 }
 
 fn record_operation_count(
@@ -1452,54 +1468,167 @@ fn record_operation_count(
 }
 
 /// Infers the closed mutation operation for one decoded authority parameter
-/// map within its receipt transition class.
+/// map within its receipt transition class (issue #10, W6/W8).
 ///
 /// The atomic writer does not persist operation names beside the opaque
 /// bytes; the closed parameter shapes plus the receipt transition class
-/// discriminate exactly one activated mutation per class on base
-/// (`TaskControl` → `UpdateTaskState`, `LifecyclePolicy` →
-/// `ApplyLifecyclePolicy`, `RecoverySchema` → `ApplyProblemOwnerState` when the
-/// named-transition discriminator is present and `ReconcileRecovery`
-/// otherwise, `CaptureCandidate` → `CaptureObservation`/`AppendAuditEvent`,
-/// `Epistemic` → `ApplyEpistemicRevision`). Anything else fails closed.
+/// discriminate exactly one activated mutation per class on base:
+/// `TaskControl` → `UpdateTaskState` (`task_id`+`event_id`), owner `record`
+/// documents (swarm revisions carry `owner_kind`, task acceptance sets carry
+/// `task_id`); `LifecyclePolicy` → `ApplyLifecyclePolicy`; `RecoverySchema` →
+/// `ApplyProblemOwnerState` (`transition`), `RecordAuthorityRevocation`
+/// (`origin_ref`), `RecordFinishDecision` (`receipt_json`),
+/// `RecordFinishEvidence`/`RecordModuleCatalogSnapshot` (their distinct
+/// expected-revision keys beside `snapshot_json`), and `ReconcileRecovery`
+/// (`problem_id`); `CaptureCandidate` → `AppendAuditEvent`, learning
+/// (`record_kind`), capability evidence (`scope_key`), experience bank vs
+/// feedback (the admitted document's `bank_revision` vs `feedback_revision`
+/// field), blackboard (`revision`), mailbox (`admission`), and
+/// `CaptureObservation` (`subject`); `Epistemic` → `ApplyEpistemicRevision`;
+/// `Erasure` → `ApplyErasure`; `NotificationState` →
+/// `ApplyNotificationState`; `ReactiveState` → ledger (`ledger_json`) vs
+/// snapshot (`content_sha256`); `UserAutomation` →
+/// `ApplyUserAutomationState`. `ApplyInstrumentRegistryState` stays
+/// known-but-unsupported and can never arrive through the catalogue gate.
+/// Anything else fails closed.
 fn infer_authority_operation(
     transition_class: eliot_store_api::TransitionClass,
     parameters: &BTreeMap<String, Value>,
 ) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
     use eliot_store_api::{NamedMutationOperation, TransitionClass};
+    let has = |name: &str| parameters.contains_key(name);
     match transition_class {
-        TransitionClass::TaskControl
-            if parameters.contains_key("task_id") && parameters.contains_key("event_id") =>
-        {
-            Ok(NamedMutationOperation::UpdateTaskState)
-        }
-        TransitionClass::LifecyclePolicy if parameters.contains_key("skill_id") => {
+        TransitionClass::TaskControl => infer_task_control_operation(parameters),
+        TransitionClass::LifecyclePolicy if has("skill_id") => {
             Ok(NamedMutationOperation::ApplyLifecyclePolicy)
         }
-        // The named owner transitions are discriminated first: they are also
-        // `RecoverySchema` and also carry `problem_id`, so without this arm a
-        // committed `ApplyProblemOwnerState` row would be read back under
-        // `ReconcileRecovery`'s name and its verb would be lost.
-        TransitionClass::RecoverySchema if parameters.contains_key("transition") => {
-            Ok(NamedMutationOperation::ApplyProblemOwnerState)
-        }
-        TransitionClass::RecoverySchema if parameters.contains_key("problem_id") => {
-            Ok(NamedMutationOperation::ReconcileRecovery)
-        }
-        TransitionClass::CaptureCandidate
-            if parameters.contains_key("operation_id")
-                && parameters.contains_key("idempotency_key") =>
-        {
-            Ok(NamedMutationOperation::AppendAuditEvent)
-        }
-        TransitionClass::CaptureCandidate if parameters.contains_key("subject") => {
-            Ok(NamedMutationOperation::CaptureObservation)
-        }
-        TransitionClass::Epistemic if parameters.contains_key("revision") => {
+        TransitionClass::RecoverySchema => infer_recovery_schema_operation(parameters),
+        TransitionClass::CaptureCandidate => infer_capture_candidate_operation(parameters),
+        TransitionClass::Epistemic if has("revision") => {
             Ok(NamedMutationOperation::ApplyEpistemicRevision)
+        }
+        TransitionClass::Erasure if has("subject") && has("erasure_operation_id") => {
+            Ok(NamedMutationOperation::ApplyErasure)
+        }
+        TransitionClass::NotificationState if has("mutation") && has("dedup_key") => {
+            Ok(NamedMutationOperation::ApplyNotificationState)
+        }
+        TransitionClass::ReactiveState if has("session_id") && has("ledger_json") => {
+            Ok(NamedMutationOperation::ApplyReactiveInjectionState)
+        }
+        TransitionClass::ReactiveState if has("uri") && has("content_sha256") => {
+            Ok(NamedMutationOperation::ApplyResourceSnapshot)
+        }
+        TransitionClass::UserAutomation if has("operation") && has("automation_id") => {
+            Ok(NamedMutationOperation::ApplyUserAutomationState)
         }
         _ => Err(StoreError::InvalidReceipt),
     }
+}
+
+/// Discriminates the `TaskControl` authority operations by parameter shape.
+fn infer_task_control_operation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
+    use eliot_store_api::NamedMutationOperation;
+    let has = |name: &str| parameters.contains_key(name);
+    if has("task_id") && has("event_id") {
+        return Ok(NamedMutationOperation::UpdateTaskState);
+    }
+    // Owner records travel whole under one `record` key; the closed inner
+    // shapes discriminate: swarm revisions carry `owner_kind`, task
+    // acceptance sets carry `task_id`.
+    if has("record") {
+        let inner_has = |name: &str| {
+            parameters
+                .get("record")
+                .and_then(Value::as_object)
+                .is_some_and(|object| object.contains_key(name))
+        };
+        if inner_has("owner_kind") && inner_has("owner_id") {
+            return Ok(NamedMutationOperation::ApplySwarmOwnerRevisions);
+        }
+        if inner_has("task_id") && inner_has("acceptance_digest") {
+            return Ok(NamedMutationOperation::RecordTaskContractAcceptanceSet);
+        }
+    }
+    Err(StoreError::InvalidReceipt)
+}
+
+/// Discriminates the `RecoverySchema` authority operations by parameter shape.
+fn infer_recovery_schema_operation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
+    use eliot_store_api::NamedMutationOperation;
+    let has = |name: &str| parameters.contains_key(name);
+    // The named owner transitions are discriminated first: they are also
+    // `RecoverySchema` and also carry `problem_id`, so without this arm a
+    // committed `ApplyProblemOwnerState` row would be read back under
+    // `ReconcileRecovery`'s name and its verb would be lost.
+    if has("transition") {
+        return Ok(NamedMutationOperation::ApplyProblemOwnerState);
+    }
+    if has("origin_ref") && has("closure_id") {
+        return Ok(NamedMutationOperation::RecordAuthorityRevocation);
+    }
+    if has("attempt_id") && has("receipt_json") {
+        return Ok(NamedMutationOperation::RecordFinishDecision);
+    }
+    if has("expected_canonical_revision") && has("snapshot_json") {
+        return Ok(NamedMutationOperation::RecordFinishEvidence);
+    }
+    if has("expected_module_registry_revision") && has("snapshot_json") {
+        return Ok(NamedMutationOperation::RecordModuleCatalogSnapshot);
+    }
+    if has("problem_id") {
+        return Ok(NamedMutationOperation::ReconcileRecovery);
+    }
+    Err(StoreError::InvalidReceipt)
+}
+
+/// Discriminates the `CaptureCandidate` authority operations by parameter shape.
+fn infer_capture_candidate_operation(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
+    use eliot_store_api::NamedMutationOperation;
+    let has = |name: &str| parameters.contains_key(name);
+    if has("operation_id") && has("idempotency_key") {
+        return Ok(NamedMutationOperation::AppendAuditEvent);
+    }
+    if has("record_kind") && has("handle") && has("record_json") {
+        return Ok(NamedMutationOperation::RecordLearningRecord);
+    }
+    if has("skill_id") && has("scope_key") && has("record_json") {
+        return Ok(NamedMutationOperation::RecordCapabilityEvidenceRecord);
+    }
+    // Bank and feedback share one parameter table; the admitted document's
+    // family revision field discriminates (admission already proved the
+    // field matches the committed operation).
+    if has("record_revision") && has("scope_digest") && has("fence_digest") && has("record_json") {
+        let document = parameters
+            .get("record_json")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok());
+        match document {
+            Some(document) if document.contains_key("bank_revision") => {
+                return Ok(NamedMutationOperation::CommitExperienceBank);
+            }
+            Some(document) if document.contains_key("feedback_revision") => {
+                return Ok(NamedMutationOperation::CommitAgentFeedback);
+            }
+            _ => return Err(StoreError::InvalidReceipt),
+        }
+    }
+    if has("revision") {
+        return Ok(NamedMutationOperation::ApplyBlackboardItem);
+    }
+    if has("admission") {
+        return Ok(NamedMutationOperation::AdmitMailboxMessage);
+    }
+    if has("subject") {
+        return Ok(NamedMutationOperation::CaptureObservation);
+    }
+    Err(StoreError::InvalidReceipt)
 }
 
 struct IndexedAuthority {
@@ -1550,23 +1679,151 @@ fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthor
             ))
         };
         for record in authorities {
-            let parameters = validate_authority_record(row, record)?;
+            let (transition_class, scope_id) = in_scope_receipt
+                .as_ref()
+                .ok_or(StoreError::InvalidReceipt)?;
+            let (parameters, operation) =
+                validate_authority_record(row, record, *transition_class)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
-            if let Some((transition_class, scope_id)) = &in_scope_receipt {
-                let operation = infer_authority_operation(*transition_class, &parameters)?;
-                indexed.push(IndexedAuthority {
-                    capture_index,
-                    operation,
-                    parameters,
-                    scope_id: scope_id.clone(),
-                });
-            }
+            indexed.push(IndexedAuthority {
+                capture_index,
+                operation,
+                parameters,
+                scope_id: scope_id.clone(),
+            });
         }
         operation_base =
             operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
     }
     Ok(indexed)
 }
+
+/// Historical payload inventory over one authority+evidence snapshot (issue
+/// #10, W7/A5).
+///
+/// One entry per persisted payload: authority records where the receipt
+/// carries a bound authority array, else the legacy evidence records, so the
+/// same logical payload is never counted twice. Provenance is re-validated,
+/// never assumed: an authority record whose envelope
+/// (version/encoding/length/digest/parse) re-validates carries post-fix
+/// provenance; any other stored bytes — envelope-damaged authority rows and
+/// authority-less legacy evidence rows, whose stored projection can never
+/// self-prove a post-fix origin — dispose by signature under pre-fix
+/// provenance, never intact (fail-closed direction). Disposal and replay run
+/// through the store-api pure inventory, so per-record dispositions match the
+/// unit-tested evidence rules exactly.
+pub(crate) async fn inventory_historical_payloads(
+    adapter: &SurrealStoreAdapter,
+) -> Result<HistoricalInventoryReport, AdapterError> {
+    let db = super::client(adapter).await?;
+    let authorities = read_authority_records(db, &adapter.config).await?;
+    let evidence = read_evidence_records(db, &adapter.config).await?;
+    let mut evidence_by_commit: BTreeMap<u64, Vec<EvidenceRecordRow>> = BTreeMap::new();
+    for row in &evidence {
+        if let Some(sequence) = row.commit_sequence {
+            evidence_by_commit
+                .entry(sequence)
+                .or_default()
+                .extend(row.evidence_records.clone().unwrap_or_default());
+        }
+    }
+    Ok(inventory_payload_population(&join_inventory_entries(
+        &authorities,
+        &evidence_by_commit,
+    )))
+}
+
+/// Joins one snapshot into inventory entries without double counting.
+fn join_inventory_entries(
+    authorities: &[AuthorityReceiptRow],
+    evidence_by_commit: &BTreeMap<u64, Vec<EvidenceRecordRow>>,
+) -> Vec<HistoricalRecordInventoryEntry> {
+    let mut entries = Vec::new();
+    for row in authorities {
+        match row.payload_authority.as_deref() {
+            Some(records) if !records.is_empty() => {
+                entries.extend(records.iter().map(authority_inventory_entry));
+            }
+            _ => {
+                if let Some(sequence) = row.commit_sequence
+                    && let Some(records) = evidence_by_commit.get(&sequence)
+                {
+                    entries.extend(records.iter().map(evidence_inventory_entry));
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// Builds the inventory entry for one persisted authority record.
+fn authority_inventory_entry(record: &AuthorityRecordRow) -> HistoricalRecordInventoryEntry {
+    let stored = record.bytes_utf8.as_bytes().to_vec();
+    let provenance = if revalidated_authority_bytes(record).is_some() {
+        POST_FIX_INVENTORY_PROVENANCE
+    } else {
+        PRE_FIX_INVENTORY_PROVENANCE
+    };
+    HistoricalRecordInventoryEntry {
+        stored,
+        provenance,
+        exact_source: None,
+    }
+}
+
+/// Builds the inventory entry for one legacy evidence record.
+///
+/// Authority-less rows predate bound authorities, so they never claim
+/// post-fix preservation: the adapter holds no external canonical source for
+/// them (`exact_source` stays `None`) and the stored projection disposes by
+/// signature.
+fn evidence_inventory_entry(record: &EvidenceRecordRow) -> HistoricalRecordInventoryEntry {
+    HistoricalRecordInventoryEntry {
+        stored: record.bytes_utf8.as_bytes().to_vec(),
+        provenance: PRE_FIX_INVENTORY_PROVENANCE,
+        exact_source: None,
+    }
+}
+
+/// Re-validates one persisted authority envelope, returning the trusted
+/// bytes on success.
+///
+/// Mirrors the envelope half of [`validate_authority_record`] (no decode, no
+/// count): a mismatch here forfeits the post-fix provenance claim instead of
+/// failing the whole scan, so one damaged row quarantines by signature while
+/// the rest still inventory.
+fn revalidated_authority_bytes(record: &AuthorityRecordRow) -> Option<Vec<u8>> {
+    if record.version != PAYLOAD_AUTHORITY_VERSION {
+        return None;
+    }
+    if record.encoding != PayloadEncoding::Utf8Json.mnemonic() {
+        return None;
+    }
+    if record.byte_len != record.bytes_utf8.len() {
+        return None;
+    }
+    let bound = ExactJsonBytes::parse(
+        PayloadSource::NamedOperationParameter,
+        record.bytes_utf8.as_bytes(),
+    )
+    .ok()?;
+    if bound.digest_hex() != record.digest_hex || bound.byte_len() != record.byte_len {
+        return None;
+    }
+    Some(record.bytes_utf8.as_bytes().to_vec())
+}
+
+/// Write-path provenance for envelope-revalidated authority bytes.
+const POST_FIX_INVENTORY_PROVENANCE: HistoricalRecordProvenance = HistoricalRecordProvenance {
+    written_before_record_coercion_fix: false,
+    exact_source_bytes_available: false,
+};
+
+/// Write-path provenance for bytes that cannot prove a post-fix origin.
+const PRE_FIX_INVENTORY_PROVENANCE: HistoricalRecordProvenance = HistoricalRecordProvenance {
+    written_before_record_coercion_fix: true,
+    exact_source_bytes_available: false,
+};
 
 fn parse_max_records_param(query: &NamedReadRequest) -> Result<(u32, usize), StoreError> {
     let bound_raw = query
@@ -4931,12 +5188,13 @@ mod admitted_read_tests {
 
     #[test]
     fn task_state_returns_exact_history_with_current() {
-        // Surreal persistence gap (reported as residual): `UpdateTaskState`
-        // owner parameters contain `task_id`, which the generic
-        // `ExactJsonBytes` control denylist rejects, so no
-        // operation-aware authority binding exists yet (needs `plan.rs` /
-        // `atomic_write.rs`, unclaimed here). The handler itself is real
-        // (authority-row walk, exact scope/`task_id` match, bound,
+        // Operation-aware authority binding (issue #10, W6) exists:
+        // `UpdateTaskState` parameters carry `task_id`, which the generic
+        // `ExactJsonBytes` control denylist rejects, but the planner and the
+        // read boundary decode operation-aware (`decode_object_parameters_for`
+        // after closed (class, parameters) inference), so declared control
+        // names bind while foreign ones still fail closed. The handler itself
+        // is real (authority-row walk, exact scope/`task_id` match, bound,
         // history + current, provenance); the reference memory handler
         // proves the data path end to end. Here we prove the gate, the
         // exact-empty contract, and filtering against real lifecycle rows.
@@ -5151,6 +5409,123 @@ mod admitted_read_tests {
         assert_eq!(
             task_state_payload(&stale_query, &other_fence, &rows),
             Err(StoreError::FenceMismatch)
+        );
+    }
+}
+
+#[cfg(test)]
+mod historical_inventory_tests {
+    use super::*;
+    use eliot_store_api::HistoricalRecordDisposition;
+
+    const INTACT_BYTES: &[u8] = br#"{"subject":"memory:operator-runtime-proof"}"#;
+    const TRUNCATED_BYTES: &[u8] = br#"{"subject":"observation:f31e5b3f"}"#;
+
+    fn authority_record(bytes: &[u8], digest_hex: String) -> AuthorityRecordRow {
+        AuthorityRecordRow {
+            operation_index: 0,
+            version: PAYLOAD_AUTHORITY_VERSION,
+            encoding: PayloadEncoding::Utf8Json.mnemonic().to_owned(),
+            digest_hex,
+            byte_len: bytes.len(),
+            bytes_utf8: String::from_utf8(bytes.to_vec()).expect("test bytes are UTF-8"),
+        }
+    }
+
+    fn authority_row(records: Option<Vec<AuthorityRecordRow>>) -> AuthorityReceiptRow {
+        AuthorityReceiptRow {
+            commit_sequence: Some(7),
+            named_operation_count: Some(1),
+            payload_authority: records,
+            receipt: None,
+        }
+    }
+
+    fn evidence_record(bytes: &[u8]) -> EvidenceRecordRow {
+        EvidenceRecordRow {
+            operation_index: 0,
+            subject: "memory:operator-runtime-proof".to_owned(),
+            parameters: BTreeMap::from([(
+                "subject".to_owned(),
+                Value::String("memory:operator-runtime-proof".to_owned()),
+            )]),
+            version: PAYLOAD_AUTHORITY_VERSION,
+            encoding: PayloadEncoding::Utf8Json.mnemonic().to_owned(),
+            digest_hex: String::new(),
+            byte_len: bytes.len(),
+            bytes_utf8: String::from_utf8(bytes.to_vec()).expect("test bytes are UTF-8"),
+            commit_sequence: 7,
+            named_operation_count: 1,
+        }
+    }
+
+    #[test]
+    fn revalidated_authority_row_inventories_intact() {
+        let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, INTACT_BYTES)
+            .expect("test authority parses");
+        let row = authority_row(Some(vec![authority_record(
+            INTACT_BYTES,
+            bound.digest_hex(),
+        )]));
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &BTreeMap::new());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provenance, POST_FIX_INVENTORY_PROVENANCE);
+        assert!(inventory_payload_population(&entries).all_intact());
+    }
+
+    #[test]
+    fn damaged_envelope_quarantines_by_signature() {
+        let row = authority_row(Some(vec![authority_record(
+            TRUNCATED_BYTES,
+            "0".repeat(64),
+        )]));
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &BTreeMap::new());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provenance, PRE_FIX_INVENTORY_PROVENANCE);
+        let report = inventory_payload_population(&entries);
+        assert!(
+            matches!(
+                report.records[0].disposition,
+                HistoricalRecordDisposition::CorruptedStaleUnreconstructable { .. }
+            ),
+            "unexpected disposition: {:?}",
+            report.records[0].disposition
+        );
+        assert!(!report.all_intact());
+    }
+
+    #[test]
+    fn authority_absent_row_falls_back_to_evidence_without_intact_claim() {
+        let row = authority_row(None);
+        let evidence = BTreeMap::from([(7u64, vec![evidence_record(INTACT_BYTES)])]);
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &evidence);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provenance, PRE_FIX_INVENTORY_PROVENANCE);
+        let report = inventory_payload_population(&entries);
+        assert_eq!(
+            report.records[0].disposition,
+            HistoricalRecordDisposition::UnverifiedPreFix
+        );
+        assert!(!report.all_intact());
+    }
+
+    #[test]
+    fn authority_present_row_ignores_evidence() {
+        let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, INTACT_BYTES)
+            .expect("test authority parses");
+        let row = authority_row(Some(vec![authority_record(
+            INTACT_BYTES,
+            bound.digest_hex(),
+        )]));
+        let evidence = BTreeMap::from([(
+            7u64,
+            vec![evidence_record(INTACT_BYTES), evidence_record(INTACT_BYTES)],
+        )]);
+        let entries = join_inventory_entries(std::slice::from_ref(&row), &evidence);
+        assert_eq!(
+            entries.len(),
+            1,
+            "one persisted payload inventories exactly once"
         );
     }
 }

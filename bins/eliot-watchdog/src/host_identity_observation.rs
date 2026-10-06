@@ -19,6 +19,9 @@ use eliot_runtime_contracts::VerifiedSupervisionLease;
 use crate::independent_sensor::{
     ApprovedSensorBinding, ArtifactDigestObservation, observe_approved_artifact_digest,
 };
+use crate::store_endpoint_observation::{
+    StoreEndpointObservation, StoreEndpointTarget, observe_store_endpoint, store_endpoint_target,
+};
 
 use super::{
     ApprovedHostRegistration, GapRecoveryReason, WatchdogRuntimeBinding, WatchdogRuntimeReadback,
@@ -483,6 +486,14 @@ pub trait HostObservationSource: Send + Sync + 'static {
     fn observe_approved_registration(&self) -> Option<ApprovedRegistrationReadback> {
         None
     }
+
+    /// Observes the Host-managed store process through its registered
+    /// loopback listener (#1755 W2). The default is deliberately `None` for
+    /// test/read-only sources without a registry-selected manifest: no
+    /// endpoint target means no sample rather than an unbound one.
+    fn observe_store_endpoint(&self) -> Option<StoreEndpointObservation> {
+        None
+    }
 }
 
 /// Production observation source backed by the canonical `EliotHost` SCM
@@ -490,6 +501,10 @@ pub trait HostObservationSource: Send + Sync + 'static {
 /// and cannot perform lifecycle effects.
 pub struct LiveHostObservationSource {
     monitor: Mutex<HostIdentityMonitor>,
+    /// Installer-approved canonical store endpoint target retained from the
+    /// registry-selected manifest (#1755 W2). `None` for observers built
+    /// without the manifest: no target means no store sample.
+    store_target: Option<StoreEndpointTarget>,
 }
 
 impl LiveHostObservationSource {
@@ -497,6 +512,7 @@ impl LiveHostObservationSource {
     pub fn new(expected_image: PathBuf) -> Self {
         Self {
             monitor: Mutex::new(HostIdentityMonitor::new(Some(expected_image))),
+            store_target: None,
         }
     }
 
@@ -536,6 +552,36 @@ impl LiveHostObservationSource {
                 Some(binding.selected_manifest.generation.as_str().to_owned());
             monitor.sensor_binding = sensor_binding;
         }
+        // The same retained manifest also carries the canonical store launch
+        // contour (#1755 W2): the `--bind` loopback socket and the approved
+        // store image the store-endpoint probe observes against. A manifest
+        // that cannot bind, or a contour that is not the approved shape,
+        // leaves no target: the store channels stay unobserved rather than
+        // probed against an unbound endpoint.
+        let mut source = source;
+        source.store_target = source
+            .monitor
+            .lock()
+            .ok()
+            .and_then(|monitor| monitor.sensor_binding.clone())
+            .and_then(|bound| {
+                let launch = &binding.selected_manifest.runtime_launch;
+                let arguments: Vec<&str> = launch
+                    .canonical_store_arguments
+                    .iter()
+                    .map(eliot_platform::PlatformHandle::as_str)
+                    .collect();
+                let image = Path::new(launch.canonical_store_executable_path.as_str());
+                let target = store_endpoint_target(&bound, &arguments, image);
+                if target.is_none() {
+                    tracing::debug!(
+                        event = "watchdog.store_endpoint_target_refused",
+                        observation = "unbound",
+                        "registry-selected manifest carries no approved store contour; store observations stay unobserved"
+                    );
+                }
+                target
+            });
         source
     }
 
@@ -562,6 +608,7 @@ impl LiveHostObservationSource {
         };
         Self {
             monitor: Mutex::new(monitor),
+            store_target: None,
         }
     }
 }
@@ -595,6 +642,22 @@ impl HostObservationSource for LiveHostObservationSource {
             .lock()
             .ok()
             .and_then(|monitor| monitor.observe_approved_registration())
+    }
+
+    fn observe_store_endpoint(&self) -> Option<StoreEndpointObservation> {
+        let target = self.store_target.as_ref()?;
+        match observe_store_endpoint(target) {
+            Ok(observation) => Some(observation),
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.store_endpoint_probe_failed",
+                    observation = "unobserved",
+                    reason = error.to_string(),
+                    "store endpoint probe refused; no store sample this interval"
+                );
+                None
+            }
+        }
     }
 }
 

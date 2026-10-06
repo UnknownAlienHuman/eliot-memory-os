@@ -151,3 +151,136 @@ impl OrientationSupplySource for KernelStagedOwnerRecordSource {
         Ok(None)
     }
 }
+
+/// Smart-layer dependency probe (issue #2901 A8): no crate under
+/// `crates/smart` pulls a model-route provider or an effect-execution
+/// edge. Checked by reading the manifests, without invoking cargo, so the
+/// layering rule survives dependency drift.
+///
+/// Grandfathered (present at the audit base, named so no new edge hides
+/// behind them): the three context crates' `eliot-governor` edge (context
+/// orchestration lives under the Governor) and `eliot-context-candidates`'
+/// `eliot-epistemic-context-provider` edge (a contracts-only prototype
+/// data contribution, no model and no effects). Any other `governor`,
+/// `provider`, `executor`, or `effect` edge fails this probe.
+#[cfg(test)]
+mod smart_dependency_tests {
+    /// Manifest files that predate the probe and are therefore allowed to
+    /// keep their single documented edge. Everything else in the
+    /// provider/effect/governor family is forbidden.
+    const GRANDFATHERED: &[(&str, &str)] = &[
+        ("eliot-context-admission", "eliot-governor"),
+        ("eliot-context-assembly", "eliot-governor"),
+        ("eliot-context-compiler-wasm", "eliot-governor"),
+        (
+            "eliot-context-candidates",
+            "eliot-epistemic-context-provider",
+        ),
+    ];
+
+    /// Reads every `crates/smart/*/Cargo.toml` `[dependencies]`-family
+    /// section and returns `(manifest_crate, dependency)` pairs, parsed by
+    /// hand (no toml crate: this probe adds no dependency to run).
+    fn smart_dependency_edges() -> Vec<(String, String)> {
+        let workspace = match std::env::var("CARGO_MANIFEST_DIR") {
+            Ok(dir) => std::path::PathBuf::from(dir),
+            Err(error) => panic!("CARGO_MANIFEST_DIR must be set: {error:?}"),
+        };
+        let smart = workspace.join("../../crates/smart");
+        let entries = match std::fs::read_dir(&smart) {
+            Ok(entries) => entries,
+            Err(error) => panic!("crates/smart must list: {error:?}"),
+        };
+        let mut edges = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => panic!("smart entry must read: {error:?}"),
+            };
+            let manifest = entry.path().join("Cargo.toml");
+            if !manifest.is_file() {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&manifest) {
+                Ok(text) => text,
+                Err(error) => panic!("{manifest:?} must read: {error:?}"),
+            };
+            let package = package_name(&text).unwrap_or_else(|| {
+                panic!("{manifest:?} must name its package");
+            });
+            let mut in_dependencies = false;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_dependencies = line.contains("dependencies");
+                    continue;
+                }
+                if !in_dependencies || line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let name = line
+                    .split(['=', ' '])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_matches('"')
+                    .to_owned();
+                if name.is_empty() || name == "package" {
+                    continue;
+                }
+                edges.push((package.clone(), name));
+            }
+        }
+        edges
+    }
+
+    /// Reads the `[package] name` of one manifest.
+    fn package_name(text: &str) -> Option<String> {
+        let mut in_package = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_package = line == "[package]";
+                continue;
+            }
+            if in_package && let Some(value) = line.strip_prefix("name") {
+                let value = value.trim_start_matches([' ', '=']).trim();
+                if !value.is_empty() {
+                    return Some(value.trim_matches('"').to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the forbidden family a dependency belongs to, if any.
+    fn forbidden_family(dependency: &str) -> Option<&'static str> {
+        let dependency = dependency.trim().to_ascii_lowercase();
+        if dependency.contains("executor") || dependency.contains("effect") {
+            Some("effect execution")
+        } else if dependency.contains("provider") || dependency == "eliot-governor" {
+            Some("provider/governor")
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn no_smart_crate_pulls_provider_or_effect() {
+        let mut violations = Vec::new();
+        for (package, dependency) in smart_dependency_edges() {
+            let Some(family) = forbidden_family(&dependency) else {
+                continue;
+            };
+            if GRANDFATHERED.contains(&(package.as_str(), dependency.as_str())) {
+                continue;
+            }
+            violations.push(format!("{package} pulls {dependency} ({family})"));
+        }
+        assert!(
+            violations.is_empty(),
+            "new provider/effect/governor edge in Smart: {}",
+            violations.join(", ")
+        );
+    }
+}
