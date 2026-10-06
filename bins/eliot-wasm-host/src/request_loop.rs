@@ -6168,6 +6168,63 @@ fn frame_binds_to_identity(
         && frame.input_digest == identity.input_digest
 }
 
+/// Seals one served loop report and reclaims exactly the claimed generation
+/// (issue #2786 W6): the served marker and the exact retained sequence seal
+/// durably before physical reclaim, and the pre-execution `InFlight`
+/// evidence drops best-effort after. Returns the claimed identity and the
+/// terminal frame the report carried.
+fn seal_and_reclaim_served(
+    directory: &std::path::Path,
+    claim: crate::dispatch_material::DeliveryClaim,
+    report: &RequestLoopReport,
+) -> Result<
+    (
+        crate::dispatch_material::StagedDeliveryIdentity,
+        OrdinaryOutcome,
+    ),
+    OrdinaryDriveError,
+> {
+    // The served terminal is the last event of the sequence this
+    // same report carries, so the frame sealed below and the frame
+    // returned below cannot be a different observation. A served
+    // report without one is the exact refusal the loop has always
+    // reported for a terminal it cannot name.
+    let Some(terminal) = report.served_terminal() else {
+        return Err(OrdinaryDriveError::Loop(denied("no-request")));
+    };
+    // Containment evidence is the loop's own terminal condition:
+    // it only reports served once the operation's effect is
+    // attested as settled, so reclaiming here never races an
+    // unresolved guest child.
+    //
+    // The served marker and the exact retained sequence seal
+    // durably before physical reclaim, so restart reconciles
+    // terminal-unacknowledged state by republishing the original
+    // sequence instead of re-executing.
+    seal_served_outcome(directory, &claim, report.retained(), edge_now_ms())?;
+    let reclamation = consume_delivery_set(&claim);
+    // The served marker is now durable, so the pre-execution
+    // InFlight evidence is redundant: drop it best-effort. A
+    // leftover only replays, never re-executes.
+    let _ = crate::dispatch_material::clear_inflight_marker(directory, claim.identity());
+    // Bounded residual only: a partial reclamation never
+    // overwrites the primary result; retained files stay for
+    // maintenance under the exact claimed identity.
+    let _residual_complete = match &reclamation {
+        crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
+            let _reclaimed_operation = detail.identity.operation_id.len();
+            detail.fully_reclaimed()
+        }
+        crate::dispatch_material::ClaimedReclamation::ReplacementPreserved { claimed }
+        | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
+        | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery { claimed } => {
+            let _preserved_operation = claimed.operation_id.len();
+            false
+        }
+    };
+    Ok((claim.into_identity(), terminal.clone()))
+}
+
 /// Runs the ordinary governed path for this process: binds the owner
 /// delivery set, resolves the authenticated grant into a local admitted port
 /// set, and serves the bounded request loop to its correlated terminal
@@ -6324,51 +6381,9 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // not a second execution.
         match report.completion() {
             LoopCompletion::Served => {
-                // The served terminal is the last event of the sequence this
-                // same report carries, so the frame sealed below and the frame
-                // returned below cannot be a different observation. A served
-                // report without one is the exact refusal the loop has always
-                // reported for a terminal it cannot name.
-                let Some(terminal) = report.served_terminal() else {
-                    return Err(OrdinaryDriveError::Loop(denied("no-request")));
-                };
-                // Containment evidence is the loop's own terminal condition:
-                // it only reports served once the operation's effect is
-                // attested as settled, so reclaiming here never races an
-                // unresolved guest child.
-                //
-                // The served marker and the exact retained sequence seal
-                // durably before physical reclaim, so restart reconciles
-                // terminal-unacknowledged state by republishing the original
-                // sequence instead of re-executing.
-                seal_served_outcome(&directory, &claim, report.retained(), edge_now_ms())?;
-                let reclamation = consume_delivery_set(&claim);
-                // The served marker is now durable, so the pre-execution
-                // InFlight evidence is redundant: drop it best-effort. A
-                // leftover only replays, never re-executes.
-                let _ =
-                    crate::dispatch_material::clear_inflight_marker(&directory, claim.identity());
-                // Bounded residual only: a partial reclamation never
-                // overwrites the primary result; retained files stay for
-                // maintenance under the exact claimed identity.
-                let _residual_complete = match &reclamation {
-                    crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
-                        let _reclaimed_operation = detail.identity.operation_id.len();
-                        detail.fully_reclaimed()
-                    }
-                    crate::dispatch_material::ClaimedReclamation::ReplacementPreserved {
-                        claimed,
-                    }
-                    | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
-                    | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
-                        claimed,
-                    } => {
-                        let _preserved_operation = claimed.operation_id.len();
-                        false
-                    }
-                };
-                served.push(claim.into_identity());
-                outcome = Some(terminal.clone());
+                let (identity, terminal) = seal_and_reclaim_served(&directory, claim, &report)?;
+                served.push(identity);
+                outcome = Some(terminal);
             }
             LoopCompletion::Failed { failure } => {
                 // Nothing about the observation is lost here and nothing is
