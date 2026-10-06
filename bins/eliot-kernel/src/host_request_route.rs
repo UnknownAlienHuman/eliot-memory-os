@@ -7689,6 +7689,11 @@ impl KernelComposition {
         })
     }
 
+    /// Names the bridge stream-owners saturation dimension (issue #2731).
+    fn stream_owners_pressure() -> TransportError {
+        TransportError::AttributedBackpressure(eliot_ipc::BACKPRESSURE_BRIDGE_STREAM_OWNERS)
+    }
+
     /// Stages one durable/control event with its pre-persistence privacy
     /// decision and records the Governor-intake handoff (Implements #2561,
     /// I7.23 + I5(i)).
@@ -7780,7 +7785,11 @@ impl KernelComposition {
                     eliot_ipc::BACKPRESSURE_BRIDGE_ENVELOPE_BYTES,
                 ));
             }
-            Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
+            // Owner-table bind: the only reachable capacity failure here
+            // (issue #2731) — every other stage-path budget answers typed
+            // pressure, so this residual names stream-owners. The session
+            // stays retained by the front-door backpressure arm.
+            Err(OrsError::ProjectionLimitExceeded) => return Err(Self::stream_owners_pressure()),
             Err(_) => return Err(TransportError::SessionFenced),
         };
         // An elapsed absolute deadline is staged honestly, then
@@ -8013,7 +8022,11 @@ impl KernelComposition {
                 ));
             }
             Err(OrsError::DuplicateConflict) => return Err(TransportError::IdentityConflict),
-            Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
+            // Unscoped-gap owner bind: the only reachable capacity failure
+            // here (issue #2731) — gap-table budget answers typed pressure
+            // and scoped gaps never bind. The session stays retained by
+            // the front-door backpressure arm.
+            Err(OrsError::ProjectionLimitExceeded) => return Err(Self::stream_owners_pressure()),
             Err(_) => return Err(TransportError::SessionFenced),
         };
         let accepted = outcome
