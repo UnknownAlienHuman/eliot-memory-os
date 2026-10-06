@@ -170,6 +170,21 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
+/// Counts the exact `detail="..."` cell: several frozen events are strict
+/// prefixes of sibling events (e.g. the unknown vs the owner-fenced
+/// unknown), so a bare substring count would conflate phases the issue
+/// keeps distinct.
+fn exact_detail(event: &str) -> String {
+    format!("detail=\"{event}\"")
+}
+
+/// Terminal records carry the frozen code, not a detail cell (the
+/// `code="host-open-failed"` pattern the frozen table pins): a terminal
+/// code is a strict substring risk the other way, so it gets its own cell.
+fn exact_code(event: &str) -> String {
+    format!("code=\"{event}\"")
+}
+
 fn restart_request(case: &str, id: &str) -> HostRuntimeControlRequest {
     HostRuntimeControlRequest::new(
         HostRuntimeControlOperation::RestartKernel,
@@ -239,17 +254,28 @@ fn dispatch_fenced_owner_answers_unknown_with_identity() {
     for boundary in [
         BOUNDARY_KERNEL_RESTART_REQUESTED,
         BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED,
-        BOUNDARY_KERNEL_RESTART_TERMINAL,
     ] {
         assert_eq!(
-            count_occurrences(&captured, boundary.event),
+            count_occurrences(&captured, &exact_detail(boundary.event)),
             1,
             "the fenced dispatch must emit {:?} exactly once: {captured}",
             boundary.event
         );
     }
+    // The terminal travels as the frozen code cell, not a detail cell.
     assert_eq!(
-        count_occurrences(&captured, BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION.event),
+        count_occurrences(
+            &captured,
+            &exact_code(BOUNDARY_KERNEL_RESTART_TERMINAL.event)
+        ),
+        1,
+        "the fenced dispatch owns exactly one terminal: {captured}"
+    );
+    assert_eq!(
+        count_occurrences(
+            &captured,
+            &exact_detail(BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION.event)
+        ),
         0,
         "the fenced dispatch must never emit the receipt completion: {captured}"
     );
@@ -290,7 +316,7 @@ fn dispatch_committed_receipt_replays_through_owner() {
         BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION,
     ] {
         assert_eq!(
-            count_occurrences(&captured, boundary.event),
+            count_occurrences(&captured, &exact_detail(boundary.event)),
             1,
             "the receipt dispatch must emit {:?} exactly once: {captured}",
             boundary.event
@@ -342,7 +368,7 @@ fn dispatch_reconcile_replays_committed_receipt_without_recommit() {
     assert_eq!(
         count_occurrences(
             &captured,
-            BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY.event
+            &exact_detail(BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY.event)
         ),
         1,
         "the reconcile must observe the readback replay exactly once: {captured}"
@@ -373,17 +399,26 @@ fn dispatch_unsupported_operation_stays_unknown_without_receipt() {
         "the typed refusal must still retain the exact control request identity"
     );
     assert_eq!(
-        count_occurrences(&captured, BOUNDARY_KERNEL_RESTART_UNKNOWN.event),
+        count_occurrences(
+            &captured,
+            &exact_detail(BOUNDARY_KERNEL_RESTART_UNKNOWN.event)
+        ),
         1,
         "the unsupported operation must observe the unknown exactly once: {captured}"
     );
     assert_eq!(
-        count_occurrences(&captured, BOUNDARY_KERNEL_RESTART_TERMINAL.event),
+        count_occurrences(
+            &captured,
+            &exact_code(BOUNDARY_KERNEL_RESTART_TERMINAL.event)
+        ),
         1,
         "the unsupported operation owns exactly one terminal: {captured}"
     );
     assert_eq!(
-        count_occurrences(&captured, BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION.event),
+        count_occurrences(
+            &captured,
+            &exact_detail(BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION.event)
+        ),
         0,
         "an unsupported operation must never emit the receipt completion: {captured}"
     );

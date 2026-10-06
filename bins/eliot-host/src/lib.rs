@@ -13791,6 +13791,9 @@ mod backup_dispatch_success_tests;
 mod runtime_control_dispatch_tests;
 
 #[cfg(all(test, windows))]
+mod stop_drain_activation_tests;
+
+#[cfg(all(test, windows))]
 mod tests;
 
 impl From<io::Error> for HostError {
