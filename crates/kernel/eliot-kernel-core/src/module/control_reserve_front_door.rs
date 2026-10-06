@@ -60,6 +60,7 @@
 //! belongs to the I6.10 authority owner (STITCH).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -70,6 +71,10 @@ use crate::RouteScope;
 use crate::authority::{AuthorityGrant, AuthorityReceipt, KernelAuthority};
 use crate::error::{KernelError, validate_id};
 
+use eliot_runtime_contracts::{
+    BottleneckCapacityProfile, BottleneckCoverageState, CapacityEnforcement, CapacityLimit,
+    frozen_bottleneck_owner_map,
+};
 pub use eliot_runtime_contracts::{
     CapacityBottleneck, CapacityClass, CapacityPermitBinding, CapacityRequest,
     ControlOperationClass, EmergencyOperationClass, NormalWorkClass, RequestedOperationClass,
@@ -334,6 +339,34 @@ impl ControlPermit {
     }
 }
 
+/// Composition-resolved reference strings the front-door owner binds into its
+/// published capacity row but cannot observe itself.
+///
+/// The owner supplies every quantity in the row from the live reserve: the
+/// frozen bottleneck and unit, the disjoint normal/protected partition limits
+/// and their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+/// mechanism those partitions are held under. The composition supplies the
+/// references that identify the observation: its own owner-generation
+/// reference for the front-door owner, the independent proof-profile
+/// reference, and the current evidence and invalidation references. Both
+/// halves are required: [`ControlReserve::publish_owner_row`] fails closed
+/// through the existing
+/// [`BottleneckCapacityProfile::validate`][eliot_runtime_contracts::BottleneckCapacityProfile::validate]
+/// when any reference is missing or non-canonical, so the composition must
+/// resolve canonical (strictly ascending, duplicate-free) reference sets
+/// rather than have them defaulted or sorted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontDoorOwnerEvidenceContext {
+    /// Owner generation/revision reference for the Kernel front-door owner.
+    pub owner_generation_ref: String,
+    /// Independent proof-profile reference produced for the dimension.
+    pub proof_profile_ref: String,
+    /// Current owner evidence references supporting the published row.
+    pub evidence_refs: Vec<String>,
+    /// Exact invalidation set of the published row.
+    pub invalidation_set: Vec<String>,
+}
+
 impl ControlReserve {
     /// Creates a reserve with symmetric migration partitions.
     ///
@@ -531,6 +564,91 @@ impl ControlReserve {
         *sealed = None;
         self.inner.restart_sealed.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// Publishes the owner-produced capacity row for the frozen Kernel
+    /// control-channel dimension (issue #1679 W3).
+    ///
+    /// Every quantity is read from this reserve: the frozen bottleneck and
+    /// unit, the configured disjoint normal/protected partition limits and
+    /// their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+    /// mechanism those partitions are held under. The published limits are the
+    /// configured partition capacities, not the currently available remainder:
+    /// availability moves as permits are acquired and released, while the
+    /// guarantee the profile records is the partition itself. No emergency
+    /// partition is claimed here: the preallocated last-resort slot stays with
+    /// the loss-reporting path (W9), mirroring the ORS owner which likewise
+    /// claims none. The composition-resolved references come from `ctx`
+    /// unchanged.
+    ///
+    /// The row is checked by the existing contract validation before it is
+    /// returned, so a missing owner, generation, physical total, protected
+    /// partition, enforcement, proof, evidence or invalidation reference fails
+    /// here rather than publishing a row the Kernel composition would have to
+    /// lower to `UNKNOWN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::InvalidField`] when the frozen owner map binds
+    /// no owner to the front-door dimension or when the configured partition
+    /// capacities cannot form a positive physical total, and
+    /// [`KernelError::RuntimeContract`] when the assembled row fails the
+    /// existing contract validation.
+    pub fn publish_owner_row(
+        &self,
+        ctx: &FrontDoorOwnerEvidenceContext,
+    ) -> Result<BottleneckCapacityProfile, KernelError> {
+        let owner = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == FRONT_DOOR_BOTTLENECK)
+            .map(|bound| bound.owner)
+            .ok_or(KernelError::InvalidField {
+                field: "control_reserve.owner_row",
+                reason: "frozen owner map binds no owner to the front-door dimension",
+            })?;
+        let unit = FRONT_DOOR_BOTTLENECK.unit();
+        let limit = |field: &'static str, amount: usize| {
+            u64::try_from(amount)
+                .ok()
+                .and_then(NonZeroU64::new)
+                .map(|quantity| CapacityLimit { unit, quantity })
+                .ok_or(KernelError::InvalidField {
+                    field,
+                    reason: "partition capacity must be a positive value",
+                })
+        };
+        let normal_limit = limit("control_reserve.normal_limit", self.inner.normal_capacity)?;
+        let protected_limit = limit(
+            "control_reserve.protected_limit",
+            self.inner.protected_capacity,
+        )?;
+        let physical_total = self
+            .inner
+            .normal_capacity
+            .checked_add(self.inner.protected_capacity)
+            .ok_or(KernelError::InvalidField {
+                field: "control_reserve.physical_total_limit",
+                reason: "disjoint partition capacities overflow the physical total",
+            })?;
+        let physical_total_limit = limit("control_reserve.physical_total_limit", physical_total)?;
+        let row = BottleneckCapacityProfile {
+            bottleneck: FRONT_DOOR_BOTTLENECK,
+            coverage_state: BottleneckCoverageState::Claimed,
+            owner_ref: owner.to_owned(),
+            owner_generation_ref: ctx.owner_generation_ref.clone(),
+            unit,
+            physical_total_limit: Some(physical_total_limit),
+            normal_work_applicable: true,
+            normal_limit: Some(normal_limit),
+            protected_limit: Some(protected_limit),
+            emergency_limit: None,
+            enforcement: Some(CapacityEnforcement::PhysicalPartition),
+            proof_profile_ref: ctx.proof_profile_ref.clone(),
+            evidence_refs: ctx.evidence_refs.clone(),
+            invalidation_set: ctx.invalidation_set.clone(),
+        };
+        row.validate()?;
+        Ok(row)
     }
 
     /// Attempts to acquire one normal-workload permit without blocking.
@@ -1716,6 +1834,94 @@ mod tests {
     }
 
     #[test]
+    fn normal_saturation_response_refuses_an_unsaturated_partition() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([11u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The normal partition still admits work, so it must never be reported
+        // as saturated: pressure evidence is not manufactured.
+        assert_eq!(front_door.available_normal(), 1);
+
+        let err = front_door
+            .normal_saturation_response(
+                NormalWorkClass::Interactive,
+                "op-unsaturated-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("an unsaturated partition must not report saturation");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.normal_partition",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn protected_exhaustion_response_refuses_a_remaining_partition() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([13u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The protected partition still admits control work, so it must never be
+        // reported as exhausted: recovery-boundary evidence is not manufactured
+        // for a partition that has not refused anything.
+        assert_eq!(front_door.available_protected(), 1);
+
+        let err = front_door
+            .protected_exhaustion_response(
+                ControlOperationClass::CancelOperation,
+                "op-protected-remaining-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("a remaining protected partition must not report exhaustion");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.protected_partition",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn guarantee_lost_response_refuses_a_remaining_last_resort_path() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([15u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The preallocated last-resort emergency slot is still live, so there is
+        // no guarantee loss to record: this pins the fail-closed property, not
+        // the preallocation constant.
+        assert!(front_door.available_emergency() > 0);
+
+        let err = front_door
+            .guarantee_lost_response(
+                "op-loss-premature-1",
+                eliot_contracts::ArtifactId::new("profile-rev-1").expect("valid artifact id"),
+            )
+            .expect_err("a live last-resort path must not produce a loss record");
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "front_door.last_resort_path",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn protected_and_emergency_permits_are_owner_and_epoch_bound() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([9u8; 32]),
@@ -1818,6 +2024,152 @@ mod tests {
     }
 
     #[test]
+    fn protected_acquire_rejects_blank_owner() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([9u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 2, 8)?;
+
+        let Err(err) =
+            front_door.acquire_protected(ControlOperationClass::Recovery, "", "op-recovery-1")
+        else {
+            panic!("blank owner must never hold a protected permit");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "control_permit.owner",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn control_permit_release_returns_slot_exactly_once() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([19u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        let permit =
+            front_door.acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-rel-1")?;
+        assert_eq!(front_door.available_normal(), 0);
+
+        // The explicit release returns the slot to the partition it was drawn
+        // from and binds the returned evidence to its operation and owner.
+        let evidence = permit.release();
+        assert_eq!(front_door.available_normal(), 1);
+        assert_eq!(evidence.operation_id(), "op-rel-1");
+        assert_eq!(evidence.owner(), "owner-a");
+
+        // Drop after an explicit release moves no counter, so the slot is
+        // returned exactly once and never twice.
+        drop(evidence);
+        assert_eq!(front_door.available_normal(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn emergency_permit_release_returns_last_resort_slot_exactly_once() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([77u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
+
+        // The last-resort slot is preallocated outside normal accounting
+        // (I14.3), so one emergency acquire drains it exactly like the
+        // normal slot above.
+        let permit = front_door.acquire_emergency(
+            EmergencyOperationClass::ReserveExhaustionGapRecord,
+            "owner-a",
+            "op-emrel-1",
+        )?;
+        assert_eq!(front_door.available_emergency(), 0);
+
+        // The explicit release returns the slot and binds the returned
+        // evidence to its operation and owner.
+        let evidence = permit.release();
+        assert_eq!(front_door.available_emergency(), 1);
+        assert_eq!(evidence.operation_id(), "op-emrel-1");
+        assert_eq!(evidence.owner(), "owner-a");
+
+        // Drop after an explicit release moves no counter: exactly once,
+        // never twice.
+        drop(evidence);
+        assert_eq!(front_door.available_emergency(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_zero_normal_capacity_fails_closed() {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([25u8; 32]),
+            genesis_epoch(),
+        );
+        // The constructor floor (issue #1679): a front door with no normal
+        // partition can never admit normal work, so building one fails
+        // closed instead of producing a reserve that refuses everything
+        // at runtime (I14.3: partitions are non-borrowable; zero
+        // capacity is a build error, not a runtime surprise).
+        let Err(err) = FrontDoor::partitioned(authority, 0, 1, 8) else {
+            panic!("zero normal capacity must fail at build");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "control_reserve.normal_capacity",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn partitioned_zero_protected_capacity_fails_closed() {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([33u8; 32]),
+            genesis_epoch(),
+        );
+        // The second constructor floor (issue #1679): a front door with no
+        // protected partition can never admit control work, so building one
+        // fails closed instead of producing a reserve that refuses every
+        // control operation at runtime (I14.3: protected control is
+        // non-borrowable; zero capacity is a build error, not a runtime
+        // surprise).
+        let Err(err) = FrontDoor::partitioned(authority, 1, 0, 8) else {
+            panic!("zero protected capacity must fail at build");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "control_reserve.protected_capacity",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ledger_zero_capacity_fails_closed() {
+        // The ledger constructor floor (issue #1679, A7): a zero-capacity
+        // idempotency ledger cannot order any entry, so building one fails
+        // at build instead of producing a ledger that evicts everything
+        // (exact replay needs a real ledger).
+        let Err(err) = IdempotencyLedger::new(0) else {
+            panic!("zero ledger capacity must fail at build");
+        };
+        assert!(matches!(
+            err,
+            KernelError::InvalidField {
+                field: "idempotency_ledger.capacity",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn ledger_evicts_oldest_when_full() -> Result<(), KernelError> {
         let mut ledger = IdempotencyLedger::new(2)?;
         ledger.record(
@@ -1847,6 +2199,213 @@ mod tests {
             IdempotencyDisposition::Replay(AuthorityDecision::Denied {
                 reason: DecisionDenialReason::Expired,
             })
+        );
+        Ok(())
+    }
+
+    /// No-scaling construction plus the preallocated last-resort slot
+    /// (issue #1679): a fresh front door reports exactly its
+    /// configured normal/protected capacities and a live emergency
+    /// slot (I14.3: quantities are copied from configuration, never
+    /// derived; the last-resort slot is preallocated outside normal
+    /// accounting).
+    #[test]
+    fn fresh_front_door_reports_configured_partitions() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([37u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 3, 8)?;
+        assert_eq!(front_door.available_normal(), 2);
+        assert_eq!(front_door.available_protected(), 3);
+        assert!(front_door.available_emergency() > 0);
+        Ok(())
+    }
+
+    /// The legacy ownerless control path spends exactly the
+    /// preallocated protected slot (issue #1679): the migration-only
+    /// `acquire_control` draws from the protected partition with
+    /// legacy attribution, so saturating it never touches normal
+    /// capacity (I14.3: the protected partition is preallocated and
+    /// non-borrowable).
+    #[test]
+    fn legacy_control_acquire_spends_the_single_protected_slot() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([44u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 1, 8)?;
+
+        assert_eq!(front_door.available_control(), 1);
+        let _held = front_door
+            .acquire_control()
+            .expect("legacy protected acquire");
+        assert_eq!(front_door.available_control(), 0);
+
+        let err = front_door
+            .acquire_control()
+            .expect_err("spent protected slot must refuse");
+        assert!(matches!(err, KernelError::ControlReserveExhausted));
+        Ok(())
+    }
+
+    /// The legacy permit carries its legacy attribution
+    /// (issue #1679): the neighbour tests pin only capacity
+    /// movement (spend/refuse, normal untouched); nothing
+    /// pins WHO the legacy slot is attributed to. Reading
+    /// the live permit attribution here means a regression
+    /// stamping the wrong identity fails this test while the
+    /// capacity tests still pass (I14.3: every permit binds
+    /// owner and operation identity; the legacy path
+    /// attributes holders as legacy rather than anonymous).
+    #[test]
+    fn legacy_control_permit_carries_legacy_attribution() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([44u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 1, 8)?;
+
+        // Held in a named binding so the attribution can be read
+        // while the single protected slot stays spent.
+        let permit = front_door
+            .acquire_control()
+            .expect("legacy protected acquire");
+        assert_eq!(permit.owner(), "legacy-control-reserve");
+        assert_eq!(permit.operation_id(), "legacy-control");
+        assert_eq!(permit.operation(), PermitOperation::LegacyControl);
+        Ok(())
+    }
+
+    /// Legacy control saturation leaves normal capacity available
+    /// (issue #1679): the neighbour above pins only that the
+    /// protected slot is spent and refuses; it never proves the
+    /// spend did not borrow from normal. Holding the spent
+    /// protected permit while normal work still acquires pins the
+    /// cross-partition guarantee (I14.3: the protected partition
+    /// is preallocated and non-borrowable, so spending it never
+    /// reduces normal capacity).
+    #[test]
+    fn legacy_control_saturation_leaves_normal_capacity_available() -> Result<(), KernelError> {
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([44u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 1, 8)?;
+
+        // Spend the single legacy control slot: the permit releases
+        // on drop, so holding it keeps the protected partition spent.
+        let _held = front_door
+            .acquire_control()
+            .expect("legacy protected acquire");
+        assert_eq!(front_door.available_control(), 0);
+
+        // Positive control: normal work still acquires while the
+        // protected partition is spent, so a cross-partition leak
+        // would fail here.
+        let _held_normal = front_door
+            .acquire_normal(NormalWorkClass::Interactive, "owner-a", "op-norm-1")
+            .expect("normal path stays open while protected spent");
+        assert_eq!(front_door.available_normal(), 1);
+        Ok(())
+    }
+
+    fn owner_evidence_context() -> FrontDoorOwnerEvidenceContext {
+        FrontDoorOwnerEvidenceContext {
+            owner_generation_ref: "resource-generation:7".to_owned(),
+            proof_profile_ref: "proof-profile:front-door-capacity-proof".to_owned(),
+            evidence_refs: vec!["evidence:front-door-capacity-observation".to_owned()],
+            invalidation_set: vec!["invalidation:epoch-close".to_owned()],
+        }
+    }
+
+    #[test]
+    fn front_door_publish_owner_row_names_frozen_dimension() -> Result<(), KernelError> {
+        // The W3 front-door adapter (issue #1679): the published row carries
+        // the frozen bottleneck, unit and owner with live partition
+        // quantities, so the Kernel profile composition can join it without
+        // restating owner facts.
+        let reserve = ControlReserve::partitioned(8, 4)?;
+        let row = reserve.publish_owner_row(&owner_evidence_context())?;
+        assert_eq!(row.bottleneck, FRONT_DOOR_BOTTLENECK);
+        assert_eq!(row.unit, FRONT_DOOR_BOTTLENECK.unit());
+        assert_eq!(row.owner_ref, "Kernel front-door/control-channel owner");
+        assert_eq!(row.normal_limit.map(|limit| limit.quantity.get()), Some(8));
+        assert_eq!(
+            row.protected_limit.map(|limit| limit.quantity.get()),
+            Some(4)
+        );
+        assert_eq!(
+            row.physical_total_limit.map(|limit| limit.quantity.get()),
+            Some(12)
+        );
+        row.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn front_door_publish_owner_row_rejects_blank_generation() {
+        // A row without the composition-resolved owner generation is not a
+        // claim: validation fails it here instead of publishing a row the
+        // composition would have to lower to UNKNOWN.
+        let reserve = ControlReserve::partitioned(8, 4).expect("reserve builds");
+        let mut ctx = owner_evidence_context();
+        ctx.owner_generation_ref.clear();
+        assert!(reserve.publish_owner_row(&ctx).is_err());
+    }
+
+    #[test]
+    fn front_door_publish_owner_row_rejects_missing_evidence() {
+        // Evidence and invalidation are required halves of the claim: the
+        // owner holds quantities, the composition holds references, and a
+        // row missing either half fails closed at publish time.
+        let reserve = ControlReserve::partitioned(8, 4).expect("reserve builds");
+        let mut ctx = owner_evidence_context();
+        ctx.evidence_refs.clear();
+        ctx.invalidation_set.clear();
+        assert!(reserve.publish_owner_row(&ctx).is_err());
+    }
+
+    #[test]
+    fn issue_permit_normal_request_cannot_reach_protected_or_emergency() -> Result<(), KernelError>
+    {
+        // A5 (issue #1679): the operation tag alone selects the partition.
+        // A normal Store write, named read, agent, model, swarm, report or
+        // maintenance operation names a `Normal` tag, so issuance draws only
+        // the normal partition: no priority or class relabelling can move it
+        // onto protected or emergency capacity.
+        let authority = KernelAuthority::new(
+            crate::authority::KernelAuthorityKey::from_bytes([41u8; 32]),
+            genesis_epoch(),
+        );
+        let front_door = FrontDoor::partitioned(authority, 2, 2, 8)?;
+        let request = CapacityRequest {
+            operation: RequestedOperationClass::Normal(NormalWorkClass::CanonicalWrite),
+            operation_id: "op-a5-store-write-1".to_owned(),
+            requested_bottleneck: FRONT_DOOR_BOTTLENECK,
+            requested_limit: CapacityLimit {
+                unit: FRONT_DOOR_BOTTLENECK.unit(),
+                quantity: NonZeroU64::new(1).expect("single slot"),
+            },
+            requesting_owner_ref: "store-bridge".to_owned(),
+            requesting_generation_ref: ResourceGeneration::genesis(),
+            authority_epoch_ref: front_door.epoch(),
+            profile_id: "profile-1".to_owned(),
+            profile_revision: "rev-1".to_owned(),
+            deadline_ms: 1_000,
+        };
+        let (_permit, binding) =
+            front_door.issue_permit(&request, ResourceGeneration::genesis(), 500)?;
+
+        assert_eq!(binding.capacity_class, CapacityClass::NormalWorkload);
+        assert_eq!(binding.bottleneck, FRONT_DOOR_BOTTLENECK);
+        // Exactly one normal slot is held; protected and emergency partitions
+        // are untouched by the normal issuance.
+        assert_eq!(front_door.available_normal(), 1);
+        assert_eq!(front_door.available_protected(), 2);
+        assert_eq!(
+            front_door.available_emergency(),
+            EMERGENCY_PREALLOCATED_SLOTS
         );
         Ok(())
     }
