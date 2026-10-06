@@ -327,17 +327,12 @@ def answer() -> bool:
 '''
 
 
-def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINAL'):
-    """Build a temp gate root proving selected success honestly end-to-end.
+def _write_offline_capture(tmp: Path, issue_num, unit_name):
+    """Controller-side offline assignment snapshot + admission sidecar.
 
-    The test acts as CONTROLLER admitting inputs: descriptor TOML (with
-    measured body/matrix shas from the frozen #849 parser), tiny suite
-    sources, offline snapshot, and the admission sidecar carrying expected
-    digests. The gate (worker) reads digests only from the sidecar, validates
-    the snapshot via #849, binds via #850, reconciles via #851, materializes
-    via #852, and executes the real tiny suite through the frozen #850 child
-    protocol. No network, no mocks of child logic. Returns the capture path
-    for --offline-capture (pass tmp as --root).
+    The assignment is mode-independent, so the python and rust selected
+    roots admit the same snapshot. Returns (capture_path, body_sha256,
+    matrix_sha256) measured from OFFLINE_BODY via the #849 parser.
     """
     import time as _time
 
@@ -372,6 +367,22 @@ def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINA
          'capture_receipt_sha256': 'e' * 64, 'freshness_policy_sha256': 'f' * 64,
          'max_age_seconds': max_age}, sort_keys=True, separators=(',', ':')),
         encoding='utf-8')
+    return capture, matrix.body_sha256, matrix.matrix_sha256
+
+
+def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINAL'):
+    """Build a temp gate root proving selected success honestly end-to-end.
+
+    The test acts as CONTROLLER admitting inputs: descriptor TOML (with
+    measured body/matrix shas from the frozen #849 parser), tiny suite
+    sources, offline snapshot, and the admission sidecar carrying expected
+    digests. The gate (worker) reads digests only from the sidecar, validates
+    the snapshot via #849, binds via #850, reconciles via #851, materializes
+    via #852, and executes the real tiny suite through the frozen #850 child
+    protocol. No network, no mocks of child logic. Returns the capture path
+    for --offline-capture (pass tmp as --root).
+    """
+    capture, body_sha, matrix_sha = _write_offline_capture(tmp, issue_num, unit_name)
     suite = tmp / 'suite'
     suite.mkdir(parents=True)
     (suite / 'src.py').write_text(MARKED_SOURCE, encoding='utf-8')
@@ -390,8 +401,8 @@ def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINA
         'matrix_cases = 2\n'
         'proof_ceiling = {value = "assignment-source-only"}\n'
         'revision = 1\n'
-        f'body_sha256 = "{matrix.body_sha256}"\n'
-        f'matrix_sha256 = "{matrix.matrix_sha256}"\n'
+        f'body_sha256 = "{body_sha}"\n'
+        f'matrix_sha256 = "{matrix_sha}"\n'
         'require_workspace_member = false\n'
         'module = {value = "suite.test_marked"}\n'
         'requirements = {source_floor = 1, public_floor = 1, test_floor = 2, '
@@ -400,6 +411,52 @@ def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINA
         'line_bytes = 65536, discovery_tests = 100, child_processes = 4}\n',
         encoding='utf-8')
     return capture
+
+def make_rust_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINAL',
+                            matrix_cases=2, broken_build=False):
+    """Build a temp gate root with a real zero-dep cargo crate at the root.
+
+    Mirrors make_offline_selected_root field-for-field, except the crate lives
+    at tmp/Cargo.toml + tmp/src/lib.rs: the gate builds manifest_rel="Cargo.toml"
+    with cwd=root, so the manifest must sit at the root, not in a subdir.
+    rust-tiny supplies the sources (two passing tests, one failure, one
+    ignore); broken_build appends a compile_error! canary so `cargo build`
+    exits nonzero. Returns the --offline-capture path.
+    """
+    capture, body_sha, matrix_sha = _write_offline_capture(tmp, issue_num, unit_name)
+    (tmp / 'src').mkdir(parents=True, exist_ok=True)
+    lib = (INTEGRATION / 'repos/rust-tiny/src/lib.rs').read_bytes()
+    if broken_build:
+        lib += b'\ncompile_error!("o2-canary-broken-build");\n'
+    (tmp / 'src' / 'lib.rs').write_bytes(lib)
+    (tmp / 'Cargo.toml').write_text(
+        '[package]\nname = "wu837_tiny"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n',
+        encoding='utf-8')
+    units = tmp / '.github' / 'work-units'
+    units.mkdir(parents=True, exist_ok=True)
+    (units / f'{issue_num}.toml').write_text(
+        'schema_version = "eliot-work-unit-descriptor-v2"\n'
+        f'identity = {{value = "work-unit-{issue_num}"}}\n'
+        'issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, '
+        f'number = {issue_num}}}\n'
+        f'unit = {{value = "{unit_name}"}}\n'
+        'mode = "rust-package"\n'
+        'source_roots = [{value = "src/lib.rs"}]\n'
+        'test_roots = [{value = "src/lib.rs"}]\n'
+        f'matrix_cases = {matrix_cases}\n'
+        'proof_ceiling = {value = "assignment-source-only"}\n'
+        'revision = 1\n'
+        f'body_sha256 = "{body_sha}"\n'
+        f'matrix_sha256 = "{matrix_sha}"\n'
+        'require_workspace_member = false\n'
+        'package = {name = "wu837_tiny"}\n'
+        'requirements = {source_floor = 1, public_floor = 0, test_floor = 2, '
+        'required_guards = [{value = "bounded"}]}\n'
+        'bounds = {wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, '
+        'line_bytes = 65536, discovery_tests = 100, child_processes = 4}\n',
+        encoding='utf-8')
+    return capture
+
 
 
 class WorkUnitGateMatrixTests(unittest.TestCase):
@@ -1236,6 +1293,157 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
                                 test_roots=('scripts/testdata/work-unit-gate/integration/repos/rust-tiny/src/lib.rs',))
         self.assertEqual(member_desc.phase, contractsmod.VerificationPhase.WORKSPACE_INTEGRATION)
         self.assertEqual(ready.phase, contractsmod.VerificationPhase.PACKAGE_LOCAL)
+
+    # WORK_UNIT_CASE: 837/43
+    def test_selected_rust_workspace_manifest_observed(self):
+        # The closed root-manifest read must observe the manifest (tomllib.loads
+        # needs str; bytes raised TypeError, swallowed into {} so every package
+        # resolved UNAVAILABLE). A standalone crate root now passes workspace
+        # admission, so the gate reaches binary binding instead. Binary
+        # production itself is a separate defect (plain cargo build emits no
+        # test-profile artifact): pinned here only by its message, to be
+        # replaced by a real execution proof once test binaries are produced.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_rust_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        combined = out + err
+        self.assertNotIn('workspace incomplete', combined)
+        self.assertIn('missing test binary: issue-837', combined)
+
+    # WORK_UNIT_CASE: 837/44
+    def test_full_project_selected_ceiling_refused(self):
+        # CCV7: no contract-approved full-project ceiling exists, so a
+        # successful full-project result must fail closed (exit 1) instead of
+        # being reported under the selected-verification-only ceiling. The
+        # selector flag is omitted: full-project selects the entire profile and
+        # an explicit selector is rejected before execution.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'full-project', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        combined = out + err
+        self.assertIn('full-project ceiling unavailable', combined)
+
+    # WORK_UNIT_CASE: 837/45
+    def test_recursive_gate_selection_rejected_snapshot_roots_allowed(self):
+        # CCV7 no-recursion rule with real teeth, over two real temp roots: a
+        # descriptor whose TEST roots name this gate would execute the gate as
+        # its own prerequisite, so the selection is rejected (exit 1) before
+        # any runner instead of failing confusingly downstream. Source roots
+        # are snapshot-only inputs that are never executed, so the same path in
+        # source_roots stays allowed and the real tiny suite still proves
+        # selected end to end.
+        gate_rel = 'scripts/verify-work-unit.py'
+        descriptor_rel = '.github/work-units/837.toml'
+        test_roots_line = 'test_roots = [{value = "suite/test_marked.py"}]'
+        source_roots_line = 'source_roots = [{value = "suite/src.py"}]'
+        # Leg 1 (reject): the gate named as a test root.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            (tmp / 'scripts').mkdir(parents=True)
+            (tmp / gate_rel).write_bytes((ROOT / gate_rel).read_bytes())
+            descriptor = tmp / descriptor_rel
+            original = descriptor.read_text(encoding='utf-8')
+            rewritten = original.replace(
+                test_roots_line,
+                'test_roots = [{value = "scripts/verify-work-unit.py"}]')
+            self.assertNotEqual(original, rewritten)
+            descriptor.write_text(rewritten, encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        self.assertIn('recursive gate selection: issue-837', out + err)
+        # Leg 2 (snapshot-only allowed): the gate named as a source root only.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            (tmp / 'scripts').mkdir(parents=True)
+            (tmp / gate_rel).write_bytes((ROOT / gate_rel).read_bytes())
+            descriptor = tmp / descriptor_rel
+            original = descriptor.read_text(encoding='utf-8')
+            rewritten = original.replace(
+                source_roots_line,
+                'source_roots = [{value = "suite/src.py"}, '
+                '{value = "scripts/verify-work-unit.py"}]')
+            self.assertNotEqual(original, rewritten)
+            self.assertIn(test_roots_line, rewritten)
+            descriptor.write_text(rewritten, encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(0, code)
+
+    # WORK_UNIT_CASE: 837/46
+    def test_selected_success_digest_binds_cohort_aggregate(self):
+        # CCV7: the immutable result digest must be the cross-checked cohort
+        # aggregate (binding catalogue, selection, descriptors, snapshots,
+        # receipts, discovered tests and executions) - not a counts-only hash.
+        # The success-path identity list carries the same aggregate prefix, so
+        # the projection cannot claim a digest it did not compute.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(0, code)
+        payload = json.loads(out)
+        self.assertIn('cohort:' + payload['digest'][:12], payload['identities'])
+
+    # WORK_UNIT_CASE: 837/47
+    def test_selected_python_child_output_bound_truncates_fail_closed(self):
+        # CCV3: the descriptor output bound must be enforced on the OBSERVED
+        # python child protocol bytes, not passed as a literal `truncated=False`.
+        # Every other bounded read in the selected path length-checks against
+        # out_cap and early-returns; an oversize body must do the same, so the
+        # run fails closed through the existing None mapping
+        # (`discovery failure`, exit 1) instead of reaching the cleanup site.
+        # Tiny-but-consistent bounds (line_bytes <= output_bytes): a 64-byte cap
+        # is certainly exceeded by the real discovery protocol body yet still
+        # passes decode_descriptor shape validation, so the run reaches the new
+        # check instead of failing earlier on bounds shape. Every other bound is
+        # unchanged, mirroring test_selected_end_to_end_success_through_all_owners.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            descriptor = tmp / '.github' / 'work-units' / '837.toml'
+            raw = descriptor.read_text(encoding='utf-8')
+            honest = ('bounds = {wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, '
+                      'line_bytes = 65536, discovery_tests = 100, child_processes = 4}')
+            tiny = ('bounds = {wall_ms = 60000, idle_ms = 10000, output_bytes = 64, '
+                    'line_bytes = 32, discovery_tests = 100, child_processes = 4}')
+            self.assertIn(honest, raw)
+            descriptor.write_text(raw.replace(honest, tiny), encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        self.assertIn('discovery failure', out + err)
+
+
+    # WORK_UNIT_CASE: 837/48
+    def test_selected_python_extra_discovery_denominator_mismatch(self):
+        # CCV6 exact selected denominator on the python path: the marked
+        # suite discovers exactly 2 tests against matrix_cases = 2, so a
+        # third test must fail closed before any execution (not clip, not
+        # execute-then-fail). The descriptor/assignment binding stays
+        # intact (rewriting matrix_cases would break it with
+        # STALE_ASSIGNMENT_BINDING instead); only the suite grows.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            suite = tmp / 'suite' / 'test_marked.py'
+            raw = suite.read_text(encoding='utf-8')
+            self.assertEqual(2, raw.count('def test_selected_'))
+            suite.write_text(raw + '\n    def test_selected_extra_denominator(self):\n        self.assertTrue(True)\n',
+                             encoding='utf-8')
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
+        self.assertEqual(1, code)
+        self.assertIn('discovery denominator mismatch: issue-837 (discovered 3, matrix 2)', out + err)
 
 
 if __name__ == '__main__':

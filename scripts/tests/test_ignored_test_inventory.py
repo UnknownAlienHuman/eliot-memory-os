@@ -69,7 +69,10 @@ def _scan_snippet(code: str, target: PackageTarget | None = None, file_name: str
         root = Path(td).resolve()
         src_path = root / file_name
         src_path.parent.mkdir(parents=True, exist_ok=True)
-        src_path.write_text(code, encoding="utf-8")
+        # LF write: on Windows a default text write would store CRLF and
+        # shift every span past the first line, while checked-in sources
+        # (and the scanned text) use LF.
+        src_path.write_text(code, encoding="utf-8", newline="\n")
         if target is None:
             target = PackageTarget(
                 package_id="test-pkg 0.1.0 (path+file:///crates/test-pkg)",
@@ -91,6 +94,89 @@ def _fixture_rustc_verbose(toolchain: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+_WRITE_CALLS = frozenset({"open", "write_text", "write_bytes", "mkdir", "unlink"})
+_PATH_FACTORY_CALLS = frozenset(
+    {"Path", "PurePath", "PurePosixPath", "PureWindowsPath", "PosixPath", "WindowsPath"}
+)
+
+
+def _resolve_path_literal(node: ast.AST) -> str | None:
+    """Fold a path expression to a string when fully constant, else None.
+
+    Covers string constants, Path(...) factories over constants, ``/`` joins
+    and ``+`` concatenations of constants, and constant-only f-strings.
+    Anything computed (names, calls, formatted values) is not resolved: the
+    oracle cannot certify it, and the production writes it only to admitted
+    computed destinations the closed argv/lease checks already bound.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = (
+            func.attr if isinstance(func, ast.Attribute)
+            else func.id if isinstance(func, ast.Name)
+            else None
+        )
+        if name == "joinpath" and isinstance(func, ast.Attribute) and node.args:
+            base = _resolve_path_literal(func.value)
+            tail = [_resolve_path_literal(arg) for arg in node.args]
+            if base is not None and all(part is not None for part in tail):
+                return base + "/" + "/".join(tail)
+            return None
+        if name in _PATH_FACTORY_CALLS and node.args:
+            parts = [_resolve_path_literal(arg) for arg in node.args]
+            if all(part is not None for part in parts):
+                return parts[0] if len(parts) == 1 else "/".join(parts)
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+        left = _resolve_path_literal(node.left)
+        right = _resolve_path_literal(node.right)
+        if left is not None and right is not None:
+            if isinstance(node.op, ast.Add):
+                return left + right
+            return left.rstrip("/") + "/" + right.lstrip("/")
+        return None
+    if isinstance(node, ast.JoinedStr):
+        if all(isinstance(value, ast.Constant) for value in node.values):
+            return "".join(value.value for value in node.values if isinstance(value.value, str))
+        return None
+    return None
+
+
+def _forbidden_write_destinations(tree: ast.AST) -> list[str]:
+    """Resolved workflow/secret write destinations in a source tree.
+
+    Every file-mutation call contributes its receiver (when attribute-form)
+    plus all positional/keyword arguments, each constant-folded; only fully
+    resolved destinations are reported, so computed admitted paths stay out.
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            call_name = node.func.id
+            receiver: ast.AST | None = None
+        elif isinstance(node.func, ast.Attribute):
+            call_name = node.func.attr
+            receiver = node.func.value
+        else:
+            continue
+        if call_name not in _WRITE_CALLS:
+            continue
+        candidates = ([receiver] if receiver is not None else []) + list(node.args)
+        candidates.extend(keyword.value for keyword in node.keywords)
+        for candidate in candidates:
+            resolved = _resolve_path_literal(candidate)
+            if resolved is None:
+                continue
+            lowered = resolved.lower()
+            if ".github/workflows" in lowered or "secret" in lowered:
+                found.append(resolved)
+    return found
+
+
 class TestIgnoredTestInventory(unittest.TestCase):
     """Test suite verifying the exact ignored-test denominator contract (issue #905)."""
 
@@ -101,7 +187,7 @@ class TestIgnoredTestInventory(unittest.TestCase):
     def test_closed_descriptor_schema_round_trip(self) -> None:
         """Closed descriptor/schema round trip."""
         self.assertEqual(SCHEMA, "eliot.integration.ignored-test-inventory.v1")
-        self.assertEqual(TOOL_VERSION, "0.5.0")
+        self.assertEqual(TOOL_VERSION, "0.8.0")
 
         fixture_path = self.fixture_dir / "sample_inventory.json"
         self.assertTrue(fixture_path.is_file(), f"missing fixture: {fixture_path}")
@@ -157,14 +243,19 @@ class TestIgnoredTestInventory(unittest.TestCase):
             digest = hashlib.sha256(_canonical_bytes(header[denominator_field])).hexdigest()
             self.assertEqual(header[digest_field], digest)
 
+        # Closed denominator schema (issue #905 W10): production emits exactly
+        # these key sets (`_target_denominator`, `discover_source` resolved
+        # shape, artifact records) - no extra fields admitted.
         target_fields = {
             "package_id", "package_name", "target_name", "target_kind", "src_path",
             "test_enabled", "doctest_enabled", "bench_enabled", "required_features",
-            "required_features_satisfied", "test_disposition",
+            "required_features_satisfied", "features", "available_features", "edition",
+            "test_disposition",
         }
         source_fields = {
             "package_id", "package_name", "target_name", "target_kind", "path",
-            "module_path", "sha256", "cfg_evidence", "resolution", "declaration",
+            "module_path", "sha256", "file_identity", "cfg_evidence", "resolution",
+            "declaration",
         }
         artifact_fields = {
             "package_id", "package_name", "target_name", "target_kind", "profile",
@@ -172,18 +263,31 @@ class TestIgnoredTestInventory(unittest.TestCase):
             "ignored_test_count",
         }
         for record in header["target_denominator"]:
-            self.assertTrue(target_fields.issubset(record))
+            self.assertEqual(set(record), target_fields)
             self.assertIn(record["test_disposition"], {"test_enabled", "test_disabled", "exempt"})
             self.assertIsNone(record["bench_enabled"])
+            self.assertIsInstance(record["edition"], str)
+            self.assertTrue(record["edition"])
+            self.assertIsInstance(record["features"], list)
+            self.assertIsInstance(record["available_features"], list)
+            if record["required_features_satisfied"] is True:
+                self.assertTrue(
+                    set(record["required_features"]).issubset(set(record["features"])),
+                    "satisfied target must enable its required features",
+                )
         for record in header["source_denominator"]:
-            self.assertTrue(source_fields.issubset(record))
+            self.assertEqual(set(record), source_fields)
             self.assertIn(record["resolution"], {"resolved", "unresolved"})
             if record["resolution"] == "resolved":
                 self.assertRegex(record["sha256"], r"\A[0-9a-f]{64}\Z")
+                self.assertEqual(
+                    set(record["file_identity"]), {"device", "inode", "size", "mtime_ns"}
+                )
             else:
                 self.assertIsNone(record["sha256"])
+                self.assertIsNone(record["file_identity"])
         for record in header["artifact_denominator"]:
-            self.assertTrue(artifact_fields.issubset(record))
+            self.assertEqual(set(record), artifact_fields)
             self.assertIsInstance(record["ignored_test_count"], int)
             self.assertGreaterEqual(record["ignored_test_count"], 0)
             self.assertEqual(set(record["file_identity"]), {"device", "inode", "size", "mtime_ns"})
@@ -483,6 +587,38 @@ class TestIgnoredTestInventory(unittest.TestCase):
             self.assertLess(failed_events.index("assign"), failed_events.index("kill"))
             self.assertLess(failed_events.index("kill"), failed_events.index("reap"))
             self.assertLess(failed_events.index("reap"), failed_events.index("close"))
+
+        # The owned-execution environment is a closed allowlist (issue #905 W1):
+        # toolchain locators pass, everything else drops, absent vars vanish.
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "p",
+                "SystemDrive": "C:",
+                "ProgramData": "D:\\pd",
+                "EVIL_INJECTED": "x",
+                "RUSTFLAGS": "--cfg evil",
+            },
+            clear=True,
+        ):
+            owned_env = iti._fixed_command_env("troot")
+        self.assertEqual(
+            set(owned_env),
+            {
+                "PATH", "SystemDrive", "ProgramData", "CARGO_TARGET_DIR",
+                "CARGO_TERM_COLOR", "RUST_BACKTRACE",
+            },
+        )
+        self.assertEqual(owned_env["SystemDrive"], "C:")
+        self.assertEqual(owned_env["ProgramData"], "D:\\pd")
+        self.assertEqual(owned_env["CARGO_TARGET_DIR"], "troot")
+        self.assertNotIn("EVIL_INJECTED", owned_env)
+        self.assertNotIn("RUSTFLAGS", owned_env)
+        with patch.dict(os.environ, {}, clear=True):
+            empty_env = iti._fixed_command_env("troot")
+        self.assertEqual(
+            set(empty_env), {"CARGO_TARGET_DIR", "CARGO_TERM_COLOR", "RUST_BACKTRACE"}
+        )
 
     # WORK_UNIT_CASE: 905/3
     def test_ordinary_reason_bearing_ignored_sync_tests_found(self) -> None:
@@ -1519,6 +1655,38 @@ class TestIgnoredTestInventory(unittest.TestCase):
             }
             compiler_message_line = json.dumps(compiler_message).encode("utf-8") + b"\n"
             valid_closed_stream = artifact_line + compiler_message_line + success_line
+            # Live rustc envelopes each diagnostic with "$message_type":
+            # "diagnostic" - admitted exactly; any other marker value or extra
+            # key stays refused so the closed shape holds on the live stream.
+            message_type_admitted = {
+                **compiler_message,
+                "message": {**compiler_message["message"], "$message_type": "diagnostic"},
+            }
+            message_type_stream = (
+                artifact_line + json.dumps(message_type_admitted).encode("utf-8") + b"\n" + success_line
+            )
+            self.assertEqual(
+                discover_compiled(troot, [target], runner=runner_for(message_type_stream)),
+                [],
+            )
+            for bad_diagnostic_message in (
+                {**compiler_message["message"], "$message_type": "artifact"},
+                {**compiler_message["message"], "$message_type": None},
+                {**compiler_message["message"], "unknown_extra": 1},
+            ):
+                with self.subTest(bad_diagnostic_message=bad_diagnostic_message):
+                    with self.assertRaises(InventoryError) as cm:
+                        discover_compiled(
+                            troot,
+                            [target],
+                            runner=runner_for(
+                                artifact_line
+                                + json.dumps({**compiler_message, "message": bad_diagnostic_message}).encode("utf-8")
+                                + b"\n"
+                                + success_line
+                            ),
+                        )
+                    self.assertEqual(cm.exception.code, "COMPILED_GRAPH_UNAVAILABLE")
             self.assertEqual(
                 discover_compiled(troot, [target], runner=runner_for(valid_closed_stream)),
                 [],
@@ -1597,8 +1765,21 @@ class TestIgnoredTestInventory(unittest.TestCase):
                 }],
             }
             build_targets = _targets(troot, build_metadata)
+            # Closed target schema (issue #905 W10): production emits exactly
+            # these keys for every target record - no extra fields admitted.
+            denominator_records = iti._target_denominator(troot, build_targets)
+            for denominator_record in denominator_records:
+                self.assertEqual(
+                    set(denominator_record),
+                    {
+                        "package_id", "package_name", "target_name", "target_kind",
+                        "src_path", "test_enabled", "doctest_enabled", "bench_enabled",
+                        "required_features", "required_features_satisfied", "features",
+                        "available_features", "edition", "test_disposition",
+                    },
+                )
             build_target_record = next(
-                record for record in iti._target_denominator(troot, build_targets)
+                record for record in denominator_records
                 if record["target_kind"] == "custom-build"
             )
             self.assertEqual(
@@ -1885,6 +2066,92 @@ class TestIgnoredTestInventory(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].state, RowState.UNCLASSIFIED.value)
         self.assertEqual(rows[0].remediation_owner, "test-declaration-owner")
+
+        # W7/W24 (issue #905): a supported Store word must not certify an
+        # additional unknown provider - the composed set keeps UNKNOWN and the
+        # row stays UNCLASSIFIED (refuting comment 5981399706; I18.32:3).
+        self.assertEqual(
+            _requirements("requires SurrealDB and Redis"),
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        self.assertEqual(
+            _requirements("requires store with PostgreSQL"),
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        # All-known compositions are unaffected by the provider guard.
+        self.assertEqual(
+            _requirements("requires store and runtime windows pipe"),
+            (Requirement.RUNTIME.value, Requirement.STORE.value),
+        )
+        # Order, shared-generic-word and comma variants name the same extra
+        # unleased dependency regardless of position or masking vocabulary.
+        for phrase in (
+            "requires Redis and SurrealDB",
+            "requires SurrealDB and Redis database",
+            "requires SurrealDB, Redis",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(
+                    _requirements(phrase),
+                    (Requirement.STORE.value, Requirement.UNKNOWN.value),
+                )
+        self.assertEqual(
+            _requirements("requires store database"),
+            (Requirement.STORE.value,),
+        )
+
+        mixed_code = """
+        #[test]
+        #[ignore = "requires SurrealDB and Redis"]
+        fn test_store_unknown_provider() {}
+        """
+        mixed_tests = _scan_snippet(mixed_code)
+        self.assertEqual(len(mixed_tests), 1)
+        mixed_source = mixed_tests[0]
+        self.assertEqual(
+            mixed_source.requirements,
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        mixed_compiled = CompiledTest(
+            package_id=mixed_source.package_id,
+            package_name=mixed_source.package_name,
+            target_name=mixed_source.target_name,
+            target_kind=mixed_source.target_kind,
+            executable="target/debug/deps/lib",
+            executable_digest="ed",
+            test_name=mixed_source.test_name,
+        )
+        mixed_rows = reconcile([mixed_source], [mixed_compiled])
+        self.assertEqual(len(mixed_rows), 1)
+        self.assertEqual(mixed_rows[0].state, RowState.UNCLASSIFIED.value)
+        self.assertEqual(mixed_rows[0].remediation_owner, "test-declaration-owner")
+
+        # Comma-enumerated unknown provider, same guarantee end to end.
+        comma_code = """
+        #[test]
+        #[ignore = "requires SurrealDB, Redis"]
+        fn test_store_comma_unknown_provider() {}
+        """
+        comma_tests = _scan_snippet(comma_code)
+        self.assertEqual(len(comma_tests), 1)
+        comma_source = comma_tests[0]
+        self.assertEqual(
+            comma_source.requirements,
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        comma_compiled = CompiledTest(
+            package_id=comma_source.package_id,
+            package_name=comma_source.package_name,
+            target_name=comma_source.target_name,
+            target_kind=comma_source.target_kind,
+            executable="target/debug/deps/lib",
+            executable_digest="ed",
+            test_name=comma_source.test_name,
+        )
+        comma_rows = reconcile([comma_source], [comma_compiled])
+        self.assertEqual(len(comma_rows), 1)
+        self.assertEqual(comma_rows[0].state, RowState.UNCLASSIFIED.value)
+        self.assertEqual(comma_rows[0].remediation_owner, "test-declaration-owner")
 
     # WORK_UNIT_CASE: 905/16
     def test_local_authenticated_surrealdb_version_binary_requirement_maps_to_store(self) -> None:
@@ -2544,6 +2811,21 @@ class TestIgnoredTestInventory(unittest.TestCase):
 
                 with patch.object(iti, "_observe_source_file", side_effect=observe_with_shared_synthetic_identity):
                     tests = discover_source(root, [target], source_denominator_records=records)
+                # Closed source schema (issue #905 W10): every denominator record
+                # production emits is exactly the resolved shape or the dangling
+                # (unresolved/inactive/recheck) shape - no other keys admitted.
+                resolved_shape = frozenset({
+                    "package_id", "package_name", "target_name", "target_kind",
+                    "path", "module_path", "sha256", "file_identity", "cfg_evidence",
+                    "resolution", "declaration",
+                })
+                dangling_shape = resolved_shape | frozenset({
+                    "reason", "declaration_source_path", "declaration_source_sha256",
+                    "declaration_source_file_identity",
+                })
+                for source_record in records:
+                    self.assertIn(frozenset(source_record), {resolved_shape, dangling_shape})
+                    self.assertEqual("reason" in source_record, frozenset(source_record) == dangling_shape)
                 return tests, records
 
         tests_created_forward, sources_created_forward = discover_in_creation_order(("alpha.rs", "omega.rs"))
@@ -2792,9 +3074,55 @@ class TestIgnoredTestInventory(unittest.TestCase):
         row_alt_line = reconcile([s_alt_line], [base_c])[0]
         self.assertNotEqual(base_row.row_digest, row_alt_line.row_digest)
 
+        # Perturb source bytes identity (source_digest is the row's binding to
+        # the observed file bytes): the row digest must invalidate (W33).
+        s_alt_digest = dataclasses.replace(
+            base_s, source_digest="0" * 64,
+        )
+        row_alt_digest = reconcile([s_alt_digest], [base_c])[0]
+        self.assertNotEqual(base_row.row_digest, row_alt_digest.row_digest)
+
+        # Perturb rule identity: the aggregate digest covers header.rule_table,
+        # so a rule version/sha change must invalidate the aggregate (W33).
+        # The preimage construction below is the production one (build_inventory
+        # lines 4006-4007), whose fidelity case 1 proves against the fixture.
+        fixture_inventory = json.loads(
+            (self.fixture_dir / "sample_inventory.json").read_bytes()
+        )
+        fixture_header = fixture_inventory["header"]
+        base_aggregate_input = {
+            "header": {
+                key: value
+                for key, value in fixture_header.items()
+                if key != "aggregate_sha256"
+            },
+            "rows": fixture_inventory["rows"],
+        }
+        self.assertEqual(
+            fixture_header["aggregate_sha256"],
+            hashlib.sha256(_canonical_bytes(base_aggregate_input)).hexdigest(),
+        )
+        for perturbed_rule_table in (
+            {"version": "9.9.9", "sha256": fixture_header["rule_table"]["sha256"]},
+            {"version": fixture_header["rule_table"]["version"], "sha256": "1" * 64},
+        ):
+            perturbed_header = dict(base_aggregate_input["header"])
+            perturbed_header["rule_table"] = perturbed_rule_table
+            perturbed_aggregate = hashlib.sha256(
+                _canonical_bytes(
+                    {"header": perturbed_header, "rows": fixture_inventory["rows"]}
+                )
+            ).hexdigest()
+            self.assertNotEqual(
+                fixture_header["aggregate_sha256"],
+                perturbed_aggregate,
+                f"rule identity change must invalidate aggregate: {perturbed_rule_table}",
+            )
+
     # WORK_UNIT_CASE: 905/25
     def test_path_reparse_escape_and_file_test_output_time_bounds_fail_within_limits(self) -> None:
-        """Path/reparse escape and file/test/output/time bounds fail within limits."""
+        """Path/reparse escape, file/test/output/time bounds, and source/compiled count bounds."""
+        self._check_source_and_compiled_count_bounds()
         with tempfile.TemporaryDirectory() as td:
             troot = Path(td).resolve()
             (troot / ".eliot").mkdir()
@@ -3549,6 +3877,110 @@ class TestIgnoredTestInventory(unittest.TestCase):
                 ns=(admitted_identity["mtime_ns"], admitted_identity["mtime_ns"]),
             )
 
+    def _check_source_and_compiled_count_bounds(self) -> None:
+        """Source/compiled count bounds refuse listings past the limit."""
+        fixture = json.loads((self.fixture_dir / "sample_inventory.json").read_bytes())
+        target_record = fixture["header"]["target_denominator"][0]
+        artifact_record = fixture["header"]["artifact_denominator"][0]
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            package_dir = root / "crates" / "sample-package"
+            src_dir = package_dir / "src"
+            src_dir.mkdir(parents=True)
+            source_path = src_dir / "lib.rs"
+            source_path.write_text("mod alpha;\nmod beta;\n", encoding="utf-8")
+            for name in ("alpha.rs", "beta.rs"):
+                (src_dir / name).write_text(
+                    f'#[test]\n#[ignore = "requires store database"]\nfn test_{Path(name).stem}() {{}}\n',
+                    encoding="utf-8",
+                )
+            target = PackageTarget(
+                package_id=target_record["package_id"],
+                package_name=target_record["package_name"],
+                manifest_dir=package_dir,
+                target_name=target_record["target_name"],
+                target_kind=target_record["target_kind"],
+                src_path=source_path,
+            )
+            # Positive control: the driver yields two source tests by default.
+            control_records: list[dict[str, object]] = []
+            control_tests = discover_source(root, [target], source_denominator_records=control_records)
+            self.assertEqual(len(control_tests), 2)
+            # A listing past a patched small source bound refuses, never truncates.
+            with patch.object(iti, "BOUNDS", dataclasses.replace(BOUNDS, max_source_tests=1)):
+                with self.assertRaises(InventoryError) as cm:
+                    discover_source(root, [target])
+                self.assertEqual(cm.exception.code, "SOURCE_TEST_LIMIT")
+
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td).resolve()
+            admitted_root = iti._admitted_target_root(troot)
+            troot_source = troot / target_record["src_path"]
+            troot_source.parent.mkdir(parents=True, exist_ok=True)
+            troot_source.write_text("", encoding="utf-8")
+            manifest = troot_source.parent.parent / "Cargo.toml"
+            manifest.write_text("[package]\nname = \"sample-package\"\nversion = \"0.1.0\"\n", encoding="utf-8")
+            executable = admitted_root / artifact_record["executable"]
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_bytes(b"synthetic executable identity")
+            compiled_target = PackageTarget(
+                package_id=target_record["package_id"],
+                package_name=target_record["package_name"],
+                manifest_dir=manifest.parent,
+                target_name=target_record["target_name"],
+                target_kind=target_record["target_kind"],
+                src_path=troot_source,
+                test_enabled=target_record["test_enabled"],
+                doctest_enabled=target_record["doctest_enabled"],
+                bench_enabled=target_record["bench_enabled"],
+                required_features=tuple(target_record["required_features"]),
+                edition="2021",
+            )
+            cargo_stream = "\n".join((
+                json.dumps({
+                    "reason": "compiler-artifact",
+                    "package_id": compiled_target.package_id,
+                    "manifest_path": str(manifest),
+                    "target": {
+                        "kind": [compiled_target.target_kind],
+                        "crate_types": ["lib"],
+                        "name": compiled_target.target_name,
+                        "src_path": str(troot_source),
+                        "edition": "2021",
+                        "doc": True,
+                        "doctest": compiled_target.doctest_enabled,
+                        "test": compiled_target.test_enabled,
+                    },
+                    "profile": artifact_record["profile"],
+                    "features": artifact_record["features"],
+                    "filenames": [str(executable)],
+                    "executable": str(executable),
+                    "fresh": True,
+                }),
+                json.dumps({"reason": "build-finished", "success": True}),
+            )).encode("utf-8") + b"\n"
+            listing = b"test_alpha_ignored: test\ntest_beta_ignored: test\n"
+
+            def listing_runner(
+                run_root: Path, argv: Sequence[str], timeout: int | None = None
+            ) -> CommandResult:
+                if tuple(argv[:2]) == ("cargo", "test"):
+                    return CommandResult(stdout=cargo_stream, stderr=b"")
+                return CommandResult(stdout=listing, stderr=b"")
+
+            # Positive control: two ignored names list cleanly by default.
+            control_compiled = discover_compiled(troot, [compiled_target], runner=listing_runner)
+            self.assertEqual(
+                [item.test_name for item in control_compiled],
+                ["test_alpha_ignored", "test_beta_ignored"],
+            )
+            # A listing past a patched small compiled bound refuses, never truncates.
+            with patch.object(iti, "BOUNDS", dataclasses.replace(BOUNDS, max_compiled_tests=1)):
+                with self.assertRaises(InventoryError) as cm:
+                    discover_compiled(troot, [compiled_target], runner=listing_runner)
+                self.assertEqual(cm.exception.code, "COMPILED_TEST_LIMIT")
+
     # WORK_UNIT_CASE: 905/26
     def test_no_provisioning_ignored_test_execution_workflow_secret_rust_mutation_path(self) -> None:
         """No provisioning, ignored-test execution, workflow/secret/Rust mutation path."""
@@ -3604,6 +4036,50 @@ class TestIgnoredTestInventory(unittest.TestCase):
                         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                             self.assertNotIn(".rs", arg.value)
 
+        # The ignored-test listing runs one exact argv: the executable followed
+        # by the locked libtest suffix, with no extra flag admitted (W35).
+        self.assertEqual(iti._LIBTEST_LIST_ARGS, ("--list", "--ignored", "--format", "terse"))
+        list_argv_tuples = [
+            node
+            for node in ast.walk(parsed_ast)
+            if isinstance(node, ast.Tuple)
+            and any(
+                isinstance(elt, ast.Starred)
+                and isinstance(elt.value, ast.Name)
+                and elt.value.id == "_LIBTEST_LIST_ARGS"
+                for elt in node.elts
+            )
+        ]
+        self.assertEqual(len(list_argv_tuples), 1)
+        self.assertEqual(len(list_argv_tuples[0].elts), 2)
+
+        # No file-mutation call resolves to a workflow path or a secret-bearing
+        # destination: receivers fold (Path(...) factories, `/` joins, `+`
+        # concats) and only fully resolved destinations are judged; the rest are
+        # computed admitted paths (W35). Secret _patterns_ (diagnostic
+        # redaction) are not write targets.
+        self.assertEqual(_forbidden_write_destinations(parsed_ast), [])
+        # Executable discriminator: the resolver rejects the audit
+        # counterexample and equivalent receiver/constructed-path forms, while
+        # admitted computed writes (unresolvable receivers) stay clean.
+        benign_tree = ast.parse('output.open("xb")\npath.write_text("data")\n')
+        self.assertEqual(_forbidden_write_destinations(benign_tree), [])
+        hostile_sources = [
+            'from pathlib import Path\nPath(".github/workflows/ci.yml").write_text("x")\n',
+            'open("out" + "/.github/workflows/report.json", "w")\n',
+            'open(Path("repo") / ".github" / "workflows" / "x.yml", "w")\n',
+            'Path("d").joinpath("my-secret-key.txt").write_text("k")\n',
+        ]
+        for hostile in hostile_sources:
+            with self.subTest(hostile=hostile):
+                hits = _forbidden_write_destinations(ast.parse(hostile))
+                self.assertTrue(hits, hostile)
+        self.assertIn(
+            ".github/workflows/ci.yml",
+            _forbidden_write_destinations(ast.parse(hostile_sources[0])),
+        )
+        self.assertEqual(_forbidden_write_destinations(parsed_ast), [])
+
     # WORK_UNIT_CASE: 905/27
     def test_supported_cfg_attr_ignore_forms_reconcile_without_evaluating_cfg(self) -> None:
         """Supported cfg_attr ignore forms reconcile without evaluating arbitrary cfg expressions."""
@@ -3623,16 +4099,51 @@ class TestIgnoredTestInventory(unittest.TestCase):
         simple = by_name["test_cfg_attr_simple"]
         self.assertEqual(simple.reason, "requires windows runtime named pipe")
         self.assertEqual(simple.requirements, (Requirement.RUNTIME.value,))
+        # cfg predicate is preserved verbatim as evidence, never evaluated:
+        # the `windows` gate stays unevaluated even off-Windows.
+        self.assertEqual(
+            simple.cfg_evidence,
+            ('#[cfg_attr(windows, ignore = "requires windows runtime named pipe")]',),
+        )
 
         complex_t = by_name["test_cfg_attr_complex"]
         self.assertEqual(complex_t.reason, "requires store database")
         self.assertEqual(complex_t.requirements, (Requirement.STORE.value,))
+        self.assertEqual(
+            complex_t.cfg_evidence,
+            ('#[cfg_attr(all(target_os = "linux", feature = "custom_db"), ignore = "requires store database")]',),
+        )
+
+        # Both scanned forms reconcile to CLASSIFIED against their compiled
+        # pair with the evidence carried into the row (issue #905 W36).
+        compiled_pair = [
+            CompiledTest(
+                package_id=item.package_id,
+                package_name=item.package_name,
+                target_name=item.target_name,
+                target_kind=item.target_kind,
+                executable="target/debug/deps/lib",
+                executable_digest="ed",
+                test_name=item.test_name,
+            )
+            for item in (simple, complex_t)
+        ]
+        rows = reconcile([simple, complex_t], compiled_pair)
+        self.assertEqual(len(rows), 2)
+        by_test_name = {item.test_name: item for item in (simple, complex_t)}
+        for row in rows:
+            item = by_test_name[row.test_name]
+            self.assertEqual(row.state, RowState.CLASSIFIED.value)
+            self.assertEqual(row.remediation_owner, "declared-environment-owner")
+            self.assertEqual(row.requirements, item.requirements)
+            self.assertEqual(row.cfg_evidence, item.cfg_evidence)
+            self.assertEqual(row.ignore_reason, item.reason)
 
     # WORK_UNIT_CASE: 905/28
     def test_exact_repository_owned_disabled_test_entries_and_composed_requirements(self) -> None:
         """Exact repository-owned disabled-test entries and composed Runtime+Store requirements stay in denominator."""
         code = """
-        #[disabled_test = "requires local authenticated surrealdb store and governor host runtime"]
+        #[disabled_test = "requires authenticated surrealdb store and governor host runtime"]
         fn test_disabled_composed() {}
 
         #[eliot_disabled_test = "requires store and runtime windows pipe"]
@@ -3640,11 +4151,24 @@ class TestIgnoredTestInventory(unittest.TestCase):
 
         #[test_disabled = "requires kernel host"]
         fn test_disabled_alt() {}
+
+        #[disabled_test = "requires SurrealDB and Redis"]
+        fn test_disabled_unknown_provider() {}
+
+        #[disable_test = "requires store database"]
+        fn test_near_miss_singular() {}
         """
         tests = _scan_snippet(code)
-        self.assertEqual(len(tests), 3)
+        # The near-miss marker `disable_test` is not a repository-owned entry:
+        # only the three supported spellings plus the unknown-provider form scan.
+        self.assertEqual(len(tests), 4)
         by_name = {t.test_name: t for t in tests}
+        self.assertNotIn("test_near_miss_singular", by_name)
 
+        # No locality adjective ("local") here by design: inside an
+        # enumeration an unaccountable word keeps UNKNOWN under the
+        # conservative norm (false-clean forbidden, false-unknown safe);
+        # "local"+known-product coverage stays pinned by case 16 instead.
         composed = by_name["test_disabled_composed"]
         self.assertEqual(composed.requirements, (Requirement.RUNTIME.value, Requirement.STORE.value))
 
@@ -3665,6 +4189,103 @@ class TestIgnoredTestInventory(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].state, RowState.CLASSIFIED.value)
         self.assertEqual(rows[0].requirements, (Requirement.RUNTIME.value, Requirement.STORE.value))
+
+        # Unknown provider behind a supported marker keeps UNKNOWN and stays
+        # UNCLASSIFIED even with a compiled pair (issue #905 W37; P1 guard).
+        unknown_item = by_name["test_disabled_unknown_provider"]
+        self.assertEqual(
+            unknown_item.requirements,
+            (Requirement.STORE.value, Requirement.UNKNOWN.value),
+        )
+        unknown_compiled = CompiledTest(
+            package_id=unknown_item.package_id,
+            package_name=unknown_item.package_name,
+            target_name=unknown_item.target_name,
+            target_kind=unknown_item.target_kind,
+            executable="target/debug/deps/lib",
+            executable_digest="ed",
+            test_name=unknown_item.test_name,
+        )
+        unknown_rows = reconcile([unknown_item], [unknown_compiled])
+        self.assertEqual(len(unknown_rows), 1)
+        self.assertEqual(unknown_rows[0].state, RowState.UNCLASSIFIED.value)
+        self.assertEqual(unknown_rows[0].remediation_owner, "test-declaration-owner")
+
+    # WORK_UNIT_CASE: 905/W3
+    def test_item_and_attribute_spans_exact_and_digest_covered(self) -> None:
+        """Scanned rows carry exact fn-name and attribute spans, covered by the row digest."""
+        source_path = self.fixture_dir / "sample_test_source.rs"
+        text = source_path.read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[2]
+        target = PackageTarget(
+            package_id="sample-package 0.1.0 (path+file:///crates/sample-package)",
+            package_name="sample-package",
+            manifest_dir=root,
+            target_name="sample_package",
+            target_kind="lib",
+            src_path=root / "crates/sample-package/src/lib.rs",
+        )
+        tests = _scan_file(root, target, source_path)
+        item = next(t for t in tests if t.test_name == "test_sync_ignored")
+        # Character offsets into the decoded source text (the lexer runs on
+        # str, so multibyte characters count one): attributes occupy lines
+        # 3-4 (`#[test]` at 66 through the closing `]` at 132) and the fn
+        # name sits on line 5 (136-153). Values verified against the file.
+        self.assertEqual(item.fn_span, (136, 153))
+        self.assertEqual(item.attribute_span, (66, 132))
+        self.assertEqual(item.line, 5)
+        self.assertEqual(text[item.fn_span[0]:item.fn_span[1]], "test_sync_ignored")
+        self.assertEqual(
+            text[item.attribute_span[0]:item.attribute_span[1]],
+            '#[test]\n#[ignore = "requires local authenticated SurrealDB store"]',
+        )
+        # The checked-in sample row carries the same spans (no drift).
+        fixture = json.loads((self.fixture_dir / "sample_inventory.json").read_bytes())
+        self.assertEqual(len(fixture['rows']), 1)
+        fixture_row = fixture['rows'][0]
+        self.assertEqual(fixture_row['test_name'], 'test_sync_ignored')
+        self.assertEqual(tuple(fixture_row['fn_span']), item.fn_span)
+        self.assertEqual(tuple(fixture_row['attribute_span']), item.attribute_span)
+        # Spans ride the row payload and are covered by the row digest.
+        rows = reconcile([item], [])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.state, RowState.SOURCE_ONLY.value)
+        self.assertEqual(row.fn_span, (136, 153))
+        self.assertEqual(row.attribute_span, (66, 132))
+        payload = dataclasses.asdict(row)
+        self.assertEqual(payload['fn_span'], (136, 153))
+        self.assertEqual(payload['attribute_span'], (66, 132))
+        expected_digest = hashlib.sha256(
+            _canonical_bytes({k: v for k, v in payload.items() if k != 'row_digest'})
+        ).hexdigest()
+        self.assertEqual(row.row_digest, expected_digest)
+        perturbed_fn = dataclasses.replace(item, fn_span=(0, 0))
+        perturbed_attr = dataclasses.replace(item, attribute_span=None)
+        self.assertNotEqual(reconcile([perturbed_fn], [])[0].row_digest, row.row_digest)
+        self.assertNotEqual(reconcile([perturbed_attr], [])[0].row_digest, row.row_digest)
+        # Non-ASCII units: multibyte characters before the item shift byte
+        # offsets but not character offsets, so this pins the span unit.
+        non_ascii_code = (
+            '#[test]\n#[ignore = "requires SurrealDB — naïve café"]\n'
+            "fn tëst_nönascii() {}\n"
+        )
+        self.assertGreater(len(non_ascii_code.encode("utf-8")), len(non_ascii_code))
+        non_ascii_tests = _scan_snippet(non_ascii_code)
+        self.assertEqual(len(non_ascii_tests), 1)
+        non_ascii_item = non_ascii_tests[0]
+        self.assertEqual(
+            non_ascii_code[
+                non_ascii_item.fn_span[0]:non_ascii_item.fn_span[1]
+            ],
+            "tëst_nönascii",
+        )
+        self.assertEqual(
+            non_ascii_code[
+                non_ascii_item.attribute_span[0]:non_ascii_item.attribute_span[1]
+            ],
+            '#[test]\n#[ignore = "requires SurrealDB — naïve café"]',
+        )
 
 
 if __name__ == "__main__":

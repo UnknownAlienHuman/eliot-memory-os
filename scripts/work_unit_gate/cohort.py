@@ -210,6 +210,53 @@ def is_integration_owner(
     return profile.role_of(unit, issue) is OwnerRole.INTEGRATION_OWNER
 
 
+def derive_integration_owners(
+    relations: Sequence[c.AssignmentRelation],
+    units: Mapping[c.IssueIdentity, c.WorkUnitIdentity],
+) -> IntegrationOwnerProfile:
+    """Project admitted integrated-by relations onto the owner profile.
+
+    Authority comes only from caller-admitted AssignmentRelation values with
+    the closed integrated-by role: the relation target holding the admitted
+    unit for its issue is the integration owner. Relations with any other
+    role confer nothing; a target with no admitted unit is skipped (never
+    fabricated); contradictory admitted units for one target fail closed.
+    Unit-name spelling and bare issue numbers never confer authority.
+    An empty input yields the empty profile, which authorizes nothing.
+    Pure: no network, subprocess or mutation.
+    """
+    try:
+        rel_list = list(relations)
+    except Exception:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "owner relations unreadable") from None
+    try:
+        unit_map = dict(units)
+    except Exception:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "owner units unreadable") from None
+    seen: Dict[c.IssueIdentity, c.WorkUnitIdentity] = {}
+    for rel in rel_list:
+        if type(rel) is not c.AssignmentRelation:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "owner relation mistyped")
+        if rel.role is not c.RelationRole.INTEGRATED_BY:
+            continue
+        unit = unit_map.get(rel.target_issue)
+        if unit is None:
+            continue
+        if type(unit) is not c.WorkUnitIdentity:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "owner unit mistyped")
+        prev = seen.get(rel.target_issue)
+        if prev is None:
+            seen[rel.target_issue] = unit
+        elif prev != unit:
+            raise CohortError(
+                CohortProblem.DUPLICATE_UNIT,
+                f"contradictory admitted owner identity for #{rel.target_issue.number}",
+            )
+    return IntegrationOwnerProfile(
+        owners=tuple(IntegrationOwnerEntry(issue, unit) for issue, unit in seen.items())
+    )
+
+
 def validate_descriptor_scope(
     desc: c.WorkUnitDescriptor,
     *,
@@ -349,6 +396,69 @@ def _require_package_sharing(
     )
 
 
+def derive_package_sharing(
+    descriptors: Sequence[c.WorkUnitDescriptor],
+    prerequisites: Mapping[int, Set[int]],
+    integration_owners: Optional[IntegrationOwnerProfile] = None,
+) -> Tuple[PackageSharingEdge, ...]:
+    """Derive explicit per-pair sharing edges from accepted rows and scopes.
+
+    Finite parties only: descriptors sharing one package name are paired in
+    canonical order. A pair with no overlapping mutable (source) scopes yields
+    a DISJOINT edge. An overlapping pair yields a SERIALIZED edge only with a
+    one-direction typed prerequisite edge plus exactly one admitted
+    integration owner on the pair (the same rule _require_package_sharing
+    enforces). Any other pair yields no edge, so the conflict stands.
+    Deterministic order; pure: no network, subprocess or mutation.
+    """
+    try:
+        desc_list = list(descriptors)
+    except Exception:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "sharing descriptors unreadable") from None
+    try:
+        prereq_map = {k: set(v) for k, v in dict(prerequisites).items()}
+    except Exception:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "sharing prerequisites unreadable") from None
+    if integration_owners is not None and type(integration_owners) is not IntegrationOwnerProfile:
+        raise CohortError(CohortProblem.MALFORMED_FIELD, "integration owners profile mistyped")
+    by_package: Dict[str, List[c.WorkUnitDescriptor]] = {}
+    for desc in desc_list:
+        if type(desc) is not c.WorkUnitDescriptor:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "sharing descriptor mistyped")
+        if desc.package is None:
+            continue
+        by_package.setdefault(desc.package.name, []).append(desc)
+    edges: List[PackageSharingEdge] = []
+    for package_name in sorted(by_package):
+        holders = sorted(by_package[package_name], key=lambda d: d.issue)
+        for pos, first in enumerate(holders):
+            for second in holders[pos + 1:]:
+                if (first.issue, first.unit) == (second.issue, second.unit):
+                    continue
+                kind = None
+                if not check_write_scope_overlap(first, second):
+                    kind = PackageSharingKind.DISJOINT
+                else:
+                    serialized = (
+                        first.issue.number in prereq_map.get(second.issue.number, set())
+                        or second.issue.number in prereq_map.get(first.issue.number, set())
+                    )
+                    owner_count = sum(
+                        1 for desc in (first, second)
+                        if integration_owners is not None
+                        and is_integration_owner(desc.unit, desc.issue, profile=integration_owners)
+                    )
+                    if serialized and owner_count == 1:
+                        kind = PackageSharingKind.SERIALIZED
+                if kind is not None:
+                    edges.append(PackageSharingEdge(
+                        package=c.PackageIdentity(package_name),
+                        issues=(first.issue, second.issue),
+                        kind=kind,
+                    ))
+    return tuple(edges)
+
+
 def materialize_catalogue(
     rows: Sequence[c.CatalogueRow],
     expected_issues: Sequence[c.IssueIdentity],
@@ -394,6 +504,17 @@ def materialize_catalogue(
     if len(set(active_units)) != len(active_units):
         raise CohortError(CohortProblem.DUPLICATE_UNIT, "duplicate unit across active catalogue rows")
 
+    # Prerequisite edges resolve inside the denominator: a row depending on
+    # an issue outside the rows being materialized is orphaned and stays
+    # blocking instead of validating.
+    known_issues = set(row_issues)
+    for r in rows:
+        if any(p not in known_issues for p in r.prerequisites):
+            raise CohortError(
+                CohortProblem.UNRESOLVED_PREREQUISITE,
+                f"row #{r.issue.number} requires a prerequisite outside the denominator",
+            )
+
     if integration_owners is not None and type(integration_owners) is not IntegrationOwnerProfile:
         raise CohortError(CohortProblem.MALFORMED_FIELD, "integration owners profile mistyped")
     if type(package_sharing) is tuple:
@@ -435,6 +556,13 @@ def materialize_catalogue(
         elif r.disposition is c.CatalogueDisposition.PLANNED:
             if r.descriptor is not None:
                 validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
+        elif r.disposition is c.CatalogueDisposition.BLOCKED and r.descriptor is not None:
+            # A blocked allocation is unresolved work, not an exemption from the
+            # scope rules: a blocked row carrying a descriptor that claims a
+            # restricted/shared root belongs to its named integrator, not to
+            # every leaf, so it is validated exactly like a planned row.
+            # Descriptor-less blocked rows pass through (case 852/36).
+            validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
         elif r.disposition is c.CatalogueDisposition.SUPERSEDED and r.descriptor is not None:
             # A superseded historical row is a terminal record: #843 accepts no
             # implementation evidence ("Superseded source donor only") and #859
@@ -490,11 +618,31 @@ def materialize_selection_plan(
         raise CohortError(CohortProblem.SELECTION_MISMATCH, "selection catalogue sha256 does not match catalogue")
 
     cat_rows = {r.issue: r for r in catalogue.rows}
+    if selection.scope is c.SelectionScope.FULL_PROJECT:
+        active = {r.issue for r in catalogue.rows if r.disposition in
+                  (c.CatalogueDisposition.ASSIGNED, c.CatalogueDisposition.BLOCKED,
+                   c.CatalogueDisposition.PLANNED)}
+        if {d.issue for d in descriptors} != active:
+            raise CohortError(
+                CohortProblem.DENOMINATOR_REDUCTION_REJECTED,
+                "full-project selection is not the exact active catalogue denominator",
+            )
+    selected_issues = {d.issue for d in descriptors}
     for d in descriptors:
         if d.issue not in cat_rows:
             raise CohortError(CohortProblem.UNEXPECTED_DESCRIPTOR, f"descriptor #{d.issue.number} not in catalogue")
         row = cat_rows[d.issue]
         if row.disposition is not c.CatalogueDisposition.ASSIGNED:
+            if row.disposition is c.CatalogueDisposition.BLOCKED:
+                raise CohortError(
+                    CohortProblem.BLOCKED_ALLOCATION,
+                    f"selected row #{d.issue.number} is an unresolved blocked allocation",
+                )
+            if any(d.issue in cat_rows[other].prerequisites for other in selected_issues if other in cat_rows):
+                raise CohortError(
+                    CohortProblem.PARENT_SCHEDULED_WITH_CHILDREN,
+                    f"replaced parent row #{d.issue.number} scheduled alongside its children",
+                )
             raise CohortError(CohortProblem.SELECTION_MISMATCH, f"selected row #{d.issue.number} is not ASSIGNED")
         if row.descriptor != d:
             raise CohortError(CohortProblem.STALE_MIRROR_BINDING, f"descriptor #{d.issue.number} does not match catalogue row")
@@ -516,7 +664,21 @@ def materialize_cohort_receipt(
     plan: c.SelectedVerificationPlan,
     evidence_rows: Sequence[c.VerificationEvidence],
 ) -> c.CohortReceipt:
-    """Construct a CohortReceipt binding evidence to plan and verifying digest."""
+    """Construct a CohortReceipt binding evidence to plan and verifying digest.
+
+    Evidence for an edited (or substituted) descriptor is stale: a source
+    edit changes the descriptor identity, so evidence bound to the old
+    descriptor no longer proves the planned one. The catalogue identity is
+    unaffected by this rejection.
+    """
+    planned = {d.issue: d for d in plan.descriptors}
+    for ev in evidence_rows:
+        if planned.get(ev.descriptor.issue) != ev.descriptor:
+            raise CohortError(
+                CohortProblem.EXECUTION_EVIDENCE_INVALIDATED,
+                f"stale execution evidence for #{ev.descriptor.issue.number}: "
+                "evidence descriptor does not match the planned descriptor",
+            )
     ordered_evidence = tuple(sorted(evidence_rows, key=lambda e: e.descriptor.issue))
     digest = c.cohort_digest(plan, ordered_evidence)
 
@@ -597,9 +759,10 @@ def discover_work_units(work_units_dir: Path | str) -> DescriptorDiscovery:
                 continue
         except OSError:
             return DescriptorDiscovery(DescriptorDiscoveryStatus.UNREADABLE)
-        stem = child.stem
-        if stem in ALLOWED_NAMED_INVENTORY:
+        name = child.name
+        if name in ALLOWED_NAMED_INVENTORY:
             continue
+        stem = child.stem
         if _RE_NUMERIC_STEM.fullmatch(stem) is None:
             raise CohortError(
                 CohortProblem.UNEXPECTED_DESCRIPTOR,
@@ -998,6 +1161,13 @@ def locked_catalogue_rows(
         raise
     except c.ContractViolation as exc:
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    try:
+        expected = tuple(c.IssueIdentity(repo, n) for n in lock.aggregate.issues)
+        receipt = c.CatalogueIntegrityReceipt(tuple(rows.values()), expected)
+    except c.ContractViolation as exc:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    if receipt.sha256 != lock.aggregate.sha256:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate digest mismatch")
     return rows
 
 
@@ -1009,6 +1179,8 @@ def verify_cohort_lock(
     expected_base_commit: Optional[str] = None,
     expected_repository: Optional[c.RepositoryIdentity] = None,
     assignment_receipts: Optional[Mapping[int, c.AssignmentSourceReceipt]] = None,
+    integration_owners: Optional[IntegrationOwnerProfile] = None,
+    package_sharing: Sequence[PackageSharingEdge] = (),
 ) -> c.CatalogueIntegrityReceipt:
     """Verify the committed aggregate lock against freshly discovered state.
 
@@ -1022,6 +1194,9 @@ def verify_cohort_lock(
     is invalidation, even when the lock is internally self-consistent. Any
     mismatch fails closed with INVALID_AGGREGATE_LOCK (or the precise
     structural problem); the lock is never trusted on its own bytes.
+    A supplied integration-owner profile and package-sharing declaration are
+    threaded into re-materialization; omitted, restricted roots and same-
+    package pairs fail closed exactly as in materialize_catalogue.
     """
     lock = read_cohort_lock(lock_path)
     if lock.schema_version != SCHEMA_REVISION:
@@ -1065,7 +1240,9 @@ def verify_cohort_lock(
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
     if assignment_receipts is not None:
         verify_assignment_binding(lock, supplied, assignment_receipts)
-    receipt = materialize_catalogue(rows, expected, expected_cases=lock.aggregate.matrix_cases)
+    receipt = materialize_catalogue(
+        rows, expected, expected_cases=lock.aggregate.matrix_cases,
+        integration_owners=integration_owners, package_sharing=package_sharing)
 
     counted = {"assigned": 0, "blocked": 0, "planned": 0, "nonexecutable": 0,
                "superseded": 0, "accepted-historical": 0}
@@ -1126,6 +1303,194 @@ def validate_snapshot_completeness(snapshot: dict) -> None:
             continue
         if type(count) is not int or count < 0 or type(items) is not list or len(items) != count:
             raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot coverage and count mismatch")
+
+
+def _toml_escape(text: str) -> str:
+    """Escape free text for a TOML basic string (deterministic)."""
+    out = []
+    for char in text:
+        code = ord(char)
+        if char == "\\":
+            out.append("\\\\")
+        elif char == '"':
+            out.append('\\"')
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\r":
+            out.append("\\r")
+        elif char == "\t":
+            out.append("\\t")
+        elif code < 0x20 or code == 0x7F:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot text carries a control character")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+_SNAPSHOT_ROW_KEYS = frozenset({"issue", "unit", "body_sha256", "disposition", "prerequisites"})
+
+
+def generate_cohort_lock(
+    snapshot: dict,
+    descriptors: Mapping[int, c.WorkUnitDescriptor],
+) -> bytes:
+    """Render a deterministic closed cohort lock from a validated snapshot.
+
+    Owner-side generation outside read-only validation (issue body: the owner
+    may explicitly generate its authorized descriptors outside read-only
+    validation): the controller-supplied snapshot carries the accepted
+    header (repository, exact base revision, acquisition receipt, coverage)
+    plus the classified row table, and the caller supplies the currently
+    observed typed descriptors bound by issue. Steps: validate_snapshot_
+    completeness first (truncated/tag-filtered/moved snapshots never
+    generate); closed-shape row checks against _LOCK_ROW_KEYS; assigned rows
+    without an observed descriptor are incomplete, never fabricated;
+    aggregate arithmetic recomputed from the built receipt with the exact
+    digest function verify_cohort_lock compares against; provenance bound to
+    the snapshot header (never a hand-edited base). Blocked/planned/
+    superseded rows pass through with their dispositions preserved.
+    Same inputs give byte-identical outputs. Pure: no network, subprocess,
+    repository mutation or writes; the caller persists the bytes.
+    """
+    validate_snapshot_completeness(snapshot)
+    header = snapshot["header"]
+    assert isinstance(header, dict)
+    repository = header["repository"]
+    if type(repository) is not str or repository.count("/") != 1:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot repository is not owner/name")
+    owner_name, repo_name = repository.split("/")
+    try:
+        repo = c.RepositoryIdentity(owner_name, repo_name)
+    except c.ContractViolation:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot repository identity invalid") from None
+    base_revision = header["base_revision"] if "base_revision" in header else header.get("base_commit")
+    if type(base_revision) is not str or _RE_GIT_SHA.fullmatch(base_revision) is None:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot lacks exact base revision")
+    acquisition = header.get("acquisition")
+    acquired_at = header.get("acquired_at")
+    if type(acquisition) is not str or not acquisition:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot lacks acquisition receipt")
+    if type(acquired_at) is not str or not acquired_at:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot lacks acquisition time")
+    note = header.get("note")
+    if note is None:
+        note = (f"Generated outside read-only validation from the controller snapshot acquired "
+                f"{acquired_at} via {acquisition} at base {base_revision}.")
+    if type(note) is not str or not note:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot note invalid")
+    raw_rows = snapshot.get("rows")
+    if type(raw_rows) is not list or not raw_rows:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot carries no classified rows")
+    if len(raw_rows) > MAX_CATALOGUE_ROWS:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot row count exceeds the catalogue limit")
+    numeric = snapshot.get("numeric_descriptors", [])
+    if type(numeric) is not list or any(type(n) is not int or n < 1 for n in numeric):
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot numeric class invalid")
+    numeric_t = tuple(sorted(numeric))
+    if any(b <= a for a, b in zip(numeric_t, numeric_t[1:])):
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot numeric class not canonical sorted")
+    try:
+        supplied = dict(descriptors)
+    except Exception:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "generation descriptors unreadable") from None
+    entries = []
+    for entry in raw_rows:
+        if type(entry) is not dict or set(entry) != _SNAPSHOT_ROW_KEYS:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot row is not closed")
+        number = entry["issue"]
+        if type(number) is not int or number < 1:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot row issue invalid")
+        unit_raw = entry["unit"]
+        body_raw = entry["body_sha256"]
+        disp_raw = entry["disposition"]
+        prereqs_raw = entry["prerequisites"]
+        if type(prereqs_raw) is not list or any(type(n) is not int or n < 1 for n in prereqs_raw):
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot row prerequisites invalid")
+        if type(disp_raw) is not str or disp_raw not in _LOCK_DISPOSITIONS:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot row disposition unknown")
+        if type(body_raw) is not str or _RE_HEX_SHA256.fullmatch(body_raw) is None:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot row body digest invalid")
+        try:
+            unit = c.WorkUnitIdentity(unit_raw)
+            disposition = c.CatalogueDisposition(disp_raw)
+            prereqs = tuple(c.IssueIdentity(repo, n) for n in prereqs_raw)
+        except c.ContractViolation:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot row identity invalid") from None
+        body = body_raw
+        descriptor = supplied.get(number)
+        if descriptor is not None and type(descriptor) is not c.WorkUnitDescriptor:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "generation descriptor mistyped")
+        if disposition is c.CatalogueDisposition.ASSIGNED and descriptor is None:
+            raise CohortError(
+                CohortProblem.INCOMPLETE_SNAPSHOT,
+                f"assigned row #{number} has no observed descriptor",
+            )
+        try:
+            entries.append(c.CatalogueRow(
+                issue=c.IssueIdentity(repo, number),
+                unit=unit,
+                body_sha256=body,
+                disposition=disposition,
+                descriptor=descriptor,
+                prerequisites=prereqs,
+            ))
+        except c.ContractViolation as exc:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    numbers = [r.issue.number for r in entries]
+    if len(set(numbers)) != len(numbers):
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "snapshot rows carry a duplicate issue")
+    ordered = sorted(entries, key=lambda r: r.issue.number)
+    expected = tuple(r.issue for r in ordered)
+    try:
+        receipt = c.CatalogueIntegrityReceipt(tuple(ordered), expected)
+    except c.ContractViolation as exc:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    counted = {"assigned": 0, "blocked": 0, "planned": 0, "nonexecutable": 0,
+               "superseded": 0, "accepted-historical": 0}
+    for row in ordered:
+        counted[row.disposition.value] += 1
+    lines = [
+        "# Immutable gate-owned assignment catalogue lock (#852).",
+        "# Generated outside read-only validation; see the #852 REPORT for",
+        "# acquisition bindings, classifications and evidence. Do not hand-edit.",
+        f'schema_version = "{SCHEMA_REVISION}"',
+        "",
+        "[repository]",
+        f'owner = "{_toml_escape(repo.owner)}"',
+        f'name = "{_toml_escape(repo.name)}"',
+        "",
+    ]
+    for row in ordered:
+        lines += [
+            "[[row]]",
+            f"issue = {row.issue.number}",
+            f'unit = "{_toml_escape(row.unit.value)}"',
+            f'body_sha256 = "{row.body_sha256}"',
+            f'disposition = "{row.disposition.value}"',
+            "prerequisites = [" + ", ".join(str(p.number) for p in row.prerequisites) + "]",
+            "",
+        ]
+    lines += [
+        "[aggregate]",
+        "issues = [" + ", ".join(str(r.issue.number) for r in ordered) + "]",
+        "numeric_descriptors = [" + ", ".join(str(n) for n in numeric_t) + "]",
+        f"matrix_cases = {receipt.matrix_cases}",
+        f"assigned = {counted['assigned']}",
+        f"blocked = {counted['blocked']}",
+        f"planned = {counted['planned']}",
+        f"nonexecutable = {counted['nonexecutable']}",
+        f"superseded = {counted['superseded']}",
+        f"accepted_historical = {counted['accepted-historical']}",
+        f'sha256 = "{receipt.sha256}"',
+        "",
+        "[provenance]",
+        f'base_commit = "{base_revision}"',
+        f'acquired_at = "{_toml_escape(acquired_at)}"',
+        f'acquisition = "{_toml_escape(acquisition)}"',
+        f'note = "{_toml_escape(note)}"',
+        "",
+    ]
+    return ("\n".join(lines)).encode("utf-8")
 
 
 def is_real_repository_root(candidate: Path) -> bool:
@@ -1201,11 +1566,27 @@ def verify_leaf_routers_unchanged(
 
 
 def verify_attempt_paths_exist(desc: c.WorkUnitDescriptor, repo_root: Path) -> None:
-    """Verify that source and test roots exist on disk for an execution attempt."""
+    """Verify that source and test roots exist on disk for an execution attempt.
+
+    Existence is not enough: a symlink, junction or reparse point smuggling
+    an outside tree under an innocent root value is a physical alias escape,
+    so every existing path must resolve inside the repository root. Pure read
+    (no network, subprocess or mutation).
+    """
+    try:
+        root_real = os.path.normcase(os.path.realpath(repo_root))
+    except (OSError, ValueError):
+        raise CohortError(CohortProblem.UNSAFE_PATH, "attempt root is not resolvable") from None
     for r in tuple(desc.source_roots) + tuple(desc.test_roots):
         p = repo_root / r.value
         if not p.exists():
             raise CohortError(CohortProblem.MISSING_ATTEMPT_SOURCE, f"path does not exist on disk: {r.value}")
+        try:
+            resolved = os.path.normcase(os.path.realpath(p))
+        except (OSError, ValueError):
+            raise CohortError(CohortProblem.UNSAFE_PATH, f"attempt path is not resolvable: {r.value}") from None
+        if resolved != root_real and not resolved.startswith(root_real + os.sep):
+            raise CohortError(CohortProblem.UNSAFE_PATH, f"attempt path escapes the repository root: {r.value}")
 
 
 # Stable redacted #850 rejection codes mapped to cohort problems. Any other

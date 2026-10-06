@@ -139,6 +139,20 @@ impl WindowsPathIdentity {
         self.contains(other) || other.contains(self)
     }
 
+    /// Returns the components of `self` strictly below `ancestor`, or `None`
+    /// when the two are not on the same volume or `self` is not contained by
+    /// `ancestor`.
+    ///
+    /// Containment is decided on the already-normalised component vectors, so
+    /// it is a lexical property of two declared roots and not a filesystem
+    /// observation. An empty slice means the two paths are the SAME root.
+    pub(crate) fn relative_to(&self, ancestor: &Self) -> Option<&[String]> {
+        if !ancestor.contains(self) {
+            return None;
+        }
+        Some(&self.components[ancestor.components.len()..])
+    }
+
     pub(crate) fn ends_with(&self, suffix: &[&str]) -> bool {
         self.components.len() >= suffix.len()
             && self.components[self.components.len() - suffix.len()..]
