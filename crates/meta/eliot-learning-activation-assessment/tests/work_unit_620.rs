@@ -484,8 +484,10 @@ fn fixture() -> Result<
         dependencies: vec![aid("delta-dependency")?],
         equivalent_retry: None,
         proof_ceiling: ProofCeiling::CandidateArtifact,
+        frozen_pre_evaluation_digest: None,
         canonical_digest: String::new(),
     };
+    delta.frozen_pre_evaluation_digest = Some(delta.frozen_digest()?);
     delta.seal()?;
     let mut overlay = CampaignHarnessOverlayCandidate {
         binding: binding.clone(),
