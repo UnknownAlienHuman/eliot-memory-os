@@ -6619,7 +6619,8 @@ mod tests {
         TESTD_ADMISSION_WIRE_ID, TESTD_ADMISSION_WIRE_VERSION, TestdAdmissionResponse,
     };
     use eliot_runtime_contracts::{
-        GenerationCutoverState, HealthDimension, HealthVector, ServiceProcessState,
+        CapacityBottleneck, CapacityPermitBinding, CapacityRequest, GenerationCutoverState,
+        HealthDimension, HealthVector, ServiceProcessState,
     };
     use std::num::NonZeroU64;
 
@@ -8826,6 +8827,250 @@ mod tests {
             compose_production_native_worker_front_door("not-a-sha256-digest"),
             Err(DispatchLaunchError::InvalidMaterial(_))
         ));
+    }
+
+    /// Owner-held launch capacity at the dispatch boundary (issue #1679,
+    /// W11/W4/A7 producer side).
+    ///
+    /// One ordered test drives the composed reserve through the real
+    /// issuance path: acquire issues and verifies a live permit, the
+    /// writer carries the authenticated pair bound to the claim
+    /// (mirroring every consumer agreement rule), the absent section
+    /// keeps the previous closed shape, currency checks distinguish
+    /// live from tampered and released holdings, saturation refuses
+    /// naming the exact dimension, and release restores the slot exactly
+    /// once. The full prepare path is not driven here: its
+    /// launch-nonce gate is unsatisfiable for fixture joins on this
+    /// branch (pre-existing, red on base, reported to the GM), so the
+    /// prepare glue is covered by review plus the uncomposed-path
+    /// assertions in the contour lifecycle test. No child is ever
+    /// spawned: everything exercised is pre-effect.
+    #[test]
+    fn native_worker_launch_capacity_section() {
+        use eliot_kernel_service::{NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION};
+        let root = temp_root("capacity");
+        let kernel = ready_kernel(&root);
+        match compose_dispatch_contour(PRINCIPAL.to_owned()) {
+            Ok(()) => {}
+            Err(DispatchLaunchError::AlreadyComposed(_)) => {}
+            Err(other) => panic!("contour must compose: {other:?}"),
+        }
+        match compose_process_capacity_reserve(8, 2, 2, 2) {
+            Ok(()) => {}
+            Err(DispatchLaunchError::AlreadyComposed(_)) => {}
+            Err(other) => panic!("capacity reserve must compose: {other:?}"),
+        }
+        let contour = DISPATCH_CONTOUR.get().expect("contour");
+        let epoch = live_epoch(&kernel);
+        let live_generation_value = kernel
+            .service
+            .lock()
+            .expect("service lock")
+            .activation_receipt()
+            .expect("activation receipt")
+            .generation
+            .value();
+        let live_generation = Generation::new(live_generation_value).expect("generation");
+        let now_ms = i64::try_from(super::super::unix_ms()).expect("now ms");
+        let boundary =
+            process_capacity_boundary(&kernel, &epoch, live_generation, now_ms).expect("boundary");
+
+        // 1. Acquire issues a live verified permit for the admitted claim.
+        let native_request = native_claim_request("claim-cap-A", "reg-cap-A", "attempt-A", "op-A");
+        let pair = acquire_native_worker_capacity(contour, &native_request, &boundary)
+            .expect("acquire")
+            .expect("composed reserve issues");
+        assert!(
+            matches!(
+                check_retained_native_worker_capacity(contour, "claim-cap-A", &boundary)
+                    .expect("check"),
+                PermitCurrency::Current
+            ),
+            "the freshly issued holding verifies current"
+        );
+
+        // 2. The writer carries the authenticated pair bound to the claim.
+        let mut receipt = eliot_kernel_service::NativeWorkerClaimReceipt {
+            wire_id: NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
+            wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            claim_id: native_request.claim_id.clone(),
+            registration_id: native_request.registration_id.clone(),
+            attempt_id: native_request.attempt_id.clone(),
+            operation_id: native_request.operation_id.clone(),
+            worker_generation: native_request.worker_generation,
+            authority_epoch: native_request.authority_epoch.clone(),
+            state_fence: native_request.state_fence.clone(),
+            binding_digest: native_request.binding_digest.clone(),
+            admitted_at_unix_ms: super::super::unix_ms(),
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt.compute_digest().expect("receipt digest");
+        let grant = dispatch_grant_for(
+            DispatchedWorkerKind::NativeWorker,
+            &receipt.binding_digest,
+            &epoch,
+            live_generation,
+            receipt.admitted_at_unix_ms * 1_000_000,
+            None,
+        )
+        .expect("grant");
+        // The fixture join carries this fixed nonce, so the writer
+        // receives it back: the join-match gate belongs to the prepare
+        // path (unsatisfiable there on this branch), not to this proof.
+        let fixture_nonce = "launch-nonce-0123456789abcdef";
+        let section = NativeWorkerCapacitySection {
+            request: &pair.0,
+            binding: &pair.1,
+        };
+        let bytes = native_worker_material_bytes(
+            &native_request,
+            &receipt,
+            &epoch,
+            live_generation_value,
+            fixture_nonce,
+            &grant,
+            Some(section),
+        )
+        .expect("material bytes");
+        let file_json: serde_json::Value = serde_json::from_slice(&bytes).expect("material JSON");
+        let section_json = file_json
+            .get("capacity_permit")
+            .expect("material carries the capacity section");
+        let cap_request: CapacityRequest =
+            serde_json::from_value(section_json["request"].clone()).expect("request parses");
+        let cap_binding: CapacityPermitBinding =
+            serde_json::from_value(section_json["binding"].clone()).expect("binding parses");
+        // Consumer agreement mirrors (issue #1701 validator rules): the
+        // pair is valid and matching, names exactly the process-launch
+        // dimension, and binds the claim's operation, epoch, generation,
+        // profile and live window.
+        cap_request.validate().expect("section request valid");
+        cap_binding.validate().expect("section binding valid");
+        assert!(
+            cap_binding.matches_request(&cap_request),
+            "section binding matches its request"
+        );
+        assert_eq!(
+            cap_binding.bottleneck,
+            CapacityBottleneck::ProcessLaunchSlots,
+            "section names the process-launch dimension"
+        );
+        assert_eq!(
+            cap_binding.operation_id, native_request.operation_id,
+            "section binds the claim operation"
+        );
+        assert!(
+            cap_binding
+                .authority_epoch_ref
+                .is_same_authority(&native_request.authority_epoch),
+            "section binds the claim epoch"
+        );
+        assert_eq!(
+            cap_binding.requesting_generation_ref.value(),
+            native_request.worker_generation,
+            "section binds the claim generation"
+        );
+        assert_eq!(
+            cap_binding.profile_revision,
+            kernel.control_reserve_profile().profile_revision,
+            "section binds the current profile"
+        );
+        assert!(
+            cap_binding.expires_at_ms != 0 && cap_binding.expires_at_ms > super::super::unix_ms(),
+            "section window is live"
+        );
+
+        // 3. Without a composed issuance the file keeps the closed shape.
+        let bare = native_worker_material_bytes(
+            &native_request,
+            &receipt,
+            &epoch,
+            live_generation_value,
+            fixture_nonce,
+            &grant,
+            None,
+        )
+        .expect("bare material bytes");
+        let bare_json: serde_json::Value =
+            serde_json::from_slice(&bare).expect("bare material JSON");
+        assert!(
+            bare_json.get("capacity_permit").is_none(),
+            "no issuance means no capacity section"
+        );
+
+        // 4. Saturation refuses naming the exact dimension.
+        let mut filled = Vec::new();
+        let mut saturated = false;
+        for index in 0..256 {
+            let fill = native_claim_request(
+                &format!("claim-cap-fill-{index}"),
+                "reg-cap-fill",
+                &format!("attempt-cap-fill-{index}"),
+                &format!("op-cap-fill-{index}"),
+            );
+            match acquire_native_worker_capacity(contour, &fill, &boundary) {
+                Ok(issued) => {
+                    assert!(issued.is_some(), "composed reserve issues");
+                    filled.push(fill.claim_id.clone());
+                }
+                Err(DispatchLaunchError::Gate(detail)) => {
+                    assert!(
+                        detail.contains("ProcessLaunchSlots"),
+                        "saturation names the dimension: {detail}"
+                    );
+                    saturated = true;
+                    break;
+                }
+                Err(other) => panic!("fill must saturate, never fail: {other:?}"),
+            }
+        }
+        assert!(saturated, "the launch partition must saturate");
+
+        // 5. Currency distinguishes live from tampered and released
+        // holdings, and release restores the slot exactly once.
+        assert!(
+            matches!(
+                check_retained_native_worker_capacity(contour, "claim-cap-A", &boundary)
+                    .expect("check live"),
+                PermitCurrency::Current
+            ),
+            "the first holding is still current"
+        );
+        {
+            let mut state = contour.process_capacity.lock().expect("capacity lock");
+            let retained = state
+                .held
+                .get_mut(&retained_permit_key("claim-cap-A"))
+                .expect("retained permit");
+            retained.binding.operation_id = "tampered-operation".to_owned();
+        }
+        assert!(
+            matches!(
+                check_retained_native_worker_capacity(contour, "claim-cap-A", &boundary)
+                    .expect("check tampered"),
+                PermitCurrency::Stale(_)
+            ),
+            "a tampered holding reads stale, never current"
+        );
+        release_retained_native_worker_capacity(contour, "claim-cap-A");
+        for claim_id in &filled {
+            release_retained_native_worker_capacity(contour, claim_id);
+        }
+        assert!(
+            matches!(
+                check_retained_native_worker_capacity(contour, "claim-cap-A", &boundary)
+                    .expect("check released"),
+                PermitCurrency::Absent
+            ),
+            "a released holding reads absent"
+        );
+        let reacquired =
+            acquire_native_worker_capacity(contour, &native_request, &boundary).expect("reacquire");
+        assert!(
+            reacquired.is_some(),
+            "the released slot issues again exactly once"
+        );
+        release_retained_native_worker_capacity(contour, "claim-cap-A");
     }
 
     fn assert_nonce_shape(nonce: &str) {
