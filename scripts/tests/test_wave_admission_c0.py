@@ -71,14 +71,14 @@ fixed by the gate-owned descriptor, not by a caller option.
 Execution ceiling
 -----------------
 
-This suite runs **no Cargo command**. The mandatory locked workspace and
-per-package Cargo commands are issue #829's TEST-PHASE obligation and belong to
-root acceptance (see ``TASK.md`` "Current phase"). What the suite proves for
+Case 25 runs the three mandatory locked workspace Cargo commands live
+and binds their exit and counts. The remaining per-package Cargo commands
+stay issue #829's TEST-PHASE obligation in root acceptance. What the suite proves for
 execution is identity, freshness, completeness and validation: each accepted
 descriptor is invoked through #837's supported current CLI over its real bytes,
 the immutable typed result is parsed, and a bounded mutation of a real receipt is
 refused by that same production path. Cases 23-25 state their proof ceiling
-explicitly in their own docstrings; they do not claim a fresh Cargo run.
+explicitly in their own docstrings; only case 25 claims a fresh Cargo run.
 
 Recorded blocker
 ----------------
@@ -202,6 +202,19 @@ def py_script(*args: str, timeout: int = 900,
               env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, *args], cwd=str(ROOT),
                           capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def cargo_cmd(command: tuple[str, ...], timeout: int = 1500) -> subprocess.CompletedProcess:
+    """Run one mandatory locked workspace cargo command in the repo root.
+
+    ``command`` is the full argv verbatim (it already starts with "cargo").
+    Bytes (not text) keep non-UTF-8 toolchain output from raising inside the
+    runner; callers decode what they assert. The generous timeout covers a
+    cold workspace-wide check/test build; a hung toolchain fails the case
+    instead of hanging the suite forever.
+    """
+    return subprocess.run(list(command), cwd=str(ROOT),
+                          capture_output=True, text=False, timeout=timeout)
 
 
 # ------------------------------------------------------------------ repository
@@ -2064,11 +2077,11 @@ class TestWaveAdmissionC0(unittest.TestCase):
 
     # WORK_UNIT_CASE: 829/25
     def test_25_locked_workspace_commands_and_single_membership(self) -> None:
-        """Ceiling: exact mandatory command identity and single membership.
+        """Ceiling: exact mandatory command identity, exit and single membership.
 
         The three mandatory workspace commands below are frozen verbatim from
-        the issue's verification block. Their exit status belongs to root
-        acceptance (this suite runs no Cargo command); what is proved here is
+        the issue's verification block. Each command runs below and its exit
+        binds to this case (no longer root acceptance); what is proved here is
         that each command is the mandatory identity, that it is locked and
         workspace-wide, and that the selection it addresses is non-empty and
         contains every admitted member exactly once, so neither a
@@ -2092,6 +2105,37 @@ class TestWaveAdmissionC0(unittest.TestCase):
             self.assertEqual(len(lock[name]), 1, name)
             self.assertEqual(counts[self.by_name[name]["crate_path"]], 1, name)
         self.assertTrue(members)
+
+        # Exit legs (AUD5): each mandatory command runs here and its exit and
+        # counts bind to this case. A nonzero exit or a short count fails the
+        # suite; root acceptance never re-proves what this case already bound.
+        # WHY run, not record: a recorded exit rots the day the workspace
+        # changes, while the identity legs above already pin the exact argv,
+        # so only a live run proves the bound command still passes.
+        live_runs = [cargo_cmd(command) for command in WORKSPACE_COMMANDS]
+        for command, run in zip(WORKSPACE_COMMANDS, live_runs):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    run.returncode, 0,
+                    run.stderr.decode("utf-8", "replace")[-2000:])
+        meta = json.loads(live_runs[0].stdout.decode("utf-8"))
+        meta_names = [entry["name"] for entry in meta["packages"]]
+        for name in self.six_names:
+            with self.subTest(package=name):
+                self.assertEqual(meta_names.count(name), 1, name)
+        for entry in meta["workspace_members"]:
+            self.assertTrue(entry.startswith("path+file://"), entry)
+        for path in self.six_paths:
+            with self.subTest(member=path):
+                hits = [entry for entry in meta["workspace_members"]
+                        if f"/{path}#" in entry]
+                self.assertEqual(len(hits), 1, path)
+        for run in live_runs[1:]:
+            stream = run.stderr.decode("utf-8", "replace")
+            self.assertIn("Finished", stream)
+        norun_lines = live_runs[2].stderr.decode("utf-8", "replace").splitlines()
+        built = [line for line in norun_lines if "Executable " in line]
+        self.assertTrue(built)
 
         # Negative legs through the same validator: a package-scoped substitute,
         # an unlocked command, an unfrozen command and an empty selection are
