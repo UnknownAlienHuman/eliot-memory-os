@@ -41446,4 +41446,87 @@ mod bridge_handoff_retirement_2731 {
         let _ = std::fs::remove_file(path);
         Ok(())
     }
+
+    #[test]
+    fn replay_after_reconcile_answers_duplicate_without_second_application()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #2731 item A5: a lost acknowledgement replayed after
+        // reconcile answers the retained duplicate (fresh=false) instead of
+        // applying twice — one record row, the exact receipt preserved.
+        let (store, path) = temp_retire_store();
+        let first = store
+            .stage_bridge_event_checked(&staged_event_payload(1, "rpl-2731-00001"))
+            .map_err(|error| format!("first stage must succeed, got {error:?}"))?;
+        assert_eq!(
+            first.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the first stage of a new identity must be fresh"
+        );
+        let namespace = first
+            .get("owner_namespace")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("staged outcome must carry its owner namespace")?
+            .to_owned();
+        store.acknowledge_bridge_event_batch(&json!({
+            "items": [{
+                "namespace": namespace,
+                "expected_revision": 1,
+                "expected_incarnation": 1,
+                "sequence": 1,
+                "owner_authority_lineage": RETIRE_LINEAGE_2731,
+                "owner_principal": "principal-2731",
+            }],
+        }))?;
+        let reconciled =
+            store.reconcile_bridge_event_handoffs_checked(&namespace, 1, &"b".repeat(64))?;
+        assert_eq!(
+            reconciled
+                .get("reconciled")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the handoff must reconcile under its covering frontier"
+        );
+        let records_before = {
+            let read = store.database.begin_write().map_err(storage)?;
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records.len().map_err(storage)?
+        };
+        // The lost acknowledgement: the producer resubmits the identical
+        // stage after reconcile already covered it.
+        let replay = store
+            .stage_bridge_event_checked(&staged_event_payload(1, "rpl-2731-00001"))
+            .map_err(|error| format!("identical replay must succeed, got {error:?}"))?;
+        assert_eq!(
+            replay.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "the replay must answer duplicate, never a fresh insertion"
+        );
+        assert_eq!(
+            replay
+                .get("disposition")
+                .and_then(serde_json::Value::as_str),
+            Some("duplicate"),
+            "the replay disposition must name the retained duplicate"
+        );
+        assert_eq!(
+            replay
+                .get("envelope_sha256")
+                .and_then(serde_json::Value::as_str),
+            first
+                .get("envelope_sha256")
+                .and_then(serde_json::Value::as_str),
+            "the replay must preserve the exact receipt bytes"
+        );
+        let records_after = {
+            let read = store.database.begin_write().map_err(storage)?;
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records.len().map_err(storage)?
+        };
+        assert_eq!(
+            records_after, records_before,
+            "the replay must add no second record row"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }
