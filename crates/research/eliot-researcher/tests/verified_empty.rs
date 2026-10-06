@@ -5,20 +5,24 @@
 //! every later W1 slice binds against, so the four states must render
 //! distinct wire names.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-use eliot_research_exchange_api::{DisclosureClass, SourceClass};
+use eliot_research_exchange_api::{AnchorPrecision, DisclosureClass, SourceClass};
 use eliot_researcher::evidence_portfolio::{
-    AbsenceVerdict, CoverageAccount, ObservedOutsideScope, SourceDisposition,
+    AbsenceVerdict, CoverageAccount, EvidenceSpan, ObservedOutsideScope, PortfolioError, RiskState,
+    SourceDisposition, SourceRecord, SourceRecordParams,
 };
 use eliot_researcher::inquiry_governance::{
     CoverageGoal, CoverageReceipt, CoverageReceiptParams, DenominatorKind, EnumerationState,
-    EvidenceGrade, HypothesisPolicy, IndependenceBlindingPolicy, InquiryLane,
+    EvidenceGrade, HypothesisPolicy, IndependenceBlindingPolicy, InquiryError, InquiryLane,
     InquiryOutputContract, InquiryProtocol, InquiryProtocolProfile, InquiryStopRule,
-    ReopenCondition, StopRuleKind,
+    ReopenCondition, SourcePortfolio, StopRuleKind,
 };
-use eliot_researcher::source_admissibility::SourceAdmissibilityRecord;
+use eliot_researcher::source_admissibility::{
+    SourceAdmissibilityRecord, SourceEligibility, SourceIndependence, SourceLimits,
+};
 
 #[test]
 fn verified_empty_wire_spelling_is_distinct() {
@@ -193,4 +197,123 @@ fn verified_empty_account_receipts_without_proof() {
         AbsenceVerdict::Proven,
         "no owner-issued record was presented, so nothing may prove the absence"
     );
+}
+
+// Issue #1767 W4: the citation relation closes inside the portfolio
+// projection. A cycle or an edge to an unrecorded handle in the admitted set
+// refuses assembly fail-closed; an acyclic graph assembles. Unknown lineage
+// stays unknown through the independence axes, never counted as support.
+fn w4_record(handle: &str, cites: Vec<String>) -> SourceRecord {
+    SourceRecord::new(SourceRecordParams {
+        handle: handle.to_owned(),
+        class: SourceClass::Paper,
+        title: format!("title {handle}"),
+        locator: format!("snapshot::{handle}"),
+        content_digest: DIGEST_VE.to_owned(),
+        operation_id: format!("op-{handle}"),
+        receipt_handle: format!("rcpt-{handle}"),
+        acquisition: SourceDisposition::Observed,
+        published_ms: Some(1_700_000_000_000),
+        observed_ms: Some(1_700_000_100_000),
+        retrieved_ms: Some(1_700_000_200_000),
+        freshness_boundary_ms: Some(1_800_000_000_000),
+        transformed_from: None,
+        transform_verified: false,
+        grade: Some(2),
+        authority_domains: BTreeSet::from(["propulsion".to_owned()]),
+        lineage_root: Some(format!("root-{handle}")),
+        provider_family: Some(format!("provider-{handle}")),
+        evaluator_family: Some(format!("evaluator-{handle}")),
+        assumptions: BTreeSet::from([format!("assumption-{handle}")]),
+        disclosure: DisclosureClass::ProjectBound,
+        content_flags: BTreeSet::new(),
+        incentives_note: "independent lab, no sponsor".to_owned(),
+        deception_risk: RiskState::Low,
+        allowed_use: "evidence-only".to_owned(),
+        allowed_effects: "none".to_owned(),
+        verifier: "verifier-w4".to_owned(),
+        quarantine: None,
+        counterevidence_of: BTreeSet::new(),
+        cites,
+        evidence_spans: vec![EvidenceSpan {
+            span_id: format!("span-{handle}"),
+            anchor: "section-2".to_owned(),
+            excerpt_digest: DIGEST_VE.to_owned(),
+        }],
+        data_role: "primary".to_owned(),
+    })
+    .expect("w4 source record")
+}
+
+fn w4_admissible(
+    profile: &InquiryProtocolProfile,
+    record: SourceRecord,
+) -> SourceAdmissibilityRecord {
+    SourceAdmissibilityRecord {
+        inquiry_id: profile.inquiry_id.clone(),
+        evidence_set_id: "es-w4".to_owned(),
+        profile_id: profile.profile_id.clone(),
+        profile_revision: profile.revision,
+        profile_digest: profile.integrity_digest.clone(),
+        record,
+        scope: "thermal envelope alloy review".to_owned(),
+        eligibility: SourceEligibility::Eligible,
+        taint: BTreeSet::new(),
+        independence: SourceIndependence {
+            lineage_root: None,
+            shared_context_ancestor: None,
+            shared_assumptions: Vec::new(),
+            derived_from: None,
+        },
+        limits: SourceLimits {
+            max_anchor_precision: AnchorPrecision::Section,
+            allowed_uses: vec!["evidence-only".to_owned()],
+            freshness_boundary_ms: Some(1_800_000_000_000),
+            disclosure: DisclosureClass::ProjectBound,
+            verifier: "verifier-w4".to_owned(),
+        },
+        reasons: Vec::new(),
+        assessment_time_ms: 1_700_000_300_000,
+        state_fence: test_fence(),
+        candidate_only: true,
+        governor_admission_required: true,
+        digest: DIGEST_VE.to_owned(),
+    }
+}
+
+#[test]
+fn citation_cycle_refuses_portfolio_assembly() {
+    let profile = receipt_profile();
+    let records = vec![
+        w4_admissible(&profile, w4_record("cyc-a", vec!["cyc-b".to_owned()])),
+        w4_admissible(&profile, w4_record("cyc-b", vec!["cyc-a".to_owned()])),
+    ];
+    assert!(matches!(
+        SourcePortfolio::assemble(&profile.inquiry_id, &profile, &records),
+        Err(InquiryError::Portfolio(
+            PortfolioError::CircularCitation { .. }
+        ))
+    ));
+}
+
+#[test]
+fn citation_closure_holds_acyclic_assembly() {
+    let profile = receipt_profile();
+    let chained = vec![
+        w4_admissible(&profile, w4_record("head", vec!["tail".to_owned()])),
+        w4_admissible(&profile, w4_record("tail", Vec::new())),
+    ];
+    let portfolio =
+        SourcePortfolio::assemble(&profile.inquiry_id, &profile, &chained).expect("acyclic graph");
+    assert_eq!(portfolio.primary_sources.len(), 2);
+    let dangling = vec![w4_admissible(
+        &profile,
+        w4_record("tip", vec!["ghost".to_owned()]),
+    )];
+    assert!(matches!(
+        SourcePortfolio::assemble(&profile.inquiry_id, &profile, &dangling),
+        Err(InquiryError::Portfolio(
+            PortfolioError::UnresolvedRoot { .. }
+        ))
+    ));
 }

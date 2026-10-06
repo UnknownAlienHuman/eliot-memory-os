@@ -55,9 +55,9 @@ use crate::evidence_portfolio::{
     ClaimVerdict, CoverageAccount, EvidencePortfolio, LineageTable, ManifestSource,
     MaterialClaimRoster, NoMatchEvaluation, ObservedOutsideScope, PortfolioError,
     PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
-    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text, check_precision,
-    digest, fence_preimage, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
-    text,
+    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, bool_text, check_citation_graph,
+    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
+    push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -2715,7 +2715,9 @@ impl SourcePortfolio {
     ///
     /// Returns a field error when the inquiry identity is blank and
     /// [`InquiryError::UnknownHandle`] when a record belongs to another inquiry
-    /// or profile revision.
+    /// or profile revision. A citation cycle or an edge to an unrecorded
+    /// handle in the admitted set refuses through the citation closure
+    /// (`source.cites`).
     pub fn assemble(
         inquiry_id: &str,
         profile: &InquiryProtocolProfile,
@@ -2798,6 +2800,17 @@ impl SourcePortfolio {
             .filter(|record| record.is_admitted_to(profile))
             .map(|record| record.record.handle.clone())
             .collect();
+        // W4 (#1767): the citation relation closes inside the projection. A
+        // cycle or an edge to an unrecorded handle refuses the portfolio
+        // fail-closed; only the admitted set is checked, so a stale edge on a
+        // skipped record cannot kill the run. Unknown lineage stays unknown
+        // through the independence axes below, never counted as support.
+        let eligible_records: BTreeMap<String, SourceRecord> = records
+            .iter()
+            .filter(|record| record.is_admitted_to(profile))
+            .map(|record| (record.record.handle.clone(), record.record.clone()))
+            .collect();
+        check_citation_graph(&eligible_records)?;
         portfolio.independence = IndependenceProfile::derive(
             &eligible,
             &records_by_handle,
