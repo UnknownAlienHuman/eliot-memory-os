@@ -610,6 +610,40 @@ mod tests {
         )
     }
 
+    /// Norm: `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md:60`
+    /// - the pipeline runs to evaluation before any promotion, so the `Evaluate` row
+    /// is what binds the record's grader.
+    #[test]
+    fn evaluate_row_binds_the_verifier_family_not_the_executor() {
+        // Read the Evaluate row out of the production map rather than restating the
+        // family literal beside it, so this proof covers the same projection the
+        // route builds its records from.
+        let owners = improvement_operation_owners(ROLLBACK_OWNER);
+        let evaluator = operation_owner(&owners, ImprovementOperation::Evaluate);
+        assert_eq!(evaluator, VERIFIER_OWNER_FAMILY);
+        assert!(
+            evaluator.starts_with("instrument-verifier-"),
+            "the Evaluate row must name the Instrument verifier family, got {evaluator}"
+        );
+        // The executor is a different principal: A14.6 separates the production path
+        // (Testd executes the bounded experiment) from the measurement path (the
+        // verifier grades it), and A00.3 requires fail-closed behaviour where an
+        // error could create hidden control capture - a party grading its own
+        // experiment. `check_evaluator_independence` in the pipeline enforces the
+        // same split.
+        let executor = operation_owner(&owners, ImprovementOperation::ExecuteExperiment);
+        assert_eq!(executor, TESTD_OWNER);
+        assert_ne!(evaluator, executor);
+        assert_eq!(evaluator, experiment_evaluator());
+        // The records the route submits carry that map row, because `joined_group`
+        // builds the plan and the evidence through `experiment_evaluator()`; a drift
+        // between map and record refuses downstream as `UnboundRelation` instead of
+        // passing silently.
+        let group = joined_group("a");
+        assert_eq!(group.experiment.evaluator_id, evaluator);
+        assert_eq!(group.evidence.verifier_id, evaluator);
+    }
+
     /// The admission policy record, built by its own owner-side constructor.
     fn policy_of(group: &str) -> ImprovementAdmissionPolicy {
         improvement_admission_policy(OP_ADMIT, &idempotency_key(group), ROLLBACK_OWNER)
@@ -1140,6 +1174,93 @@ mod tests {
         assert_eq!(
             direct_handoff.wire_revision,
             IMPROVEMENT_PIPELINE_WIRE_REVISION
+        );
+    }
+
+    /// Norm: `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md:69`.
+    #[test]
+    fn unknown_effect_without_receipt_denies_retry_and_retains_nothing() {
+        let group = joined_group("a");
+        let handoff = match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::CanaryAdmitted { handoff }) => handoff,
+            other => panic!("must admit, got {other:?}"),
+        };
+        // The checked current record is the handoff's OWN three identity objects
+        // and the exact plan this run passed, so the obligation the owner raises
+        // names this attempt's proposal bytes and nothing restated beside them.
+        let current = ImprovementCurrentProposal {
+            candidate_id: handoff.candidate_id.clone(),
+            commitment: handoff.proposal_commitment.clone(),
+            discriminator: handoff.proposal_discriminator.clone(),
+            material_equality: handoff.proposal_material_equality.clone(),
+            experiment_plan: group.experiment.clone(),
+        };
+        let prior = ImprovementAdmissionDecision::RequiresReconciliation {
+            reason: "unknown-execution-outcome: reconcile exact external effect before retry"
+                .to_string(),
+            owner_id: "external-owner-2702-a".to_string(),
+        };
+        let disposition = reconcile_improvement_unknown(&prior, &current, &group.rollback)
+            .expect("unknown reconciles");
+        assert!(matches!(
+            disposition,
+            ImprovementTerminalDisposition::UnknownRequiresReconciliation { .. }
+        ));
+        // The norm routes the delayed outcome through rollback reconciliation, so
+        // with no owner-settled receipt the debt stays owed and the retry gate
+        // stays closed: this is the denying direction A00.03 requires, not a
+        // missing-evidence sentence that would permit another attempt.
+        let state = read_improvement_effect_state(&disposition);
+        assert!(
+            !state.retry_permitted,
+            "an unsettled external effect must deny the retry gate"
+        );
+        assert!(
+            !state.completion_retained,
+            "no owner-settled receipt may be retained for an unsettled effect"
+        );
+        assert!(
+            state.obligation.is_some(),
+            "the unresolved obligation must stay named for its owner"
+        );
+    }
+
+    /// Norm: `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md:69`.
+    #[test]
+    fn unknown_effect_tampered_identity_refuses_reconciliation() {
+        let group = joined_group("a");
+        let handoff = match route_result(&group) {
+            Ok(ImprovementTerminalDisposition::CanaryAdmitted { handoff }) => handoff,
+            other => panic!("must admit, got {other:?}"),
+        };
+        let current = ImprovementCurrentProposal {
+            candidate_id: handoff.candidate_id.clone(),
+            commitment: handoff.proposal_commitment.clone(),
+            discriminator: handoff.proposal_discriminator.clone(),
+            material_equality: handoff.proposal_material_equality.clone(),
+            experiment_plan: group.experiment.clone(),
+        };
+        // The retained debt re-binds itself to the exact proposal bytes it was
+        // raised over, so an identity naming ANOTHER candidate is a different
+        // debt: the Governor entry point is called directly here because
+        // `reconcile_improvement_unknown` builds the retained identity FROM
+        // `current` and could therefore never be handed a spliced one.
+        let retained = ImprovementUnknownEffectIdentity {
+            candidate_id: "cand-2702-tampered".to_string(),
+            experiment_id: group.experiment.experiment_id.clone(),
+            commitment: handoff.proposal_commitment.clone(),
+            owner_id: "external-owner-2702-a".to_string(),
+            forward_repair_ref: group.rollback.forward_repair_ref.clone(),
+            invalidation_set: group.rollback.invalidation_set.clone(),
+        };
+        let result = eliot_maintenance::improvement_pipeline::reconcile_retained_unknown_effect(
+            &retained, &current, None,
+        );
+        assert_eq!(
+            result,
+            Err(PipelineError::UnboundRelation {
+                relation: "retained-unknown-effect: candidate-identity-mismatch"
+            })
         );
     }
 }

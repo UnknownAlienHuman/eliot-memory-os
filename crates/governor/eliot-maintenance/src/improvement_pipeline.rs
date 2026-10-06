@@ -5095,6 +5095,51 @@ mod tests {
         );
     }
 
+    /// `I12.24:76`: replay-only evidence cannot promote. Every status other than
+    /// `Executed` refuses, and the refused label is the machine state's own.
+    #[test]
+    fn evidence_shape_refuses_non_executed_status() {
+        let mut group = fixture("a");
+        group.evidence.execution = ImprovementEvidenceExecution::NotExecuted;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "not-executed",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.evidence.execution = ImprovementEvidenceExecution::Simulated;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "simulated",
+            }
+        );
+
+        let mut group = fixture("a");
+        group.evidence.execution = ImprovementEvidenceExecution::UnknownOutcome;
+        assert_eq!(
+            group.refusal(),
+            PipelineError::EvidenceNotExecuted {
+                status: "unknown-outcome",
+            }
+        );
+    }
+
+    /// `I12.24:76`: a dependent or failed evaluation is not independent
+    /// evidence, even though the evaluation itself did execute.
+    #[test]
+    fn evidence_shape_refuses_dependent_or_failed_verdict() {
+        let mut group = fixture("a");
+        group.evidence.independent = false;
+        assert_eq!(group.refusal(), PipelineError::EvidenceNotIndependent);
+
+        let mut group = fixture("a");
+        group.evidence.verifier_passed = false;
+        assert_eq!(group.refusal(), PipelineError::EvidenceNotIndependent);
+    }
+
     #[test]
     fn substituted_operation_and_idempotency_identity_refuse_on_both_joins() {
         // Proposal to candidate: the candidate view no longer declares the
@@ -5925,5 +5970,55 @@ mod tests {
         // The control's handoff is an admitted handoff too, so it carries the
         // owner's pulse evidence AND no execution authority.
         assert!(!control.admitted().execution_authorized);
+    }
+
+    /// Norm: `I12.24:60, :76` - the pipeline reaches evaluation before any promotion.
+    #[test]
+    fn gate_without_execution_evidence_rejects_invalid_closure_and_records_durable_decision() {
+        let mut group = fixture("a");
+        group.admission_evidence.closure_valid = false;
+        // This gate entry is the exact production path the daemon calls when no
+        // executed evidence exists, so an invalid closure binding must close here as
+        // a recorded `Rejected` disposition - never as an admission, and never as an
+        // untyped escape out of the entry point.
+        let disposition = match admit_improvement_candidate_without_execution_evidence(
+            &group.proposal,
+            &group.experiment,
+            &group.candidate,
+            &group.admission_evidence,
+            &group.policy,
+        ) {
+            Ok(disposition) => disposition,
+            Err(error) => panic!("the gate must dispose an invalid closure binding, got {error:?}"),
+        };
+        match &disposition {
+            ImprovementTerminalDisposition::Rejected { cause, reason, .. } => {
+                assert_eq!(*cause, ImprovementRejectCause::InvalidClosureBinding);
+                assert!(
+                    reason.contains("invalid-closure-binding"),
+                    "the recorded refusal must name the closure binding, got {reason}"
+                );
+            }
+            other => panic!("an invalid closure binding must reject, got {other:?}"),
+        }
+        // The terminal outcome is then re-proved into a durable decision bound to
+        // the candidate identity AND revision on top of the checked records. `current`
+        // is `None` because this path publishes no checked current record, so the
+        // proposal commitment stays absent rather than invented.
+        let decision = match improvement_terminal_decision(
+            group.proposal.candidate_id.as_str(),
+            3,
+            &group.proposal,
+            &group.experiment,
+            &group.evidence,
+            None,
+            &disposition,
+        ) {
+            Ok(decision) => decision,
+            Err(error) => panic!("a recorded refusal must be a durable decision, got {error:?}"),
+        };
+        assert_eq!(decision.candidate_id, "cand-2702-a");
+        assert_eq!(decision.candidate_revision, 3);
+        assert_eq!(decision.disposition, disposition);
     }
 }
