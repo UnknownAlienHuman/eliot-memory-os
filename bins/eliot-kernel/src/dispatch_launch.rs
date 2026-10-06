@@ -2790,6 +2790,21 @@ fn release_retained_native_worker_capacity(
     drop(removed);
 }
 
+/// Serializes the established native-worker material without capacity evidence.
+/// Production prepare adds only its owner-issued capacity through the same writer.
+pub fn native_worker_material_bytes(
+    request: &NativeWorkerClaimRequest,
+    receipt: &NativeWorkerClaimReceipt,
+    epoch: &EpochId,
+    generation: u64,
+    nonce: &str,
+    grant: &DispatchGrant,
+) -> Result<Vec<u8>, DispatchLaunchError> {
+    native_worker_material_bytes_with_capacity(
+        request, receipt, epoch, generation, nonce, grant, None,
+    )
+}
+
 /// Writes the native-worker dispatch file carrying the admitted claim plus
 /// the Kernel-issued launch grant.
 ///
@@ -2824,7 +2839,7 @@ fn release_retained_native_worker_capacity(
 /// `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`): the
 /// material carries the request/receipt projection, while the record stays
 /// the durable authority for reconcile.
-pub fn native_worker_material_bytes(
+fn native_worker_material_bytes_with_capacity(
     request: &NativeWorkerClaimRequest,
     receipt: &NativeWorkerClaimReceipt,
     epoch: &EpochId,
@@ -5630,7 +5645,7 @@ pub fn prepare_native_worker_launch(
     let capacity_section = capacity
         .as_ref()
         .map(|(request, binding)| NativeWorkerCapacitySection { request, binding });
-    let bytes = native_worker_material_bytes(
+    let bytes = native_worker_material_bytes_with_capacity(
         material.request,
         &receipt,
         &authority_epoch,
@@ -8873,13 +8888,11 @@ mod tests {
         let root = temp_root("capacity");
         let kernel = ready_kernel(&root);
         match compose_dispatch_contour(PRINCIPAL.to_owned()) {
-            Ok(()) => {}
-            Err(DispatchLaunchError::AlreadyComposed(_)) => {}
+            Ok(()) | Err(DispatchLaunchError::AlreadyComposed(_)) => {}
             Err(other) => panic!("contour must compose: {other:?}"),
         }
         match compose_process_capacity_reserve(8, 2, 2, 2) {
-            Ok(()) => {}
-            Err(DispatchLaunchError::AlreadyComposed(_)) => {}
+            Ok(()) | Err(DispatchLaunchError::AlreadyComposed(_)) => {}
             Err(other) => panic!("capacity reserve must compose: {other:?}"),
         }
         let contour = DISPATCH_CONTOUR.get().expect("contour");
@@ -8944,7 +8957,7 @@ mod tests {
             request: &pair.0,
             binding: &pair.1,
         };
-        let bytes = native_worker_material_bytes(
+        let bytes = native_worker_material_bytes_with_capacity(
             &native_request,
             &receipt,
             &epoch,
@@ -9010,7 +9023,6 @@ mod tests {
             live_generation_value,
             fixture_nonce,
             &grant,
-            None,
         )
         .expect("bare material bytes");
         let bare_json: serde_json::Value =
