@@ -7445,6 +7445,19 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
+        // W6 (#1767): re-prove the receipt's accounting from the retained
+        // run material. The carried receipt binds `account_digest`, but a
+        // binding alone cannot catch an account swapped after compute:
+        // rebuilding from the retained manifest + admissibility and
+        // comparing digests makes the substitution observable. This runs on
+        // the live path because `record` ends with `validate_integrity`.
+        let rederived_account_digest =
+            rederive_coverage_account_digest(&self.run_reference_manifest, &self.admissibility)?;
+        if rederived_account_digest != self.coverage_receipt.account_digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.coverage_accounting",
+            });
+        }
         self.validate_source_admission_requests()?;
         self.validate_committed_freeze_and_synthesis_input()?;
         for diagnostic in &self.unadmitted_references {
@@ -9454,7 +9467,16 @@ fn coverage_account(
     observation: &InquiryObservation,
     admissibility: &[SourceAdmissibilityRecord],
 ) -> Result<CoverageAccount, InquiryError> {
-    let manifest = &observation.reference_manifest;
+    build_coverage_account(&observation.reference_manifest, admissibility)
+        .map_err(InquiryError::from)
+}
+
+/// Rebuilds the exact coverage accounting the live path opens, from the
+/// retained manifest + admissibility rather than from a fresh observation.
+fn build_coverage_account(
+    manifest: &AllowedReferenceManifest,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<CoverageAccount, PortfolioError> {
     let mut members: BTreeSet<String> = BTreeSet::new();
     for handle in manifest
         .source_handles
@@ -9482,9 +9504,9 @@ fn coverage_account(
                 admitted_manifest_digest: manifest.digest.clone(),
             })
             .collect();
-        CoverageAccount::open_verified_empty(&examined).map_err(InquiryError::from)?
+        CoverageAccount::open_verified_empty(&examined)?
     } else {
-        CoverageAccount::open(members).map_err(InquiryError::from)?
+        CoverageAccount::open(members)?
     };
     for record in admissibility {
         account.observe(
@@ -9496,6 +9518,22 @@ fn coverage_account(
         )?;
     }
     Ok(account)
+}
+
+/// Re-proves the coverage-account digest from retained run material.
+///
+/// Holder re-proof primitive for W6 (#1767): the carried receipt binds
+/// `account_digest`, and this rebuilds the exact accounting the receipt was
+/// computed over from the retained manifest + admissibility — the same
+/// construction the live path runs, no new semantics — so a holder (and
+/// `validate_integrity` below) observes an account swapped after compute
+/// instead of trusting the binding. Absence-dependent verdict fields stay
+/// under `AbsencePreconditions::derive`, not here.
+pub fn rederive_coverage_account_digest(
+    manifest: &AllowedReferenceManifest,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<String, InquiryError> {
+    Ok(build_coverage_account(manifest, admissibility)?.digest())
 }
 
 /// The claim audit this run actually produced, plus the coverage map that says

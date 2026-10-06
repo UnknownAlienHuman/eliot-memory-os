@@ -9,7 +9,9 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-use eliot_research_exchange_api::{AnchorPrecision, DisclosureClass, SourceClass};
+use eliot_research_exchange_api::{
+    AllowedReferenceManifest, AnchorPrecision, DisclosureClass, SourceClass,
+};
 use eliot_researcher::evidence_portfolio::{
     AbsenceVerdict, CoverageAccount, EvidenceSpan, ObservedOutsideScope, PortfolioError, RiskState,
     SourceDisposition, SourceRecord, SourceRecordParams,
@@ -18,7 +20,7 @@ use eliot_researcher::inquiry_governance::{
     CoverageGoal, CoverageReceipt, CoverageReceiptParams, DenominatorKind, EnumerationState,
     EvidenceGrade, HypothesisPolicy, IndependenceBlindingPolicy, InquiryError, InquiryLane,
     InquiryOutputContract, InquiryProtocol, InquiryProtocolProfile, InquiryStopRule,
-    ReopenCondition, SourcePortfolio, StopRuleKind,
+    ReopenCondition, SourcePortfolio, StopRuleKind, rederive_coverage_account_digest,
 };
 use eliot_researcher::source_admissibility::{
     SourceAdmissibilityRecord, SourceEligibility, SourceIndependence, SourceLimits,
@@ -316,4 +318,68 @@ fn citation_closure_holds_acyclic_assembly() {
             PortfolioError::UnresolvedRoot { .. }
         ))
     ));
+}
+
+// Issue #1767 W6: the carried receipt binds `account_digest`, and the digest
+// is re-proved here from the retained manifest + admissibility — the same
+// construction the live path runs. Same material re-proves the same digest
+// (both denominator arms), and a substituted disposition moves it, so an
+// account swapped after compute is observable instead of trusted.
+fn w6_manifest(handles: Vec<String>) -> AllowedReferenceManifest {
+    AllowedReferenceManifest {
+        run_id: "run-w6".to_owned(),
+        root_context_revision: "rev-w6".to_owned(),
+        state_fence: test_fence(),
+        source_handles: handles,
+        evidence_handles: Vec::new(),
+        artifact_handles: Vec::new(),
+        url_handles: Vec::new(),
+        tool_refs: Vec::new(),
+        verifier_refs: Vec::new(),
+        allowed_anchor_precision: AnchorPrecision::Section,
+        scope_class: "scope-w6".to_owned(),
+        disclosure: DisclosureClass::ProjectBound,
+        retention_class: "retention-w6".to_owned(),
+        stale_or_revoked_handles: Vec::new(),
+        expansion_routes: Vec::new(),
+        digest: DIGEST_VE.to_owned(),
+    }
+}
+
+#[test]
+fn coverage_account_digest_rederives_deterministically() {
+    let profile = receipt_profile();
+    let admissibility = vec![
+        w4_admissible(&profile, w4_record("rd-a", Vec::new())),
+        w4_admissible(&profile, w4_record("rd-b", Vec::new())),
+    ];
+    let manifest = w6_manifest(vec!["rd-a".to_owned(), "rd-b".to_owned()]);
+    let first = rederive_coverage_account_digest(&manifest, &admissibility).expect("rederive");
+    let second =
+        rederive_coverage_account_digest(&manifest, &admissibility).expect("rederive again");
+    assert_eq!(
+        first, second,
+        "same retained material re-proves the same digest"
+    );
+    let bare = w6_manifest(Vec::new());
+    rederive_coverage_account_digest(&bare, &admissibility)
+        .expect("empty manifest rebuilds over the examined run evidence");
+}
+
+#[test]
+fn coverage_account_digest_observes_substitution() {
+    let profile = receipt_profile();
+    let base = vec![
+        w4_admissible(&profile, w4_record("sub-a", Vec::new())),
+        w4_admissible(&profile, w4_record("sub-b", Vec::new())),
+    ];
+    let manifest = w6_manifest(vec!["sub-a".to_owned(), "sub-b".to_owned()]);
+    let intact = rederive_coverage_account_digest(&manifest, &base).expect("intact");
+    let mut changed = base.clone();
+    changed[0].record.acquisition = SourceDisposition::Partial;
+    let altered = rederive_coverage_account_digest(&manifest, &changed).expect("altered");
+    assert_ne!(
+        intact, altered,
+        "a substituted disposition must move the digest"
+    );
 }
