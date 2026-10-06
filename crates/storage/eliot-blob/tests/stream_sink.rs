@@ -1072,6 +1072,20 @@ fn open_sink_on_store(
     root: &str,
     store: FixtureStore,
 ) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
+    open_sink_on_store_with_limits(case, root, store, replay_limits())
+}
+
+/// Binds and opens one sink session under caller-chosen session limits.
+///
+/// Only the pressure case needs this: every other case shares
+/// `replay_limits`. The limits travel into the open request the session
+/// pins, so the ceilings a case probes are the ceilings the session states.
+fn open_sink_on_store_with_limits(
+    case: &str,
+    root: &str,
+    store: FixtureStore,
+    limits: ProcessStreamSinkLimits,
+) -> (BlobStoreStreamSink<FixtureStore>, ProcessStreamSinkSession) {
     let stage_context = receipt_context(&format!("sink-{case}-stage"));
     let read_context: BlobReceiptContext = ok(serde_json::from_str(&context_json(
         "READ",
@@ -1137,7 +1151,7 @@ fn open_sink_on_store(
         binding_json,
         ProcessStreamKind::Stdout,
         stream_policy,
-        replay_limits(),
+        limits,
         ProcessStreamDigestAlgorithm::Sha256,
         ProcessStreamDigestAlgorithm::Sha256,
     ));
@@ -2001,5 +2015,144 @@ fn repeat_finalize_reuses_object_and_fresh_adapter_holds_no_proof() {
         block_on(fresh_sink.reconcile(fresh_session.clone(), fabricated)),
         Err(ProcessStreamSinkError::ProviderUnavailable),
         "no retained reservation means no reconcile, never a synthesized terminal"
+    );
+}
+
+/// Source: `PersistenceQueueBound` + the latched overflow (`src/stream_sink.rs`)
+/// and the terminal-identity fencing in `abort_snapshot`/`record_locked`: a
+/// full persistence queue REFUSES the append with `Backpressured` instead of
+/// blocking, sheds every later append too, stages nothing, and a terminal
+/// command that arrives after the terminal recorded conflicts instead of
+/// minting a second outcome.
+/// Discovery: without the latch a fast producer could grind through a full
+/// queue by retrying and stall the drain; without the fencing a late abort
+/// could rename the recorded outcome. The shed bytes must therefore be absent
+/// from the published object (not merely refused at the door), and the late
+/// abort must leave the recorded publication, terminal and platform exactly
+/// as they were.
+/// Executed-pass: under a two-chunk / 250-byte in-flight ceiling two chunks
+/// are accepted, the third and fourth shed with `retry_after_ms: 0`, the
+/// cursor never moves past the admitted two, and the finalize publishes
+/// exactly those two chunks. A `Cancellation` abort naming the recorded
+/// terminal id then conflicts, and nothing — publication, terminal digest,
+/// platform writes — moves.
+/// I05-12: one active root owner; pressure is refused, never queued.
+// WORK_UNIT_CASE: 297/A4
+#[test]
+fn pressure_sheds_without_stalling_and_late_abort_conflicts() {
+    const KEPT: &[u8] = b"kept-297-16-bytes!";
+    const SHED: &[u8] = b"shed-297-16-bytes!";
+    assert_eq!(KEPT.len(), 18);
+    assert_eq!(SHED.len(), 18);
+    // Two 9-byte chunks charge 2 * (32 + 64 + 9) = 210 bytes against the
+    // 250-byte in-flight ceiling, so both fit; the third would reach 315 and
+    // sheds. KEPT is exactly the two admitted chunks.
+    let root = unique_test_root();
+    let platform = FixturePlatform::default();
+    let platform_handle = platform.clone();
+    let store = store_with_platform(platform, &root);
+    let limits = ok(ProcessStreamSinkLimits::new(
+        64, 4096, 8, 4096, 2, 250, 10, 20, 20,
+    ));
+    let (sink, session) = open_sink_on_store_with_limits("pressure", &root, store, limits);
+
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 0, 0, &KEPT[..9])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 1,
+            next_offset: 9,
+        },
+    );
+    assert_disposition(
+        ok(append_chunk(&sink, &session, 1, 9, &KEPT[9..])),
+        ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: 2,
+            next_offset: 18,
+        },
+    );
+    // The queue is full: this append and every retry at the live cursor shed
+    // with a zero hint — a refusal per chunk, never a block (the latch, not
+    // the sequence check, sheds them: coordinates stay at the live cursor, so
+    // no `SequenceGap` fires first). The cursor stays where the admitted
+    // bytes left it.
+    for _ in 0..3 {
+        assert_eq!(
+            append_chunk(&sink, &session, 2, 18, SHED),
+            Ok(ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 0 }),
+            "a full queue refuses without blocking and without advancing"
+        );
+    }
+    let ProcessStreamSinkReadback::Session { view } = ok(block_on(sink.readback(session.clone())))
+    else {
+        panic!("an unfinalized pressured session reads back as its session view");
+    };
+    assert_eq!(view.admitted_chunks(), 2);
+    assert_eq!(view.admitted_bytes(), 18);
+    assert_eq!(view.next_sequence(), 2);
+    assert_eq!(view.next_offset(), 18);
+
+    // The finalize publishes exactly the admitted prefix: the shed bytes are
+    // absent from the object, not merely refused at the door.
+    let expected_sha256 = format!("{:x}", Sha256::digest(KEPT));
+    let finalize = ok(ProcessStreamSinkFinalizeRequest::new(
+        session.terminal_id().clone(),
+        2,
+        18,
+        10,
+        StreamTransportStatus::Complete,
+        expected_sha256.clone(),
+        18,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            KEPT.to_vec(),
+            18,
+        )),
+        None,
+        Vec::new(),
+    ));
+    let terminal = ok(block_on(sink.finalize(session.clone(), finalize)));
+    assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+    match sink.publication() {
+        Some(BlobStreamPublication::Complete(complete)) => {
+            assert_eq!(complete.byte_length, 18);
+            assert_eq!(complete.sha256, expected_sha256);
+        }
+        other => panic!("pressure must not lose the admitted prefix, got {other:?}"),
+    }
+    let recorded = terminal.terminal_sha256().to_owned();
+    let before = durable_write_counts(&platform_handle);
+
+    // Race half: a `Cancellation` abort that arrives after the terminal
+    // recorded names the same terminal id with a different command kind, so
+    // it conflicts — and moves nothing behind it.
+    let abort = ok(ProcessStreamSinkAbortRequest::new(
+        session.terminal_id().clone(),
+        ProcessStreamSinkAbortReason::Cancellation,
+        2,
+        18,
+        10,
+        StreamTransportStatus::CancelledBeforeEof,
+        expected_sha256.clone(),
+        18,
+        ok(ProcessStreamPrefixPreview::from_transport_prefix(
+            KEPT.to_vec(),
+            18,
+        )),
+        None,
+        vec![StreamEvidenceGap::CancelledBeforeEof],
+    ));
+    assert_eq!(
+        block_on(sink.abort(session.clone(), abort)),
+        Err(ProcessStreamSinkError::TerminalIdentityConflict),
+        "a terminal command after the recorded one conflicts, never renames it"
+    );
+    assert_eq!(
+        terminal.terminal_sha256(),
+        recorded,
+        "the recorded terminal is untouched by the late abort"
+    );
+    assert_eq!(
+        durable_write_counts(&platform_handle),
+        before,
+        "a conflicted abort stages nothing behind the recorded terminal"
     );
 }
