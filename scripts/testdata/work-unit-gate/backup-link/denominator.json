@@ -38,7 +38,7 @@
     {
       "manifest": "bins/eliot-watchdog/Cargo.toml",
       "base_blob_sha256": "c50af4a00562da28dc5d718f45f7301d6a9b1ca074a7d89bd13e310527fe78f4",
-      "current_blob_sha256": "d301b38f27f50d273dfa757ca92526e2e1f7abe64b637f5c5db8ac970af5f002",
+      "current_blob_sha256": "3340750934c60148ab5730e4b86daa70e6397902e40b2455f8ca2830365dd3a6",
       "byte_identical_since_base": false
     },
     {
@@ -56,7 +56,7 @@
     {
       "manifest": "crates/storage/eliot-backup/Cargo.toml",
       "base_blob_sha256": "e76fc58cdb7af04a3e8c95933d0e5d7f495f734d91e07d7bb4295f7e7da42dbf",
-      "current_blob_sha256": "bd920450260159d44462195703308943ad2e40bebffc091c608fc34db431cbff",
+      "current_blob_sha256": "758251bf33f6ccd17f793443a4fc699c98b71e2e73576e4bc105252a3a5e0fb8",
       "byte_identical_since_base": false
     },
     {
@@ -74,7 +74,7 @@
     {
       "manifest": "Cargo.lock",
       "base_blob_sha256": "8694704b293ac155f6a073c19734c72de81564719570abf5bc1bdfe4719118d3",
-      "current_blob_sha256": "0bd6dfa8bd935a93fd7797a7ca1cb2e5350cf2a02d5fa89ceb733b485783fc75",
+      "current_blob_sha256": "76bee601f18e0c22e525af3303fdc1baeec24aa8a5aff76b20a7febb757ea797",
       "byte_identical_since_base": false
     }
   ],
@@ -212,5 +212,5 @@
       "declaration": "eliot-blob-api.workspace = true"
     }
   ],
-  "denominator_digest": "81a40f28de01741b4b0db5a679402d889d8c7f041d531362c80de56279a90c0c"
+  "denominator_digest": "34103f8cbf7f5e375b6a3a2b12db62f3b1740207e8923c55d30f8777c4cd9418"
 }

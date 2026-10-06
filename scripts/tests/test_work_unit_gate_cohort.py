@@ -5,8 +5,10 @@ One substantive Python unittest per # WORK_UNIT_CASE: 852/<case> immediately abo
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.work_unit_gate import __main__ as gate_main
 from scripts.work_unit_gate import cohort as ch
 from scripts.work_unit_gate import contracts as c
 from scripts.work_unit_gate import descriptor_runner as dr
@@ -25,13 +28,18 @@ BODY, MATRIX, SOURCE, ARTIFACT = (char * 64 for char in "abcd")
 PROOF = c.ProofCeiling("catalogue-integrity-only")
 GUARD = c.WorkUnitIdentity("source-shape")
 
+# Committed aggregate lock `[aggregate]` sha256 line (the only line replaced by
+# the tampered copy) and its 64-nines replacement.
+COMMITTED_AGGREGATE_SHA256 = "1177af1d0dff9e7ea72975877b88c204c70610c3c76e88efcc0cc65c59a13667"
+TAMPERED_AGGREGATE_SHA256 = "9" * 64
+
 # Frozen leaf-router byte identities: sha256 of the exact on-disk bytes at base
-# commit c0c7257f (Windows CRLF checkout; `.gitattributes` sets `* text=auto`
+# commit 38d5ac18b (Windows CRLF checkout; `.gitattributes` sets `* text=auto`
 # so disk bytes are CRLF while git blobs are LF-only). Fixed literals recorded
 # once — never computed from live files at test runtime.
 FROZEN_LEAF_ROUTER_SHA256 = {
     "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
-    "scripts/docs_router_core.py": "455aec470ab6f3f8bf7e64578d264ca0877a06cfec411d9aa415ffa62ae4a06a",
+    "scripts/docs_router_core.py": "19532a3505c6c94ccb3f4868ffa2d62fa0f666a6389c1166407937c15eb7ff9c",
     "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
     "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
 }
@@ -148,6 +156,34 @@ def make_evidence(desc: c.WorkUnitDescriptor, result: c.OverallResult = c.Overal
 
 class WorkUnitCohortTests(unittest.TestCase):
 
+    def test_discover_named_inventory_exempt_and_unknown_rejected(self):
+        # A temporary directory, never the real `.github/work-units`: asserting
+        # on the real dir would couple this unit test to checkout state.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in sorted(ch.ALLOWED_NAMED_INVENTORY):
+                (root / name).write_bytes(b"")
+
+            # The closed named-inventory class is exempt from the numeric class.
+            self.assertEqual(
+                ch.discover_work_units(root),
+                ch.DescriptorDiscovery(ch.DescriptorDiscoveryStatus.OBSERVED, ()),
+            )
+
+            # Any other non-numeric TOML artifact fails closed.
+            (root / "unknown.toml").write_bytes(b"")
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.discover_work_units(root)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNEXPECTED_DESCRIPTOR)
+
+            # A numeric descriptor is still discovered alongside exempt files.
+            (root / "unknown.toml").unlink()
+            (root / "852.toml").write_bytes(b"")
+            self.assertEqual(
+                ch.discover_work_units(root),
+                ch.DescriptorDiscovery(ch.DescriptorDiscoveryStatus.OBSERVED, ((852, "852.toml"),)),
+            )
+
     # WORK_UNIT_CASE: 852/1
     def test_exact_frozen_current_catalogue_row_denominator(self):
         d1 = make_desc(851, "D-WU-BINDINGS", 44, source_roots=("scripts/work_unit_gate/case_binding.py",))
@@ -255,6 +291,49 @@ schema_version = "eliot-work-unit-descriptor-v2"
                 disposition=c.CatalogueDisposition.ASSIGNED,
                 descriptor=None,
             )
+        # On-disk discovery leg: a generated lock over the admitted snapshot
+        # validates against the observed numeric class, and an unexpectedly
+        # missing executable descriptor fails closed (A14-08:56 counts are not
+        # progress without proof; I00-14:54 identity follows the bytes).
+        g1 = make_desc(851, "D-WU-A", 3)
+        snapshot = {
+            "header": {
+                "repository": "UnknownAlienHuman/eliot-memory-os",
+                "base_revision": "0" * 40,
+                "acquisition": "probe",
+                "acquired_at": "2026-10-05T00:00:00Z",
+                "complete": True,
+            },
+            "rows": [
+                {"issue": 851, "unit": "D-WU-A", "body_sha256": g1.body_sha256,
+                 "disposition": "assigned", "prerequisites": []},
+                {"issue": 852, "unit": "D-WU-B", "body_sha256": "c" * 64,
+                 "disposition": "blocked", "prerequisites": []},
+            ],
+            "numeric_descriptors": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            wu_dir = Path(tmp) / "work-units"
+            wu_dir.mkdir()
+            lock_path = Path(tmp) / "cohort.toml"
+            lock_path.write_bytes(ch.generate_cohort_lock(snapshot, {851: g1}))
+            receipt = ch.verify_cohort_lock(lock_path, wu_dir, {851: g1})
+            self.assertEqual(
+                receipt.sha256,
+                ch.read_cohort_lock(lock_path).aggregate.sha256,
+            )
+
+            # The executable descriptor is unexpectedly missing on disk: the
+            # same rows claiming numeric class [851] fail closed, because the
+            # discovered class does not match the lock.
+            snapshot_missing = dict(snapshot, numeric_descriptors=[851])
+            lock_missing = Path(tmp) / "cohort-missing.toml"
+            lock_missing.write_bytes(
+                ch.generate_cohort_lock(snapshot_missing, {851: g1}))
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.verify_cohort_lock(lock_missing, wu_dir, {851: g1})
+            self.assertEqual(
+                ctx.exception.problem, ch.CohortProblem.INVALID_AGGREGATE_LOCK)
 
     # WORK_UNIT_CASE: 852/6
     def test_unexpected_extra_descriptor_fails(self):
@@ -267,6 +346,30 @@ schema_version = "eliot-work-unit-descriptor-v2"
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_selection_plan(cat, selection, [d1, d_extra])
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNEXPECTED_DESCRIPTOR)
+
+        # The numeric descriptor class must be *discovered* as the denominator,
+        # not merely consumed: only the canonical `<issue>.toml` spelling is a
+        # member. A temporary directory, never the real `.github/work-units`.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "852.toml").write_bytes(b"")
+            self.assertEqual(
+                ch.discover_numeric_descriptor_files(root),
+                ((852, "852.toml"),),
+            )
+
+            # A noncanonical spelling of the same issue number is not a member.
+            (root / "0852.toml").write_bytes(b"")
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.discover_numeric_descriptor_files(root)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.FILENAME_MISMATCH)
+            (root / "0852.toml").unlink()
+
+            # An unknown non-numeric artifact fails closed.
+            (root / "notes.toml").write_bytes(b"")
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.discover_numeric_descriptor_files(root)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNEXPECTED_DESCRIPTOR)
 
     # WORK_UNIT_CASE: 852/7
     def test_malformed_unknown_field_fails(self):
@@ -345,6 +448,37 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue))
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
 
+        # The very same well-formed pair is declarable: sharing is valid only
+        # with an explicit disjoint (or serialized) declaration, and the
+        # production derivation helper supplies exactly that one edge. Deriving
+        # is deterministic, so a repeated derivation is the identical tuple.
+        edges = ch.derive_package_sharing([d1, d2], {}, None)
+        self.assertEqual(len(edges), 1)
+        self.assertIsInstance(edges[0], ch.PackageSharingEdge)
+        self.assertIs(edges[0].kind, ch.PackageSharingKind.DISJOINT)
+        self.assertEqual(edges[0].package.name, "eliot-core")
+        self.assertEqual(set(edges[0].issues), {d1.issue, d2.issue})
+        self.assertEqual(edges, ch.derive_package_sharing([d1, d2], {}, None))
+
+        cat = ch.materialize_catalogue(
+            [make_row(d1), make_row(d2)], (d1.issue, d2.issue), package_sharing=tuple(edges)
+        )
+        self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+        self.assertEqual(len(cat.rows), 2)
+
+        # The undeclarable counterpart: same package and same distinct issues,
+        # but the mutable scopes overlap and there is neither a typed
+        # prerequisite nor an integration owner, so no edge is derivable and
+        # the same empty sharing leaves the conflict standing.
+        o1 = make_desc(853, "D-WU-PKG-O1", 20, package="eliot-core", source_roots=("crates/core",))
+        o2 = make_desc(854, "D-WU-PKG-O2", 22, package="eliot-core", source_roots=("crates/core/sub.rs",))
+        self.assertEqual(ch.derive_package_sharing([o1, o2], {}, None), ())
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(o1), make_row(o2)], (o1.issue, o2.issue), package_sharing=()
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
+
     # WORK_UNIT_CASE: 852/12
     def test_valid_distinct_same_order_tracks(self):
         d1 = make_desc(851, "D-WU-TRACK-A", 20, package="eliot-track-a", source_roots=("crates/track-a/src/lib.rs",))
@@ -355,12 +489,63 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         self.assertEqual(len(cat.rows), 2)
         self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
 
+        # Two same-package tracks are a valid cohort when their mutable scopes
+        # are disjoint and that fact is explicitly declared: derivation holds
+        # exactly the one pair edge, and the unrelated third package needs none.
+        t1 = make_desc(853, "D-WU-TRACK-A", 20, package="eliot-track", source_roots=("crates/track/a.rs",))
+        t2 = make_desc(854, "D-WU-TRACK-B", 22, package="eliot-track", source_roots=("crates/track/b.rs",))
+        t3 = make_desc(855, "D-WU-OTHER", 20, package="eliot-other", source_roots=("crates/other/lib.rs",))
+        track_edges = ch.derive_package_sharing([t1, t2, t3], {}, None)
+        self.assertEqual(len(track_edges), 1)
+        self.assertIs(track_edges[0].kind, ch.PackageSharingKind.DISJOINT)
+        self.assertEqual(track_edges[0].package.name, "eliot-track")
+        self.assertEqual(set(track_edges[0].issues), {t1.issue, t2.issue})
+
+        cat3 = ch.materialize_catalogue(
+            [make_row(t1), make_row(t2), make_row(t3)],
+            (t1.issue, t2.issue, t3.issue),
+            package_sharing=tuple(track_edges),
+        )
+        self.assertEqual(len(cat3.rows), 3)
+        self.assertEqual(cat3.result, c.CatalogueResult.INTEGRITY_VALID)
+
     # WORK_UNIT_CASE: 852/13
     def test_zero_negative_malformed_case_count_rejected(self):
         with self.assertRaises(c.ContractViolation):
             make_desc(852, "D-WU-COHORT", cases=0)
         with self.assertRaises(c.ContractViolation):
             make_desc(852, "D-WU-COHORT", cases=-5)
+
+        # The same defects must fail at the closed decoder, not only at the
+        # constructor: a descriptor artifact carrying a non-integer case count.
+        toml_string_count = b"""
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = { value = "work-unit-852" }
+issue = { repository = { owner = "UnknownAlienHuman", name = "eliot-memory-os" }, number = 852 }
+unit = { value = "D-WU-COHORT" }
+mode = "python-unittest"
+source_roots = [{ value = "scripts/work_unit_gate" }]
+test_roots = [{ value = "scripts/tests" }]
+matrix_cases = "42"
+proof_ceiling = { value = "catalogue-integrity-only" }
+revision = 1
+body_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+matrix_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+require_workspace_member = false
+requirements = { source_floor = 1, public_floor = 0, test_floor = 42, required_guards = [] }
+bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes = 65536, discovery_tests = 1000, child_processes = 4 }
+"""
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_string_count, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("INTEGER_BOUND", str(ctx.exception))
+
+        # A zero case count is a well-typed integer outside the closed bound.
+        toml_zero_count = toml_string_count.replace(b'matrix_cases = "42"', b"matrix_cases = 0")
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_zero_count, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("INTEGER_BOUND", str(ctx.exception))
 
     # WORK_UNIT_CASE: 852/14
     def test_floor_weaker_than_matrix_rejected(self):
@@ -395,6 +580,19 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
                 descriptor=d1,
             )
 
+        # A changed matrix digest is well-formed but no longer the descriptor the
+        # catalogue row retains, so the mirror binding is stale: proven through
+        # the plan, not only through the row constructor.
+        d_orig = make_desc(852, "D-WU-COHORT", 42)
+        d_changed = make_desc(852, "D-WU-COHORT", 42, matrix_sha256="f" * 64)
+        self.assertNotEqual(d_orig.sha256, d_changed.sha256)
+        cat = ch.materialize_catalogue([make_row(d_orig)], (d_orig.issue,))
+        selection = c.VerificationSelection(cat.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_orig.issue,))
+
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection, [d_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
     # WORK_UNIT_CASE: 852/16
     def test_changed_mode_source_test_root_invalidates_row(self):
         d_orig = make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/work_unit_gate/cohort.py",))
@@ -407,6 +605,21 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_selection_plan(cat, selection, [d_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # A changed runner mode is equally well-formed and equally stales the
+        # mirror binding of the same catalogue row.
+        d_mode_changed = make_desc(852, "D-WU-COHORT", 42, mode=c.RunnerMode.METADATA_PYTHON)
+        self.assertNotEqual(d_orig.sha256, d_mode_changed.sha256)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection, [d_mode_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # A changed test root likewise invalidates the retained mirror.
+        d_test_root_changed = make_desc(852, "D-WU-COHORT", 42, test_roots=("scripts/other-tests",))
+        self.assertNotEqual(d_orig.sha256, d_test_root_changed.sha256)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection, [d_test_root_changed])
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
 
     # WORK_UNIT_CASE: 852/17
@@ -432,6 +645,95 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             with self.assertRaises(ch.CohortError) as ctx:
                 ch.validate_path_safety(bad)
             self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNSAFE_PATH)
+        # Physical alias leg: a junction (Windows, no privilege needed) or a
+        # symlink (POSIX) smuggling an outside tree under an innocent root
+        # value resolves outside the repository root, so attempt-path
+        # containment rejects it (UNSAFE_PATH); a real directory inside the
+        # root passes. Tmp only; the link itself is removed, never the target.
+        import ctypes
+        from ctypes import wintypes
+
+        def _make_alias(link: Path, target: Path) -> None:
+            if os.name != "nt":
+                os.symlink(target, link)
+                return
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.DeviceIoControl.restype = wintypes.BOOL
+            kernel32.DeviceIoControl.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+            ]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            os.mkdir(link)
+            handle = kernel32.CreateFileW(
+                str(link), 0x40000000, 0, None, 3,
+                0x00200000 | 0x02000000, None)
+            if handle == wintypes.HANDLE(-1).value:
+                raise OSError(
+                    f"open reparse point failed: {ctypes.get_last_error()}")
+            try:
+                sub = ("\\??\\" + os.path.abspath(target)).encode("utf-16-le")
+                prn = os.path.abspath(target).encode("utf-16-le")
+                buf = (
+                    (0xA0000003).to_bytes(4, "little")
+                    + (len(sub) + 2 + len(prn) + 2 + 8).to_bytes(2, "little")
+                    + b"\x00\x00"
+                    + (0).to_bytes(2, "little")
+                    + len(sub).to_bytes(2, "little")
+                    + (len(sub) + 2).to_bytes(2, "little")
+                    + len(prn).to_bytes(2, "little")
+                    + sub + b"\x00\x00" + prn + b"\x00\x00"
+                )
+                inbuf = ctypes.create_string_buffer(buf)
+                returned = wintypes.DWORD(0)
+                ok = kernel32.DeviceIoControl(
+                    handle, 0x900A4, inbuf, len(buf),
+                    None, 0, ctypes.byref(returned), None)
+                if not ok:
+                    raise OSError(
+                        "set reparse point failed: "
+                        f"{ctypes.get_last_error()}")
+            finally:
+                kernel32.CloseHandle(handle)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (outside / "evil.py").write_text("x = 1\n", encoding="utf-8")
+            (root / "real").mkdir()
+            (root / "real" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            link = root / "link"
+            _make_alias(link, outside)
+            try:
+                d_escape = make_desc(
+                    852, "D-WU-ESC", 1,
+                    source_roots=("link/evil.py",),
+                    test_roots=("link/evil.py",),
+                )
+                with self.assertRaises(ch.CohortError) as ctx:
+                    ch.verify_attempt_paths_exist(d_escape, root)
+                self.assertEqual(
+                    ctx.exception.problem, ch.CohortProblem.UNSAFE_PATH)
+                d_inside = make_desc(
+                    852, "D-WU-OK", 1,
+                    source_roots=("real/ok.py",),
+                    test_roots=("real/ok.py",),
+                )
+                ch.verify_attempt_paths_exist(d_inside, root)
+            finally:
+                if os.name == "nt":
+                    os.rmdir(link)
+                else:
+                    link.unlink()
 
     # WORK_UNIT_CASE: 852/19
     def test_concurrent_exclusive_source_overlap_rejected(self):
@@ -452,6 +754,21 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         cat = ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue))
         self.assertEqual(len(cat.rows), 2)
 
+        # Shared reads stay legal, identical write claims do not: two distinct
+        # issues writing the very same source file are a write-scope overlap.
+        d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/mod.py",))
+        d2 = make_desc(852, "D-WU-B", 20, source_roots=("scripts/mod.py",))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([make_row(d1), make_row(d2)], (d1.issue, d2.issue))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.WRITE_SCOPE_OVERLAP)
+
+        # The same conflict holds for an identical write directory.
+        d3 = make_desc(851, "D-WU-C", 20, source_roots=("scripts/pkg",))
+        d4 = make_desc(852, "D-WU-D", 20, source_roots=("scripts/pkg",))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([make_row(d3), make_row(d4)], (d3.issue, d4.issue))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.WRITE_SCOPE_OVERLAP)
+
     # WORK_UNIT_CASE: 852/21
     def test_explicit_serialized_overlap_remains_nonparallel(self):
         d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/shared",))
@@ -462,12 +779,63 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         cat = ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue), allow_overlapping_prereqs=True)
         self.assertEqual(len(cat.rows), 2)
 
+        # A serialized overlap pins order through acceptance only. Launch stays
+        # ungated by it: without prerequisite evidence the plan refuses, and the
+        # accepted dependency never enters the selected denominator.
+        d_dep = make_desc(851, "D-WU-DEP", 44)
+        r_dep = make_row(d_dep, disposition=c.CatalogueDisposition.ACCEPTED_HISTORICAL, override_desc=None)
+        d_main = make_desc(852, "D-WU-MAIN", 42, source_roots=("scripts/work_unit_gate/cohort.py",))
+        r_main = make_row(d_main, prerequisites=(d_dep.issue,))
+
+        cat_serialized = ch.materialize_catalogue([r_dep, r_main], (d_dep.issue, d_main.issue))
+        self.assertEqual(len(cat_serialized.rows), 2)
+
+        selection_main = c.VerificationSelection(
+            cat_serialized.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_main.issue,)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_serialized, selection_main, [d_main])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
+        ev_serialized = c.PrerequisiteEvidence(
+            make_assignment(
+                d_dep,
+                state=c.IssueState.CLOSED,
+                source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE,
+            ),
+            "a" * 40,
+            "b" * 64,
+        )
+        plan_serialized = ch.materialize_selection_plan(
+            cat_serialized, selection_main, [d_main], prerequisites=[ev_serialized]
+        )
+        self.assertEqual(plan_serialized.prerequisites, (ev_serialized,))
+
+        # The same overlapping assigned pair without the serialization
+        # allowance stays a write-scope conflict.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_dep), r_main],
+                (d_dep.issue, d_main.issue),
+                allow_overlapping_prereqs=False,
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.WRITE_SCOPE_OVERLAP)
+
     # WORK_UNIT_CASE: 852/22
     def test_root_shared_generated_claims_rejected_for_ordinary_leaf(self):
         d_root = make_desc(852, "D-WU-LEAF", 42, source_roots=("Cargo.toml",))
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_catalogue([make_row(d_root)], (d_root.issue,))
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # Every restricted claim class rejects an ordinary leaf the same way:
+        # a lock file, a nested shared-configuration directory and a subpath of
+        # a generated-artifact root.
+        for restricted in ("Cargo.lock", ".github/workflows", "target/debug"):
+            d_claim = make_desc(852, "D-WU-LEAF", 42, source_roots=(restricted,))
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.materialize_catalogue([make_row(d_claim)], (d_claim.issue,))
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
 
     # WORK_UNIT_CASE: 852/23
     def test_exact_integration_owner_can_claim_root_paths(self):
@@ -482,6 +850,55 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         d_other = make_desc(999, "D-WU-FINAL", 42, source_roots=("Cargo.toml",))
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_catalogue([make_row(d_other)], (d_other.issue,), integration_owners=profile)
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # The same exact pair admitted through the production derivation
+        # helper - the authority path the gate itself uses for the
+        # selected/full cohort - authorizes the root claim identically.
+        rel = c.AssignmentRelation(
+            source_issue=c.IssueIdentity(REPO, 999),
+            role=c.RelationRole.INTEGRATED_BY,
+            target_issue=d_int.issue,
+        )
+        derived = ch.derive_integration_owners([rel], {d_int.issue: d_int.unit})
+        cat_derived = ch.materialize_catalogue(
+            [make_row(d_int)], (d_int.issue,), integration_owners=derived
+        )
+        self.assertEqual(len(cat_derived.rows), 1)
+
+        # Impersonation leg: the very same unit spelling under an unlisted
+        # issue is not admitted by that derived profile.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_other)], (d_other.issue,), integration_owners=derived
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # An unadmitted target unit derives no owner at all, so the same
+        # claim is refused rather than fabricated.
+        unadmitted = ch.derive_integration_owners([rel], {})
+        self.assertEqual(unadmitted.owners, ())
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_int)], (d_int.issue,), integration_owners=unadmitted
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # Only the closed integrated-by role carries authority: the same
+        # well-formed relation with a blocked-by role derives nothing.
+        blocked_rel = c.AssignmentRelation(
+            source_issue=c.IssueIdentity(REPO, 999),
+            role=c.RelationRole.BLOCKED_BY,
+            target_issue=d_int.issue,
+        )
+        blocked_profile = ch.derive_integration_owners(
+            [blocked_rel], {d_int.issue: d_int.unit}
+        )
+        self.assertEqual(blocked_profile.owners, ())
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue(
+                [make_row(d_int)], (d_int.issue,), integration_owners=blocked_profile
+            )
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
 
     # WORK_UNIT_CASE: 852/24
@@ -507,6 +924,33 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             dr.decode_descriptor(toml_bad_mode, ".github/work-units/852.toml")
         self.assertIn("UNSUPPORTED_SCHEMA_OR_MODE", str(ctx.exception))
 
+        # The cohort decoder is the #850 boundary the gate itself calls, so the
+        # same arbitrary payloads are proved rejected through it rather than
+        # through the runner alone: a URL smuggled in as the execution mode is
+        # refused as a malformed field (it names no runner the gate may start),
+        # while an injected command line and an injected environment table are
+        # refused as fields outside the closed descriptor shape - the shapes a
+        # hostile descriptor would use to make the gate execute something.
+        toml_url_mode = toml_bad_mode.replace(
+            b'mode = "arbitrary-bash-exec"', b'mode = "https://evil/x"'
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_url_mode, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertEqual(ctx.exception.detail, "UNSUPPORTED_SCHEMA_OR_MODE")
+
+        toml_command = toml_bad_mode.rstrip(b"\n") + b'\ncommand = "rm -rf /"\n'
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_command, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNKNOWN_FIELD)
+        self.assertEqual(ctx.exception.detail, "CLOSED_FIELDS")
+
+        toml_environment = toml_bad_mode.rstrip(b"\n") + b'\nenvironment = { FOO = "bar" }\n'
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_environment, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNKNOWN_FIELD)
+        self.assertEqual(ctx.exception.detail, "CLOSED_FIELDS")
+
     # WORK_UNIT_CASE: 852/25
     def test_leaf_router_cannot_lower_descriptor_denominator(self):
         d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/a.py",))
@@ -520,6 +964,26 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
                 descriptors=(d1,),
                 prerequisites=(),
             )
+
+        # Promotion of a subset is not a way to drop a row from the denominator:
+        # with a router-rooted descriptor in the catalogue, a full-project
+        # selection over the two promoted leaves is refused precisely because
+        # the third row is still counted. A router cannot lower the descriptor
+        # denominator by being routed around.
+        d3 = make_desc(853, "D-WU-ROUTER", 10, source_roots=("scripts/docs_router.py",))
+        cat3 = ch.materialize_catalogue(
+            [make_row(d1), make_row(d2), make_row(d3)], (d1.issue, d2.issue, d3.issue)
+        )
+        self.assertEqual(len(cat3.rows), 3)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(
+                cat3,
+                c.VerificationSelection(
+                    cat3.sha256, "e" * 64, c.SelectionScope.FULL_PROJECT, (d1.issue, d2.issue)
+                ),
+                [d1, d2],
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.DENOMINATOR_REDUCTION_REJECTED)
 
     # WORK_UNIT_CASE: 852/26
     def test_leaf_source_edit_invalidates_execution_evidence_without_rewriting_catalogue_identity(self):
@@ -539,6 +1003,17 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         ev_fail = make_evidence(d1, c.OverallResult.CONTRACT_FAILURE)
         rec_fail = ch.materialize_cohort_receipt(plan, [ev_fail])
         self.assertEqual(rec_fail.result, c.OverallResult.CONTRACT_FAILURE)
+
+        # A leaf source edit is a well-formed descriptor that is no longer the
+        # planned one: execution evidence bound to it is stale and the receipt is
+        # refused, rather than accepted as proof of the planned descriptor.
+        ev_stale = make_evidence(
+            make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/edited.py",))
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_cohort_receipt(plan, [ev_stale])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.EXECUTION_EVIDENCE_INVALIDATED)
+
         self.assertEqual(cat.sha256, ch.materialize_catalogue([r1], (d1.issue,)).sha256)
 
     # WORK_UNIT_CASE: 852/27
@@ -547,6 +1022,46 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         r_hist = make_row(d_hist, disposition=c.CatalogueDisposition.SUPERSEDED, override_desc=None)
         cat = ch.materialize_catalogue([r_hist], (d_hist.issue,))
         self.assertEqual(cat.rows[0].disposition, c.CatalogueDisposition.SUPERSEDED)
+
+        # The committed aggregate lock is the historical migration map itself,
+        # not a count of it: every row's unit, disposition and prerequisites are
+        # proven exactly, from the committed bytes via a tmp copy.
+        _, pristine = self._committed_aggregate_lock_copies()
+        lock = ch.read_cohort_lock(pristine)
+        self.assertEqual(
+            {r.issue: (r.unit, r.disposition, tuple(r.prerequisites)) for r in lock.rows},
+            {
+                728: ("F-UNSAFE", "accepted-historical", ()),
+                748: ("D-CLIPPY-POLICY", "blocked", ()),
+                750: ("D-CI", "accepted-historical", ()),
+                818: ("D-ASSIGN-0", "nonexecutable", ()),
+                838: ("D-CLIPPY-BASELINE", "blocked", ()),
+                839: ("B-ACTIVATION-PROJECTION", "blocked", ()),
+                843: ("D-WORK-UNIT-GATE", "superseded", ()),
+                846: ("D-TEST-WINDOWS-STAGING", "blocked", ()),
+                859: ("D-WU-ACCEPTANCE-DATA", "superseded", ()),
+                974: ("B-BACKUP-LINK", "blocked", ()),
+                994: ("S-CONC-ACCEPT", "nonexecutable", ()),
+            },
+        )
+
+        # ...and the disposition arithmetic that map must reproduce.
+        aggregate = lock.aggregate
+        self.assertEqual(
+            (
+                aggregate.assigned,
+                aggregate.blocked,
+                aggregate.planned,
+                aggregate.nonexecutable,
+                aggregate.superseded,
+                aggregate.accepted_historical,
+                aggregate.matrix_cases,
+            ),
+            (0, 5, 0, 2, 2, 2, 0),
+        )
+        # The committed `numeric_descriptors = []` is a TOML list, but the closed
+        # lock field is `Tuple[int, ...]`, so emptiness is spelled `()` here.
+        self.assertEqual(aggregate.numeric_descriptors, ())
 
     # WORK_UNIT_CASE: 852/28
     def test_routers_unchanged_against_current_base_newer_semantic_edits_preserved(self):
@@ -622,6 +1137,77 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
                 aggregate_sha256="f" * 64,
             )
 
+        # The committed invalidation paths, proven on well-formed but stale or
+        # unadmitted inputs. The lock is minted by the production minter (the
+        # `generate-cohort-lock` CLI path) into a tmp file, never hand-rendered,
+        # and the work-units dir stays an observed-empty tmp directory.
+        d1 = make_desc(851, "D-WU-A", 3)
+        snapshot = {
+            "header": {
+                "repository": "UnknownAlienHuman/eliot-memory-os",
+                "base_revision": "0" * 40,
+                "acquisition": "probe",
+                "acquired_at": "2026-10-05T00:00:00Z",
+                "complete": True,
+            },
+            "rows": [
+                {
+                    "issue": 851,
+                    "unit": "D-WU-A",
+                    "body_sha256": d1.body_sha256,
+                    "disposition": "assigned",
+                    "prerequisites": [],
+                },
+                {
+                    "issue": 852,
+                    "unit": "D-WU-B",
+                    "body_sha256": "c" * 64,
+                    "disposition": "blocked",
+                    "prerequisites": [],
+                },
+            ],
+            "numeric_descriptors": [],
+        }
+        lock_bytes = ch.generate_cohort_lock(snapshot, {851: d1})
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        lock_path = root / "work-unit-cohort.toml"
+        lock_path.write_bytes(lock_bytes)
+        wu_dir = root / "work-units"
+        wu_dir.mkdir()
+
+        # A stale base is invalidation, never a valid self-consistent lock.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_cohort_lock(lock_path, wu_dir, {851: d1}, expected_base_commit="f" * 40)
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.INVALID_AGGREGATE_LOCK)
+
+        # An assigned row with no admitted receipt is incomplete, not valid: the
+        # admitted receipt set covers only the blocked row.
+        d2 = make_desc(852, "D-WU-B", 3)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_assignment_binding(
+                ch.read_cohort_lock(lock_path), {851: d1}, {852: make_assignment(d2)}
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+        # A moved mirror: the receipt's body digest is well-formed but no longer
+        # the digest the locked row retained.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_assignment_binding(
+                ch.read_cohort_lock(lock_path),
+                {851: d1},
+                {851: make_assignment(d1, body_sha256="f" * 64)},
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # Control: at the lock's own base revision the same lock verifies, so the
+        # refusals above are currency- and admission-driven.
+        receipt = ch.verify_cohort_lock(
+            lock_path, wu_dir, {851: d1}, expected_base_commit="0" * 40
+        )
+        self.assertEqual(receipt.sha256, ch.read_cohort_lock(lock_path).aggregate.sha256)
+
     # WORK_UNIT_CASE: 852/30
     def test_normal_validator_has_no_network_subprocess_repository_mutation(self):
         def forbidden_call(*args, **kwargs):
@@ -637,6 +1223,49 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             d2 = make_desc(852, "D-WU-B", 22, source_roots=("scripts/b.py",))
             cat = ch.materialize_catalogue([make_row(d1), make_row(d2)], (d1.issue, d2.issue))
             self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+
+            # Normal CLI validator legs: the production entry itself reaches no
+            # network, spawns no process and mutates no repository. Temp roots
+            # only; `--root` never points at the real checkout.
+
+            def run_validator(root: Path) -> tuple[int, dict]:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = gate_main.main(["--proof", "catalogue-only", "--root", str(root), "--json"])
+                self.assertIsInstance(code, int)
+                return code, json.loads(stdout.getvalue())
+
+            def path_set(root: Path) -> set[str]:
+                return {p.relative_to(root).as_posix() for p in root.rglob("*")}
+
+            # Leg A: a bare tmp root carries no catalogue at all.
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                before = path_set(root)
+                code, doc = run_validator(root)
+                self.assertEqual(code, 1)
+                self.assertEqual(doc["exit"], 1)
+
+                # Leg C: the validator wrote nothing under either tmp root.
+                self.assertEqual(path_set(root), before)
+
+            # Leg B: the committed aggregate lock over an empty descriptor
+            # directory is a valid catalogue with no execution claimed.
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / ".github" / "work-units").mkdir(parents=True)
+                (root / ".github" / "work-unit-cohort.toml").write_bytes(
+                    (ROOT / ".github" / "work-unit-cohort.toml").read_bytes()
+                )
+                before = path_set(root)
+                code, doc = run_validator(root)
+                self.assertEqual(code, 0)
+                self.assertEqual(doc["exit"], 0)
+                self.assertEqual(doc["digest"], COMMITTED_AGGREGATE_SHA256)
+                self.assertEqual(len(doc["blocked_evidence"]), 5)
+
+                # Leg C: the validator wrote nothing under either tmp root.
+                self.assertEqual(path_set(root), before)
         finally:
             socket.socket = orig_socket
             subprocess.Popen = orig_popen
@@ -653,6 +1282,28 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_selection_plan(cat, selection, [d_parent], prerequisites=())
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
+        # A replaced parent kept as accepted historical is never scheduled with
+        # the replacement child that depends on it.
+        d_par = make_desc(837, "D-WU-FINAL", 42, source_roots=("scripts/work_unit_gate/cohort.py",))
+        d_chi = make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/work_unit_gate/plan.py",))
+        r_par = make_row(d_par, disposition=c.CatalogueDisposition.ACCEPTED_HISTORICAL)
+        r_chi = make_row(d_chi, prerequisites=(d_par.issue,))
+
+        cat_both = ch.materialize_catalogue([r_par, r_chi], (d_par.issue, d_chi.issue))
+        selection_both = c.VerificationSelection(
+            cat_both.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_par.issue, d_chi.issue)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_both, selection_both, [d_par, d_chi])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.PARENT_SCHEDULED_WITH_CHILDREN)
+
+        # A requirement outside the denominator stays blocking instead of
+        # validating as a resolvable prerequisite.
+        r_orphan = make_row(d_chi, prerequisites=(c.IssueIdentity(REPO, 999),))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([r_orphan], (d_chi.issue,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.UNRESOLVED_PREREQUISITE)
 
     # WORK_UNIT_CASE: 852/32
     def test_accepted_closed_prerequisite_versus_closed_without_proof_or_unresolved_legacy_umbrella(self):
@@ -676,11 +1327,91 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(c.ContractViolation):
             c.PrerequisiteEvidence(assignment_bad, "a" * 40, "b" * 64)
 
+        # CLOSED without proof is not a closed prerequisite: the state is
+        # right, but the accepted commit is not an observed Git object ID, so
+        # the evidence cannot be built at all - readiness stays unproven rather
+        # than being granted on a state claim alone.
+        assignment_unproven = make_assignment(
+            d_dep,
+            state=c.IssueState.CLOSED,
+            source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE,
+        )
+        with self.assertRaises(c.ContractViolation):
+            c.PrerequisiteEvidence(assignment_unproven, "not-a-commit", "b" * 64)
+
+        # An unresolved legacy umbrella is a superseded row with no retained
+        # descriptor: even perfectly well-formed closed evidence naming it
+        # cannot make it a matching accepted-historical prerequisite, so the
+        # selection is refused instead of the umbrella silently counting as
+        # satisfied.
+        d_sup = make_desc(859, "D-WU-OLD", 34)
+        r_sup = make_row(d_sup, disposition=c.CatalogueDisposition.SUPERSEDED, override_desc=None)
+        d_main = make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/cohort.py",))
+        r_main = make_row(d_main, prerequisites=(d_sup.issue,))
+        cat_legacy = ch.materialize_catalogue([r_sup, r_main], (d_sup.issue, d_main.issue))
+        ev_legacy = c.PrerequisiteEvidence(
+            make_assignment(
+                d_sup,
+                state=c.IssueState.CLOSED,
+                source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE,
+            ),
+            "a" * 40,
+            "b" * 64,
+        )
+        selection_legacy = c.VerificationSelection(
+            cat_legacy.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_main.issue,)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_legacy, selection_legacy, [d_main], prerequisites=[ev_legacy])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
     # WORK_UNIT_CASE: 852/33
     def test_package_local_excluded_versus_membership_required_integration_unauthorized_weakening_changes_identity(self):
         d_standalone = make_desc(852, "D-WU-COHORT", 42, package="eliot-standalone", require_member=False)
         d_member = make_desc(852, "D-WU-COHORT", 42, package="eliot-standalone", require_member=True)
         self.assertNotEqual(d_standalone.sha256, d_member.sha256)
+
+        # Weakening membership is not a free re-labelling: the membership-
+        # required descriptor and the package-local one differ in identity, so
+        # the weakened descriptor cannot be planned against a catalogue built
+        # from the strong one - the old identity does not carry over.
+        d_weak = make_desc(852, "D-WU-COHORT", 42, package="eliot-standalone", require_member=False)
+        cat_member = ch.materialize_catalogue([make_row(d_member)], (d_member.issue,))
+        selection_member = c.VerificationSelection(
+            cat_member.sha256, "e" * 64, c.SelectionScope.SELECTED, (d_member.issue,)
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat_member, selection_member, [d_weak])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
+        # Membership-required with no exact package is refused at construction,
+        # not tolerated as "integration by default" - built directly here
+        # because `make_desc` would auto-fill a sample package instead.
+        with self.assertRaises(c.ContractViolation):
+            c.WorkUnitDescriptor(
+                schema_version=c.WORK_UNIT_DESCRIPTOR_SCHEMA,
+                identity=c.DescriptorIdentity("work-unit-852"),
+                issue=c.IssueIdentity(REPO, 852),
+                unit=c.WorkUnitIdentity("D-WU-COHORT"),
+                mode=c.RunnerMode.PYTHON_UNITTEST,
+                source_roots=(c.RepositoryPath("scripts/work_unit_gate/cohort.py"),),
+                test_roots=(c.RepositoryPath("scripts/tests/test_work_unit_gate_cohort.py"),),
+                matrix_cases=42,
+                proof_ceiling=PROOF,
+                revision=1,
+                body_sha256=BODY,
+                matrix_sha256=MATRIX,
+                require_workspace_member=True,
+                requirements=c.VerificationRequirements(
+                    source_floor=1, public_floor=0, test_floor=42, required_guards=(GUARD,)
+                ),
+                bounds=c.ExecutionBounds(
+                    wall_ms=60000, idle_ms=10000, output_bytes=1048576,
+                    line_bytes=65536, discovery_tests=1000, child_processes=4,
+                ),
+                package=None,
+                module=c.ModuleIdentity("scripts.work_unit_gate"),
+            )
 
     # WORK_UNIT_CASE: 852/34
     def test_unfrozen_inventory_paths_or_contradictory_counts_cannot_be_dispatch_ready(self):
@@ -690,6 +1421,52 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         # Wildcard authority is rejected at contract construction time
         with self.assertRaises(c.ContractViolation):
             make_desc(852, "D-WU-COHORT", 42, source_roots=("scripts/work_unit_gate/*.py",))
+
+        # ...and a wildcard root in a descriptor artifact cannot decode into a
+        # dispatch-ready descriptor either.
+        toml_wildcard_root = b"""
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = { value = "work-unit-852" }
+issue = { repository = { owner = "UnknownAlienHuman", name = "eliot-memory-os" }, number = 852 }
+unit = { value = "D-WU-COHORT" }
+mode = "python-unittest"
+source_roots = [{ value = "scripts/*.py" }]
+test_roots = [{ value = "scripts/tests" }]
+matrix_cases = 42
+proof_ceiling = { value = "catalogue-integrity-only" }
+revision = 1
+body_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+matrix_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+require_workspace_member = false
+requirements = { source_floor = 1, public_floor = 0, test_floor = 42, required_guards = [] }
+bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes = 65536, discovery_tests = 1000, child_processes = 4 }
+"""
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_wildcard_root, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("NONCANONICAL_PATH", str(ctx.exception))
+
+        # A test floor below the declared matrix denominator is a contradiction
+        # the closed decoder rejects.
+        toml_low_test_floor = toml_wildcard_root.replace(
+            b'source_roots = [{ value = "scripts/*.py" }]', b'source_roots = [{ value = "scripts/work_unit_gate" }]'
+        ).replace(
+            b"requirements = { source_floor = 1, public_floor = 0, test_floor = 42, required_guards = [] }",
+            b"requirements = { source_floor = 1, public_floor = 0, test_floor = 10, required_guards = [] }",
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_low_test_floor, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("TEST_FLOOR_TOO_LOW", str(ctx.exception))
+
+        # A zero matrix denominator cannot become dispatch-ready either.
+        toml_zero_cases = toml_wildcard_root.replace(
+            b'source_roots = [{ value = "scripts/*.py" }]', b'source_roots = [{ value = "scripts/work_unit_gate" }]'
+        ).replace(b"matrix_cases = 42", b"matrix_cases = 0")
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.decode_cohort_descriptor(toml_zero_cases, ".github/work-units/852.toml")
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        self.assertIn("INTEGER_BOUND", str(ctx.exception))
 
     # WORK_UNIT_CASE: 852/35
     def test_incomplete_truncated_tag_filtered_moving_snapshot_cannot_assert_complete_catalogue(self):
@@ -703,6 +1480,75 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.validate_snapshot_completeness(incomplete_snapshot)
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+        # Every remaining leg is an honest-but-incomplete snapshot that still
+        # claims completeness: each refusal is INCOMPLETE_SNAPSHOT, never a
+        # malformed-input error and never "zero findings".
+        base_header = {
+            "repository": "UnknownAlienHuman/eliot-memory-os",
+            "complete": True,
+            "base_revision": "0" * 40,
+            "acquisition": "probe",
+            "acquired_at": "2026-10-05T00:00:00Z",
+        }
+        incomplete_legs = (
+            # Truncated: pagination says the walk stopped early.
+            {**base_header, "pagination": {"complete": False}},
+            # Tag-filtered: declared issue_count disagrees with observed issues.
+            {**base_header, "issue_count": 2, "issues": [{"number": 1}]},
+            # Moving snapshot: reported movement.
+            {**base_header, "moved": True},
+            # Moving snapshot: reported inconsistency.
+            {**base_header, "inconsistent": True},
+            # No acquisition receipt.
+            {
+                key: value
+                for key, value in base_header.items()
+                if key not in ("acquisition", "acquired_at")
+            },
+        )
+        for leg_header in incomplete_legs:
+            with self.subTest(keys=sorted(leg_header)):
+                with self.assertRaises(ch.CohortError) as ctx:
+                    ch.validate_snapshot_completeness({"header": leg_header})
+                self.assertEqual(ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+        # Positive control: the complete, bound, acquired snapshot alone is
+        # accepted, so the refusals above are shape-driven.
+        self.assertIsNone(ch.validate_snapshot_completeness({"header": dict(base_header)}))
+
+    def _committed_aggregate_lock_copies(self):
+        """Two tmp copies of the committed lock: pristine and digest-tampered.
+
+        The lock header forbids hand-edits, so the committed file is copied into
+        a tmp directory and only the single `[aggregate]` sha256 line differs.
+        """
+        source = (ROOT / ".github" / "work-unit-cohort.toml").read_text()
+        committed = 'sha256 = "' + COMMITTED_AGGREGATE_SHA256 + '"'
+        tampered_line = 'sha256 = "' + TAMPERED_AGGREGATE_SHA256 + '"'
+        self.assertEqual(source.count(committed), 1)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        tampered = root / "work-unit-cohort-tampered.toml"
+        tampered.write_text(source.replace(committed, tampered_line))
+        pristine = root / "work-unit-cohort-pristine.toml"
+        pristine.write_text(source)
+        return tampered, pristine
+
+    def test_tampered_aggregate_digest_in_committed_lock_rejected(self):
+        # The stored aggregate digest no longer covers the rows the lock
+        # declares: the projection must fail closed instead of returning them.
+        tampered, _ = self._committed_aggregate_lock_copies()
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.locked_catalogue_rows(tampered)
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.INVALID_AGGREGATE_LOCK)
+
+    def test_pristine_committed_lock_copy_projects_eleven_rows(self):
+        # The re-derivation must not be a false positive on the real shape.
+        _, pristine = self._committed_aggregate_lock_copies()
+        rows = ch.locked_catalogue_rows(pristine)
+        self.assertEqual(len(rows), 11)
 
     # WORK_UNIT_CASE: 852/36
     def test_catalogue_with_planned_or_blocked_rows_integrity_valid_but_not_project_complete(self):
@@ -744,6 +1590,22 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(c.ContractViolation):
             c.SelectedVerificationPlan(cat, selection_promoted, (d1,), ())
 
+        # An omitted required selected row fails the selection/descriptor
+        # denominator contract: the selection names both catalogue rows while the
+        # plan carries only one of them.
+        selection_omitted = c.VerificationSelection(cat.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue, d2.issue))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection_omitted, [d1])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SELECTION_MISMATCH)
+
+        # A substituted required selected row - same issue, different descriptor
+        # identity - is well-formed yet stales the retained mirror binding.
+        d_changed = make_desc(852, "D-WU-B", 99, source_roots=("scripts/changed.py",))
+        self.assertNotEqual(d2.sha256, d_changed.sha256)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(cat, selection_omitted, [d1, d_changed])
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.STALE_MIRROR_BINDING)
+
     # WORK_UNIT_CASE: 852/39
     def test_same_task_prerequisite_created_path_valid_planned_but_missing_actual_source_fails_attempt(self):
         d = make_desc(852, "D-WU-COHORT", 42, source_roots=("nonexistent/path/for/test.py",))
@@ -751,12 +1613,58 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             ch.verify_attempt_paths_exist(d, ROOT)
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.MISSING_ATTEMPT_SOURCE)
 
+        # A prerequisite-created path that really IS on disk is the positive
+        # half of the same distinction: attempt verification passes and the
+        # descriptor is a valid planned registration, so "missing" is a fact
+        # about the checkout and never a shape the gate rejects up front.
+        d_created = make_desc(
+            852,
+            "D-WU-COHORT",
+            42,
+            source_roots=("scripts/work_unit_gate/cohort.py",),
+            test_roots=("scripts/tests/test_work_unit_gate_cohort.py",),
+        )
+        self.assertIsNone(ch.verify_attempt_paths_exist(d_created, ROOT))
+        cat_created = ch.materialize_catalogue(
+            [make_row(d_created, disposition=c.CatalogueDisposition.PLANNED)], (d_created.issue,)
+        )
+        self.assertEqual(cat_created.result, c.CatalogueResult.INTEGRITY_VALID)
+
     # WORK_UNIT_CASE: 852/40
     def test_unresolved_finite_allocation_is_explicit_blocked_materialization_not_wildcard_descriptor(self):
         d = make_desc(852, "D-WU-COHORT", 42)
         r_blocked = make_row(d, disposition=c.CatalogueDisposition.BLOCKED, override_desc=None)
         self.assertIsNone(r_blocked.descriptor)
         self.assertEqual(r_blocked.disposition, c.CatalogueDisposition.BLOCKED)
+
+        # Unresolved finite allocation is an explicit blocked row inside an
+        # otherwise valid cohort, not a wildcard descriptor: it materializes,
+        # and it can never be selected for execution.
+        d1 = make_desc(851, "D-WU-A", 20, source_roots=("scripts/a.py",))
+        d2 = make_desc(852, "D-WU-B", 22, source_roots=("scripts/b.py",))
+        cat = ch.materialize_catalogue(
+            [make_row(d1), make_row(d2, disposition=c.CatalogueDisposition.BLOCKED)],
+            (d1.issue, d2.issue),
+        )
+        self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
+
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_selection_plan(
+                cat,
+                c.VerificationSelection(
+                    cat.sha256, "e" * 64, c.SelectionScope.SELECTED, (d2.issue,)
+                ),
+                [d2],
+            )
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.BLOCKED_ALLOCATION)
+
+        # Blocked-only: the same explicit materialization with no executable
+        # row is itself integrity-valid.
+        cat_blocked = ch.materialize_catalogue(
+            [make_row(d2, disposition=c.CatalogueDisposition.BLOCKED, override_desc=None)],
+            (d2.issue,),
+        )
+        self.assertEqual(cat_blocked.result, c.CatalogueResult.INTEGRITY_VALID)
 
     # WORK_UNIT_CASE: 852/41
     def test_catalogue_generation_digest_no_future_commit_or_result_cycle(self):
@@ -772,6 +1680,25 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         self.assertNotIn("future_commit", {f.name for f in dataclasses.fields(cat)})
         self.assertNotIn("future_commit", {f.name for f in dataclasses.fields(plan)})
         self.assertNotIn("result", {f.name for f in dataclasses.fields(plan)})
+
+        # Field absence is not enough: the generated bytes must themselves be
+        # identical on regeneration, so no generation counter or iteration-order
+        # dependence can hide behind a missing field name.
+        self.assertEqual(
+            ch.serialize_catalogue_canonical(cat),
+            ch.serialize_catalogue_canonical(cat),
+        )
+        self.assertEqual(
+            ch.serialize_plan_canonical(plan),
+            ch.serialize_plan_canonical(plan),
+        )
+
+        # Nor can a future result cycle ride in through the digest: the receipt
+        # aggregate binds the executed result, so a failing run and a passing
+        # run over the same plan cannot share one aggregate identity.
+        receipt_pass = ch.materialize_cohort_receipt(plan, [make_evidence(d, c.OverallResult.PASS)])
+        receipt_fail = ch.materialize_cohort_receipt(plan, [make_evidence(d, c.OverallResult.CONTRACT_FAILURE)])
+        self.assertNotEqual(receipt_pass.aggregate_sha256, receipt_fail.aggregate_sha256)
 
     # WORK_UNIT_CASE: 852/42
     def test_unchanged_canonical_inputs_produce_byte_identical_materialization(self):
@@ -790,6 +1717,156 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         d2_changed = make_desc(852, "D-WU-B", 25, source_roots=("scripts/b.py",))
         cat_changed = ch.materialize_catalogue([r1, make_row(d2_changed)], (d1.issue, d2_changed.issue))
         self.assertNotEqual(cat1.sha256, cat_changed.sha256)
+
+        # The legs above prove a CHANGED COUNT changes identity. A count alone
+        # is not the whole denominator: the selection, the parent catalogue
+        # digest, every required descriptor and the phase are bound too, and
+        # those are what a regenerated plan must carry (A14-08:56 counts are
+        # not progress without proof; I00-14:54 generated counts are recomputed
+        # from payloads, so identity follows the bytes).
+        #
+        # Plan determinism: two independent materializations of the SAME
+        # unchanged canonical selection serialize to identical bytes, so no
+        # ordering or identity dependence can hide behind a digest equality.
+        self.assertEqual(
+            ch.serialize_plan_canonical(ch.materialize_selection_plan(
+                cat1,
+                c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue,)),
+                [d1],
+            )),
+            ch.serialize_plan_canonical(ch.materialize_selection_plan(
+                cat1,
+                c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue,)),
+                [d1],
+            )),
+        )
+
+        # Changed selection changes identity: both plans materialize from the
+        # same UNCHANGED catalogue, so the selection is the only differing
+        # input, and its exact descriptor denominator rides in the digest.
+        plan_single = ch.materialize_selection_plan(
+            cat1,
+            c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue,)),
+            [d1],
+        )
+        plan_changed_selection = ch.materialize_selection_plan(
+            cat1,
+            c.VerificationSelection(cat1.sha256, "e" * 64, c.SelectionScope.SELECTED, (d1.issue, d2.issue)),
+            [d1, d2],
+        )
+        self.assertNotEqual(
+            plan_single.sha256,
+            plan_changed_selection.sha256,
+        )
+
+        # The changed assignment carries its exact obligations under a DISTINCT
+        # leaf owner, so a changed matrix count never duplicated one.
+        self.assertNotEqual(d1.unit, d2_changed.unit)
+    def test_generated_lock_is_deterministic_and_validates(self):
+        # Owner-side generation end-to-end (D-SNAPSHOT): deterministic bytes,
+        # truncated snapshots never generate, and the production
+        # `generate-cohort-lock` subcommand round-trips through discovery.
+        # No WORK_UNIT_CASE marker: this proves the generator, not a matrix case.
+        g1 = make_desc(851, "D-WU-A", 3)
+        snapshot = {
+            "header": {
+                "repository": "UnknownAlienHuman/eliot-memory-os",
+                "base_revision": "0" * 40,
+                "acquisition": "probe",
+                "acquired_at": "2026-10-05T00:00:00Z",
+                "complete": True,
+            },
+            "rows": [
+                {"issue": 851, "unit": "D-WU-A", "body_sha256": g1.body_sha256,
+                 "disposition": "assigned", "prerequisites": []},
+                {"issue": 852, "unit": "D-WU-B", "body_sha256": "c" * 64,
+                 "disposition": "blocked", "prerequisites": []},
+            ],
+            "numeric_descriptors": [],
+        }
+        first = ch.generate_cohort_lock(snapshot, {851: g1})
+        self.assertEqual(first, ch.generate_cohort_lock(snapshot, {851: g1}))
+
+        # A truncated snapshot (complete False plus missing sections) never
+        # generates: the owner-side minter fails closed before rendering.
+        truncated = dict(
+            snapshot,
+            header=dict(
+                snapshot["header"], complete=False, missing_sections=["issues"]),
+        )
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.generate_cohort_lock(truncated, {851: g1})
+        self.assertEqual(
+            ctx.exception.problem, ch.CohortProblem.INCOMPLETE_SNAPSHOT)
+
+        # Production subcommand: the tmp root carries a real numeric
+        # descriptor for the assigned row, so generation binds the observed
+        # descriptor, the numeric class matches discovery, and the emitted
+        # digest equals the read-back lock aggregate. An assigned row with no
+        # observed descriptor would stay INCOMPLETE (never fabricated).
+        toml_851 = (
+            'schema_version = "eliot-work-unit-descriptor-v2"\n'
+            'identity = { value = "work-unit-851" }\n'
+            'issue = { repository = { owner = "UnknownAlienHuman", '
+            'name = "eliot-memory-os" }, number = 851 }\n'
+            'unit = { value = "D-WU-A" }\n'
+            'mode = "python-unittest"\n'
+            'source_roots = [{ value = "scripts/work_unit_gate/cohort.py" }]\n'
+            'test_roots = [{ value = "scripts/tests/test_work_unit_gate_cohort.py" }]\n'
+            'matrix_cases = 3\n'
+            'proof_ceiling = { value = "catalogue-integrity-only" }\n'
+            'revision = 1\n'
+            f'body_sha256 = "{g1.body_sha256}"\n'
+            f'matrix_sha256 = "{g1.matrix_sha256}"\n'
+            'require_workspace_member = false\n'
+            'requirements = { source_floor = 1, public_floor = 0, test_floor = 3, '
+            'required_guards = [{ value = "source-shape" }] }\n'
+            'bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, '
+            'line_bytes = 65536, discovery_tests = 1000, child_processes = 4 }\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wu = root / ".github" / "work-units"
+            wu.mkdir(parents=True)
+            (wu / "851.toml").write_bytes(toml_851.encode("utf-8"))
+            snap_path = root / "snapshot.json"
+            snap_path.write_text(
+                json.dumps(dict(snapshot, numeric_descriptors=[851])),
+                encoding="utf-8",
+            )
+            out_path = root / "cohort.toml"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = gate_main.main([
+                    "generate-cohort-lock",
+                    "--snapshot", str(snap_path),
+                    "--out", str(out_path),
+                    "--root", str(root),
+                    "--json",
+                ])
+            self.assertEqual(code, 0)
+            doc = json.loads(buf.getvalue())
+            self.assertEqual(
+                doc["digest"],
+                ch.read_cohort_lock(out_path).aggregate.sha256,
+            )
+
+    def test_blocked_row_with_restricted_root_descriptor_rejected(self):
+        # A blocked row carrying a descriptor is unresolved work, not an
+        # exemption from the scope rules: an ordinary leaf claiming a
+        # restricted root is rejected exactly like an assigned/planned row.
+        d_bad = make_desc(852, "D-WU-COHORT", 42, source_roots=(".github",))
+        r_bad = make_row(d_bad, disposition=c.CatalogueDisposition.BLOCKED)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([r_bad], (d_bad.issue,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # Control: the same BLOCKED disposition with ordinary roots and no
+        # integration-owner profile materializes normally.
+        d_ok = make_desc(852, "D-WU-COHORT", 42)
+        cat = ch.materialize_catalogue(
+            [make_row(d_ok, disposition=c.CatalogueDisposition.BLOCKED)], (d_ok.issue,))
+        self.assertEqual(cat.result, c.CatalogueResult.INTEGRITY_VALID)
 
 
 if __name__ == "__main__":

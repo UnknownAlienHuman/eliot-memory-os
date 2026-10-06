@@ -706,3 +706,77 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     .expect("plain projection survives");
     assert_eq!(view.view.rendered.len(), 2);
 }
+
+#[test]
+fn marked_set_refuses_plain_assembly() {
+    let governor = governor_1869();
+    let fence = fence_1869();
+    let permit = owner_permit(&governor, &fence);
+    // Well-formed marked set that the governed entry accepts (same fixture
+    // as `marked_atom_projects_with_owner_issued_permit`).
+    let value = admitted_with_learning(permit.digest(), Some(NOW_1869 + 3600));
+    let context = value.binding.clone();
+    let recipe1 = recipe(&context);
+    let recipe1_approved = approved_for(&recipe1);
+    // The plain live entry holds no verified permit, so it cannot establish
+    // admission and refuses instead of rendering ungoverned (I12.24:295).
+    let mut calls = 0;
+    let result = assemble_active_view(
+        &value,
+        &recipe1,
+        &recipe1_approved,
+        quality_for_binding(&context, &recipe1, &value),
+        &policy_for(&context, 100_000),
+        |bytes| {
+            calls += 1;
+            Ok(measurement(&context, bytes))
+        },
+    );
+    assert_eq!(calls, 0);
+    assert_eq!(result, Err(AssemblyError::LearningPresentationRequired));
+}
+
+#[test]
+fn foreign_task_without_carryover_refused_at_delivery() {
+    let governor = governor_1869();
+    let fence = fence_1869();
+    let permit = owner_permit(&governor, &fence);
+    let verified =
+        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
+    // Well-formed local-bound marked set: genuine owner permit, live overlay,
+    // marks citing that permit's digest.
+    let value = admitted_with_learning(permit.digest(), Some(NOW_1869 + 3600));
+    let context = value.binding.clone();
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
+    let recipe4 = recipe(&context);
+    let recipe4_approved = approved_for(&recipe4);
+    // A foreign task requests delivery of locally bound marks with NO
+    // carryover presented. `PresentedLearning` is `Copy` with all-public
+    // fields (`governed_screen.rs:69-70`), so the foreign identity is set by
+    // struct-update syntax on the existing helper. The per-mark binding check
+    // (`governed_screen.rs:154`) refuses before anything renders (I12.24:295).
+    let presented = presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869);
+    let foreign = PresentedLearning {
+        requesting_task_id: "task-1869-foreign",
+        ..presented
+    };
+    let mut calls = 0;
+    let result = assemble_active_view_with_learning(
+        &value,
+        &recipe4,
+        &recipe4_approved,
+        quality_for_binding(&context, &recipe4, &value),
+        &policy_for(&context, 100_000),
+        |bytes| {
+            calls += 1;
+            Ok(measurement(&context, bytes))
+        },
+        foreign,
+    );
+    assert_eq!(calls, 0);
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::IdentityConflict))
+    );
+}

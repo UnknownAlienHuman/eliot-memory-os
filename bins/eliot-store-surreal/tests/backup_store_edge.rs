@@ -1629,9 +1629,12 @@ fn page_continuation_and_cumulative_bounds_hold_identity() {
     let begin = fixture_begin();
     assert!(begin.validate().is_ok());
     let partial = fixture_partial_page();
-    let complete = fixture_complete_page();
+    let mut complete = fixture_complete_page();
     assert!(!partial.is_last);
     assert!(complete.is_last);
+    complete.predecessor_digest = partial
+        .compute_digest()
+        .expect("the partial fixture page has a canonical digest");
     assert!(complete.validate_continuation(&partial).is_ok());
     // Reversal, replay, and cross-handle forks are refused.
     assert!(partial.validate_continuation(&complete).is_err());
