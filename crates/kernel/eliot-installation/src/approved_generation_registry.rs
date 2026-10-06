@@ -24,6 +24,7 @@ use super::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, PHASE_B_PENDING_MARKER,
     PHASE_B_PENDING_SCM_DIGEST, PlatformAgentBridgeSecurityConvergenceReceipt,
     PlatformAgentBridgeStagePrepared, PlatformAgentBridgeStagingReceipt, PlatformHandle,
+    PreparedDestinationAdmission, PreparedDestinationMaterialisation,
     ProvisionedSupervisionAuthority, ResourceGeneration, RuntimeLaunchDescriptor, StateFence,
     canonical_json_bytes, handle, sha256_handle, sha256_hex, text,
 };
@@ -2803,6 +2804,39 @@ pub struct ApprovedGenerationRegistry {
     /// `INSTALLATION_REGISTRY_WIRE_VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) committed_cutover_activation: Option<CommittedCutoverActivation>,
+    /// Destination installations this authority allocated and admitted as
+    /// PREPARED but never activated (issue #958, I5.13 `restore to isolated
+    /// root;`).
+    ///
+    /// The admission record lives here; the allocated installation itself
+    /// additionally holds a real row in `generations` (never active, never
+    /// last-known-good, its approval issued through the explicit preparation
+    /// issuer). The admission is the operation-keyed fact, the row is the
+    /// installation fact, and the two are written and forgotten together.
+    ///
+    /// `skip_serializing_if` plus `default` is the wire-compatibility mechanism
+    /// for the same reason it is on `committed_cutover_activation`:
+    /// `registry_projection_identity` hashes the whole serialized registry, so a
+    /// member that always serialized would change the identity of every registry
+    /// written before this one and invalidate already-staged activation intents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) prepared_isolated_destinations: Vec<PreparedDestinationAdmission>,
+    /// Destination installations this authority actually CREATED, one record
+    /// per admitted destination whose root was materialised (#958, I5.13
+    /// `restore to isolated root;`).
+    ///
+    /// A member beside `prepared_isolated_destinations` and not a field of it,
+    /// for a concrete reason rather than a stylistic one: the admission's
+    /// `admission_digest` folds in `IsolationEvidence::evidence_digest`, so a
+    /// post-creation observation folded into the same record would change the
+    /// admission's own digest between the admission write and the creation
+    /// write, and the exact-replay path this issue requires would turn into a
+    /// self-conflict. The link is a CONTENT binding instead: each record here
+    /// carries the `admission_digest` of the admission it realises, and
+    /// [`Self::validate`] compares it against the digest the retained admission
+    /// actually holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) prepared_destination_materialisations: Vec<PreparedDestinationMaterialisation>,
 }
 
 impl Default for ApprovedGenerationRegistry {
@@ -3009,7 +3043,8 @@ const TEST_SUPPORT_ACTIVATION_FIXTURE_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestSupportRegistryFixtureContour {
     /// In-memory `ApprovedGenerationRegistry` used by the state-machine, wire
-    /// and launch fixtures.
+    /// and launch fixtures (in-crate unit tests only).
+    #[cfg(test)]
     InMemory,
     /// Durable redb `RedbInstallationRegistry` used by the store and Host
     /// recovery fixtures.
@@ -3021,6 +3056,7 @@ impl TestSupportRegistryFixtureContour {
     /// Canonical label bound into the fixture preimage.
     fn canonical_label(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::InMemory => "IN_MEMORY_REGISTRY",
             Self::Durable => "DURABLE_REDB_REGISTRY",
         }
@@ -3138,6 +3174,8 @@ impl ApprovedGenerationRegistry {
             aborted_activation_receipts: Vec::new(),
             active_phase_b_rebind: None,
             committed_cutover_activation: None,
+            prepared_isolated_destinations: Vec::new(),
+            prepared_destination_materialisations: Vec::new(),
         }
     }
 
@@ -3682,6 +3720,633 @@ impl ApprovedGenerationRegistry {
             .ok_or(InstallationError::IdentityConflict)?;
         self.validate()?;
         Ok(recorded)
+    }
+
+    /// Returns the retained prepared-destination admission for one operation,
+    /// when this authority holds one.
+    ///
+    /// This is the idempotency read a repeated request uses: the same operation
+    /// resolves the same destination here instead of allocating a second
+    /// installation, and the CONTENT comparison happens in
+    /// [`Self::record_prepared_isolated_destination_unchecked`], not in this
+    /// accessor.
+    #[must_use]
+    pub fn prepared_isolated_destination(
+        &self,
+        operation_id: &PlatformHandle,
+    ) -> Option<&PreparedDestinationAdmission> {
+        self.prepared_isolated_destinations
+            .iter()
+            .find(|admission| &admission.operation_id == operation_id)
+    }
+
+    /// Every prepared-destination admission this authority currently retains.
+    ///
+    /// Cleanup uses this set rather than a caller-supplied list: a destination
+    /// whose operation this projection does not own is preserved, never removed
+    /// by path name.
+    #[must_use]
+    pub fn prepared_isolated_destinations(&self) -> &[PreparedDestinationAdmission] {
+        &self.prepared_isolated_destinations
+    }
+
+    /// Returns the retained materialisation for one operation, when this
+    /// authority holds one.
+    ///
+    /// This is the read an import-side consumer uses to learn WHICH root was
+    /// created for its operation: the record names the created root and the
+    /// identity the owner observed for it, so the destination the import targets
+    /// is the one that was admitted and created rather than a name a request
+    /// chose.
+    #[must_use]
+    pub fn prepared_destination_materialisation(
+        &self,
+        operation_id: &PlatformHandle,
+    ) -> Option<&PreparedDestinationMaterialisation> {
+        self.prepared_destination_materialisations
+            .iter()
+            .find(|record| &record.operation_id == operation_id)
+    }
+
+    /// Every materialised destination this authority currently retains.
+    #[must_use]
+    pub fn prepared_destination_materialisations(&self) -> &[PreparedDestinationMaterialisation] {
+        &self.prepared_destination_materialisations
+    }
+
+    /// Records the admission of one destination AND the fact that its root was
+    /// actually created, in one mutation.
+    ///
+    /// The two records are admitted together because they are one fact: the
+    /// materialisation carries the admission's `admission_digest`, and this
+    /// method refuses a materialisation whose digest does not equal the digest
+    /// the admission it was given actually holds. A root that was created for
+    /// some other admission, or an admission whose root nobody created, can
+    /// therefore never be recorded as a pair.
+    ///
+    /// A repeat of the SAME pair is idempotent and returns the stored record, so
+    /// a repeated request returns the same verified destination. Any other
+    /// record for the same operation, or a second operation naming the same
+    /// destination, is an [`InstallationError::IdentityConflict`] rather than a
+    /// second installation.
+    pub(crate) fn record_prepared_isolated_destination_creation_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+        destination_generation: &ApprovedGeneration,
+        materialisation: &PreparedDestinationMaterialisation,
+        current_purge_ledger_revision: u64,
+    ) -> Result<PreparedDestinationMaterialisation, InstallationError> {
+        self.record_prepared_isolated_destination_unchecked(
+            admission,
+            destination_generation,
+            current_purge_ledger_revision,
+        )?;
+        materialisation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if materialisation.admission_digest != admission.admission_digest
+            || materialisation.operation_id != admission.operation_id
+            || materialisation.destination_installation != admission.destination_installation
+            || !Self::same_windows_root_text(
+                &materialisation.destination_installation_root,
+                &admission.isolation.destination_installation_root,
+            )
+            || materialisation.isolated_area_root != admission.isolation.isolated_area_root
+            || materialisation.isolated_area_identity != admission.isolation.isolated_area_identity
+        {
+            return Err(InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: "the materialisation does not realise the admitted destination".to_owned(),
+            });
+        }
+        if let Some(held) = self.prepared_destination_materialisation(&materialisation.operation_id)
+        {
+            if held == materialisation {
+                return Ok(held.clone());
+            }
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self
+            .prepared_destination_materialisations
+            .iter()
+            .any(|record| {
+                record.destination_installation == materialisation.destination_installation
+            })
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // Committed only if the whole projection still validates, and rolled
+        // back otherwise, for the same reason as the admission write in
+        // [`Self::record_prepared_isolated_destination_unchecked`]: a refusal
+        // must not leave behind a retained record the projection itself
+        // declares invalid.
+        //
+        // The rollback is deliberately NARROW. A refused creation receipt leaves
+        // the ADMISSION retained, which is not a half-written pair: the
+        // admission was admitted on its own merits and the destination root is
+        // created and recorded in a later step, so "admitted, not yet
+        // materialised" is a real state this authority must be able to hold. What
+        // must never survive is the creation receipt, because a receipt this
+        // projection refuses is a claim about a root that was never proved.
+        self.prepared_destination_materialisations
+            .push(materialisation.clone());
+        if let Err(error) = self.validate() {
+            self.prepared_destination_materialisations.pop();
+            return Err(error);
+        }
+        Ok(materialisation.clone())
+    }
+
+    /// Forgets one exact materialised destination during cleanup, together with
+    /// the admission it realised.
+    ///
+    /// Only an explicitly owned, never-activated pair may be forgotten, and the
+    /// pair must match exactly: a materialisation this authority does not hold,
+    /// or one whose admission it no longer holds, is refused rather than removed
+    /// by name.
+    pub(crate) fn forget_prepared_isolated_destination_creation_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+        materialisation: &PreparedDestinationMaterialisation,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        materialisation
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_destination_materialisation".to_owned(),
+                reason: error.to_string(),
+            })?;
+        // "Never activated" is decided in the DESTINATION's own identity space:
+        // no generation row outside this operation's own retained destination
+        // row may hold the destination installation identity, and the own row
+        // itself must still be inactive: an activated destination belongs to
+        // the activation lifecycle now, and cleanup must not unhook it.
+        //
+        // What was removed here, and why it was not a guarantee being dropped:
+        // the clause `approved_target_build == active_generation` compared the
+        // destination's APPROVED TARGET against this authority's active
+        // GENERATION. In the production shape both are fields of the SOURCE's
+        // own record -- `admit_prepared_isolated_destination` derives
+        // `approved_target_build` from the approved target row, and the Host
+        // caller nominates the source's active generation as that target -- so
+        // the clause was `a == a`. It was true for EVERY prepared destination
+        // and false for none, which made cleanup unreachable: a destination
+        // could be allocated, retained and materialised but never released.
+        //
+        // The activation question is answered by this clause and by
+        // `Self::validate`. An activated destination is one this authority
+        // holds an ACTIVE `ApprovedGeneration` for, and that row's
+        // `runtime_launch.installation_epoch.installation` IS the destination
+        // identity, so "the destination became real" is decided in the same
+        // identity space the destination is written in. I could not exhibit an
+        // input the deleted clause refused that this one admits, because the
+        // deleted clause never mentioned the destination at all; that is the
+        // honest statement of why this is a repair rather than a dropped
+        // guarantee. The operation's own inactive destination row is the one
+        // record this check exempts, and the sibling admission forget removes
+        // it together with the admission.
+        //
+        // KNOWN CEILING, not fixed here: this clause can only observe activation
+        // that happened in THIS registry. An isolated destination is created
+        // outside the source installation's own root, under the declared
+        // isolated area, so an activation performed by a DIFFERENT installation
+        // authority would not appear in `self.generations` at all. I could not
+        // establish whether an activation path for such a destination exists
+        // yet; #958 assigns activation to a later dedicated cutover child. If one
+        // lands, this clause needs the destination's own activation record as a
+        // second source before "never activated" is fully decided.
+        let own_row_active = self
+            .generations
+            .iter()
+            .filter(|generation| {
+                generation.approval.transaction_id() == &admission.operation_id
+                    && generation
+                        .manifest
+                        .runtime_launch
+                        .installation_epoch
+                        .installation
+                        == admission.destination_installation
+            })
+            .any(|generation| generation.active || generation.last_known_good);
+        if own_row_active {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.generations.iter().any(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                == admission.destination_installation
+                && generation.approval.transaction_id() != &admission.operation_id
+        }) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let Some(index) = self
+            .prepared_destination_materialisations
+            .iter()
+            .position(|held| held == materialisation)
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "this authority retains no materialised isolated destination for that operation"
+                    .to_owned(),
+            ));
+        };
+        if self
+            .prepared_isolated_destination(&admission.operation_id)
+            .is_none_or(|held| held != admission)
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "this authority retains no matching isolated destination admission to forget"
+                    .to_owned(),
+            ));
+        }
+        self.prepared_destination_materialisations.remove(index);
+        self.forget_prepared_isolated_destination_unchecked(admission)?;
+        self.validate()?;
+        Ok(())
+    }
+
+    /// Separator-aware equality over two already-resolved Windows path texts.
+    fn same_windows_root_text(left: &str, right: &str) -> bool {
+        left.replace('/', "\\").to_lowercase() == right.replace('/', "\\").to_lowercase()
+    }
+
+    /// Records one prepared, UNACTIVATED destination installation.
+    ///
+    /// The admission record is this crate's operation-keyed representation of
+    /// "admitted but not yet approved", and the destination
+    /// [`ApprovedGeneration`] row beside it is the allocated installation
+    /// itself — never active, never last-known-good, its approval issued
+    /// through the explicit preparation issuer, never through the signed
+    /// activation bridge. Staging the row here does not activate the
+    /// destination: activation is the cutover child's own mutation, and this
+    /// issue forbids it.
+    ///
+    /// The CONTENT comparison is what makes the seam an admission rather than an
+    /// existence check: the incoming record is validated, and an operation this
+    /// projection already holds is idempotent only when the whole record is
+    /// equal. Any other record for the same operation is an
+    /// [`InstallationError::IdentityConflict`], and a destination this
+    /// projection already holds under a different operation is refused outright,
+    /// because two operations may never share one destination.
+    /// `current_purge_ledger_revision` is the purge-ledger revision the ORS
+    /// owner reports NOW, at record time. It is compared against the revision
+    /// the admission bound; see
+    /// [`Self::record_prepared_isolated_destination_unchecked`].
+    /// Returns the retained destination [`ApprovedGeneration`] row for one
+    /// operation, when this authority holds one.
+    ///
+    /// The row is found by the preparation operation that allocated it (the
+    /// approval's transaction identity), never by installation name: names are
+    /// what callers supply, and this read must resolve the authority's own
+    /// record for the exact operation to reconcile.
+    #[must_use]
+    pub fn prepared_destination_generation(
+        &self,
+        operation_id: &PlatformHandle,
+    ) -> Option<&ApprovedGeneration> {
+        self.generations.iter().find(|generation| {
+            !generation.active
+                && !generation.last_known_good
+                && generation.approval.transaction_id() == operation_id
+        })
+    }
+
+    /// Whether one generation row is a preparation-allocated destination whose
+    /// operation admission this projection still retains.
+    ///
+    /// The row must be inactive and never last-known-good, and an admission
+    /// for the row's own operation must be retained with the same destination
+    /// installation. This is the operation link the SCM-approval exemption in
+    /// [`Self::validate`] and the cleanup ownership checks rely on.
+    fn is_retained_preparation_destination(&self, generation: &ApprovedGeneration) -> bool {
+        !generation.active
+            && !generation.last_known_good
+            && self.prepared_isolated_destinations.iter().any(|admission| {
+                &admission.operation_id == generation.approval.transaction_id()
+                    && admission.destination_installation
+                        == generation
+                            .manifest
+                            .runtime_launch
+                            .installation_epoch
+                            .installation
+            })
+    }
+
+    /// Inserts one prepared-destination [`ApprovedGeneration`] row, or verifies
+    /// the retained one on a repeat.
+    ///
+    /// A repeat of the same operation with the same row is idempotent. A row
+    /// this operation already holds that differs from the incoming one, or any
+    /// row another operation holds for the same destination installation, is an
+    /// [`InstallationError::IdentityConflict`]: two operations never share one
+    /// destination installation. The row is never active and never
+    /// last-known-good here; activation is the cutover child's own mutation.
+    fn record_prepared_destination_generation_unchecked(
+        &mut self,
+        destination_generation: &ApprovedGeneration,
+    ) -> Result<(), InstallationError> {
+        destination_generation.validate()?;
+        if destination_generation.active || destination_generation.last_known_good {
+            return Err(InstallationError::InvalidField {
+                field: "prepared_destination.destination_generation".to_owned(),
+                reason: "a prepared destination row is never active or last-known-good".to_owned(),
+            });
+        }
+        if let Some(held) = self.generations.iter().find(|generation| {
+            generation.manifest.generation == destination_generation.manifest.generation
+        }) {
+            if held == destination_generation {
+                return Ok(());
+            }
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.generations.iter().any(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                == destination_generation
+                    .manifest
+                    .runtime_launch
+                    .installation_epoch
+                    .installation
+        }) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.generations.push(destination_generation.clone());
+        Ok(())
+    }
+
+    pub(crate) fn record_prepared_isolated_destination_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+        destination_generation: &ApprovedGeneration,
+        current_purge_ledger_revision: u64,
+    ) -> Result<PreparedDestinationAdmission, InstallationError> {
+        self.validate()?;
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        // The purge-ledger revision the admission bound is compared against the
+        // revision the ORS purge-ledger owner reports NOW. Without this the field
+        // was only ever compared with `0`, so a destination admitted against a
+        // stale revision and one admitted against the current revision were
+        // indistinguishable after admission — and A13.7 requires the restore to
+        // apply the CURRENT privacy purge, not whatever was current when
+        // preparation started. The ORS owner is not reachable from this crate,
+        // so the live value arrives as a required argument from the caller that
+        // holds that lease, and this authority refuses when the two disagree.
+        if current_purge_ledger_revision == 0
+            || current_purge_ledger_revision != admission.current_purge_ledger_revision
+        {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "the destination admission is bound to purge-ledger revision {} but the ORS owner \
+                 reports {}",
+                admission.current_purge_ledger_revision, current_purge_ledger_revision
+            )));
+        }
+        // The source generation the admission was prepared against is compared
+        // against this projection's OWN current active generation. The field
+        // existed to be compared and nothing read it, so a preparation bound to a
+        // configuration snapshot the source has since moved on from was retained
+        // as if it were current. A mismatch means the bound configuration is
+        // stale, which is refused rather than recorded.
+        //
+        // This is the SECOND of two comparisons of the same field, and both are
+        // kept on purpose; they divide the work rather than duplicate it.
+        //
+        // `materialise_prepared_isolated_destination` runs the FIRST one BEFORE it
+        // creates anything, against a read of the authority taken AFTER admission,
+        // so on that path a cutover between the two is refused with no directory
+        // created at all. This one runs against the projection RE-READ INSIDE the
+        // write transaction, by `read_registry_in_write`, which is later than any
+        // snapshot a caller can be holding, so it decides currency against the
+        // projection that is about to retain the record rather than against the
+        // caller's stale view of it.
+        //
+        // It is NOT redundant, and it is NOT dead code, and the reason is the
+        // opposite of what it was previously documented as. It does not close a
+        // window between the two comparisons: on the production path the caller
+        // holds a pre-cutover `expected_revision`, so `mutate_atomic` refuses at
+        // the compare-and-save fence before this closure runs at all, and THAT
+        // refusal — after the directory already exists — is the orphan this pair
+        // exists to prevent. Removing this clause would not widen that window,
+        // because the window is closed by refusing to create, not by refusing to
+        // record. It is still needed because it is the only fence for a caller
+        // passing a CURRENT `expected_revision`, whose write would otherwise land
+        // a record bound to a generation the projection has moved off, and for the
+        // admission-only seam `record_prepared_isolated_destination`, which never
+        // materialises anything and so has no materialise-time comparison to run.
+        if Some(&admission.isolation.source_active_generation) != self.active_generation.as_ref() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // A repeat of an operation this projection already holds is idempotent
+        // only when the whole admission record is byte-equal, and it ALSO
+        // verifies (or heals) the operation's destination generation row: a
+        // registry written before the row existed returns the same verified
+        // destination and gains the row now, while a changed same-operation
+        // input conflicts instead of allocating a second installation. This
+        // repeat path runs BEFORE the existing-installation comparison below,
+        // because that comparison would otherwise fire on the operation's OWN
+        // retained row and turn every idempotent repeat into a refusal.
+        if let Some(existing) = self
+            .prepared_isolated_destination(&admission.operation_id)
+            .cloned()
+        {
+            if existing != *admission {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let row_preexisted = self.generations.iter().any(|generation| {
+                generation.manifest.generation == destination_generation.manifest.generation
+            });
+            self.record_prepared_destination_generation_unchecked(destination_generation)?;
+            if let Err(error) = self.validate() {
+                if !row_preexisted {
+                    self.generations.retain(|generation| {
+                        generation.manifest.generation != destination_generation.manifest.generation
+                    });
+                }
+                return Err(error);
+            }
+            return Ok(existing.clone());
+        }
+        // A destination another operation already holds is refused before the
+        // existing-installation comparison below, so "two operations may never
+        // share one destination" keeps its established conflict class even now
+        // that the first operation's destination also holds a generation row:
+        // the pair check fires on the retained admission, not on the row.
+        if self
+            .prepared_isolated_destinations
+            .iter()
+            .any(|held| held.destination_installation == admission.destination_installation)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // The DESTINATION identity is compared against the EXISTING-INSTALLATION
+        // identities this projection holds, in the SAME identity space, and
+        // against nothing else: the installation identity of every approved
+        // generation, plus the source installation identity the admission claims.
+        //
+        // It is deliberately NOT `approved_target_build == active_generation`.
+        // That compares the destination's APPROVED TARGET against the source's
+        // own active generation, which in the production shape were the same
+        // field of the same record, so it refused every legitimate destination
+        // while proving nothing about the destination itself. Nor is
+        // `destination_installation == manifest.generation`: a generation handle
+        // and an installation key are different identity spaces, so that
+        // comparison could not decide "already an installation" either.
+        //
+        // For a prepared destination the destination installation key IS the
+        // row's generation identity by construction
+        // (`destination_generation_for_admission`), so this comparison also
+        // sees the operation's own destination row once recorded — which is
+        // why the idempotent repeat above returns before reaching it.
+        let known_installation = self.generations.iter().any(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                == admission.destination_installation
+        });
+        if known_installation {
+            return Err(InstallationError::Duplicate {
+                kind: "known installation offered as an isolated destination".to_owned(),
+                identity: admission.destination_installation.as_str().to_owned(),
+            });
+        }
+        // The write is COMMITTED only if the whole projection still validates
+        // with both records in it, and both are rolled back otherwise.
+        //
+        // `Self::validate` is where this authority's own self-consistency
+        // cross-checks live: the approved target must name a generation in the
+        // registry's approved collection, the bound source generation must name
+        // one too, and the destination must not be an installation identity the
+        // registry holds. Those are comparisons against an INDEPENDENT expected
+        // set — the retained approved rows — not against a field of the incoming
+        // record, which is why the refusal they produce is worth having.
+        //
+        // Validating AFTER the push without the rollback made a refusal
+        // non-atomic: the record was already retained, so the projection both
+        // returned `IdentityConflict` AND held the very record it had just
+        // declared invalid. Restoring the projection before returning the error
+        // is what makes "a refused destination is never retained" true of every
+        // refusal this function can produce, not only of the ones that happen to
+        // be decided before the push.
+        self.prepared_isolated_destinations.push(admission.clone());
+        // A row this operation already holds with a new admission is
+        // impossible through the public seams (both records are written
+        // together), but the rollback below must still not remove a row it
+        // did not insert.
+        let row_preexisted = self.generations.iter().any(|generation| {
+            generation.manifest.generation == destination_generation.manifest.generation
+        });
+        self.record_prepared_destination_generation_unchecked(destination_generation)?;
+        if let Err(error) = self.validate() {
+            self.prepared_isolated_destinations.pop();
+            if !row_preexisted {
+                self.generations.retain(|generation| {
+                    generation.manifest.generation != destination_generation.manifest.generation
+                });
+            }
+            return Err(error);
+        }
+        Ok(admission.clone())
+    }
+
+    /// Forgets one exact prepared-destination admission during cleanup.
+    ///
+    /// Only an explicitly owned, never-activated destination may be forgotten:
+    /// an operation that has since been activated is refused rather than
+    /// dropped, so cleanup can never orphan an installation this authority now
+    /// considers real.
+    pub(crate) fn forget_prepared_isolated_destination_unchecked(
+        &mut self,
+        admission: &PreparedDestinationAdmission,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        admission
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "prepared_isolated_destination".to_owned(),
+                reason: error.to_string(),
+            })?;
+        // "Never activated" is decided in the DESTINATION's own identity space:
+        // no generation row outside this operation's own retained destination
+        // row may hold the destination installation identity. The operation's
+        // own row is removed together with the admission below; a FOREIGN row
+        // (or an own row the cutover child has since activated) refuses the
+        // forget, because the installation is live under another lifecycle
+        // now. The previous form also demanded
+        // `approved_target_build != active_generation`, but both are fields of
+        // the SOURCE's own record in the production shape, so that clause was
+        // `a == a` for every prepared destination and no destination could
+        // ever be cleaned up. The reasoning and the input I could not construct
+        // are set out on the sibling
+        // `forget_prepared_isolated_destination_creation_unchecked`.
+        let own_row_position = self.generations.iter().position(|generation| {
+            generation.approval.transaction_id() == &admission.operation_id
+                && generation
+                    .manifest
+                    .runtime_launch
+                    .installation_epoch
+                    .installation
+                    == admission.destination_installation
+        });
+        if let Some(position) = own_row_position {
+            let row = &self.generations[position];
+            if row.active || row.last_known_good {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        if self.generations.iter().any(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                == admission.destination_installation
+                && generation.approval.transaction_id() != &admission.operation_id
+        }) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let Some(index) = self
+            .prepared_isolated_destinations
+            .iter()
+            .position(|held| held == admission)
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "this authority retains no prepared isolated destination for that operation"
+                    .to_owned(),
+            ));
+        };
+        let removed_admission = self.prepared_isolated_destinations.remove(index);
+        let removed_row =
+            own_row_position.map(|position| (position, self.generations.remove(position)));
+        if let Err(error) = self.validate() {
+            self.prepared_isolated_destinations
+                .insert(index, removed_admission);
+            if let Some((position, row)) = removed_row {
+                self.generations.insert(position, row);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_pending_phase_b_agent_bridge_stage_prepared_unchecked(
@@ -4665,6 +5330,148 @@ impl ApprovedGenerationRegistry {
                 reason: "must be non-zero".to_owned(),
             });
         }
+        // Prepared, never-activated destinations are checked for SELF-consistency
+        // and against the approved collection, not admitted into it: each record
+        // must validate on its own terms, no two may share an operation or a
+        // destination, and no destination may be an installation this projection
+        // already approves or currently has active. That last pair is the durable
+        // half of "a client-supplied arbitrary path, active/source installation
+        // or preexisting foreign owner is rejected": a hand-edited registry row
+        // naming the active installation fails here even though its own digest
+        // was recomputed correctly.
+        let mut prepared_operations = BTreeSet::new();
+        let mut prepared_destinations = BTreeSet::new();
+        for admission in &self.prepared_isolated_destinations {
+            admission
+                .validate()
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "registry.prepared_isolated_destinations".to_owned(),
+                    reason: error.to_string(),
+                })?;
+            if !prepared_operations.insert(admission.operation_id.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "prepared isolated destination operation".to_owned(),
+                    identity: admission.operation_id.as_str().to_owned(),
+                });
+            }
+            if !prepared_destinations.insert(admission.destination_installation.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "prepared isolated destination installation".to_owned(),
+                    identity: admission.destination_installation.as_str().to_owned(),
+                });
+            }
+            // The DESTINATION must not be an installation identity this projection
+            // already holds. Compared in the SAME identity space — the
+            // `installation_epoch.installation` of every approved generation —
+            // and never against `manifest.generation`, which is a generation
+            // handle rather than an installation key.
+            //
+            // The APPROVED TARGET is a generation HANDLE, so it is compared as one: it must
+            // be a generation this projection approves. That is a real cross-check
+            // against an independent expected set — the registry's own approved
+            // rows — and it is exactly what a caller cannot fake by presenting a
+            // manifest and an approval that merely agree with each other.
+            //
+            // It is deliberately NOT also compared for inequality against the
+            // active generation. A destination installation does not exist yet, so
+            // this authority has no approved generation FOR it: the build a restore
+            // is prepared for is the currently approved build of the installation
+            // that owns the archive. DISTINCTNESS is decided solely by the
+            // destination-identity comparison above, and demanding that the target
+            // differ from the active generation would compare one field of the
+            // source's own record with itself and refuse every real destination.
+            //
+            // The comparison exempts this admission's OWN retained destination
+            // row: an inactive row whose approval transaction is this very
+            // operation and whose epoch installation is this destination. Any
+            // other row holding the identity — active, or allocated by another
+            // operation — still conflicts, so a second installation for one
+            // destination is impossible.
+            if self.generations.iter().any(|generation| {
+                generation
+                    .manifest
+                    .runtime_launch
+                    .installation_epoch
+                    .installation
+                    == admission.destination_installation
+                    && !(generation.approval.transaction_id() == &admission.operation_id
+                        && !generation.active
+                        && !generation.last_known_good)
+            }) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if !self
+                .generations
+                .iter()
+                .any(|generation| generation.manifest.generation == admission.approved_target_build)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            // The source generation the admission was prepared against must be a
+            // generation this projection approves. This is a SELF-consistency
+            // check, deliberately weaker than the record-time check that also
+            // compares it against the CURRENT active generation: `validate` runs
+            // on every load, and the source legitimately advances generations
+            // afterwards, so requiring activity here would make a retained
+            // preparation unreadable the moment the source was updated.
+            if !self.generations.iter().any(|generation| {
+                generation.manifest.generation == admission.isolation.source_active_generation
+            }) {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        // A materialised destination is checked for SELF-consistency AND against
+        // the retained admission set, which is the INDEPENDENT expected set: a row
+        // whose `admission_digest` does not equal the digest of the admission this
+        // projection actually holds for that operation is refused, so a created
+        // root can never be recorded as belonging to an admission it does not
+        // realise, and an admission can never claim a root that was created for
+        // something else. Nothing here recomputes a digest to stand in for
+        // owner-issued material: the comparison is between two recorded values.
+        let mut materialised_operations = BTreeSet::new();
+        let mut materialised_destinations = BTreeSet::new();
+        for record in &self.prepared_destination_materialisations {
+            record
+                .validate()
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "registry.prepared_destination_materialisations".to_owned(),
+                    reason: error.to_string(),
+                })?;
+            if !materialised_operations.insert(record.operation_id.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "materialised isolated destination operation".to_owned(),
+                    identity: record.operation_id.as_str().to_owned(),
+                });
+            }
+            if !materialised_destinations.insert(record.destination_installation.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "materialised isolated destination installation".to_owned(),
+                    identity: record.destination_installation.as_str().to_owned(),
+                });
+            }
+            let admitted = self
+                .prepared_isolated_destination(&record.operation_id)
+                .ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "a materialised isolated destination has no retained admission for its \
+                         operation"
+                            .to_owned(),
+                    )
+                })?;
+            if admitted.admission_digest != record.admission_digest
+                || admitted.destination_installation != record.destination_installation
+                || !Self::same_windows_root_text(
+                    &admitted.isolation.destination_installation_root,
+                    &record.destination_installation_root,
+                )
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "registry.prepared_destination_materialisations".to_owned(),
+                    reason: "the materialisation does not realise the retained admission"
+                        .to_owned(),
+                });
+            }
+        }
         let mut identities = BTreeSet::new();
         let mut service_identities = BTreeSet::new();
         let mut active_count = 0_usize;
@@ -4710,7 +5517,18 @@ impl ApprovedGenerationRegistry {
                     .iter()
                     .filter(|approval| approval.generation == generation.manifest.generation)
                     .count();
-                if count != 2 {
+                // A preparation-allocated destination row is exempt from the
+                // installer SCM-approval count while it is inactive AND its
+                // operation's admission is still retained: preparation runs no
+                // installer transaction, so no installer service effects exist
+                // for it, and the row can neither register services nor
+                // activate in this state. The exemption is operation-linked,
+                // not shape-linked: an active row, a row without a retained
+                // admission, or a second row for the same destination never
+                // passes it, and the cutover child must establish the real SCM
+                // approvals through the normal path before it may activate the
+                // row.
+                if count != 2 && !self.is_retained_preparation_destination(generation) {
                     return Err(InstallationError::IncompleteObservation(
                         "SystemService generation requires exactly Host and Watchdog SCM approvals"
                             .to_owned(),

@@ -169,16 +169,17 @@ pub use activation_projection::{
 #[cfg(test)]
 use agent_fabric::build_admitted_provider_capability;
 pub use agent_fabric::{
-    ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
-    AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
-    CancellationLifecycle, DAEMON_CRATE, DispatchAck, DispatchEgressPort, DispatchIntent,
-    FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION, FABRIC_PLAN_GAP_REASON, FabricAdmission,
-    FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
-    PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
-    SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    admit_swarm_definition_candidate, begin_swarm_execution_candidate, daemon_coordinator_config,
+    ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort,
+    AdmittedSoloCoordinateRequest, AgentFabric, AgentFabricDescriptor, AttemptLifecycle,
+    AttemptResultRecord, COORDINATOR_CRATE, CancellationLifecycle, DAEMON_CRATE, DispatchAck,
+    DispatchEgressPort, DispatchIntent, FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION,
+    FABRIC_PLAN_GAP_REASON, FabricAdmission, FabricError, FabricPorts, FabricSnapshot, LedgerEntry,
+    ModelRegistryPort, PREREQ_PORTS, PeerChannelPort, PeerMessage, PeerReceipt, Reservation,
+    RouteRequirements, SOLO_ROUTE_OPERATION, SwarmControlPort, SwarmDefinition, SwarmEntryReceipt,
+    VerifiedProviderMaterial, WorkerAck, admit_swarm_definition_candidate,
+    begin_swarm_execution_candidate, consume_admitted_solo_coordinate, daemon_coordinator_config,
     launch_swarm_child_candidate, plan_candidate, prepare_swarm_definition_admission_candidate,
-    prereq_ports,
+    prereq_ports, validate_admitted_solo_binding,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
@@ -972,10 +973,9 @@ fn blocked_port(
 
 /// Polls the shared solo queue through the verified async drive. The queue
 /// helper clones one intake plus the expected revisions under a short
-/// synchronous lock, then drives: the verified seam borrows the composition
-/// across its bounded owner IO (sole-path session-half resolution and
-/// capability construction on `&DaemonComposition`), and both the drive
-/// adopt and the queue adopt revalidate the consumed task/route/admission/
+/// synchronous lock, then drives: the verified seam uses owned resolved
+/// material and performs its bounded owner IO without a composition guard.
+/// Both the drive adopt and the queue adopt revalidate task/route/admission/
 /// fence revisions before dequeuing, leaving a moved head queued.
 pub async fn solo_poll_queue_async(
     composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
@@ -1001,6 +1001,49 @@ pub async fn solo_fair_pull_recovery(
     kernel: &Arc<DaemonKernelClient>,
 ) -> Result<solo_agent_driver::FairPullRecovery, DaemonError> {
     solo_agent_driver::solo_fair_pull_recovery(composition, kernel).await
+}
+
+/// Requests cancellation of the exact admitted attempt through the verified
+/// async seam (issue #2567 W5).
+///
+/// Thin wrapper over
+/// [`solo_agent_driver::solo_request_cancel_async`](crate::solo_agent_driver::solo_request_cancel_async):
+/// same retained operation as the sync leg, restored through the async seam
+/// so the control path works in a normal build. Event-driven and
+/// dispatcher-owned; the runtime tick installs no caller.
+pub async fn solo_request_cancel_async(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+    solo_agent_driver::solo_request_cancel_async(composition, kernel, operation_id).await
+}
+
+/// Ingests one worker observation through the verified async seam
+/// (issue #2567 W5).
+///
+/// Thin wrapper over
+/// [`solo_agent_driver::solo_ingest_result_async`](crate::solo_agent_driver::solo_ingest_result_async):
+/// same retained operation as the sync leg, restored through the async seam
+/// so the ingest path works in a normal build. Event-driven and
+/// dispatcher-owned; the runtime tick installs no caller.
+pub async fn solo_ingest_result_async(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+    worker_id: &str,
+    result_digest: &str,
+    observed_via: &str,
+) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+    solo_agent_driver::solo_ingest_result_async(
+        composition,
+        kernel,
+        operation_id,
+        worker_id,
+        result_digest,
+        observed_via,
+    )
+    .await
 }
 
 impl DaemonComposition {
@@ -3670,6 +3713,49 @@ impl DaemonComposition {
         crate::provider_capability::admit_provider_capability(kernel, &admission, claimed).await
     }
 
+    /// Constructs the production fabric from ALREADY-resolved verified
+    /// material without borrowing the composition (issue #2567 W3).
+    ///
+    /// Self-free half of
+    /// [`Self::agent_fabric_new_verified_async`]: `material` must have come
+    /// out of [`Self::resolve_verified_material`] (live fence set, session
+    /// binding and epoch checked). The owner IO below (Kernel verifier,
+    /// capability build) runs with no composition borrow held, so a slow
+    /// owner cannot block independent composition users; the caller
+    /// revalidates and adopts afterwards. Behavior is identical to the
+    /// second half of the seam — this step only moves code.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Kernel verifier, capability construction, or coordinator
+    /// owner rejection unchanged, each typed (same as the seam).
+    pub async fn agent_fabric_new_verified_from_resolved_async(
+        kernel: &Arc<DaemonKernelClient>,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+    ) -> Result<AgentFabric, DaemonError> {
+        let owner = kernel.owner_session_facts().ok_or_else(|| {
+            DaemonError::Kernel(
+                "daemon has no validated Kernel owner session; verified provider admission stays plan-only"
+                    .to_owned(),
+            )
+        })?;
+        let live_fence = kernel.kernel_fence();
+        kernel
+            .verify_provider_binding_async(&material)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        let capability = Self::build_production_provider_capability(
+            kernel, material, &owner, live_fence, claimed,
+        )
+        .await?;
+        let config = daemon_coordinator_config()?;
+        Ok(AgentFabric::new_with_admitted_provider(
+            config, ports, capability,
+        )?)
+    }
+
     /// Constructs the production fabric on a sealed admitted provider
     /// capability verified through the Kernel admission verifier (issue #1108
     /// W5/W2, production caller for A1).
@@ -3694,6 +3780,9 @@ impl DaemonComposition {
     /// never mints admission. The production ports source is
     /// [`Self::production_fabric_ports`] (W1).
     ///
+    /// The slow half runs without the composition borrow (see
+    /// [`Self::agent_fabric_new_verified_from_resolved_async`]).
+    ///
     /// # Errors
     ///
     /// Returns the readiness, session-resolution, Kernel verifier,
@@ -3708,25 +3797,7 @@ impl DaemonComposition {
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_new_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
-        let owner = kernel.owner_session_facts().ok_or_else(|| {
-            DaemonError::Kernel(
-                "daemon has no validated Kernel owner session; verified provider admission stays plan-only"
-                    .to_owned(),
-            )
-        })?;
-        let live_fence = kernel.kernel_fence();
-        kernel
-            .verify_provider_binding_async(&material)
-            .await
-            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        let capability = Self::build_production_provider_capability(
-            kernel, material, &owner, live_fence, claimed,
-        )
-        .await?;
-        let config = daemon_coordinator_config()?;
-        Ok(AgentFabric::new_with_admitted_provider(
-            config, ports, capability,
-        )?)
+        Self::agent_fabric_new_verified_from_resolved_async(kernel, ports, material, claimed).await
     }
 
     /// Requires a verified restore to continue the snapshot's retained
@@ -3807,9 +3878,27 @@ impl DaemonComposition {
     /// no second capability build and no second recovery path: the one
     /// `build_production_provider_capability` result drives both, and the
     /// typed snapshot stays the fabric state carrier.
-    pub async fn agent_fabric_restore_verified_async(
-        &self,
+    /// Restores the production fabric from ALREADY-resolved verified material
+    /// without borrowing the composition (issue #2567 W3/A6 round-2, recovery leg).
+    ///
+    /// Self-free half of [`Self::agent_fabric_restore_verified_async`]:
+    /// `material` must have come out of [`Self::resolve_verified_material`]
+    /// (live fence set, session binding and epoch checked) and `state_root`
+    /// must be the composition's state root captured under a short lock. The
+    /// owner IO below (Kernel verifier, capability build) runs with no
+    /// composition borrow held, so a slow owner cannot block independent
+    /// composition users; the caller revalidates and adopts afterwards.
+    /// Behavior is identical to the second half of the seam — this step only
+    /// moves code.
+    ///
+    /// # Errors
+    ///
+    /// Returns the restore-continuity, session-resolution, Kernel verifier,
+    /// capability construction, or coordinator owner restore rejection
+    /// unchanged, each typed (same as the seam).
+    pub async fn agent_fabric_restore_verified_from_resolved_async(
         kernel: &Arc<DaemonKernelClient>,
+        state_root: PathBuf,
         snapshot: FabricSnapshot,
         ports: FabricPorts,
         material: VerifiedProviderMaterial,
@@ -3817,7 +3906,6 @@ impl DaemonComposition {
         coordinator_document: &str,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
-        let material = self.resolve_verified_material(kernel, material)?;
         Self::require_restore_attempt_continuity(&snapshot, &material)?;
         let owner = kernel.owner_session_facts().ok_or_else(|| {
             DaemonError::Kernel(
@@ -3835,7 +3923,7 @@ impl DaemonComposition {
         )
         .await?;
         let config = daemon_coordinator_config()?;
-        let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
+        let store = crate::semantic_revision_store::SemanticRevisionStore::new(&state_root);
         Ok(
             AgentFabric::restore_durable_snapshot_with_admitted_provider(
                 snapshot,
@@ -3848,13 +3936,37 @@ impl DaemonComposition {
         )
     }
 
+    pub async fn agent_fabric_restore_verified_async(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        snapshot: FabricSnapshot,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+        coordinator_document: &str,
+    ) -> Result<AgentFabric, DaemonError> {
+        let material = self.resolve_verified_material(kernel, material)?;
+        let state_root = self.state_root().to_owned();
+        Self::agent_fabric_restore_verified_from_resolved_async(
+            kernel,
+            state_root,
+            snapshot,
+            ports,
+            material,
+            claimed,
+            coordinator_document,
+        )
+        .await
+    }
+
     /// Enqueues one validated solo delegate intake for the runtime poll hook
     /// (issue #2567).
     ///
     /// Thin wrapper over
     /// [`solo_agent_driver::solo_enqueue`](crate::solo_agent_driver::solo_enqueue):
     /// the intake is validated and queued bounded; driving happens on the
-    /// runtime tick or through [`Self::solo_drive_once`].
+    /// runtime tick through
+    /// [`solo_poll_queue_async`](crate::solo_agent_driver::solo_poll_queue_async).
     ///
     /// # Errors
     ///
@@ -3865,25 +3977,6 @@ impl DaemonComposition {
         intake: solo_agent_driver::SoloDelegateIntake,
     ) -> Result<(), DaemonError> {
         solo_agent_driver::solo_enqueue(self, intake, unix_ms())
-    }
-
-    /// Synchronous compatibility entry for one solo delegate intake
-    /// (issue #2567). Production returns a fail-closed async-required error;
-    /// use [`Self::solo_drive_once_async`] for Kernel-backed verification.
-    ///
-    /// Thin synchronous compatibility wrapper. Production refuses this path
-    /// because authenticated Kernel verification requires an async call.
-    ///
-    /// # Errors
-    ///
-    /// Production returns [`DaemonError::Kernel`] because the synchronous
-    /// path cannot perform authenticated owner verification.
-    pub fn solo_drive_once(
-        &self,
-        kernel: &Arc<DaemonKernelClient>,
-        intake: solo_agent_driver::SoloDelegateIntake,
-    ) -> Result<solo_agent_driver::SoloDriveOutcome, DaemonError> {
-        solo_agent_driver::drive_solo_delegate(self, kernel, intake, unix_ms())
     }
 
     /// Drives one solo delegate through the nonblocking authenticated Kernel
@@ -3903,23 +3996,6 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         solo_agent_driver::drive_solo_delegate_async(kernel, intake, unix_ms()).await
-    }
-
-    /// Drives at most one queued solo intake; the runtime poll hook
-    /// (issue #2567).
-    ///
-    /// Thin synchronous compatibility wrapper. Production refuses this path;
-    /// use [`crate::solo_poll_queue_async`] from an async cadence.
-    ///
-    /// # Errors
-    ///
-    /// Production returns [`DaemonError::Kernel`] and retains the queued item
-    /// for the asynchronous poll path.
-    pub fn solo_poll_queue(
-        &self,
-        kernel: &Arc<DaemonKernelClient>,
-    ) -> Result<solo_agent_driver::SoloPollOutcome, DaemonError> {
-        solo_agent_driver::solo_poll_queue(self, kernel)
     }
 
     /// Reads one solo attempt status under its durable identity
@@ -4035,7 +4111,7 @@ impl DaemonComposition {
     /// with the session-observed one; a validated session must exist.
     /// Presented halves and the Governor expectation travel through
     /// untouched for the coherence gates downstream to judge.
-    fn resolve_verified_material(
+    pub(crate) fn resolve_verified_material(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         mut material: VerifiedProviderMaterial,

@@ -538,6 +538,39 @@ where
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
     admitted.validate()?;
+    // Delivery-side learning governance (#1869 W4/A2, I12.24:295): marked
+    // atoms render only through `assemble_active_view_with_learning`, which
+    // re-verifies them against the live Governor issuance before delegating
+    // to `assemble_validated_view` below. This entry holds no verified
+    // permit, so it cannot establish admission and refuses marked sets
+    // instead of rendering them ungoverned. Unmarked sets project exactly
+    // as before.
+    if admitted
+        .records
+        .iter()
+        .any(|record| record.candidate.learning.is_some())
+    {
+        return Err(AssemblyError::LearningPresentationRequired);
+    }
+    assemble_validated_view(admitted, recipe, approved, quality, policy, measure)
+}
+
+/// Validated projection shared by the plain and governed entries: economy,
+/// readiness, boundary, render and grading checks over an already-validated
+/// admitted set. Never call with learning-marked atoms except from
+/// `assemble_active_view_with_learning`, which verified them against the
+/// live Governor issuance first.
+pub fn assemble_validated_view<F>(
+    admitted: &AdmittedContextSet,
+    recipe: &ContextRecipe,
+    approved: &ResolvedContextRecipe,
+    quality: QualityScorecard,
+    policy: &AssemblyPolicy,
+    measure: F,
+) -> Result<ActiveUnderstandingViewResult, AssemblyError>
+where
+    F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
+{
     if admitted.economy.recipe_digest != recipe.recipe_sha256 {
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
