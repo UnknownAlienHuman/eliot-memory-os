@@ -10937,11 +10937,11 @@ impl KernelComposition {
         };
         // Publisher concurrency (#2786 step 4): sessions run as `JoinSet`
         // tasks on the multi-threaded `#[tokio::main]` runtime, so two
-        // `publish_wasm_dispatch_bundle` calls can interleave on different
-        // threads — no single-publisher ownership is claimed. The
-        // publisher serializes replacements only through the live-envelope
-        // gate (claim-by-rename plus per-step re-verification), not a
-        // lock; the residual per-file window is stated at the reclaim.
+        // `publish_wasm_dispatch_bundle` calls contend on different threads.
+        // Same-process replacements serialize on the install guard inside
+        // the publish call; the live-envelope gate (claim-by-rename plus
+        // per-step re-verification) types the loser as backpressure. The
+        // residual per-file window is stated at the reclaim.
         let mut joins = eliot_kernel_service::WasmJoinTable::default();
         let bundle = match eliot_kernel_service::publish_wasm_dispatch_bundle(
             host_executable_path.as_str(),
