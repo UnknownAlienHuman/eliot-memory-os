@@ -13,6 +13,7 @@ import json
 import re
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,6 +26,27 @@ lane = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = lane
 spec.loader.exec_module(lane)
 FIXTURE = json.loads((ROOT / "scripts/testdata/wasm-component-lane/registry.json").read_bytes())["modules"]
+PRODUCER_SPEC = importlib.util.spec_from_file_location(
+    "eliot_verify_wasm_toolchain", ROOT / "scripts/verify-wasm-toolchain.py")
+assert PRODUCER_SPEC and PRODUCER_SPEC.loader
+producer = importlib.util.module_from_spec(PRODUCER_SPEC)
+sys.modules[PRODUCER_SPEC.name] = producer
+PRODUCER_SPEC.loader.exec_module(producer)
+# The accepted Declaration: the repo-owned rust-toolchain.toml as the
+# #870 producer reads it. Mutation variants below derive from it.
+ACCEPTED = producer.read_declaration(ROOT)
+
+
+def mutated_declaration(**overrides):
+    """Build a Declaration shaped like the accepted one with parts changed."""
+    fields = {
+        "channel": ACCEPTED.channel,
+        "profile": ACCEPTED.profile,
+        "components": ACCEPTED.components,
+        "targets": ACCEPTED.targets,
+    }
+    fields.update(overrides)
+    return producer.Declaration(**fields)
 
 
 class WasmComponentLaneTests(unittest.TestCase):
@@ -236,6 +258,7 @@ class WasmComponentLaneTests(unittest.TestCase):
         module = "eliot-context-compiler-wasm"
         frozen = lane.freeze_module(ROOT, module, lane.resolve_module(FIXTURE, module))
         closure = {
+            "declaration": ACCEPTED,
             "wit_digest": "a" * 64,
             "dependency_digest": "b" * 64,
             "source_digest": "c" * 64,
@@ -243,8 +266,11 @@ class WasmComponentLaneTests(unittest.TestCase):
         identity = lane.cache_identity(frozen, **closure)
         self.assertRegex(identity, r"^[0-9a-f]{64}$")
         self.assertEqual(identity, lane.cache_identity(frozen, **closure))
+        # The accepted file re-read is the same Declaration: same identity.
         self.assertEqual(
-            identity, lane.cache_identity(frozen, toolchain=lane.TOOLCHAIN_CHANNEL, **closure)
+            identity,
+            lane.cache_identity(
+                frozen, **{**closure, "declaration": producer.read_declaration(ROOT)}),
         )
         channels = (
             "stable",
@@ -258,38 +284,91 @@ class WasmComponentLaneTests(unittest.TestCase):
         for channel in channels:
             with self.subTest(toolchain=channel or "<empty>"):
                 with self.assertRaises(lane.LaneError) as failure:
-                    lane.cache_identity(frozen, toolchain=channel, **closure)
+                    lane.cache_identity(
+                        frozen,
+                        **{**closure, "declaration": mutated_declaration(channel=channel)})
                 self.assertEqual(str(failure.exception), "TOOLCHAIN_NOT_PINNED")
         self.assertEqual(identity, lane.cache_identity(frozen, **closure))
+        # Anything that is not an accepted-shaped Declaration fails closed.
+        for forged, expected in (
+            (None, "DECLARATION_MALFORMED"),
+            (object(), "DECLARATION_MALFORMED"),
+            (mutated_declaration(profile="minimal"), "DECLARATION_PROFILE_MISMATCH"),
+        ):
+            with self.subTest(declaration=expected):
+                with self.assertRaises(lane.LaneError) as failure:
+                    lane.cache_identity(frozen, **{**closure, "declaration": forged})
+                self.assertEqual(str(failure.exception), expected)
 
     # WORK_UNIT_CASE: 764/8
     def test_target_change_invalidates_cache_identity(self):
         module = "eliot-context-compiler-wasm"
         frozen = lane.freeze_module(ROOT, module, lane.resolve_module(FIXTURE, module))
         closure = {
+            "declaration": ACCEPTED,
             "wit_digest": "a" * 64,
             "dependency_digest": "b" * 64,
             "source_digest": "c" * 64,
         }
-        identity = lane.cache_identity(frozen, target=lane.GUEST_TARGET, **closure)
+        identity = lane.cache_identity(frozen, **closure)
         self.assertRegex(identity, r"^[0-9a-f]{64}$")
         self.assertEqual(identity, lane.cache_identity(frozen, **closure))
         with tempfile.TemporaryDirectory() as scratch:
             argv = lane.build_argv(frozen, Path(scratch) / "lane-target")
         self.assertEqual(argv[argv.index("--target") + 1], lane.GUEST_TARGET)
-        targets = (
-            "wasm32-unknown-unknown",
-            "wasm32-wasip1",
-            "x86_64-pc-windows-msvc",
-            "",
-            lane.GUEST_TARGET + " ",
-        )
-        for target in targets:
-            with self.subTest(target=target or "<empty>"):
+        # Dropping the guest target (or the target shape itself) is a
+        # refusal; the host side may vary but then binds a new identity.
+        for targets, expected in (
+            (("x86_64-pc-windows-msvc",), "TARGET_NOT_PINNED"),
+            (("wasm32-unknown-unknown",), "TARGET_NOT_PINNED"),
+            (("wasm32-wasip1",), "TARGET_NOT_PINNED"),
+            ((), "DECLARATION_MALFORMED"),
+        ):
+            with self.subTest(targets=",".join(targets) or "<empty>"):
                 with self.assertRaises(lane.LaneError) as failure:
-                    lane.cache_identity(frozen, target=target, **closure)
-                self.assertEqual(str(failure.exception), "TARGET_NOT_PINNED")
-        self.assertEqual(identity, lane.cache_identity(frozen, target=lane.GUEST_TARGET, **closure))
+                    lane.cache_identity(
+                        frozen,
+                        **{**closure, "declaration": mutated_declaration(targets=targets)})
+                self.assertEqual(str(failure.exception), expected)
+        self.assertEqual(identity, lane.cache_identity(frozen, **closure))
+
+    def test_declaration_part_change_invalidates_cache_identity(self):
+        module = "eliot-context-compiler-wasm"
+        frozen = lane.freeze_module(ROOT, module, lane.resolve_module(FIXTURE, module))
+        closure = {
+            "declaration": ACCEPTED,
+            "wit_digest": "ab" * 32,
+            "dependency_digest": "cd" * 32,
+            "source_digest": "ef" * 32,
+        }
+        baseline = lane.cache_identity(frozen, **closure)
+        guest = lane.GUEST_TARGET
+        host = next(t for t in ACCEPTED.targets if t != guest)
+        self.assertIn(guest, ACCEPTED.targets)
+        parts = {
+            "components_drop": mutated_declaration(
+                components=tuple(c for c in ACCEPTED.components if c != "rust-src")),
+            "components_add": mutated_declaration(
+                components=tuple(sorted(ACCEPTED.components + ("extra-component",)))),
+            "host_target": mutated_declaration(
+                targets=("aarch64-apple-darwin", guest)),
+            # A forged digest with honest fields is self-isolating: it binds
+            # a distinct identity that matches no real Declaration.
+            "digest_forgery": types.SimpleNamespace(
+                channel=ACCEPTED.channel, profile=ACCEPTED.profile,
+                components=ACCEPTED.components, targets=ACCEPTED.targets,
+                digest="ff" * 32),
+        }
+        identities = {}
+        for label, declaration in parts.items():
+            with self.subTest(declaration_part=label):
+                changed = lane.cache_identity(
+                    frozen, **{**closure, "declaration": declaration})
+                self.assertRegex(changed, r"^[0-9a-f]{64}$")
+                self.assertNotEqual(changed, baseline)
+                identities[label] = changed
+        self.assertEqual(len(set(identities.values())), len(parts))
+        self.assertEqual(lane.cache_identity(frozen, **closure), baseline)
 
     # WORK_UNIT_CASE: 764/3
     def test_unknown_module_fails_before_commands(self):
@@ -312,6 +391,7 @@ class WasmComponentLaneTests(unittest.TestCase):
         self.assertEqual(frozen.abi_revision, lane.TYPED_ABI_REVISION)
         self.assertIn(frozen.world, lane.FROZEN_WORLDS)
         closure = {
+            "declaration": ACCEPTED,
             "wit_digest": "ab" * 32,
             "dependency_digest": "cd" * 32,
             "source_digest": "ef" * 32,
@@ -354,6 +434,7 @@ class WasmComponentLaneTests(unittest.TestCase):
         entry = lane.resolve_module(FIXTURE, module)
         frozen = lane.freeze_module(ROOT, module, entry)
         closure = {
+            "declaration": ACCEPTED,
             "wit_digest": "ab" * 32,
             "dependency_digest": "cd" * 32,
             "source_digest": "ef" * 32,
@@ -441,6 +522,7 @@ class WasmComponentLaneTests(unittest.TestCase):
         frozen = lane.freeze_module(ROOT, module, lane.resolve_module(FIXTURE, module))
         cache_id = lane.cache_identity(
             frozen,
+            declaration=ACCEPTED,
             wit_digest="ab" * 32,
             dependency_digest="cd" * 32,
             source_digest="ef" * 32,
@@ -464,6 +546,7 @@ class WasmComponentLaneTests(unittest.TestCase):
             cache_id=cache_id,
             cache_hit=False,
             argv_digest=argv_digest,
+            declaration=ACCEPTED,
         )
         self.assertEqual(receipt["schema"], lane.RECEIPT_SCHEMA)
         self.assertEqual(receipt["module"], module)
@@ -478,6 +561,13 @@ class WasmComponentLaneTests(unittest.TestCase):
         self.assertEqual(receipt["native_revision"], frozen.native_revision)
         self.assertEqual(receipt["toolchain"], lane.TOOLCHAIN_CHANNEL)
         self.assertEqual(receipt["target"], lane.GUEST_TARGET)
+        self.assertEqual(receipt["declaration"], {
+            "channel": ACCEPTED.channel,
+            "rustup_profile": ACCEPTED.profile,
+            "components": sorted(ACCEPTED.components),
+            "targets": sorted(ACCEPTED.targets),
+            "declaration_sha256": ACCEPTED.digest,
+        })
         self.assertEqual(receipt["profile"], frozen.profile)
         self.assertEqual(receipt["features"], list(frozen.features))
         self.assertEqual(receipt["engine"], {
@@ -523,6 +613,7 @@ class WasmComponentLaneTests(unittest.TestCase):
                     cache_id=cache_id,
                     cache_hit=True,
                     argv_digest=argv_digest,
+                    declaration=ACCEPTED,
                 )
                 self.assertEqual(candidate["schema"], lane.RECEIPT_SCHEMA)
                 self.assertEqual(candidate["execution"]["disposition"], disposition)
@@ -542,6 +633,7 @@ class WasmComponentLaneTests(unittest.TestCase):
                 "cache_id": cache_id,
                 "cache_hit": False,
                 "argv_digest": argv_digest,
+                "declaration": ACCEPTED,
             }
             call.update(overrides)
             with self.assertRaises(lane.LaneError) as failure:
@@ -561,6 +653,10 @@ class WasmComponentLaneTests(unittest.TestCase):
         self.assertEqual(rejected(cache_id="ab" * 31), "INVALID_CACHE_IDENTITY")
         self.assertEqual(rejected(cache_id="AB" * 32), "INVALID_CACHE_IDENTITY")
         self.assertEqual(rejected(cache_id=None), "INVALID_CACHE_IDENTITY")
+        self.assertEqual(rejected(declaration=None), "DECLARATION_MALFORMED")
+        self.assertEqual(
+            rejected(declaration=mutated_declaration(channel="1.97.0")),
+            "TOOLCHAIN_NOT_PINNED")
         self.assertEqual(rejected(argv_digest="56" * 33), "INVALID_ARGV_DIGEST")
         self.assertEqual(rejected(argv_digest="gg" * 32), "INVALID_ARGV_DIGEST")
         self.assertEqual(rejected(argv_digest=5656), "INVALID_ARGV_DIGEST")
@@ -574,6 +670,7 @@ class WasmComponentLaneTests(unittest.TestCase):
             cache_id=cache_id,
             cache_hit=False,
             argv_digest=argv_digest,
+            declaration=ACCEPTED,
         )
         self.assertIsNone(empty["artifact"])
         self.assertIsNone(empty["capsule"]["report"])
@@ -643,6 +740,11 @@ class WasmComponentLaneTests(unittest.TestCase):
         self.assertEqual(report["passed"], 1)
         self.assertEqual(report["failed"], 0)
         self.assertEqual(report["artifact_sha256"], observed["artifact"]["sha256"])
+        # The live receipt co-binds the accepted Declaration with the
+        # artifact read back off disk: one receipt, one toolchain.
+        self.assertEqual(observed["toolchain"], ACCEPTED.channel)
+        self.assertEqual(observed["declaration"]["declaration_sha256"], ACCEPTED.digest)
+        self.assertEqual(observed["declaration"]["targets"], sorted(ACCEPTED.targets))
 
     # WORK_UNIT_CASE: 764/12
     def test_one_guest_change_selects_only_justified_dependents(self):
@@ -989,6 +1091,7 @@ class WasmComponentLaneTests(unittest.TestCase):
         frozen = lane.freeze_module(ROOT, module, lane.resolve_module(FIXTURE, module))
         cache_id = lane.cache_identity(
             frozen,
+            declaration=ACCEPTED,
             wit_digest="ab" * 32,
             dependency_digest="cd" * 32,
             source_digest="ef" * 32,
@@ -1006,6 +1109,7 @@ class WasmComponentLaneTests(unittest.TestCase):
                 cache_id=cache_id,
                 cache_hit=False,
                 argv_digest="56" * 32,
+                declaration=ACCEPTED,
             )
 
         measured = lane.bind_observations(fresh(), cold_s=12.5, warm_s=6.25)

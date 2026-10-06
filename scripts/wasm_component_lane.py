@@ -21,7 +21,10 @@ Accepted contracts consumed READ-ONLY (never mutated or redefined here):
   set owned by #756);
 - ``rust-toolchain.toml`` (pinned channel ``1.97.1`` and guest target
   ``wasm32-wasip2`` owned by #870; this lane never installs targets or
-  mutates the toolchain file).
+  mutates the toolchain file). The accepted ``Declaration`` read through
+  the #870-owned reader is consumed by ``cache_identity()`` and
+  ``make_receipt()``: every Declaration part binds the cache identity
+  and the receipt (I2.22).
 
 Registry rule: this helper contains NO module list. The caller supplies a
 registry mapping whose provenance must be an accepted source (per-module
@@ -46,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -70,6 +74,14 @@ TYPED_PACKAGE_ID = "eliot:current@0.1.0"
 TYPED_ABI_REVISION = 1
 GUEST_TARGET = "wasm32-wasip2"
 TOOLCHAIN_CHANNEL = "1.97.1"
+# Frozen mirror of the #870-owned toolchain declaration
+# (rust-toolchain.toml via scripts/verify-wasm-toolchain.py): the lane
+# consumes the accepted Declaration read-only. Mismatch with the owning
+# source is a ContractChallenge.
+RUSTUP_PROFILE = "default"
+
+_TOOLCHAIN_READER = "verify-wasm-toolchain.py"
+_producer_module: Any | None = None
 TYPED_ENGINE_IMPLEMENTATION = "wasmtime-component"
 TYPED_ENGINE_VERSION = "47.0.4"
 FROZEN_WORLDS = frozenset({
@@ -377,25 +389,108 @@ def freeze_module(root: Path, module: str, entry: Mapping[str, Any]) -> FrozenBi
     )
 
 
+def _toolchain_producer() -> Any:
+    """Load the #870-owned toolchain Declaration reader (read-only).
+
+    The hyphenated script cannot be imported by name, so it is loaded by
+    path exactly once; the producer stays the single parser of
+    ``rust-toolchain.toml`` and this lane never redefines it.
+    """
+    global _producer_module
+    if _producer_module is None:
+        path = Path(__file__).resolve().parent / _TOOLCHAIN_READER
+        spec = importlib.util.spec_from_file_location(
+            "eliot_verify_wasm_toolchain", path)
+        if spec is None or spec.loader is None:
+            raise LaneError("DECLARATION_READER_UNAVAILABLE")
+        module = importlib.util.module_from_spec(spec)
+        # Dataclass machinery resolves the defining module through
+        # sys.modules (asdict/digest); an unregistered load crashes it.
+        sys.modules['eliot_verify_wasm_toolchain'] = module
+        try:
+            spec.loader.exec_module(module)
+        except OSError:
+            raise LaneError("DECLARATION_READER_UNAVAILABLE") from None
+        _producer_module = module
+    return _producer_module
+
+
+def accepted_declaration(root: Path) -> Any:
+    """Read the accepted toolchain Declaration for root (#870 producer).
+
+    Producer reason codes are bounded (never untrusted content), so a
+    rejected file surfaces its own code; the lane adds no second parser.
+    """
+    producer = _toolchain_producer()
+    try:
+        return producer.read_declaration(Path(root))
+    except LaneError:
+        raise
+    except ValueError as error:
+        raise LaneError(str(error)) from None
+
+
+def _check_declaration(declaration: Any) -> dict[str, Any]:
+    """Validate the accepted Declaration and normalize its bound parts.
+
+    The channel stays pinned to ``TOOLCHAIN_CHANNEL`` and the guest target
+    must be admitted; every part (channel, rustup profile, components,
+    host+guest targets, declaration digest) lands in the returned mapping,
+    so any part change alters the cache identity. A forged digest is
+    self-isolating: digest semantics stay producer-owned, and a digest that
+    matches no real Declaration simply never hits a real cache entry.
+    """
+    try:
+        channel = declaration.channel
+        profile = declaration.profile
+        components = declaration.components
+        targets = declaration.targets
+        digest = declaration.digest
+    except AttributeError:
+        raise LaneError("DECLARATION_MALFORMED") from None
+    if type(channel) is not str or channel != TOOLCHAIN_CHANNEL:
+        raise LaneError("TOOLCHAIN_NOT_PINNED")
+    if type(profile) is not str or profile != RUSTUP_PROFILE:
+        raise LaneError("DECLARATION_PROFILE_MISMATCH")
+    for value in (components, targets):
+        if type(value) is not tuple or not value or len(value) > 16:
+            raise LaneError("DECLARATION_MALFORMED")
+        for item in value:
+            if type(item) is not str or not item or len(item) > 80:
+                raise LaneError("DECLARATION_MALFORMED")
+        if len(set(value)) != len(value):
+            raise LaneError("DECLARATION_MALFORMED")
+    if GUEST_TARGET not in targets:
+        raise LaneError("TARGET_NOT_PINNED")
+    if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise LaneError("DECLARATION_MALFORMED")
+    return {
+        "channel": channel,
+        "rustup_profile": profile,
+        "components": sorted(components),
+        "targets": sorted(targets),
+        "declaration_sha256": digest,
+    }
+
+
 def cache_identity(
     frozen: FrozenBinding,
     *,
-    toolchain: str = TOOLCHAIN_CHANNEL,
-    target: str = GUEST_TARGET,
+    declaration: Any,
     wit_digest: str,
     dependency_digest: str,
     source_digest: str,
 ) -> str:
     """Derive the cache identity over the full invalidation closure.
 
-    Any toolchain, target, WIT+ABI, native-contract, dependency,
-    profile/feature, or source change alters the identity (cases 7-10).
-    A cache hit is an optimization only: it never skips verification.
+    The accepted toolchain Declaration is consumed, never channel/target
+    literals: any Declaration part (channel, rustup profile, components,
+    host+guest targets, declaration digest), WIT+ABI, native-contract,
+    dependency, profile/feature, or source change alters the identity
+    (cases 7-10). A cache hit is an optimization only: it never skips
+    verification.
     """
-    if toolchain != TOOLCHAIN_CHANNEL:
-        raise LaneError("TOOLCHAIN_NOT_PINNED")
-    if target != GUEST_TARGET:
-        raise LaneError("TARGET_NOT_PINNED")
+    toolchain = _check_declaration(declaration)
     for label, value in (
         ("WIT_DIGEST", wit_digest),
         ("DEPENDENCY_DIGEST", dependency_digest),
@@ -406,8 +501,12 @@ def cache_identity(
     return _digest({
         "schema": SCHEMA,
         "kind": "cache-identity",
-        "toolchain": toolchain,
-        "target": target,
+        "toolchain": toolchain["channel"],
+        "rustup_profile": toolchain["rustup_profile"],
+        "components": toolchain["components"],
+        "targets": toolchain["targets"],
+        "declaration_sha256": toolchain["declaration_sha256"],
+        "target": GUEST_TARGET,
         "wit_digest": wit_digest,
         "abi_revision": frozen.abi_revision,
         "package_id": frozen.package_id,
@@ -808,15 +907,22 @@ def make_receipt(
     cache_id: str,
     cache_hit: bool,
     argv_digest: str,
+    declaration: Any,
 ) -> dict[str, Any]:
     """Bind one SHA-256-addressed lane receipt.
 
     Build/test/no-work/skipped/unavailable/cancelled/failed are distinct
     dispositions; missing expected execution is non-green by construction
     (callers must pass FAILED/UNAVAILABLE, never a pass).
+
+    The accepted toolchain Declaration (channel, rustup profile,
+    components, host+guest targets, declaration digest) is bound into the
+    receipt alongside the artifact, so a receipt never floats free of the
+    toolchain that produced it.
     """
     if disposition not in _DISPOSITIONS:
         raise LaneError("INVALID_DISPOSITION")
+    toolchain = _check_declaration(declaration)
     for label, value in (("BASE_SHA", base_sha), ("HEAD_SHA", head_sha)):
         if type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None:
             raise LaneError(f"INVALID_{label}")
@@ -835,8 +941,9 @@ def make_receipt(
         "interface": frozen.interface,
         "native_contract": frozen.native_contract,
         "native_revision": frozen.native_revision,
-        "toolchain": TOOLCHAIN_CHANNEL,
+        "toolchain": toolchain["channel"],
         "target": GUEST_TARGET,
+        "declaration": toolchain,
         "profile": frozen.profile,
         "features": list(frozen.features),
         "engine": {
@@ -1165,8 +1272,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             wit_digest = _digest({"package": TYPED_PACKAGE_ID, "abi": TYPED_ABI_REVISION})
             source_digest = _digest({"base": args.base_sha, "head": args.head_sha})
             dependency_digest = _digest({"depends_on": sorted(depends_on)})
+            declaration = accepted_declaration(args.root)
             cache_id = cache_identity(
-                frozen, wit_digest=wit_digest,
+                frozen, declaration=declaration, wit_digest=wit_digest,
                 dependency_digest=dependency_digest, source_digest=source_digest,
             )
             controller_root = Path(tempfile.gettempdir()) / "eliot-wasm-lane"
@@ -1256,7 +1364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 frozen=frozen, base_sha=args.base_sha, head_sha=args.head_sha,
                 artifact=artifact, capsule_report=capsule_report,
                 disposition=disposition, cache_id=cache_id, cache_hit=cache_hit,
-                argv_digest=_digest(lane_argv),
+                argv_digest=_digest(lane_argv), declaration=declaration,
             )
             # No workspace gate runs from this leaf (#750 owns it), so the
             # comparable baseline stays explicitly unavailable.
