@@ -63,6 +63,10 @@ committed as repository authority.
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 | `generate_reason_codes.py` | Render the I7.20 reason-code projection (`docs/generated/reason-codes.md`) from the `eliot-protocol` Rust registry, verified against the normative I7.20 canonical set; `--check` fails on a stale projection (#1743) | Generated reason-code projection only |
+| `audit-context-measurement-ownership.py` | Source-bound verification of serialized-context measurement cases and owner classification (#866) | Static context-measurement inventory evidence only |
+| `gen_capability_cell_registry.py` | Capability cell registry projection generator and contract validator | Generated capability cell registry contract only |
+| `prepare-dependency-policy-inputs.py` | Dependency policy input materializer and scanner identity provisioner | Dependency policy input preparation evidence only |
+| `verify-retired-authority-surfaces.py` | Verify that retired or predecessor authority surface references remain absent | Static authority surface reference evidence only |
 
 The three public documentation entrypoints are intentionally small front doors.
 Their `*_core.py` modules retain the established implementations while the front
