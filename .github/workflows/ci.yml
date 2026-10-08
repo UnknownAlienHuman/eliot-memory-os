@@ -368,11 +368,9 @@ jobs:
           if ($oracleExit -ne 0) { throw "Base-owned workflow oracle refused the candidate (exit $oracleExit)." }
 
       - name: Verify shared documentation evidence
-        # No token is passed here: GWF-021 forbids secret-store expression refs in workflow text,
-        # so review evidence uses anonymous public gh api reads; a failure
-        # stays closed (oracle changes then need human bootstrap).
-        # (anonymous gh api needs no token)
         if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
