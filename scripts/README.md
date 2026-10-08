@@ -47,6 +47,7 @@ committed as repository authority.
 | `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
 | `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
 | `audit-serde-boundary-closure.py` | Serde-boundary closure coordinator (#710, Slice A) | Static source/boundary evidence only |
+| `audit-context-measurement-ownership.py` | Context measurement ownership and classification verifier | Static ownership evidence only |
 | `long_lived_collection_inventory.py` | Deterministic source-bound inventory of mutable collections in long-lived owners (#885) | Static source classification only |
 | `serde_boundary_inventory.py` | Deterministic serialized-boundary inventory and finite repair allocations (#929, freezing the F-DENY denominator for #710) | Static source classification only |
 | `wasm_component_lane.py` | Affected-component WASM build/test lane selector and evidence helper (#764) | Build/test lane selection only |
@@ -61,6 +62,9 @@ committed as repository authority.
 | `gen_operator_schedule_contract.py` | Generate C# mirror of Kernel UserAutomation schedule contract (#2865) | Generated C# schedule contract mirror only |
 | `gen_user_automation_zone_table.py` | Generate pinned IANA zone table for Kernel UserAutomation occurrence validator (#2805) | Pinned IANA zone table generation only |
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
+| `gen_capability_cell_registry.py` | Capability cell registry generator and validator | Generated capability cell registry evidence only |
+| `prepare-dependency-policy-inputs.py` | Prepare and validate dependency policy inputs | Dependency policy input preparation evidence only |
+| `verify-retired-authority-surfaces.py` | Verify retired authority surfaces stay retired across repository configuration | Static retired authority surface evidence only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 | `generate_reason_codes.py` | Render the I7.20 reason-code projection (`docs/generated/reason-codes.md`) from the `eliot-protocol` Rust registry, verified against the normative I7.20 canonical set; `--check` fails on a stale projection (#1743) | Generated reason-code projection only |
 
