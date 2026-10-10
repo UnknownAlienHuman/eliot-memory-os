@@ -141,6 +141,16 @@ path = ".github/workflows/repository-policy.yml"
 token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
 reason = "The policy intentionally rejects restoration of the predecessor file."
 
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "This file records retired authority paths."
+
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "This file records retired authority paths."
+
 # The three surfaces below own the retirement rule itself. A rule that forbids a
 # token must spell that token out, so each is exempt from its own prohibition.
 # Adding a token here does not weaken the check: every other path in every other
@@ -334,6 +344,9 @@ ignore_globs = [
   "scripts/work_unit_gate/doc_read_evidence.py",
   "config/doc-code-conformance.toml",
   ".github/workflows/repository-policy.yml",
+  "scripts/tests/*",
+  "scripts/work_unit_gate/fixtures/*",
+  "workstreams/security/retired-authority-surfaces.toml",
 ]
 handle_index = "docs/architecture/handle-index.json"
 
@@ -366,6 +379,51 @@ reason = "The unit-test fixture preserves an incoming legacy identity and is not
 source = "scripts/verify-legacy-config-retirement.py"
 path = "docs/notes.md"
 reason = "The self-test fixture uses docs/notes.md as a temporary test path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/verify-github-workflows.py"
+path = "docs/note.md"
+reason = "The self-test fixture uses docs/note.md as a test path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/AGENTS.md"
+reason = "Candidate document path for workspace observation."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/ARCHITECTURE.md"
+reason = "Candidate document path for workspace observation."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/IMPLEMENTATION.md"
+reason = "Candidate document path for workspace observation."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/BUILD.md"
+reason = "Candidate document path for workspace observation."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/TESTING.md"
+reason = "Candidate document path for workspace observation."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/SCHEMA.md"
+reason = "Candidate document path for workspace observation."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/CHANGELOG.md"
+reason = "Candidate document path for workspace observation."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/implementation/README.md"
+reason = "Candidate document path for workspace observation."
 
 [documentation_pipeline]
 shards_front_door = "scripts/docs_shards.py"

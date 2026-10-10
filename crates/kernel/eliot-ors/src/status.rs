@@ -689,7 +689,7 @@ pub fn read_current_supervision_lease_read_only(
 }
 
 /// Read-only answering read of the owner-issued purge-ledger revision
-/// (issue #958; `I05.13:44`, `A13.7`).
+/// (issue #958; `I5.13:44`, `A13.7`).
 ///
 /// This is a read-only inspection seam, not a store: it opens the ORS with
 /// `redb::ReadOnlyDatabase`, never creates or initialises a database, never
@@ -701,7 +701,7 @@ pub fn read_current_supervision_lease_read_only(
 /// transaction as each purge-ledger row, i.e. exactly the fact
 /// `RedbRecoveryStore::purge_ledger_revision` issues to the owner. It is never
 /// recomputed here, never derived from an archive under check and never
-/// assembled from caller input: `I05.13` requires a `full_recovery` receipt to
+/// assembled from caller input: `I5.13` requires a `full_recovery` receipt to
 /// bind this revision and `A13.7` requires a restore to compare the archive
 /// against it before any effect.
 ///
