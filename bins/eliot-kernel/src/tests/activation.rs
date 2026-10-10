@@ -247,8 +247,22 @@ fn activation_denial_codes_map_each_non_resolved_disposition_distinctly() {
 // daemon and host-request legs.
 // ---------------------------------------------------------------------------
 
+/// One directly seeded ticket carrying the production activation window, so a
+/// fixture never seeds a deadline below the real wall clock (which would make
+/// `store.rs:9401-9404` expire the lifecycle before the result is admitted).
 #[cfg(windows)]
-fn activation_v2_ticket(ticket_id: &str, deadline: u64) -> AgentActivationResolutionTicket {
+fn activation_v2_ticket(ticket_id: &str) -> AgentActivationResolutionTicket {
+    activation_v2_ticket_with_deadline(
+        ticket_id,
+        activation_v2_deadline(AGENT_BRIDGE_ACTIVATION_WINDOW_MS),
+    )
+}
+
+#[cfg(windows)]
+fn activation_v2_ticket_with_deadline(
+    ticket_id: &str,
+    deadline: u64,
+) -> AgentActivationResolutionTicket {
     AgentActivationResolutionTicket {
         wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
         wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
@@ -270,6 +284,91 @@ fn activation_v2_ticket(ticket_id: &str, deadline: u64) -> AgentActivationResolu
     }
     .with_computed_digest()
     .expect("ticket digest")
+}
+
+/// Wall-clock-relative ticket deadline, mirroring the production seeding in
+/// `agent_bridge.rs::begin_agent_bridge_inner` (`:447-448`):
+/// `activation_deadline_unix_ms: unix_ms().saturating_add(AGENT_BRIDGE_ACTIVATION_WINDOW_MS)`.
+#[cfg(windows)]
+fn activation_v2_deadline(window_ms: u64) -> u64 {
+    unix_ms().saturating_add(window_ms)
+}
+
+/// The latest instant at which production could still admit this ticket.
+///
+/// `stage_activation_ticket` refuses a `now` at or past the kernel deadline
+/// (`store.rs:9014`) and so does `claim_activation_ticket` (`store.rs:9275`), so
+/// a ticket whose deadline is still ahead is seeded at `unix_ms()`, exactly as
+/// production does. A ticket whose deadline has already elapsed is seeded at the
+/// last instant it was still admissible: that is how an elapsed deadline is
+/// reproduced without sleeping and without a sentinel value.
+#[cfg(windows)]
+fn activation_v2_seed_now(ticket: &AgentActivationResolutionTicket) -> u64 {
+    unix_ms().min(ticket.kernel_deadline_unix_ms.saturating_sub(1))
+}
+
+/// Stages one ORS activation lifecycle exactly as
+/// `begin_agent_bridge_inner` does (`agent_bridge.rs:776` and `:842` pass
+/// `let enqueue_now = unix_ms();`), carrying the ticket's own activation
+/// request identity (`agent_bridge.rs:818-827`), which is what rehydration
+/// compares (`agent_bridge.rs:2691-2692`).
+#[cfg(windows)]
+fn activation_v2_stage_lifecycle(
+    ors: &eliot_ors::RedbRecoveryStore,
+    ticket: &AgentActivationResolutionTicket,
+) {
+    let entry = activation_v2_entry(ticket);
+    ors.stage_activation_ticket(
+        &eliot_ors::ActivationLifecycleRecord {
+            ticket_id: ticket.ticket_id.clone(),
+            ticket_sha256: ticket.ticket_sha256.clone(),
+            ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
+            activation_request_id: ticket.activation_request_id.as_str().to_owned(),
+            activation_request_sha256: ticket.activation_request_sha256.clone(),
+            connection_id: ticket.connection_id.clone(),
+            state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
+            kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
+            cancellation_id: entry.request.request_identity.cancellation_id.clone(),
+            state: eliot_ors::ActivationLifecycleState::Pending,
+            lifecycle_order: 0,
+            result_sha256: None,
+            claim_owner: None,
+            claim_expires_at_unix_ms: None,
+            successor_of: entry.successor_of.clone(),
+            successor_ticket_id: None,
+            terminal_reason: None,
+        },
+        activation_v2_seed_now(ticket),
+    )
+    .expect("stage activation lifecycle");
+}
+
+/// Stages and then claims one ORS activation lifecycle with the exact values
+/// production writes, so no seeded claim lease is already elapsed by the time
+/// the fixture admits a result.
+///
+/// `claim_agent_activation_ticket` (`:906-917`) claims with:
+/// ```text
+/// let now = unix_ms();
+/// let claim_expires_at = now
+///     .saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
+///     .min(ticket.kernel_deadline_unix_ms);
+/// ors.claim_activation_ticket(&ticket.ticket_id, "eliotd", now, claim_expires_at)
+/// ```
+/// Nothing in production is an absolute epoch-ms literal.
+#[cfg(windows)]
+fn activation_v2_seed_claimed_lifecycle(
+    ors: &eliot_ors::RedbRecoveryStore,
+    ticket: &AgentActivationResolutionTicket,
+) {
+    activation_v2_stage_lifecycle(ors, ticket);
+    let claim_now = activation_v2_seed_now(ticket);
+    let claim_expires_at = claim_now
+        .saturating_add(AGENT_ACTIVATION_CLAIM_LEASE_MS)
+        .min(ticket.kernel_deadline_unix_ms);
+    ors.claim_activation_ticket(&ticket.ticket_id, "eliotd", claim_now, claim_expires_at)
+        .expect("claim activation lifecycle")
+        .expect("a staged activation lifecycle is claimable");
 }
 
 #[cfg(windows)]
@@ -394,44 +493,7 @@ fn activation_kernel_with_ticket(
     std::fs::create_dir_all(&root).expect("test work root");
     let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
     let entry = activation_v2_entry(ticket);
-    kernel
-        .generation_gateway
-        .ors
-        .stage_activation_ticket(
-            &eliot_ors::ActivationLifecycleRecord {
-                ticket_id: ticket.ticket_id.clone(),
-                ticket_sha256: ticket.ticket_sha256.clone(),
-                ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
-                activation_request_id: entry
-                    .request
-                    .request_identity
-                    .request
-                    .metadata
-                    .request_id
-                    .as_str()
-                    .to_owned(),
-                activation_request_sha256: entry.request.request_sha256.clone(),
-                connection_id: ticket.connection_id.clone(),
-                state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
-                kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
-                cancellation_id: entry.request.request_identity.cancellation_id.clone(),
-                state: eliot_ors::ActivationLifecycleState::Pending,
-                lifecycle_order: 0,
-                result_sha256: None,
-                claim_owner: None,
-                claim_expires_at_unix_ms: None,
-                successor_of: entry.successor_of.clone(),
-                successor_ticket_id: None,
-                terminal_reason: None,
-            },
-            1,
-        )
-        .expect("stage activation lifecycle");
-    kernel
-        .generation_gateway
-        .ors
-        .claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
-        .expect("claim activation lifecycle");
+    activation_v2_seed_claimed_lifecycle(&kernel.generation_gateway.ors, ticket);
     {
         let mut pending = kernel
             .agent_activation_pending
@@ -459,6 +521,7 @@ fn activation_kernel_with_ticket(
 )]
 fn activation_kernel_with_live_bridge_ticket(
     name: &str,
+    deadline: u64,
 ) -> (
     std::path::PathBuf,
     KernelComposition,
@@ -700,8 +763,10 @@ fn activation_kernel_with_live_bridge_ticket(
         declaration: declaration.clone(),
     });
 
-    let deadline = unix_ms().saturating_add(60_000);
-    let pipe_name = format!(r"\\.\pipe\eliot\activation-v2-live-{}", std::process::id());
+    let pipe_name = format!(
+        r"\\.\pipe\eliot\activation-v2-live-{name}-{}",
+        std::process::id()
+    );
     let (receipt_sha256, connection_id) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -769,51 +834,14 @@ fn activation_kernel_with_live_bridge_ticket(
             (receipt.receipt_sha256, handshake.connection_id)
         });
 
-    let mut ticket = activation_v2_ticket(name, deadline);
+    let mut ticket = activation_v2_ticket_with_deadline(name, deadline);
     ticket.connection_id = connection_id;
     ticket.peer_admission_receipt_sha256 = receipt_sha256;
     let ticket = ticket
         .with_computed_digest()
         .expect("live bridge ticket digest");
     let entry = activation_v2_entry(&ticket);
-    kernel
-        .generation_gateway
-        .ors
-        .stage_activation_ticket(
-            &eliot_ors::ActivationLifecycleRecord {
-                ticket_id: ticket.ticket_id.clone(),
-                ticket_sha256: ticket.ticket_sha256.clone(),
-                ticket_payload: serde_json::to_string(&ticket).expect("ticket payload"),
-                activation_request_id: entry
-                    .request
-                    .request_identity
-                    .request
-                    .metadata
-                    .request_id
-                    .as_str()
-                    .to_owned(),
-                activation_request_sha256: entry.request.request_sha256.clone(),
-                connection_id: ticket.connection_id.clone(),
-                state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
-                kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
-                cancellation_id: entry.request.request_identity.cancellation_id.clone(),
-                state: eliot_ors::ActivationLifecycleState::Pending,
-                lifecycle_order: 0,
-                result_sha256: None,
-                claim_owner: None,
-                claim_expires_at_unix_ms: None,
-                successor_of: entry.successor_of.clone(),
-                successor_ticket_id: None,
-                terminal_reason: None,
-            },
-            1,
-        )
-        .expect("stage live activation lifecycle");
-    kernel
-        .generation_gateway
-        .ors
-        .claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
-        .expect("claim live activation lifecycle");
+    activation_v2_seed_claimed_lifecycle(&kernel.generation_gateway.ors, &ticket);
     kernel
         .agent_activation_pending
         .lock()
@@ -847,44 +875,17 @@ fn retain_test_activation_result(
     ticket: &AgentActivationResolutionTicket,
     result: &eliot_protocol::AgentActivationResolutionResult,
 ) {
-    let entry = activation_v2_entry(ticket);
-    ors.stage_activation_ticket(
-        &eliot_ors::ActivationLifecycleRecord {
-            ticket_id: ticket.ticket_id.clone(),
-            ticket_sha256: ticket.ticket_sha256.clone(),
-            ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
-            activation_request_id: entry
-                .request
-                .request_identity
-                .request
-                .metadata
-                .request_id
-                .as_str()
-                .to_owned(),
-            activation_request_sha256: entry.request.request_sha256.clone(),
-            connection_id: ticket.connection_id.clone(),
-            state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
-            kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
-            cancellation_id: entry.request.request_identity.cancellation_id.clone(),
-            state: eliot_ors::ActivationLifecycleState::Pending,
-            lifecycle_order: 0,
-            result_sha256: None,
-            claim_owner: None,
-            claim_expires_at_unix_ms: None,
-            successor_of: None,
-            successor_ticket_id: None,
-            terminal_reason: None,
-        },
-        1,
-    )
-    .expect("stage activation lifecycle");
-    ors.claim_activation_ticket(&ticket.ticket_id, "eliotd", 2, 3)
-        .expect("claim activation lifecycle");
+    // The claim seed and the commit clock move together: the claim is taken
+    // from `unix_ms()` with the production lease (see
+    // `activation_v2_seed_claimed_lifecycle`), and the commit argument is the
+    // fresh `unix_ms()` production passes at `agent_bridge.rs:1179`, so the
+    // commit lands inside the live lease and strictly before the deadline.
+    activation_v2_seed_claimed_lifecycle(ors, ticket);
     ors.commit_activation_result(
         &activation_retention_record(ticket, result),
         "eliotd",
         None,
-        2,
+        unix_ms(),
     )
     .expect("commit activation result");
 }
@@ -898,7 +899,7 @@ fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
         unix_ms()
     ));
     std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
-    let ticket = activation_v2_ticket("activation-ticket-rehydrate", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-rehydrate");
     let result = activation_v2_resolved(&ticket, 1_000);
     let ors_path = root.join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
@@ -973,7 +974,7 @@ fn activation_result_ledger_typed_corruption_fences_startup() {
         unix_ms()
     ));
     std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
-    let ticket = activation_v2_ticket("activation-ticket-corrupt", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-corrupt");
     let mut result = activation_v2_resolved(&ticket, 1_000);
     result.ticket_sha256 = "e".repeat(64);
     let ors_path = root.join(".eliot").join("kernel-ors.redb");
@@ -991,7 +992,7 @@ fn activation_result_ledger_typed_corruption_fences_startup() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_resolves_canonical_v2_envelope_result() {
-    let ticket = activation_v2_ticket("activation-ticket-v2", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-v2");
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("canonical", &ticket, Some(result.clone()));
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
@@ -1007,7 +1008,7 @@ fn activation_host_request_resolves_canonical_v2_envelope_result() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_without_any_result_is_unknown() {
-    let ticket = activation_v2_ticket("activation-ticket-unknown", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-unknown");
     let probe = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("unknown", &ticket, None);
     let envelope = activation_host_envelope(&ticket, &probe.result_sha256, &ticket.connection_id);
@@ -1025,7 +1026,7 @@ fn activation_host_request_without_any_result_is_unknown() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_non_resolved_v2_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-negative", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-negative");
     let failed = activation_v2_failed(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("negative", &ticket, Some(failed.clone()));
     let envelope = activation_host_envelope(&ticket, &failed.result_sha256, &ticket.connection_id);
@@ -1043,7 +1044,7 @@ fn activation_host_request_non_resolved_v2_fails_closed() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_wrong_connection_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-conn", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-conn");
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) = activation_kernel_with_ticket("connection", &ticket, Some(result.clone()));
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, "other-connection");
@@ -1059,6 +1060,230 @@ fn activation_host_request_wrong_connection_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
+// #203 identity refusals on the host-request resolution leg. Each case mutates
+// exactly one identity field of a fully valid envelope, so the comparison that
+// fires is the one the case names. `HostRequestEnvelope::validate()` never runs
+// on this path, so every mutated envelope is re-digested: a stale
+// `envelope_sha256` would let the case pass for a weaker reason than the
+// refusal it is meant to prove.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_wrong_ticket_digest_fails_closed() {
+    let ticket = activation_v2_ticket("activation-ticket-wrong-digest");
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("wrong-digest", &ticket, Some(result.clone()));
+    let mut envelope =
+        activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
+    envelope
+        .activation_binding
+        .as_mut()
+        .expect("activation binding")
+        .ticket_sha256 = "9".repeat(64);
+    let envelope = envelope
+        .with_computed_digest()
+        .expect("wrong-digest envelope digest");
+    // The ticket id and the result digest still match, so `validate_resolution`
+    // clears `eliot-protocol/src/lib.rs:4344` and `result.result_sha256 !=
+    // resolution_result_sha256` (`host_request_route.rs:3148`) and reaches
+    // `result.ticket_sha256 != binding.ticket_sha256`
+    // (`eliot-protocol/src/lib.rs:4345`).
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("a binding for another ticket digest must never resolve");
+    assert!(
+        matches!(error, TransportError::IdentityConflict),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        kernel
+            .agent_bridge_connections
+            .lock()
+            .expect("connection lock")
+            .is_empty(),
+        "the refusal holds no Session authority"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_wrong_state_fence_fails_closed() {
+    let ticket = activation_v2_ticket("activation-ticket-wrong-fence");
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("wrong-fence", &ticket, Some(result.clone()));
+    let mut envelope =
+        activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
+    // A valid but different State Fence: same shape, different epoch and
+    // generation, so the refusal cannot be attributed to an unparsable fence.
+    envelope.state_fence = StateFence::new(
+        test_epoch(2),
+        ResourceGeneration::new(2).expect("resource generation"),
+    );
+    let envelope = envelope
+        .with_computed_digest()
+        .expect("wrong-fence envelope digest");
+    // The ticket id, ticket digest and result digest all still match, so
+    // `result.ticket_state_fence != self.state_fence`
+    // (`eliot-protocol/src/lib.rs:4347`) is the only clause left to fire, and it
+    // is the only State Fence check on this leg.
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("a binding under another State Fence must never resolve");
+    assert!(
+        matches!(error, TransportError::IdentityConflict),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        kernel
+            .agent_bridge_connections
+            .lock()
+            .expect("connection lock")
+            .is_empty(),
+        "the refusal holds no Session authority"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_wrong_ticket_identity_fails_closed() {
+    // The card's wrong-ticket clause cannot be reached by mutating the envelope.
+    // `host_request_activation_resolution_under_transition` loads the lifecycle
+    // BY `activation_binding.ticket_id` (`:3117-3122`) and then compares
+    // `result.ticket_id` against that same string (`:3147`), so for any ticket
+    // that exists the comparison is self-satisfying, and for a ticket that does
+    // not exist the lookup already returned `UnknownRequest` (a duplicate of
+    // `activation_host_request_without_any_result_is_unknown`). This case
+    // therefore reaches the clause through the only route that is both reachable
+    // and honest: ORS keys a retention row by the lifecycle ticket and never
+    // inspects the typed payload (`ActivationResultRetentionRecord::validate`),
+    // so the bound ticket's row is made to carry a second, real ticket's sealed
+    // result. Both identities are seeded, claimed and retained, so the refused
+    // pair is not a fabricated string.
+    let mut impostor = activation_v2_ticket("activation-ticket-wrong-id-impostor");
+    impostor.activation_request_id =
+        RequestId::new("activation-request-wrong-id-impostor").expect("request id");
+    let impostor = impostor
+        .with_computed_digest()
+        .expect("impostor ticket digest");
+    let impostor_result = activation_v2_resolved(&impostor, 1_000);
+    let ticket = activation_v2_ticket("activation-ticket-wrong-id-bound");
+    let (root, kernel) = activation_kernel_with_ticket("wrong-ticket", &ticket, None);
+    activation_v2_seed_claimed_lifecycle(&kernel.generation_gateway.ors, &impostor);
+    kernel
+        .generation_gateway
+        .ors
+        .commit_activation_result(
+            &activation_retention_record(&impostor, &impostor_result),
+            "eliotd",
+            None,
+            unix_ms(),
+        )
+        .expect("retain the impostor result");
+    kernel
+        .generation_gateway
+        .ors
+        .commit_activation_result(
+            &activation_retention_record(&ticket, &impostor_result),
+            "eliotd",
+            None,
+            unix_ms(),
+        )
+        .expect("retain the impostor result under the bound ticket");
+    let envelope = activation_host_envelope(
+        &ticket,
+        &impostor_result.result_sha256,
+        &ticket.connection_id,
+    );
+    // The retained payload is internally valid and its digest matches the
+    // lifecycle, so `result.validate()` passes and the first clause of the pair
+    // at `host_request_route.rs:3147-3150` — `result.ticket_id !=
+    // activation_binding.ticket_id` — is the one that fires.
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("a result bound to another ticket must never resolve");
+    assert!(
+        matches!(error, TransportError::IdentityConflict),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        kernel
+            .agent_bridge_connections
+            .lock()
+            .expect("connection lock")
+            .is_empty(),
+        "the refusal holds no Session authority"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_result_admission_fences_an_elapsed_claim_lease() {
+    // The seeded claim in every other fixture is fresh, so nothing else enters
+    // the durable claimed-but-elapsed branch (`store.rs:9389-9400`). This case
+    // constructs that state directly, without sleeping and without a sentinel:
+    // `claim_activation_ticket` refuses only an expiry that is not later than
+    // its own `now` (`store.rs:9218-9223`) and a `now` at or past the kernel
+    // deadline (`store.rs:9275`), so a claim taken entirely inside its own past
+    // lease is admitted and leaves the row durably `Claimed`.
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-elapsed-lease-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
+    let ticket = activation_v2_ticket("activation-ticket-elapsed-lease");
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let ors_path = root.join(".eliot").join("kernel-ors.redb");
+    let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
+    activation_v2_stage_lifecycle(&ors, &ticket);
+    let claim_now = unix_ms().saturating_sub(5_000);
+    let claim_expires_at = claim_now.saturating_add(1);
+    ors.claim_activation_ticket(&ticket.ticket_id, "eliotd", claim_now, claim_expires_at)
+        .expect("claim a lease that has already elapsed")
+        .expect("a staged activation lifecycle is claimable");
+    let conflict = ors
+        .commit_activation_result(
+            &activation_retention_record(&ticket, &result),
+            "eliotd",
+            None,
+            unix_ms(),
+        )
+        .expect_err("an elapsed claim lease must fence durable result admission");
+    assert!(
+        matches!(
+            conflict,
+            eliot_ors::OrsError::ActivationLifecycleStateConflict { .. }
+        ),
+        "unexpected error: {conflict:?}"
+    );
+    let lifecycle = ors
+        .load_activation_lifecycle(&ticket.ticket_id)
+        .expect("load activation lifecycle")
+        .expect("durable activation lifecycle");
+    assert_eq!(
+        lifecycle.state,
+        eliot_ors::ActivationLifecycleState::Reconciling,
+        "an elapsed claim moves the row to Reconciling"
+    );
+    assert_eq!(
+        lifecycle.terminal_reason.as_deref(),
+        Some("claim lease elapsed before durable result admission"),
+        "the reconciliation reason is the product's own"
+    );
+    drop(ors);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// ---------------------------------------------------------------------------
 // #203 smallest slice: the legacy raw P-04 projection leg re-validates the
 // retained result against its exact pending ticket before mutating anything.
 // A tampered negative result is rejected with the pending evidence preserved.
@@ -1070,7 +1295,7 @@ fn activation_host_request_wrong_connection_fails_closed() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_projected_retry_answers_from_retained_result() {
-    let ticket = activation_v2_ticket("activation-ticket-projected-retry-203", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-projected-retry-203");
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
         activation_kernel_with_ticket("projected-retry-203", &ticket, Some(result.clone()));
@@ -1113,7 +1338,7 @@ fn activation_host_request_projected_retry_answers_from_retained_result() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-projected-conn-203", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-projected-conn-203");
     let result = activation_v2_resolved(&ticket, 1_000);
     let (root, kernel) =
         activation_kernel_with_ticket("projected-conn-203", &ticket, Some(result.clone()));
@@ -1143,11 +1368,28 @@ fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
     reason = "the restart test keeps direct-seed and live-bridge routes side by side"
 )]
 fn activation_terminal_negative_replay_survives_restart_without_pending_entry() {
-    let no_result_ticket = activation_v2_ticket("activation-ticket-no-result-deadline", 2_000);
-    let no_result = activation_v2_failed(&no_result_ticket, 1_000);
-    let (no_result_root, no_result_kernel) =
-        activation_kernel_with_ticket("no-result-deadline", &no_result_ticket, None);
-
+    // The result-less deadline leg runs on the live bridge fixture, because the
+    // bridge leg must still validate before `commit_fresh_activation_result`
+    // reaches its inclusive deadline gate (`agent_bridge.rs:1432-1434`). The
+    // ticket deadline is already in the past when the fixture seeds it: the
+    // pending entry's ticket and the ORS lifecycle carry that one deadline, and
+    // `activation_v2_seed_now` seeds both clocks at the last instant the ticket
+    // was still admissible, so the submit-time `unix_ms()` is past it with no
+    // waiting and no sentinel.
+    let elapsed_deadline = unix_ms().saturating_sub(1_000);
+    let (no_result_root, no_result_kernel, no_result_ticket) =
+        activation_kernel_with_live_bridge_ticket(
+            "activation-ticket-no-result-deadline",
+            elapsed_deadline,
+        );
+    // `AgentActivationResolutionResult::new` requires a non-zero
+    // `resolved_at_unix_ms` strictly earlier than the ticket deadline
+    // (`activation_resolution.rs:861-866`), so this result was resolved one
+    // millisecond before the deadline it must miss.
+    let no_result = activation_v2_failed(
+        &no_result_ticket,
+        no_result_ticket.kernel_deadline_unix_ms.saturating_sub(1),
+    );
     let timeout = no_result_kernel
         .submit_agent_activation_result(
             eliot_protocol::AgentActivationResultSubmit::new(no_result.clone())
@@ -1159,23 +1401,37 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
         "unexpected no-result deadline error: {timeout:?}"
     );
     drop(no_result_kernel);
-    let restarted_no_result = KernelComposition::new(KernelConfig::new(&no_result_root))
-        .expect("restart without a retained result");
-    let unknown_after_restart = restarted_no_result
-        .submit_agent_activation_result(
-            eliot_protocol::AgentActivationResultSubmit::new(no_result.clone())
-                .expect("no-result submit"),
+    // The refusal admits no durable result, and the still-claimed lifecycle is
+    // never rehydrated: `rehydrate_activation_lifecycles` refuses every live
+    // `Pending`/`Claimed` row (`agent_bridge.rs:2699-2708`), so the next
+    // incarnation fences startup instead of restoring a pending entry.
+    {
+        let ors = eliot_ors::RedbRecoveryStore::open(
+            &no_result_root.join(".eliot").join("kernel-ors.redb"),
         )
-        .expect_err("a result-less ticket is not restored as a pending entry");
+        .expect("reopen the no-result ORS");
+        let lifecycle = ors
+            .load_activation_lifecycle(&no_result_ticket.ticket_id)
+            .expect("load the no-result lifecycle")
+            .expect("durable no-result lifecycle");
+        assert!(
+            lifecycle.result_sha256.is_none(),
+            "a result-less deadline refusal admits no durable result"
+        );
+    }
+    let Err(no_result_restart) = KernelComposition::new(KernelConfig::new(&no_result_root)) else {
+        panic!("a live result-less claim must never be rehydrated");
+    };
     assert!(
-        matches!(unknown_after_restart, TransportError::UnknownRequest),
-        "unexpected result-less restart error: {unknown_after_restart:?}"
+        matches!(no_result_restart, KernelBuildError::Ors(_)),
+        "unexpected result-less restart error: {no_result_restart:?}"
     );
-    drop(restarted_no_result);
     let _ = std::fs::remove_dir_all(no_result_root);
 
-    let (commit_root, commit_kernel, commit_ticket) =
-        activation_kernel_with_live_bridge_ticket("activation-ticket-negative-commit-restart");
+    let (commit_root, commit_kernel, commit_ticket) = activation_kernel_with_live_bridge_ticket(
+        "activation-ticket-negative-commit-restart",
+        activation_v2_deadline(AGENT_BRIDGE_ACTIVATION_WINDOW_MS),
+    );
     let commit_failed = activation_v2_failed(&commit_ticket, 1_000);
     let commit_ack = commit_kernel
         .submit_agent_activation_result(
@@ -1234,7 +1490,7 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     drop(restarted_commit);
     let _ = std::fs::remove_dir_all(commit_root);
 
-    let ticket = activation_v2_ticket("activation-ticket-negative-restart", 2_000);
+    let ticket = activation_v2_ticket("activation-ticket-negative-restart");
     let failed = activation_v2_failed(&ticket, 1_000);
     let retained_root = std::env::temp_dir().join(format!(
         "eliot-kernel-activation-negative-restart-{}",
