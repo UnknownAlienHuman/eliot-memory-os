@@ -141,6 +141,16 @@ path = ".github/workflows/repository-policy.yml"
 token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
 reason = "The policy intentionally rejects restoration of the predecessor file."
 
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "The security surface record names retired authority files that must stay absent."
+
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "The security surface record names retired authority files that must stay absent."
+
 # The three surfaces below own the retirement rule itself. A rule that forbids a
 # token must spell that token out, so each is exempt from its own prohibition.
 # Adding a token here does not weaken the check: every other path in every other
@@ -366,6 +376,111 @@ reason = "The unit-test fixture preserves an incoming legacy identity and is not
 source = "scripts/verify-legacy-config-retirement.py"
 path = "docs/notes.md"
 reason = "The self-test fixture uses docs/notes.md as a temporary test path."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/AGENTS.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/ARCHITECTURE.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/IMPLEMENTATION.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/BUILD.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/TESTING.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/SCHEMA.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/CHANGELOG.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/implementation/README.md"
+reason = "Name-only candidate discovery paths scanned for potential workspace source documents."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_package_reader_closure.py"
+path = "docs/architecture/A.md"
+reason = "Test fixture path used in package reader closure tests."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_package_reader_closure.py"
+path = "docs/architecture/H.md"
+reason = "Test fixture path used in package reader closure tests."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_wasm_component_lane.py"
+path = "docs/unrelated.md"
+reason = "Test fixture path used in WASM component lane tests."
+
+[[repository_paths.allow_missing]]
+source = "scripts/verify-github-workflows.py"
+path = "docs/note.md"
+reason = "Test fixture path used in GitHub workflow verification tests."
+
+[[repository_paths.allow_missing]]
+source = "scripts/work_unit_gate/fixtures/pr_prose_override.md"
+path = "docs/architecture/ARCHITECTURE_CONTRACT.md"
+reason = "Test fixture path used in work unit gate tests."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/conformance.toml"
+reason = "Retired authority surface record."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/UNIMPLEMENTED.md"
+reason = "Retired authority surface record."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "Retired authority surface record."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "Retired authority surface record."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/BRANCH_INTEGRATION_CLEANUP_HANDOFF_2026-08-28.md"
+reason = "Retired authority surface record."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/M5_OPERATIONS_RUNBOOK.md"
+reason = "Retired authority surface record."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/PRODUCTION_CUTOVER_RUNBOOK.md"
+reason = "Retired authority surface record."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/RUNTIME_LIVE_V3_HANDOFF_2026-08-22.md"
+reason = "Retired authority surface record."
 
 [documentation_pipeline]
 shards_front_door = "scripts/docs_shards.py"

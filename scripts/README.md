@@ -32,6 +32,10 @@ committed as repository authority.
 | `verify-process-deadline-owner.py` | Source-shape discriminator for the #83 failure where a resumed process receives a start receipt while the wall-deadline owner thread is never spawned | Static source-shape evidence only; not Windows containment or wall-time proof |
 | `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
 | `audit-architecture-boundaries.py` | Detect forbidden dependencies, SurrealDB leakage, untracked direct process launch, placeholders, and exact tracked debt | Static source/build architecture evidence only |
+| `audit-context-measurement-ownership.py` | Source-bound measurement ownership and classification verifier | Static source classification evidence only |
+| `gen_capability_cell_registry.py` | Capability cell registry code generator for functional capability declarations | Generated registry projection only |
+| `prepare-dependency-policy-inputs.py` | Materializes approved offline dependency-policy scanner and SurrealDB inputs | Local dependency input preparation only |
+| `verify-retired-authority-surfaces.py` | Fail-closed verifier ensuring retired campaign and authority paths remain absent | Static authority surface policy evidence only |
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for declared source subtrees | Routing/control-plane evidence only |
 | `verify-core-daemon-inventory.py` | Verify the core-daemon inventory identity, owner references, proof requirements, exclusions, and fixed proof ceiling | Static inventory/routing evidence only |
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration signals | Static source-quality evidence only |
