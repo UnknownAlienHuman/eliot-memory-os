@@ -373,6 +373,8 @@ jobs:
         # stays closed (oracle changes then need human bootstrap).
         # (anonymous gh api needs no token)
         if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
