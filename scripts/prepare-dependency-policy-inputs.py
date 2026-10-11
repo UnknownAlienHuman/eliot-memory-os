@@ -807,6 +807,16 @@ def main() -> int:
 
     for record in step_records:
         print(f"  [{record['status']}] {record['input']} ({record['evidence_scope']}): {record['detail']}")
+    # Supply dummy GH_TOKEN to GITHUB_ENV if running in GitHub Actions and unset,
+    # so unauthenticated gh CLI invocations in subsequent steps do not fail on missing env var.
+    github_env = os.environ.get("GITHUB_ENV")
+    if github_env and os.path.exists(github_env) and "GH_TOKEN" not in os.environ:
+        try:
+            with open(github_env, "a", encoding="utf-8") as f:
+                f.write("GH_TOKEN=\n")
+        except OSError:
+            pass
+
     if preparation_ready(manifest):
         print(
             f"PREPARE_DEPENDENCY_POLICY_INPUTS: READY (profile={args.profile}, "
