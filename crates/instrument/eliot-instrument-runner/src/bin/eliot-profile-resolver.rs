@@ -136,40 +136,135 @@ use eliot_process_executor::{
     environment_projection_digest,
 };
 
+/// Exit code for a resolved, receipt-issued route whose aggregate outcome is PASS.
+///
+/// The `0` / `1` split is the same operator contract `eliot-testd` and
+/// `eliot-verifier-selfchange` use, so a caller can treat a nonzero exit as a
+/// fail-closed refusal without reading the receipt to learn why.
 const EXIT_PASS: i32 = 0;
+/// Exit code for any fail-closed refusal, including a non-PASS aggregate.
 const EXIT_REFUSED: i32 = 1;
+
+/// Validation revision pinned into every stored dispatch validation context.
+///
+/// The one-shot context shape the `eliot-verifier-selfchange` bootstrap stores;
+/// no other revision is ever admitted here.
 const VALIDATION_REVISION: u64 = 1;
+
+/// Registry generation the shared verification registry is admitted at.
+///
+/// The route profiles ship at revision 1, and a supply-chain receipt is validated
+/// against the admitted spec digest at exactly the generation the registry is
+/// assembled with, so one fixed generation keeps an attested receipt and its
+/// registry bound together on either side of a parity comparison.
 const VERIFICATION_REGISTRY_GENERATION: u64 = 1;
+
+/// Authority epoch lineage of this one-shot resolution process.
+///
+/// P-07 fences every permit of this run under the epoch it is activated with.
+/// The lineage names this process instance rather than a durable authority: the
+/// run holds one ephemeral authority and revokes nothing.
 const EPOCH_LINEAGE: &str = "eliot-verification-profile-resolver";
+
+/// Product identity every stage invocation of this run belongs to.
 const ADMITTED_PRODUCT: &str = "eliot";
+
+/// Ceiling on retained stdout bytes for one admitted stage child.
+///
+/// Bounded structurally: `ResourceLimits::new` refuses a zero ceiling, so a
+/// stage's evidence is bounded rather than unbounded, and the executor retains
+/// at most this much per stream.
 const STAGE_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Wall bound for one admitted stage child, in milliseconds.
 const STAGE_WALL_TIMEOUT_MS: u64 = 3_600_000;
+
+/// Ceiling on descendant processes for one admitted stage child.
 const STAGE_MAX_DESCENDANTS: u32 = 256;
+
+/// Ceiling on the retained bytes of one observed tool version line.
+///
+/// Bounded so a tool that answers `--version` with an unbounded stream cannot
+/// turn the version read into unbounded retention. It is far above any real
+/// tool's version line, so an ordinary version is recorded in full and only a
+/// runaway read is refused.
 const MAX_TOOL_VERSION_BYTES: usize = 4096;
+
+/// Wall bound for the permit-bound `--version` observation child, in milliseconds.
+///
+/// A version read is a short bounded probe, not a stage: this is deliberately
+/// far below [`STAGE_WALL_TIMEOUT_MS`] so a tool that hangs instead of answering
+/// its version is refused here rather than holding a stage-sized launch open.
 const VERSION_WALL_TIMEOUT_MS: u64 = 60_000;
+
+/// Per-stream capture ceiling for the permit-bound `--version` observation child.
+///
+/// Set above [`MAX_TOOL_VERSION_BYTES`] so an ordinary version is captured whole
+/// and still bounds what a runaway tool can write. Because the retained prefix
+/// preview omits any suffix past this ceiling, `observed_tool_version` refuses a
+/// read that hit it instead of reporting a truncated line as the version.
 const VERSION_STDOUT_BYTES: u64 = 64 * 1024;
+
+/// Ceiling on descendant processes for the permit-bound `--version` child.
+///
+/// A version read answers with a single line from the tool itself, so a wider
+/// descendant tree than [`STAGE_MAX_DESCENDANTS`] is not a normal observation.
 const VERSION_MAX_DESCENDANTS: u32 = 8;
+
+/// Bound on waiting for the permit-bound `--version` child to settle.
+///
+/// Set equal to [`VERSION_WALL_TIMEOUT_MS`], the wall bound that child was
+/// sealed with, because that deadline is what makes the wait finite: the
+/// executor's own operation-bound deadline watcher terminates the version child
+/// at it, so the view reaches a terminal lifecycle at or before this bound and
+/// this constant invents no timing policy of its own. A child still not settled
+/// at the bound is refused, never reported.
 const VERSION_OBSERVE_TIMEOUT: Duration = Duration::from_millis(VERSION_WALL_TIMEOUT_MS);
+
+/// Cadence for observing the permit-bound `--version` child's lifecycle.
+///
+/// Reused rather than introduced: the same 25ms bound is the executor's own
+/// terminal-wait poll, and the same cadence the two existing production callers
+/// of a real child already poll [`ProcessExecutor::inspect`] at — the
+/// `RECONCILE_OBSERVE_POLL` of `wasm_p03_adapter.rs` and `BOUND_RUN_POLL` of
+/// `eliot-git-bridge`.
 const VERSION_OBSERVE_POLL: Duration = Duration::from_millis(25);
 
+/// The exact invocation this binary reads.
 struct Request {
+    /// Closed profile alias naming the route to resolve.
     alias: String,
+    /// Admitted source root; the stage working directory.
     source_root: PathBuf,
+    /// Admitted external build target root.
     target_root: PathBuf,
+    /// Admitted cache root.
     cache_root: PathBuf,
+    /// Declared environment dependency names this run declares.
     declared_environments: Vec<String>,
+    /// Caller-chosen receipt path, when the caller wants the receipt on disk.
     receipt_out: Option<PathBuf>,
+    /// Caller-chosen counterpart receipt this run compares against, when the
+    /// caller has one.
     compare_against: Option<PathBuf>,
 }
 
+/// Fail-closed refusals of the verification-route resolution entry.
 #[derive(Debug)]
 enum CliError {
+    /// The invocation text is missing a required field or names an unknown one.
     Usage(String),
+    /// A typed contract refused the composition, the resolution, or the receipt.
     Contract(String),
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // One sentence for both variants on purpose: a caller reading stderr
+        // learns the run was REFUSED, and the `detail` after the colon says
+        // whether that was a malformed invocation or a typed contract refusal.
+        // The variant is still distinct to `From`/matching callers, which is
+        // where the two need to be told apart.
         match self {
             Self::Usage(detail) | Self::Contract(detail) => {
                 write!(f, "profile resolution refused: {detail}")
@@ -269,6 +364,19 @@ fn run() -> i32 {
             return EXIT_REFUSED;
         }
     };
+    // The comparison is part of this run's outcome, not a side report: when the
+    // caller supplied a counterpart receipt, the shared parity owner decides
+    // whether this run may proceed, and a refusal exits here.
+    //
+    // Ordering note, stated because it is load-bearing for the caller: this run's
+    // OWN receipt has already been persisted by `resolve_route` (it writes
+    // `--receipt-out` before returning), and it is retained on refusal on
+    // purpose — the receipt is this run's admission evidence and records what was
+    // actually observed, so destroying it would discard evidence of the very run
+    // whose parity was refused. A parity refusal therefore still leaves a receipt
+    // on disk alongside a nonzero exit, which is why `verify.ps1` discriminates
+    // the two refusals on this entry's `PARITY_PASS`/`PARITY_NON_PASS` verdict
+    // line rather than on the exit code or the receipt's existence.
     if let Err(error) = require_receipt_parity(&request, &receipt) {
         eprintln!("{error}");
         return EXIT_REFUSED;
@@ -283,6 +391,8 @@ fn run() -> i32 {
             return EXIT_REFUSED;
         }
     }
+    // A non-PASS normalized outcome stays a non-PASS exit: this entry reports
+    // the run's real outcome and never rounds it up to a success.
     if receipt.outcome.is_pass() {
         EXIT_PASS
     } else {
@@ -290,6 +400,25 @@ fn run() -> i32 {
     }
 }
 
+/// Requires this run's receipt and the caller's counterpart receipt to agree.
+///
+/// The comparison itself belongs to [`verify_profile_parity`]; this only reads
+/// the counterpart artifact the caller named and routes its verdict. A run with
+/// no `--compare-against` compares nothing — the counterpart receipt is the
+/// caller's exactly as the receipt path is — and a caller that wants I18.21's
+/// "local profile revision == CI profile revision" checked must therefore name
+/// it. Deserialization is the only thing this adds: a receipt read off disk
+/// bypassed every check in the issuance builder, and [`verify_profile_parity`]
+/// already runs `VerificationProfileReceipt::validate()` on both sides, so
+/// there is deliberately no second validation layer here.
+///
+/// # Errors
+///
+/// Returns a [`CliError::Contract`] refusal when the counterpart receipt cannot
+/// be read, is not a `VerificationProfileReceipt`, is internally inconsistent,
+/// or diverges from this run's receipt. Every one of those is a refusal that
+/// becomes [`EXIT_REFUSED`] in [`run`], never a warning and never a run that
+/// proceeds as if parity had held.
 fn require_receipt_parity(
     request: &Request,
     receipt: &VerificationProfileReceipt,
@@ -321,23 +450,46 @@ fn require_receipt_parity(
     }
 }
 
+/// Resolves one aliased route end to end and issues its shared receipt.
 fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliError> {
     let layout = TargetLayout::new(
         admitted_root(&request.source_root)?,
         admitted_root(&request.target_root)?,
         admitted_root(&request.cache_root)?,
     )?;
+    // The registry is assembled here from the builtin verification routes plus
+    // the supply-chain receipts this process observed, rather than supplied by
+    // the caller, because the registry is what decides which revision an alias
+    // admits and a caller-assembled registry could admit a different revision
+    // than the one CI resolves. It is built through the SAME shared owner
+    // `InstrumentRegistry::with_verification_route_profiles` that
+    // `resolve_verification_route` builds for the receipt below, so the
+    // admission this process performs on every stage and the admission the
+    // receipt builder performs are the same definitions at the same generation
+    // — the plan this process compiles therefore carries exactly the
+    // registry generation and digest `launch_plan_live` checks before it
+    // admits anything.
     let specs = builtin_specs()?;
     let receipts = observed_supply_chain(&specs, &layout.source_root)?;
     let registry = InstrumentRegistry::with_verification_route_profiles(
         VERIFICATION_REGISTRY_GENERATION,
         receipts.clone(),
     )?;
+
+    // `admitted_profile_for_alias` is the same closed-table lookup
+    // `resolve_verification_route` performs. It runs first so an alias the table
+    // does not admit fails closed before any tool is launched, rather than
+    // after a whole run of the wrong stage set.
     let route = admitted_profile_for_alias(&request.alias, &registry)?.clone();
     let compiler = ProfileCompiler::new(&registry);
     let admitted = compiler.compile_exact(&route.name, route.revision)?;
+
     let epoch = process_epoch()?;
     let clock = observation_clock(now_unix_ms());
+    // The workscope fence carries the same epoch and the same registry
+    // generation every stage launch is sealed under, so one run has exactly one
+    // admitted generation: a receipt whose scope fence and whose stage fences
+    // disagreed would name two generations for one run.
     let scope = WorkScope::new(
         ADMITTED_SCOPE_CLASS.to_owned(),
         StateFence::new(
@@ -345,6 +497,13 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
             ResourceGeneration::new(VERIFICATION_REGISTRY_GENERATION)?,
         ),
     )?;
+    // The attested environment material is the concrete fact this process
+    // actually holds: the admitted worktree class, the environment class, the
+    // admitted source root, the resolved alias, and the admitted profile
+    // digest. It is recorded into the digest rather than sniffed from ambient
+    // CI variables, so a CI-only difference is a difference in this material and
+    // shows up as a different environment digest on both sides of a parity
+    // comparison instead of as an invisible one.
     let environment = StageEnvironment::attest(
         ISOLATED_PROCESS_CLASS.to_owned(),
         &format!(
@@ -367,6 +526,10 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
             )?)
         })
         .collect::<Result<Vec<_>, CliError>>()?;
+
+    // Resolve the exact admitted revision against the same bindings the receipt
+    // is built from, before a single stage launches, so a refused binding is a
+    // refusal rather than a run whose receipt is later refused.
     compiler.resolve_full(
         &admitted.name,
         admitted.revision,
@@ -374,6 +537,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
         scope.clone(),
         environment.clone(),
     )?;
+
     let cell = Arc::new(DispatchCell::activate()?);
     let port = StagePort::seal_all(&cell, &epoch, &layout, &admitted)?;
     let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(&cell)));
@@ -383,12 +547,36 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
         layout: layout.clone(),
         port,
     };
+    // The live registry is REQUIRED here, not optional. `launch_plan_live`
+    // first checks that this plan was compiled against exactly this registry's
+    // generation and digest — and records every stage as an explicit missing
+    // proof if it was not, so a plan from a replaced generation can never
+    // launch under revoked admission. It then admits every stage through
+    // `AdmittedStage::admit_live`, which runs `refuse_if_revoked` against that
+    // live registry before sealing the grant, so a spec, parser, supply-chain
+    // receipt, or route replaced since this run's compilation fails closed here
+    // and the stage becomes a visible missing run rather than a child process.
+    // The registry-free `run_profile_stages` walks the same plan but passes
+    // `None` for the live registry, so it never performs either the
+    // generation/digest binding or the per-stage revocation check. Passing that
+    // registry in — the real one this run built from the observed supply-chain
+    // receipts, at the same generation the receipt builder uses — is what makes
+    // this resolver's stage admission a live admission rather than a walk over a
+    // stale compiled one.
     let plan = StageOrchestrator::plan(&admitted);
     let runs = block_on(StageOrchestrator::launch_plan_live(
         &runner, &registry, &plan, &launcher,
     ));
     let aggregate = ProfileAggregate::assemble(&plan, runs);
     require_launched_stage(&admitted, &aggregate)?;
+
+    // The same observed receipts travel into the receipt builder. It assembles
+    // its own registry from them, so `require_provenance` compares each run's
+    // recorded executable identity against the receipt that pins the real bytes
+    // of the tool this process launched. A receipt that did not travel here
+    // would leave every external stage with no admitted provenance, and the
+    // builder would refuse the receipt — which is the fail-closed behaviour
+    // I18.21:8 requires when the provenance data is absent.
     let receipt = resolve_verification_route(
         VERIFICATION_REGISTRY_GENERATION,
         VerificationRouteRequest {
@@ -407,6 +595,24 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
     Ok(receipt)
 }
 
+/// Requires at least one admitted stage to have really launched.
+///
+/// A run in which no stage produced a run record would hand the receipt builder
+/// an aggregate whose every stage is missing, and the only honest outcome of
+/// that is a refusal: a receipt cannot record a tool identity for a tool that
+/// never ran, so this entry fails closed instead of printing one. This is a
+/// reachability guard on the receipt, not a verdict — the aggregate's own
+/// normalized outcome still decides PASS.
+///
+/// The guard is NOT the diagnostic. Before it reduces the outcome to "launched
+/// no admitted stage", it reports what each stage's own run record already
+/// carries: every run whose evidence is `Missing` or `Omitted` is a refusal this
+/// run observed, and its exact reason text travels out with the refusal. A
+/// reader is therefore told WHICH stage refused and WHY, rather than only that
+/// the route launched nothing. The zero-launch verdict is unchanged and no
+/// refusal is dropped to reach it: a run that launched at least one stage still
+/// reports no per-stage reasons here, because this is a zero-launch guard and
+/// not a general stage report.
 fn require_launched_stage(
     admitted: &AdmittedProfile,
     aggregate: &ProfileAggregate,
@@ -426,6 +632,15 @@ fn require_launched_stage(
     Ok(())
 }
 
+/// Renders each refused stage's existing run record as one reported reason.
+///
+/// This reads the aggregate the orchestrator already assembled; it computes
+/// nothing new and launches nothing. Every run is rendered, whether it launched
+/// a tool or not, so a stage that failed with a non-empty executable identity
+/// still contributes its execution axis and outcome to the report. A run with a
+/// concrete missing/omitted reason reports that exact reason; a launched run
+/// reports the outcome it actually reached, so the report never claims a stage
+/// refused when it in fact ran.
 fn stage_refusals(aggregate: &ProfileAggregate) -> String {
     if aggregate.runs.is_empty() {
         return "no admitted stage produced a run record at all".to_owned();
@@ -446,6 +661,22 @@ fn stage_refusals(aggregate: &ProfileAggregate) -> String {
     format!("per-stage refusals: [{}]", reported.join("; "))
 }
 
+/// Pins every admitted external stage executable from the real bytes here.
+///
+/// I18.21 requires "executable/tool identities are pinned or recorded" and
+/// "external binaries require digest/provenance receipt". The digest below is the
+/// SHA-256 this process computed over the executable file the route will run, at
+/// the admitted spec digest, for the admitted generation. That receipt is what
+/// `require_provenance` compares the launch-recorded identity against, so a
+/// swapped tool fails closed instead of being receipted under a declared
+/// identity. An executable this process cannot read, or one the selected
+/// toolchain does not contain, is refused here rather than admitted with no
+/// digest.
+///
+/// One receipt is pinned per admitted spec, keyed by the spec's own kind
+/// identity — which is the key `SupplyChainTable` admits and `compile_exact`
+/// looks a stage's receipt up by — so the receipt set can never collide on two
+/// specs that happen to name the same executable.
 fn observed_supply_chain(
     specs: &[InstrumentSpec],
     source_root: &str,
@@ -458,6 +689,8 @@ fn observed_supply_chain(
                 ContractId::new(spec.kind.as_str())?,
                 spec.executable.clone(),
                 file_digest(&executable)?,
+                // No version is attested on this path, so none is claimed; a spec
+                // that pinned a version still gates inside admission.
                 None,
                 spec.digest(),
                 VERIFICATION_REGISTRY_GENERATION,
@@ -466,6 +699,7 @@ fn observed_supply_chain(
         .collect()
 }
 
+/// Requires one admitted root to be an existing, traversal-free absolute path.
 fn admitted_root(path: &Path) -> Result<String, CliError> {
     if !path.is_absolute() {
         return Err(CliError::Contract(format!(
@@ -482,6 +716,34 @@ fn admitted_root(path: &Path) -> Result<String, CliError> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+/// Resolves one admitted executable name to the real toolchain file it names.
+///
+/// An admitted spec names a TOOLCHAIN MEMBER, not a `PATH` entry: every
+/// builtin spec declares the bare name `cargo`, and the file that actually
+/// compiles the workspace is the `cargo` inside the selected rustup toolchain
+/// (issue #1914). A bare `PATH` lookup returns the FIRST `cargo` on `PATH`,
+/// which under a normal rustup install is `~/.cargo/bin/cargo` — a rustup
+/// PROXY, canonically `rustup.exe` itself. Pinning and launching that file
+/// made this process declare one identity (the proxy's bytes) while the
+/// profile declared another (the toolchain's `cargo`), and the executor
+/// correctly refused it as "not the admitted executable". The refusal was
+/// right; the resolution that produced the proxy was wrong.
+///
+/// So the admitted name is resolved through the SELECTED TOOLCHAIN ROOT, not
+/// through `PATH`. `eliot-testd` already owns this exact resolution
+/// (`resolve_selected_toolchain` in `bins/eliot-testd`), and this is the same
+/// rule rather than a second one: the workspace `rust-toolchain.toml` override
+/// wins, else the rustup default, else refusal. There is deliberately NO
+/// `PATH` fallback here — a fallback that resolved to whatever existed would
+/// reintroduce exactly the shim this defect is about, and "no toolchain" must
+/// read as a refusal rather than as a pass over some ambient binary.
+///
+/// Both identities therefore come from ONE owner function: the path this
+/// returns is the file that is hashed into the supply-chain receipt, the path
+/// `ExecutableObservation::observe_at_path` re-hashes into the sealed intent,
+/// and the path the child is launched as. The spec's declared name and the
+/// resolved file name are checked against each other by
+/// `AdmittedStage::check_executable`, so the two cannot silently disagree.
 fn resolve_tool(name: &str, source_root: &str) -> Result<PathBuf, CliError> {
     let candidate = Path::new(name);
     if candidate.is_absolute() || candidate.components().count() > 1 {
@@ -507,6 +769,14 @@ fn resolve_tool(name: &str, source_root: &str) -> Result<PathBuf, CliError> {
     )))
 }
 
+/// The `bin` directory of the ONE toolchain this workspace is verified with.
+///
+/// Selection reads the owner-published rustup metadata rather than probing for
+/// a directory that happens to contain a `cargo`: the workspace
+/// `rust-toolchain.toml` override names the channel the repo pins, and absent
+/// an override the rustup default is the toolchain the owner selected. Both
+/// are required to name exactly one INSTALLED toolchain — an ambiguous or
+/// absent selection fails closed rather than picking one.
 fn selected_toolchain_root(source_root: &str) -> Result<PathBuf, CliError> {
     let rustup_home = rustup_home()?;
     let source_root = current_source_root(source_root)?;
@@ -560,6 +830,12 @@ fn selected_toolchain_root(source_root: &str) -> Result<PathBuf, CliError> {
     Ok(toolchains.join(selected).join("bin"))
 }
 
+/// The owner-published rustup home, resolved without inventing a default.
+///
+/// `RUSTUP_HOME` wins when published; otherwise the per-user `.rustup`
+/// directory. A home that is absent, relative, or not an existing directory is
+/// a refusal: guessing a second location here would be the same
+/// "resolve to whatever exists" fallback this function exists to remove.
 fn rustup_home() -> Result<String, CliError> {
     let candidate = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
@@ -588,6 +864,12 @@ fn rustup_home() -> Result<String, CliError> {
         .into_owned())
 }
 
+/// The workspace this run verifies, as an absolute path.
+///
+/// The toolchain override is read from the same admitted root the stages run
+/// in rather than from the process working directory, so which toolchain is
+/// selected is a property of the admitted layout and not of wherever the
+/// caller happened to invoke this binary.
 fn current_source_root(source_root: &str) -> Result<String, CliError> {
     let root = PathBuf::from(source_root);
     if !root.is_absolute() || !root.is_dir() {
@@ -607,18 +889,18 @@ fn current_source_root(source_root: &str) -> Result<String, CliError> {
         .into_owned())
 }
 
+/// The channel the admitted workspace root pins, when it pins one.
+///
+/// A workspace with no override is not an error: the rustup default is then the
+/// owner's selected toolchain. A present `rust-toolchain.toml` is parsed by the
+/// existing bootstrap TOML owner; an unreadable, malformed, blank, or
+/// control-bearing override is a refusal and never falls through to the rustup
+/// default.
 fn read_toolchain_override(source_root: &Path) -> Result<Option<String>, CliError> {
     for name in ["rust-toolchain.toml", "rust-toolchain"] {
         let path = source_root.join(name);
-        match path.try_exists() {
-            Ok(false) => continue,
-            Ok(true) => {}
-            Err(error) => {
-                return Err(CliError::Contract(format!(
-                    "rust-toolchain override {} cannot be inspected: {error}",
-                    path.display()
-                )));
-            }
+        if !path.is_file() {
+            continue;
         }
         let text = read_bounded_metadata(&path, "rust-toolchain override")?;
         let value = if name.ends_with(".toml") {
@@ -652,6 +934,11 @@ fn read_toolchain_override(source_root: &Path) -> Result<Option<String>, CliErro
     Ok(None)
 }
 
+/// Reads one small owner metadata file under a fixed size bound.
+///
+/// The bound keeps an unreadable or substituted metadata file from being read
+/// into memory as part of identity selection; a file that is not UTF-8 or is
+/// implausibly large is refused rather than parsed leniently.
 fn read_bounded_metadata(path: &Path, what: &str) -> Result<String, CliError> {
     const MAX_METADATA_BYTES: usize = 64 * 1024;
     let bytes = std::fs::read(path).map_err(|error| {
@@ -667,6 +954,11 @@ fn read_bounded_metadata(path: &Path, what: &str) -> Result<String, CliError> {
         .map_err(|_| CliError::Contract(format!("{what} {} is not UTF-8", path.display())))
 }
 
+/// One top-level `key = "value"` string from a small TOML metadata file.
+///
+/// This reads only the flat scalar keys the rustup metadata actually publishes
+/// (`default_toolchain`, `default_host_triple`). It is a lookup over rustup's
+/// flat settings file, not the parser for repository `rust-toolchain.toml`.
 fn toml_string_value(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let (name, value) = line.split_once('=')?;
@@ -678,6 +970,13 @@ fn toml_string_value(text: &str, key: &str) -> Option<String> {
     })
 }
 
+/// The filename suffixes one bare tool name may resolve to on this host.
+///
+/// On a non-Windows host the name must already be complete, so only the empty
+/// suffix is admitted; on Windows the shell's own `PATHEXT` list is used when
+/// the host publishes it, so the file this entry pins and executes is the file
+/// the tool invocation would run. `PATHEXT` is a semicolon-separated list of
+/// bare suffixes rather than a path list, so it is split on `;` directly.
 fn executable_suffixes() -> Vec<String> {
     let suffixes = std::env::var("PATHEXT")
         .map(|pathext| {
@@ -694,6 +993,7 @@ fn executable_suffixes() -> Vec<String> {
     suffixes
 }
 
+/// The SHA-256 over the exact bytes of one file on this machine.
 fn file_digest(path: &Path) -> Result<String, CliError> {
     let bytes = std::fs::read(path).map_err(|error| {
         CliError::Contract(format!(
@@ -704,6 +1004,24 @@ fn file_digest(path: &Path) -> Result<String, CliError> {
     Ok(sha256_hex(&bytes))
 }
 
+/// The `--version` child through this ONE executor, bounded-poll until it settles.
+///
+/// `ProcessExecutor::reconcile` is TERMINAL-ONLY: `reconcile_inner` calls
+/// `join_streams` unconditionally (`eliot-process-executor/src/lib.rs`), which
+/// cancels the still-running capture thread's IO and can therefore quarantine
+/// this operation. `start` returns at child-CREATE, so the version child is
+/// still driving when the very next call lands — calling `reconcile` there is
+/// destructive, not merely early. So this wait observes the child the way the
+/// two existing production callers of a real child already do: bounded-poll the
+/// NON-DESTRUCTIVE `inspect` view of THIS operation on the executor that
+/// recorded the `start`, then perform the single terminal `reconcile`. Nothing
+/// here launches, cancels, re-permits, or retries anything, and the existing
+/// operation registry is the only state involved.
+///
+/// The bound is [`VERSION_OBSERVE_TIMEOUT`] and the cadence is
+/// [`VERSION_OBSERVE_POLL`]; both are justified on their constants. This returns
+/// only a TERMINAL view — the refusal is its own return type, so no caller can
+/// read an exit observation off a child that has not finished.
 fn await_terminal_view(
     executor: &WindowsProcessExecutor,
     operation: &OperationId,
@@ -727,15 +1045,54 @@ fn await_terminal_view(
     }
 }
 
+/// Observes one tool's reported version by really running that tool.
+///
+/// `ExecutableObservation::is_complete` refuses an identity that carries no
+/// tool version, so the version is a required datum here rather than an
+/// optional decoration: I18.21 requires that "executable/tool identities are
+/// pinned or recorded", and a version nobody read is neither. The text is
+/// whatever the tool itself printed on its own `--version` invocation, bounded
+/// to the first non-empty line and to [`MAX_TOOL_VERSION_BYTES`]; a tool that
+/// does not exit normally, prints nothing, or overruns that bound is refused
+/// rather than receipted under a synthesized value, because a wrong version is a
+/// pinned identity that does not describe the bytes it is bound to.
+///
+/// The `--version` child is a real launch and crosses the same physical
+/// process boundary every other launch in this entry does: it is sealed with
+/// its own one-shot P-07 dispatch permit by [`seal_version_request`] and started
+/// through the sole [`WindowsProcessExecutor`], so I10.8.2's single-executor
+/// rule holds for the version read exactly as it does for an admitted stage.
+/// Reading the tool's version is observation, not a verdict: this runs before
+/// any stage and derives nothing about the route's outcome, so it stays separate
+/// from the admitted stage launch in [`seal_stage_request`]. What the governed
+/// path adds is that the text it returns is the stdout this process's own
+/// executor really captured under a Kernel-validated permit, not bytes an
+/// ungoverned child wrote.
 fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, CliError> {
+    // The read gets its own `DispatchCell` because a P-07 dispatch permit is
+    // one-shot: the `--version` child is a distinct launch from the stage that
+    // follows it, so it can never consume the stage's permit or its stored
+    // validation context. It is still the same authority composition, the same
+    // epoch, and the same generation, so this run has exactly one epoch.
     let cell = Arc::new(DispatchCell::activate()?);
+    // ONE executor for the whole lifecycle of this read. Its registry is an
+    // instance field, so the `inspect` below must cross the same instance the
+    // `start` registered on; a second executor would read an empty registry and
+    // refuse `NotFound`, which says nothing about the operation.
     let executor = StageExecutor::with(&cell);
     let request = seal_version_request(&cell, epoch, executable)?;
     let receipt = block_on(executor.start(
         request,
         Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
     ))?;
+    // Settle first, then read the exit, then reconcile: the exit observation is
+    // only meaningful once the tree is closed, and the reconcile is the single
+    // terminal call the poll above was waiting to make safe.
     let view = await_terminal_view(executor.executor(), receipt.operation_id(), executable)?;
+    // `ExitDisposition::Completed` is the executor's own observed terminal
+    // classification, so this is the governed equivalent of the old
+    // `output.status.success()` test: a signalled, resource-limited, cancelled,
+    // or unclassifiable tree is refused here exactly as a nonzero exit was.
     let exit = view.exit().ok_or_else(|| {
         CliError::Contract(format!(
             "tool {} reported no exit observation while reading its version",
@@ -749,6 +1106,11 @@ fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, C
         )));
     }
     let evidence = block_on(executor.reconcile(receipt.operation_id().clone()))?;
+    // The version text is the stdout this executor really captured for that
+    // exact permit-bound operation, read back out of the reconciled evidence's
+    // bounded prefix preview. The preview is the transport-level prefix, so a
+    // version line longer than the retained bound is still refused below rather
+    // than silently truncated into a shorter "version".
     let stdout = evidence.stdout().ok_or_else(|| {
         CliError::Contract(format!(
             "tool {} retained no version output",
@@ -782,6 +1144,17 @@ fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, C
     Ok(version.to_owned())
 }
 
+/// Seals the one-shot permit-bound request for the `--version` observation read.
+///
+/// This is deliberately the same P-07 composition [`seal_stage_request`] uses —
+/// the same [`ProcessIntent`] fields, the same isolated [`isolated_projection`],
+/// the same fenced epoch and registry generation, and the same
+/// [`DispatchCell::issue`] one-shot issuance — so the read is a governed launch
+/// of the same kind the stage is, and the I10.8.2 single-executor rule covers it
+/// without exception. It differs only in what is being launched: the tool's own
+/// `--version` argv against the pinned executable, observed in the directory
+/// [`resolve_tool`] resolved it in, so a stage's working directory cannot change
+/// which bytes answer.
 fn seal_version_request(
     cell: &DispatchCell,
     epoch: &EpochId,
@@ -789,6 +1162,9 @@ fn seal_version_request(
 ) -> Result<ProcessRequest, CliError> {
     let projection = isolated_projection()?;
     let argv = vec!["--version".to_owned()];
+    // The operation identity is derived from the same real tool bytes the stage
+    // launch pins, so the read and the stage it precedes are bound to one
+    // concrete executable rather than to a name that could resolve elsewhere.
     let operation = format!(
         "verification-profile-version-{}",
         &sha256_hex(format!("{}\0{}", executable.display(), argv.join("\u{1}")).as_bytes())[..24]
@@ -803,6 +1179,8 @@ fn seal_version_request(
         executable.to_string_lossy().into_owned(),
         file_digest(executable)?,
         argv.clone(),
+        // The tool's own resolved parent, not the admitted source root: this
+        // observes the tool where `resolve_tool` pinned it.
         executable
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -839,6 +1217,10 @@ fn seal_version_request(
     )
 }
 
+/// Reads the exact invocation text this binary accepts.
+///
+/// Every field is required and none is defaulted: a missing root, a missing
+/// alias, or an unknown option is a refusal rather than a substituted value.
 fn read_request() -> Result<Request, CliError> {
     let mut args = std::env::args().skip(1);
     let mut alias = None;
@@ -888,6 +1270,7 @@ fn read_request() -> Result<Request, CliError> {
     })
 }
 
+/// The closed alias names, for the usage refusal only.
 fn aliases() -> String {
     PROFILE_ALIASES
         .iter()
@@ -896,6 +1279,11 @@ fn aliases() -> String {
         .join(", ")
 }
 
+/// Drives one already-resolved future on the calling thread.
+///
+/// The stage launches are synchronous under the sole Windows executor, so this
+/// binary needs no async runtime; the driver pumps the one future it owns and
+/// never sleeps, retries, or performs I/O of its own.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     let waker = std::task::Waker::noop();
     let mut context = std::task::Context::from_waker(waker);
@@ -908,8 +1296,28 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
+/// The canonical one-shot authority epoch of this resolution process.
+///
+/// `EpochLineageId` is a closed contract: `new` accepts exactly a 36-character
+/// canonical lowercase hyphenated UUID and refuses anything else, so the lineage
+/// is DERIVED into that shape rather than assembled from readable text. A
+/// `"{name}-{pid}-{nanos}"` string is a readable label, not a lineage, and is
+/// refused on every run — so the identity is minted in the spelling the contract
+/// actually validates instead of one that reads nicely and never works.
+///
+/// `EPOCH_LINEAGE` names what this process is, and `SessionId` below carries it
+/// where a human-readable product identity belongs; the epoch itself is a
+/// derived UUID because that is the only shape its owner accepts.
+///
+/// Uniqueness is what the one-shot fence needs: the epoch never leaves this
+/// process and the run revokes nothing, so per-process key bytes plus the
+/// process id and clock reading are sufficient and no durability is implied.
 fn process_epoch() -> Result<EpochId, CliError> {
     let mut material = fresh_key_bytes();
+    // Fold this process's own identity into the material so two resolutions
+    // that happened to draw the same bytes are still distinct. Each source is
+    // zero-extended into its own 8-byte lane, so the copy lengths match the
+    // destination exactly rather than panicking at runtime.
     material[..8].copy_from_slice(&u64::from(std::process::id()).to_le_bytes());
     material[8..16].copy_from_slice(&system_nanos().to_le_bytes());
     let mut lineage = String::with_capacity(36);
@@ -917,6 +1325,9 @@ fn process_epoch() -> Result<EpochId, CliError> {
         if matches!(index, 4 | 6 | 8 | 10) {
             lineage.push('-');
         }
+        // `write!` into the same String rather than appending a `format!` result:
+        // one formatting call, no intermediate allocation, and no way for the
+        // formatted hex to differ from what was pushed.
         write!(lineage, "{byte:02x}")
             .map_err(|_| CliError::Contract("epoch lineage is not formattable".to_owned()))?;
     }
@@ -926,6 +1337,7 @@ fn process_epoch() -> Result<EpochId, CliError> {
     Ok(EpochId::new(lineage, sequence)?)
 }
 
+/// Machine clock reading in Unix milliseconds, observed now.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -934,6 +1346,7 @@ fn now_unix_ms() -> u64 {
         })
 }
 
+/// Derives a process-unique nanosecond reading.
 fn system_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -942,6 +1355,12 @@ fn system_nanos() -> u64 {
         })
 }
 
+/// Builds one clock observation from an observed millisecond reading.
+///
+/// The `ClockReading` field is a signed millisecond count, so a reading beyond
+/// `i64::MAX` cannot be represented and is clamped to the maximum rather than
+/// wrapping into a negative instant. `cast_unsigned` states the intended
+/// conversion: the ceiling is a positive constant, so the sign is not lost here.
 fn observation_clock(now: u64) -> ClockReading {
     let ceiling = i64::MAX;
     let now = i64::try_from(now.min(ceiling.cast_unsigned())).unwrap_or(i64::MAX);
@@ -953,6 +1372,11 @@ fn observation_clock(now: u64) -> ClockReading {
     }
 }
 
+/// Generates fresh per-process key bytes without adding a randomness dependency.
+///
+/// Per-process uniqueness, not unpredictability, is what the one-shot replay
+/// fence needs: the key never leaves this process, is never persisted, and binds
+/// only permits this authority instance issued.
 fn fresh_key_bytes() -> [u8; 32] {
     static MIXER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
@@ -982,12 +1406,35 @@ fn fresh_key_bytes() -> [u8; 32] {
     out
 }
 
+/// The single dispatch-authority cell every stage of one run seals under.
+///
+/// The cell issues one permit per admitted stage and stores the validation
+/// context of EACH of those stages, keyed by the exact operation identity the
+/// permit was issued against. Every stage of a run shares the same authority
+/// epoch and generation, but each stage is issued its OWN one-shot nonce, its
+/// own fence nonce, and its own revision heads — so one shared context slot
+/// would compare a sealed request against ANOTHER stage's material and refuse
+/// a launch that was correctly admitted. The map is what makes the
+/// correspondence one-to-one: the context consumed with a request is the
+/// context minted with that same request.
+///
+/// The permit authority is still ONE authority for the whole run, and
+/// consumption is still one-shot: [`DispatchPermitAuthority::validate_and_consume`]
+/// keeps its own issued/consumed nonce ledger, and it is the only thing that
+/// consumes a permit.
 struct DispatchCell {
     authority: Mutex<DispatchPermitAuthority>,
+    /// One validation context per issued operation identity.
+    ///
+    /// Behind a mutex because the port that consumes it is shared, and because
+    /// a per-request entry is retained for the whole run so the context a
+    /// request is validated against is still resolvable after later requests
+    /// have been issued.
     contexts: Mutex<BTreeMap<String, DispatchValidationContext>>,
 }
 
 impl DispatchCell {
+    /// Activates one ephemeral authority around fresh in-memory key material.
     fn activate() -> Result<Self, CliError> {
         let pid = std::process::id();
         let nanos = system_nanos();
@@ -1000,6 +1447,7 @@ impl DispatchCell {
         })
     }
 
+    /// Issues the single permit-bound process request for one admitted stage.
     #[allow(clippy::too_many_arguments)]
     fn issue(
         &self,
@@ -1011,6 +1459,13 @@ impl DispatchCell {
         lease: ActionLeaseRef,
         nonce: String,
     ) -> Result<ProcessRequest, CliError> {
+        // The heads are cloned out BEFORE the issuance consumes them, and the
+        // validation context is built from that clone. This is the same value
+        // the permit was issued with, not a second source: the authority builds
+        // the permit from this exact `PermitIssuance` and re-proves the two
+        // against each other at consume time. `DispatchPermit` exposes no reader
+        // for its heads (that is deliberate — it is dispatch authority material),
+        // so the run context is pinned from the issuance the authority consumed.
         let pinned_heads = heads.clone();
         let issuance = PermitIssuance::new(
             lease,
@@ -1025,6 +1480,12 @@ impl DispatchCell {
             .lock()
             .map_err(|_| CliError::Contract("dispatch authority lock poisoned".to_owned()))?
             .issue(intent, issuance)?;
+        // The stored context pins the exact material the permit was issued
+        // with — the same fence, its own authority epoch, and the same revision
+        // heads — so consume-time validation compares the permit against THIS
+        // request's own snapshot rather than against ambient state. It is
+        // keyed by the operation identity it was minted for, so the executor
+        // can resolve it back from the request being validated.
         let context_epoch = fence.authority_epoch().clone();
         let context = DispatchValidationContext::new(
             observation_clock(issued_at_unix_ms),
@@ -1040,6 +1501,13 @@ impl DispatchCell {
         Ok(ProcessRequest::new(intent.clone(), permit)?)
     }
 
+    /// The validation context belonging to exactly the request being validated.
+    ///
+    /// The lookup key is the request's own operation identity, which is the same
+    /// key [`Self::issue`] stored its context under. A request this cell never
+    /// issued a permit for has no context and is refused here, before the
+    /// authority is consulted, so an unissued request can never be validated
+    /// against another request's material.
     fn context(
         &self,
         request: &ProcessRequest,
@@ -1066,6 +1534,9 @@ impl DispatchValidationPort for DispatchCell {
         request: ProcessRequest,
         observed: SuspendedProcessIdentity,
     ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+        // The context is resolved from the request itself, before the permit is
+        // consumed, so the one authority below compares the permit against the
+        // fence, epoch, and revision heads it was issued with and nothing else.
         let context = self.context(&request)?;
         self.authority
             .lock()
@@ -1075,7 +1546,29 @@ impl DispatchValidationPort for DispatchCell {
     }
 }
 
+/// The physical process boundary every admitted stage of this run crosses.
+///
+/// Each stage really starts a child through the sole [`WindowsProcessExecutor`]
+/// under this run's own dispatch cell, so the identity the receipt records for
+/// that stage is the identity of bytes this process actually executed.
+///
+/// The permit-bound `--version` read uses this same owner over its own cell, so
+/// every child this entry starts — the version probes and the stages alike —
+/// crosses the one executor composition below.
 struct StageExecutor {
+    /// The ONE physical executor every lifecycle call of this owner crosses.
+    ///
+    /// `WindowsProcessExecutor` owns the operation registry as an instance
+    /// field, so the registry that records a `start` must be the same instance
+    /// a later `inspect`, `cancel` or `reconcile` reads. Constructing one per
+    /// call discards the registration with the temporary, and the follow-up
+    /// call is then refused as `NotFound` against an empty registry — which is
+    /// a true statement about the wrong executor, not about the operation.
+    ///
+    /// The cell reaches this owner through this one field: the executor holds
+    /// the `Arc<dyn DispatchValidationPort>` built from it, so the port the
+    /// executor validates against and the cell this owner's caller sealed its
+    /// one-shot permits under are the same value.
     executor: WindowsProcessExecutor,
 }
 
@@ -1088,6 +1581,11 @@ impl StageExecutor {
         }
     }
 
+    /// The P-07 authority composition every lifecycle call crosses.
+    ///
+    /// Borrowed by [`await_terminal_view`] so the version probe's bounded
+    /// inspect-poll observes THIS executor's registry — the one the `start`
+    /// registered on — rather than a second executor that never saw the child.
     fn executor(&self) -> &WindowsProcessExecutor {
         &self.executor
     }
@@ -1124,19 +1622,59 @@ impl ProcessExecutor for StageExecutor {
     }
 }
 
+/// The [`StageLauncher`] that turns one admitted profile plan into launches.
+///
+/// Nothing here restates a command list. The executable, the argv, the working
+/// directory, the instrument contract, and the stage kind all come from the
+/// admitted plan the shared resolver produced, so a stage this launcher runs is
+/// exactly a stage the shared resolver admitted and no other.
 struct StageRoute {
+    /// Authority epoch every permit of this run is sealed under.
     epoch: EpochId,
+    /// Observed admission instant carried by every stage invocation.
     clock: ClockReading,
+    /// Admitted layout the stage working directory comes from.
     layout: TargetLayout,
+    /// Admitted stage launch provisions the orchestrator binds each stage
+    /// through: the per-stage permit source, the evidence sink, and the exact
+    /// sealed request already issued for the stage being launched.
+    ///
+    /// The sealed request is stored per stage rather than derived inside
+    /// `bind` because a dispatch permit is one-shot and the orchestrator asks
+    /// for the port before it knows which stage it is binding. [`StageRoute`]
+    /// seals one request per planned stage up front, in admitted plan order, so
+    /// the port hands each stage the request that was sealed for it and refuses
+    /// a bind for any other stage.
     port: StagePort,
 }
 
+/// The per-stage launch provisions the orchestrator binds one stage through.
+///
+/// The sealed requests are keyed by the exact durable stage identity the
+/// orchestrator walks, so a bind for a stage this run never sealed fails closed
+/// instead of producing a request for whatever stage happens to come next.
 struct StagePort {
+    /// One sealed, permit-bound request per admitted stage identity.
+    ///
+    /// Behind a mutex because `bind` takes `&self` (the port is shared) and
+    /// because removing the slot is what enforces one seal per stage.
     sealed: std::sync::Mutex<BTreeMap<String, ProcessRequest>>,
+    /// Evidence sink every stage launch retains through.
     sink: Arc<RetainedEvidenceSink>,
 }
 
 impl StagePort {
+    /// Seals one permit-bound request for every stage of the admitted plan.
+    ///
+    /// Sealing is a per-stage operation because the P-07 dispatch permit is
+    /// one-shot: one permit can never launch two children. Each stage's request
+    /// is bound to its own one-shot nonce, its own sealed intent, its own fence
+    /// nonce, and its own revision heads, and [`DispatchCell::issue`] stores the
+    /// matching validation context under that request's operation identity. The
+    /// stages of a run share one authority epoch and generation — so one
+    /// authority admits them all — but they do NOT share a fence or heads, so
+    /// they do not share a validation context either: each request is validated
+    /// against the context minted with it, and against no other request's.
     fn seal_all(
         cell: &DispatchCell,
         epoch: &EpochId,
@@ -1166,10 +1704,40 @@ impl StagePort {
     }
 }
 
+/// The exact process argv one admitted stage runs.
+///
+/// It is the stage's bound spec's declared [`InstrumentSpec::verification_command`]
+/// and nothing else: the real verification command the admitted profile
+/// revision executes, read from the one admitted registry a local entrypoint
+/// and CI both resolve. It is NOT derived from `argument_template` — that
+/// field bounds what a CALLER may contribute and admits only the empty vector
+/// for every builtin, which is why deriving argv from it ran each stage's
+/// executable with no arguments at all, producing a tool's default/help
+/// output rather than a package verification. An admitted verification
+/// command is non-empty by construction, so a stage can never again launch
+/// its executable with no command, and the argv is profile text read from the
+/// admitted registry rather than a command list restated here (I18.21:11).
 fn stage_argv(stage: &PlannedStage) -> Vec<String> {
     stage.stage.verification_command.clone()
 }
 
+/// Seals the one permit-bound process request for one admitted stage.
+///
+/// The executable is the one the admitted spec names, resolved to the real file
+/// on this machine, and the digest bound into the sealed intent is the SHA-256
+/// the executor computed over that file's bytes — the same observation
+/// `ExecutableObservation::observe_from_intent` re-derives at launch. The request
+/// is therefore the one the admitted stage runs, and a tool swapped between
+/// sealing and launch fails the executor's own observation check.
+///
+/// The tool version is observed by really running the tool's own version flag
+/// through [`observed_tool_version`] and keeping the first line that launch
+/// printed. A complete identity requires a non-empty version (`is_complete`
+/// refuses an observation without one), and no version is invented from the file
+/// name: a tool that cannot report one is refused here rather than receipted with
+/// a placeholder. That read is itself a governed launch under its own one-shot
+/// permit, so both children this function causes to exist — the `--version` probe
+/// and the stage itself — cross the single [`WindowsProcessExecutor`] boundary.
 fn seal_stage_request(
     cell: &DispatchCell,
     epoch: &EpochId,
@@ -1236,6 +1804,33 @@ fn seal_stage_request(
     )
 }
 
+/// The explicitly permitted toolchain environment every admitted stage child runs under.
+///
+/// `EnvironmentInheritance::None` is unchanged: the child receives no ambient
+/// variable and no inherited secret, and the executor still builds the child's
+/// environment block from exactly the names on this projection. What changed is
+/// that the projection is no longer EMPTY. A real admitted verification command
+/// — `cargo build`, `cargo clippy`, `cargo nextest run`, `cargo fmt --check` —
+/// locates its own `rustc`, its `rustup` shim, and any build-script interpreter
+/// through `PATH`, and `scripts/verify.ps1` already resolves the resolver's own
+/// executable through that same `PATH`; with nothing declared, such a command had
+/// no toolchain at all and could not be a verification. Only `PATH` is declared,
+/// and its value is read from the real process environment rather than
+/// synthesised, so the projection states a fact that already holds instead of
+/// inventing a search path.
+///
+/// This is the minimal set, not an inherited environment. I18.21:10 is why the
+/// value is named on the projection and hashed rather than leaked: the executor
+/// binds `environment_projection_digest` of exactly this projection as the
+/// stage's environment identity, so the permitted toolchain environment is now
+/// a declared, digest-bound, reviewable property of every admitted stage instead
+/// of an invisible ambient fact. Nothing switches to
+/// `EnvironmentInheritance::Allowlisted`, and every other ambient variable stays
+/// out.
+///
+/// A machine that publishes no `PATH` cannot run an admitted verification
+/// command at all, so that is refused here rather than sealed as a child that
+/// would fail for a reason the receipt could not explain.
 fn isolated_projection() -> Result<EnvironmentProjection, CliError> {
     let path = std::env::var(TOOLCHAIN_PATH_ENV).map_err(|error| {
         CliError::Contract(format!(
@@ -1250,6 +1845,19 @@ fn isolated_projection() -> Result<EnvironmentProjection, CliError> {
 }
 
 impl InstrumentRequestPort for StagePort {
+    /// Hands the stage the exact request this run sealed for it.
+    ///
+    /// The lookup key is the invocation's own request id, which is derived from
+    /// the admitted stage identity and the admitted argv, so a bind names the
+    /// stage it is for rather than consuming requests in plan order: a bind for
+    /// a stage this run never sealed finds nothing and is refused.
+    ///
+    /// The sealed slot is TAKEN, not copied. `ProcessRequest` deliberately does
+    /// not implement `Clone`: it holds the one-shot P-07 dispatch permit, so a
+    /// second bind for the same stage must fail here rather than hand the same
+    /// permit to a second child. Consuming the slot is what makes a
+    /// one-seal-per-stage run structural instead of a convention the caller has
+    /// to remember.
     fn bind(&self, invocation: &InstrumentInvocation) -> Result<ProcessRequest, RunnerError> {
         self.sealed
             .lock()
@@ -1297,6 +1905,9 @@ impl StageLauncher for StageRoute {
             kind: stage.stage.kind,
             profile: stage.route.stage().profile.clone(),
             target,
+            // Instrument-level arguments are never argv: the process argv comes
+            // from the admitted argument template in `seal`, so a stage cannot
+            // smuggle a command through this field.
             arguments: Vec::new(),
             input_artifacts: Vec::new(),
             declared_scope: ADMITTED_SCOPE_CLASS.to_owned(),
@@ -1309,14 +1920,29 @@ impl StageLauncher for StageRoute {
     }
 
     fn port(&self, _stage: &PlannedStage) -> &dyn InstrumentRequestPort {
+        // Every stage binds through the one port this run sealed against. The
+        // port keys its sealed requests by the admitted operation identity, so
+        // handing the same port to every stage cannot make one stage's permit
+        // launch another stage's child: the request each stage receives is the
+        // one sealed for that stage's own admitted identity.
         &self.port
     }
 
     fn sink(&self, _stage: &PlannedStage) -> Arc<dyn ProcessEvidenceSink> {
+        // One sink for the whole run, so every stage's retained records land in
+        // the same evidence store rather than in a per-stage buffer that would
+        // be dropped as soon as the stage returned.
         Arc::clone(&self.port.sink) as Arc<dyn ProcessEvidenceSink>
     }
 }
 
+/// The stable operation identity bound to one admitted stage and its argv.
+///
+/// Both the sealed request's operation id and the stage invocation's request id
+/// derive from it, which is what lets the request port hand each stage the exact
+/// request sealed for it. It names the admitted stage and the admitted argv, so
+/// two stages of the same profile never collide and a changed argument template
+/// changes the identity.
 fn operation_identity(stage_id: &str, argv: &[String]) -> String {
     let material = format!("{stage_id}\0{}", argv.join("\u{1}"));
     format!(
@@ -1325,6 +1951,11 @@ fn operation_identity(stage_id: &str, argv: &[String]) -> String {
     )
 }
 
+/// Process-owned sink that retains every record the process owner publishes.
+///
+/// The sink holds the executor's own evidence records for the whole run: a
+/// record the process owner published is evidence of what the stage actually
+/// did, and dropping it would mean the run retained evidence it then discarded.
 #[derive(Default)]
 struct RetainedEvidenceSink {
     records: Mutex<Vec<Vec<u8>>>,
