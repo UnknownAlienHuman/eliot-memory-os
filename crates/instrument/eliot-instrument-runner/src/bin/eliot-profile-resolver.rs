@@ -785,7 +785,7 @@ fn selected_toolchain_root(source_root: &str) -> Result<PathBuf, CliError> {
         "rustup settings",
     )?;
     let host = toml_string_value(&settings, "default_host_triple");
-    let requested = read_toolchain_override(Path::new(&source_root))
+    let requested = read_toolchain_override(Path::new(&source_root))?
         .or_else(|| toml_string_value(&settings, "default_toolchain"))
         .ok_or_else(|| {
             CliError::Contract(format!(
@@ -892,28 +892,46 @@ fn current_source_root(source_root: &str) -> Result<String, CliError> {
 /// The channel the admitted workspace root pins, when it pins one.
 ///
 /// A workspace with no override is not an error: the rustup default is then the
-/// owner's selected toolchain. The same two override file names and the same
-/// `channel` key `eliot-testd` honours are used, so both surfaces select the
-/// same toolchain for the same workspace.
-fn read_toolchain_override(source_root: &Path) -> Option<String> {
+/// owner's selected toolchain. A present `rust-toolchain.toml` is parsed by the
+/// existing bootstrap TOML owner; an unreadable, malformed, blank, or
+/// control-bearing override is a refusal and never falls through to the rustup
+/// default.
+fn read_toolchain_override(source_root: &Path) -> Result<Option<String>, CliError> {
     for name in ["rust-toolchain.toml", "rust-toolchain"] {
         let path = source_root.join(name);
         if !path.is_file() {
             continue;
         }
-        let text = read_bounded_metadata(&path, "rust-toolchain override").ok()?;
-        let value = if name.eq_ignore_ascii_case(".toml") {
-            toml_string_value(&text, "channel").or_else(|| toml_string_value(&text, "toolchain"))
+        let text = read_bounded_metadata(&path, "rust-toolchain override")?;
+        let value = if name.ends_with(".toml") {
+            eliot_bootstrap::normative::parse_rust_toolchain_channel(&text).map_err(|error| {
+                CliError::Contract(format!(
+                    "rust-toolchain override {} is invalid: {error}",
+                    path.display()
+                ))
+            })?
         } else {
             text.lines()
                 .map(str::trim)
                 .find(|line| !line.is_empty() && !line.starts_with('#'))
                 .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    CliError::Contract(format!(
+                        "rust-toolchain override {} has no selected channel",
+                        path.display()
+                    ))
+                })?
         };
-        return value
-            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control));
+        let value = value.trim();
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return Err(CliError::Contract(format!(
+                "rust-toolchain override {} has no valid selected channel",
+                path.display()
+            )));
+        }
+        return Ok(Some(value.to_owned()));
     }
-    None
+    Ok(None)
 }
 
 /// Reads one small owner metadata file under a fixed size bound.
@@ -939,9 +957,8 @@ fn read_bounded_metadata(path: &Path, what: &str) -> Result<String, CliError> {
 /// One top-level `key = "value"` string from a small TOML metadata file.
 ///
 /// This reads only the flat scalar keys the rustup metadata actually publishes
-/// (`default_toolchain`, `default_host_triple`, `channel`). It is a lookup,
-/// not a parser, so an unrecognised file shape yields "absent" and the caller
-/// fails closed on that absence rather than proceeding on a guess.
+/// (`default_toolchain`, `default_host_triple`). It is a lookup over rustup's
+/// flat settings file, not the parser for repository `rust-toolchain.toml`.
 fn toml_string_value(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let (name, value) = line.split_once('=')?;
