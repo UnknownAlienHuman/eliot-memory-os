@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 # Event-specific cancellation: a PR update cancels only that PR's obsolete
 # run; each pushed main SHA and each manual run keeps a terminal result.
@@ -368,12 +369,14 @@ jobs:
           if ($oracleExit -ne 0) { throw "Base-owned workflow oracle refused the candidate (exit $oracleExit)." }
 
       - name: Verify shared documentation evidence
-        # No token is passed here: GWF-021 forbids secret-store expression refs in workflow text,
-        # so review evidence uses anonymous public gh api reads; a failure
-        # stays closed (oracle changes then need human bootstrap).
-        # (anonymous gh api needs no token)
+        # The job-scoped GitHub token is exposed only to this trusted metadata
+        # read. GWF-021 rejects `secrets.*`; `github.token` is the platform
+        # token and the base-owned workflow oracle has already passed before
+        # this step can execute.
         if: ${{ github.event_name == 'pull_request' }}
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
           $baseSha = [string]$event.pull_request.base.sha
