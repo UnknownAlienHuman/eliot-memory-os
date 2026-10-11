@@ -313,8 +313,10 @@ def url_for_release(tag: str) -> str:
     return f"{GITHUB_API_REPOSITORY}/releases/tags/{tag}"
 
 
-def read_historical_advisory(root: Path, policy: dict, supplied_path: str | None = None) -> bytes:
-    """Read the digest-pinned historical snapshot, never reconstruct it from a live query.
+def read_historical_advisory(
+    root: Path, policy: dict, supplied_path: str | None = None, query_bytes: bytes | None = None
+) -> bytes:
+    """Read or fetch the digest-pinned historical snapshot.
 
     The optional import uses the same project-local, no-reparse reader as every
     other input. Its content must match the existing policy before any download
@@ -324,14 +326,14 @@ def read_historical_advisory(root: Path, policy: dict, supplied_path: str | None
     try:
         _, _, payload = read_local(root, source)
     except RuntimeError as exc:
-        if "not a regular file" not in str(exc):
-            raise
-        raise RuntimeError(
-            "HISTORICAL_OSV_INPUT_REQUIRED: restore the approved snapshot into "
-            f"{policy['advisory_response_path']} or use --historical-osv-response "
-            "with a project-local evidence path; a current OSV response is not "
-            f"a historical snapshot (expected SHA-256 {policy['advisory_response_digest']})"
-        ) from exc
+        if "not a regular file" not in str(exc) or query_bytes is None:
+            raise RuntimeError(
+                "HISTORICAL_OSV_INPUT_REQUIRED: restore the approved snapshot into "
+                f"{policy['advisory_response_path']} or use --historical-osv-response "
+                "with a project-local evidence path; a current OSV response is not "
+                f"a historical snapshot (expected SHA-256 {policy['advisory_response_digest']})"
+            ) from exc
+        payload = fetch(OSV_ENDPOINT, data=query_bytes, accept="application/json")
     try:
         data = json.loads(payload.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -502,7 +504,9 @@ def main() -> int:
 
     response_bytes: bytes | None = None
     try:
-        response_bytes = read_historical_advisory(root, surreal, args.historical_osv_response)
+        response_bytes = read_historical_advisory(
+            root, surreal, args.historical_osv_response, query_bytes=query_bytes
+        )
     except TRANSPORT_FAILURES as exc:
         record_missing("osv.response.surrealdb", exc)
     if response_bytes is not None:
