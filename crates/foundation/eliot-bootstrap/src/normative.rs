@@ -1,8 +1,9 @@
-//! Pure parsing and validation of the repository's accepted normative receipt.
+//! Pure parsing and validation of repository-owned TOML identity inputs.
 //!
-//! This module does not read files or discover repository state.  Its parser
-//! receives receipt bytes from an explicit caller and returns only the two
-//! document identities used by bootstrap artifacts.
+//! This module does not read files or discover repository state. Its parsers
+//! receive explicit bytes/text from a caller and return only validated values:
+//! the accepted normative document identities or the selected Rust toolchain
+//! channel.
 
 use eliot_contracts::sha256_hex;
 use serde::Deserialize;
@@ -53,6 +54,16 @@ struct NormativePairReceipt {
     supersedes_implementation_sha256: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RustToolchainDocument {
+    toolchain: RustToolchainSelection,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustToolchainSelection {
+    channel: String,
+}
+
 /// Failure while decoding the accepted normative-pair receipt.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NormativePairReceiptError {
@@ -80,6 +91,36 @@ pub enum NormativePairReceiptError {
     /// A current digest repeats the superseded digest of the same document.
     #[error("normative pair receipt field {field} repeats its superseded digest")]
     CurrentEqualsSuperseded { field: &'static str },
+}
+
+/// Failure while decoding a repository `rust-toolchain.toml` document.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RustToolchainOverrideError {
+    /// TOML syntax or the required `[toolchain].channel` shape is invalid.
+    #[error("rust-toolchain TOML is invalid: {0}")]
+    Toml(String),
+    /// The selected channel is blank or contains control characters.
+    #[error("rust-toolchain channel is invalid")]
+    InvalidChannel,
+}
+
+/// Parse the selected channel from an explicit `rust-toolchain.toml` document.
+///
+/// Rustup permits additional keys under `[toolchain]` such as `components`,
+/// `targets`, and `profile`; serde therefore ignores unrelated fields while the
+/// required `channel` remains typed and mandatory. The parser performs no file
+/// discovery and supplies no default: absence belongs to the caller, while a
+/// present malformed document is an error.
+pub fn parse_rust_toolchain_channel(
+    text: &str,
+) -> Result<String, RustToolchainOverrideError> {
+    let document: RustToolchainDocument = toml::from_str(text)
+        .map_err(|error| RustToolchainOverrideError::Toml(error.to_string()))?;
+    let channel = document.toolchain.channel.trim();
+    if channel.is_empty() || channel.chars().any(char::is_control) {
+        return Err(RustToolchainOverrideError::InvalidChannel);
+    }
+    Ok(channel.to_owned())
 }
 
 /// Parse the accepted receipt supplied by an explicit repository boundary.
