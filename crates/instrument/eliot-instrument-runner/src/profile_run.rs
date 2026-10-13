@@ -357,12 +357,18 @@ pub struct RetainedExitOutcome {
 }
 
 impl RetainedExitOutcome {
-    /// Whether this outcome is the exact shape its disposition admits.
-    const fn is_admissible(&self) -> bool {
-        match self.disposition {
-            ExitDisposition::Completed => self.code.is_some(),
-            ExitDisposition::Unknown => self.code.is_none(),
-            _ => false,
+    /// Maps the physical terminal observation to the execution axis.
+    ///
+    /// This is not a verifier verdict: zero exit establishes only successful
+    /// process execution. Nonzero and unknown outcomes remain non-successful.
+    fn execution_status(self) -> Result<ExecutionStatus, ProfileRunError> {
+        match (self.disposition, self.code) {
+            (ExitDisposition::Completed, Some(0)) => Ok(ExecutionStatus::Succeeded),
+            (ExitDisposition::Completed, Some(_)) => Ok(ExecutionStatus::Failed),
+            (ExitDisposition::Unknown, None) => Ok(ExecutionStatus::Unknown),
+            _ => Err(ProfileRunError::InvalidExitOutcome {
+                disposition: format!("{:?}", self.disposition),
+            }),
         }
     }
 
@@ -427,11 +433,7 @@ impl RetainedToolIdentity {
             validate_text(argument, "argument")?;
         }
         validate_digest(environment_digest, "environment_digest")?;
-        if !exit.is_admissible() {
-            return Err(ProfileRunError::InvalidExitOutcome {
-                disposition: format!("{:?}", exit.disposition),
-            });
-        }
+        exit.execution_status()?;
         Ok(Self {
             executable: executable.to_owned(),
             arguments: arguments.to_vec(),
@@ -714,11 +716,12 @@ impl InstrumentRun {
     ) -> Result<Self, ProfileRunError> {
         validate_text(&executable_digest, "executable_digest")?;
         let stage = route.stage().clone().bound(operation_id)?;
+        let execution = tool.exit.execution_status()?;
         Ok(Self {
             stage,
             plane: TestExecutionPlaneRoute::plane(),
             testd_dispatchable: route.dispatchable_via_testd(),
-            execution: ExecutionStatus::Succeeded,
+            execution,
             evidence: StageEvidence::Retained {
                 artifact,
                 byte_len,
@@ -737,8 +740,16 @@ impl InstrumentRun {
     /// observed executable identity. Anything else stays visible in the
     /// aggregate instead of collapsing into success.
     pub fn is_success(&self) -> bool {
+        let retained_exit_succeeded = matches!(
+            &self.evidence,
+            StageEvidence::Retained { tool, .. }
+                if matches!(
+                    tool.exit.execution_status(),
+                    Ok(ExecutionStatus::Succeeded)
+                )
+        );
         self.execution == ExecutionStatus::Succeeded
-            && matches!(self.evidence, StageEvidence::Retained { .. })
+            && retained_exit_succeeded
             && self.executable_digest.is_some()
     }
 }
