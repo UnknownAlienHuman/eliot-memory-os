@@ -271,6 +271,16 @@ path = "scripts/docs_router_core.py"
 token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
 reason = "The router resolves the stable compatibility-map paths as legacy-anchor entry points so incoming links keep working; the route table is the current read path."
 
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "The retired authority surface record lists retired paths to enforce their absence."
+
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "The retired authority surface record lists retired paths to enforce their absence."
+
 [script_inventory]
 directory = "scripts"
 documentation = "scripts/README.md"
@@ -332,10 +342,54 @@ ignore_globs = [
   "scripts/verify-doc-code-conformance.py",
   "scripts/doc_code_conformance_core.py",
   "scripts/work_unit_gate/doc_read_evidence.py",
+  "scripts/verify-github-workflows.py",
+  "scripts/tests/*",
+  "scripts/work_unit_gate/fixtures/*",
+  "workstreams/security/retired-authority-surfaces.toml",
   "config/doc-code-conformance.toml",
   ".github/workflows/repository-policy.yml",
 ]
 handle_index = "docs/architecture/handle-index.json"
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/AGENTS.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/ARCHITECTURE.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/IMPLEMENTATION.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/BUILD.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/TESTING.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/SCHEMA.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/CHANGELOG.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/implementation/README.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
 
 [[repository_paths.allow_missing]]
 source = "scripts/docs_shards_core.py"

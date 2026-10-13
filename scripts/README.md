@@ -63,6 +63,10 @@ committed as repository authority.
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 | `generate_reason_codes.py` | Render the I7.20 reason-code projection (`docs/generated/reason-codes.md`) from the `eliot-protocol` Rust registry, verified against the normative I7.20 canonical set; `--check` fails on a stale projection (#1743) | Generated reason-code projection only |
+| `audit-context-measurement-ownership.py` | Deterministic source-bound audit of context-measurement case ownership and proof boundaries (#866) | Static source classification and case ownership evidence only |
+| `gen_capability_cell_registry.py` | Generate deterministic capability-cell registry projection from crate contract manifests | Static capability-cell registry projection only |
+| `prepare-dependency-policy-inputs.py` | Materialize and verify offline SurrealDB provisioner inputs and locked scanner identity for dependency policy gates (#3004) | Local provisioner input materialization only |
+| `verify-retired-authority-surfaces.py` | Verify that retired authority and campaign surfaces recorded in `workstreams/security/retired-authority-surfaces.toml` stay absent from the repository tree (#1225) | Static repository surface absence verification only |
 
 The three public documentation entrypoints are intentionally small front doors.
 Their `*_core.py` modules retain the established implementations while the front
