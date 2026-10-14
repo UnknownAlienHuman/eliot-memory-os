@@ -3,7 +3,7 @@
 
 Do not open the former monoliths as task context.
 
-1. Read [`READING_PROTOCOL.md`](READING_PROTOCOL.md).
+1. Check the owning Issue's `## Read` declaration and applicable `AGENTS.md`.
 2. Run the verified reader for the owning Issue and exact mutable path:
 
    ```text
@@ -20,7 +20,9 @@ A route alone is navigation, not reading evidence. The local
 The Issue's `## Read` list, the Decision Safety Floor and applicable `AGENTS.md`
 files form the required bundle. Path routes are optional pointers. Without an
 owning Issue, use `--path <repository/path> --topic "<causal property>"` to resolve
-required reading from the paths. See the reading protocol before mutation.
+required reading from the paths. [`READING_PROTOCOL.md`](READING_PROTOCOL.md)
+explains this command; navigation links do not add required reading. Declare
+additional content in the Issue before rerunning the verified reader.
 
 ## Navigation
 

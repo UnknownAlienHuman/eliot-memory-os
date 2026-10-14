@@ -99,6 +99,22 @@ stale or missing, or scope expands beyond the receipt, stop and repair the Issue
 or the route; silence is not permission. See [`{relative_protocol}`]({relative_protocol})."""
 
 
+def documentation_entry_block(protocol: str) -> str:
+    return (
+        "## Documentation entry point\n\n"
+        "Run `python scripts/docs_read.py read --issue <number> --path "
+        "<repository/path> ...` and open the verified required bundle before "
+        "mutation. The "
+        f"[reading protocol]({protocol}) explains the command; navigation "
+        "links do not add required reading. If a decision needs additional "
+        "workflow or contract content, declare it in the Issue's `## Read` "
+        "and rerun the reader. Without an owning Issue, use path/topic mode. "
+        "Record the read receipt and attestation. A route alone is navigation, "
+        "not reading evidence. The stable `ELIOT_*` files are compatibility "
+        "maps, not task prompts."
+    )
+
+
 def patch_navigation_surfaces(root: Path) -> None:
     _core_patch_navigation_surfaces(root)
 
@@ -110,15 +126,7 @@ def patch_navigation_surfaces(root: Path) -> None:
         path = root / relative
         if not path.exists():
             continue
-        block = (
-            "## Documentation entry point\n\n"
-            f"Start with the [mandatory verified-reading protocol]({protocol}), "
-            "then run `python scripts/docs_read.py read ...` for the exact "
-            "repository paths and causal property being changed. Open the "
-            "verified bundle and record its read receipt before mutation. "
-            "A route alone is navigation, not reading evidence. The stable "
-            "`ELIOT_*` files are compatibility maps, not task prompts."
-        )
+        block = documentation_entry_block(protocol)
         _core.write_utf8(
             path,
             _core.insert_or_replace_block(_core.read_utf8(path), block),
@@ -155,8 +163,11 @@ The documentation is a routed contract graph, not a book-shaped prompt.
 
 ## Required sequence
 
-1. Resolve current repository authority through `AGENTS.md`, `WORKFLOW.md`, and
-   `workstreams/ACTIVE.toml`.
+1. Establish the current repository/base identity and follow applicable
+   `AGENTS.md` instructions. `WORKFLOW.md` and `workstreams/ACTIVE.toml` are
+   authority/navigation references, not additional default reading. If the
+   decision crosses their workflow/workstream boundary, declare the needed
+   content in the Issue's `## Read` and rerun the verified reader.
 2. The owning Issue lists what to read in a `## Read` (or `## Читать`)
    section: one handle selector (`I5.19`, `I1.1..I1.8`, `A4.*`, `APPENDIX-L`)
    or one repository file per list item, optionally followed by a comment.
@@ -242,7 +253,7 @@ def render_architecture_readme(pair_key_value: str) -> str:
 
 Do not open the former monoliths as task context.
 
-1. Read [`READING_PROTOCOL.md`](READING_PROTOCOL.md).
+1. Check the owning Issue's `## Read` declaration and applicable `AGENTS.md`.
 2. Run the verified reader for the owning Issue and exact mutable path:
 
    ```text
@@ -259,7 +270,9 @@ A route alone is navigation, not reading evidence. The local
 The Issue's `## Read` list, the Decision Safety Floor and applicable `AGENTS.md`
 files form the required bundle. Path routes are optional pointers. Without an
 owning Issue, use `--path <repository/path> --topic "<causal property>"` to resolve
-required reading from the paths. See the reading protocol before mutation.
+required reading from the paths. [`READING_PROTOCOL.md`](READING_PROTOCOL.md)
+explains this command; navigation links do not add required reading. Declare
+additional content in the Issue before rerunning the verified reader.
 
 ## Navigation
 
@@ -530,6 +543,17 @@ def sync_reading_protocol(root: Path, *, check: bool = False) -> list[str]:
     entry = root / "docs/architecture/README.md"
     if entry.is_file():
         wanted[entry] = render_architecture_readme(pair_identity)
+    for relative, protocol in (
+        ("README.md", "docs/architecture/READING_PROTOCOL.md"),
+        ("docs/README.md", "architecture/READING_PROTOCOL.md"),
+        ("docs/PROJECT_MAP.md", "architecture/READING_PROTOCOL.md"),
+    ):
+        path = root / relative
+        if path.is_file():
+            old = path.read_bytes().decode("utf-8")
+            wanted[path] = _core.insert_or_replace_block(
+                old, documentation_entry_block(protocol)
+            )
     changed = [str(path.relative_to(root)).replace("\\", "/") for path, text in wanted.items()
                if path.read_bytes() != text.encode("utf-8")]
     if check and changed:

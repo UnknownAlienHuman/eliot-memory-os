@@ -5,8 +5,11 @@ The documentation is a routed contract graph, not a book-shaped prompt.
 
 ## Required sequence
 
-1. Resolve current repository authority through `AGENTS.md`, `WORKFLOW.md`, and
-   `workstreams/ACTIVE.toml`.
+1. Establish the current repository/base identity and follow applicable
+   `AGENTS.md` instructions. `WORKFLOW.md` and `workstreams/ACTIVE.toml` are
+   authority/navigation references, not additional default reading. If the
+   decision crosses their workflow/workstream boundary, declare the needed
+   content in the Issue's `## Read` and rerun the verified reader.
 2. The owning Issue lists what to read in a `## Read` (or `## Читать`)
    section: one handle selector (`I5.19`, `I1.1..I1.8`, `A4.*`, `APPENDIX-L`)
    or one repository file per list item, optionally followed by a comment.
