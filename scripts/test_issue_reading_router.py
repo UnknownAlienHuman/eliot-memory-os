@@ -122,6 +122,8 @@ class IssueReadingTests(unittest.TestCase):
             owner.write_bytes(("# Owner\r\nrule before\r\n" + block + "\r\nrule after\r\n").encode("utf-8"))
             (root / "AGENTS.md").write_text("# Root\n" + block + "\n", encoding="utf-8")
             (root / "docs/architecture/READING_PROTOCOL.md").write_text("old", encoding="utf-8")
+            entry = root / "docs/architecture/README.md"
+            entry.write_text("old entry", encoding="utf-8")
             template = root / ".github/pull_request_template.md"
             template.write_text("MACHINE EVIDENCE MUST SURVIVE", encoding="utf-8")
             shards.sync_reading_protocol(root)
@@ -131,6 +133,8 @@ class IssueReadingTests(unittest.TestCase):
             self.assertTrue(owner.read_bytes().startswith(b"# Owner\r\nrule before\r\n"))
             self.assertTrue(owner.read_bytes().endswith(b"\r\nrule after\r\n"))
             self.assertIn("../../docs/architecture/READING_PROTOCOL.md", text)
+            self.assertIn("read --issue <number> --path", entry.read_text(encoding="utf-8"))
+            self.assertIn("optional pointers", entry.read_text(encoding="utf-8"))
             self.assertEqual(template.read_text(encoding="utf-8"), "MACHINE EVIDENCE MUST SURVIVE")
             self.assertEqual(shards.sync_reading_protocol(root, check=True), [])
 
