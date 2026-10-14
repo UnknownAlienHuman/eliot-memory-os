@@ -40,6 +40,12 @@ COVERAGE_KEYS = ("path", "topic", "expect_routes", "expect_required_handles", "e
 # tokens, so a multiword keyword such as "source code" matches "source-code",
 # "source_code", and "source code" alike (#4606).
 TOPIC_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# An Issue declares its own reading under one of these headings (#5320).
+ISSUE_READING_HEADINGS = ("read", "читать")
+HANDLE_SELECTOR_RE = re.compile(
+    r"(?:APPENDIX-[A-Z](?:\.\.APPENDIX-[A-Z])?"
+    r"|[AI]\d+(?:\.\d+)*(?:\.\*|\.\.[AI]\d+(?:\.\d+)*)?)"
+)
 
 
 class RouteError(RuntimeError):
@@ -57,6 +63,16 @@ class RouteRule:
     required_files: tuple[str, ...]
     optional_files: tuple[str, ...]
     max_required_bytes: int | None
+
+
+@dataclass(frozen=True)
+class DeclaredReading:
+    """The reading an Issue declares in its `## Read` section (#5320)."""
+
+    source: str
+    body_sha256: str
+    handles: tuple[str, ...]
+    files: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -373,6 +389,127 @@ def git_changed_paths(root: Path, changed_from: str) -> list[str]:
     return sorted(set(paths))
 
 
+def _reading_item_token(text: str) -> str:
+    """Return the selector or path an Issue reading list item names."""
+    text = text.strip()
+    link = re.match(r"\[[^\]]*\]\(([^)\s]+)\)", text)
+    if link:
+        return link.group(1)
+    code = re.match(r"`([^`]+)`", text)
+    if code:
+        return code.group(1).strip()
+    return text.split()[0].rstrip(",;:") if text.split() else ""
+
+
+def parse_issue_reading(body: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Parse the `## Read` / `## Читать` section of an Issue body.
+
+    Each list item names one handle selector (`I5.19`, `I1.1..I1.8`, `A4.*`,
+    `APPENDIX-L`) or one repository file as its first token, optionally in
+    backticks or as a Markdown link; the rest of the line is a free comment.
+    Returns ``None`` when the body has no such section. An unrecognized item
+    fails closed instead of being silently skipped.
+    """
+    lines = body.replace("\r\n", "\n").split("\n")
+    fence: str | None = None
+    start: int | None = None
+    level = 0
+    end = len(lines)
+    for number, line in enumerate(lines):
+        stripped = line.strip()
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if marker:
+            if fence is None:
+                fence = marker.group(1)[0]
+            elif stripped.startswith(fence * 3):
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        heading = re.match(r"(#{1,6})\s+(.*?)\s*#*\s*$", stripped)
+        if not heading:
+            continue
+        if start is None:
+            if heading.group(2).casefold() in ISSUE_READING_HEADINGS and len(heading.group(1)) >= 2:
+                start, level = number + 1, len(heading.group(1))
+        elif len(heading.group(1)) <= level:
+            end = number
+            break
+    if start is None:
+        return None
+
+    handles: list[str] = []
+    files: list[str] = []
+    for line in lines[start:end]:
+        item = re.match(r"\s*(?:[-*+]|\d+[.)])\s+(.*)$", line)
+        if not item:
+            continue
+        token = _reading_item_token(item.group(1))
+        if not token:
+            continue
+        if HANDLE_SELECTOR_RE.fullmatch(token):
+            handles.append(token)
+            continue
+        if "://" in token:
+            raise RouteError(f"Issue reading item must be a handle or repository file, not a URL: {token}")
+        path = normalize_repo_path(token.split("#", 1)[0])
+        if "/" not in path and "." not in path:
+            raise RouteError(f"Issue reading item is neither a handle selector nor a file path: {token}")
+        files.append(path)
+    if not handles and not files:
+        raise RouteError("the Issue `## Read` section lists no handles or files")
+    return tuple(dict.fromkeys(handles)), tuple(dict.fromkeys(files))
+
+
+def declared_reading_from_body(body: str, source: str) -> DeclaredReading:
+    parsed = parse_issue_reading(body)
+    if parsed is None:
+        raise RouteError(
+            f"{source} has no `## Read` section; list the handles and files the change "
+            "needs there (draft one with `docs_router.py route --path ... --format issue`)"
+        )
+    handles, files = parsed
+    return DeclaredReading(
+        source=source,
+        body_sha256=sha256_bytes(body.encode("utf-8")),
+        handles=handles,
+        files=files,
+    )
+
+
+def fetch_issue_body(root: Path, issue: str) -> str:
+    number = issue.strip().lstrip("#")
+    if not number.isdigit():
+        raise RouteError(f"--issue expects an Issue number: {issue!r}")
+    command = ["gh", "issue", "view", number, "--json", "body", "--jq", ".body"]
+    try:
+        completed = subprocess.run(
+            command, cwd=root, capture_output=True, text=True, encoding="utf-8", check=False
+        )
+    except OSError as exc:
+        raise RouteError(f"cannot run gh for Issue #{number}: {exc}; use --issue-body <file>") from exc
+    if completed.returncode != 0:
+        raise RouteError(
+            f"gh issue view {number} failed: {completed.stderr.strip()}; use --issue-body <file>"
+        )
+    return completed.stdout
+
+
+def load_declared_reading(root: Path, issue: str | None, issue_body: Path | None) -> DeclaredReading | None:
+    if issue and issue_body:
+        raise RouteError("use either --issue or --issue-body, not both")
+    if issue:
+        number = issue.strip().lstrip("#")
+        return declared_reading_from_body(fetch_issue_body(root, number), f"Issue #{number}")
+    if issue_body:
+        try:
+            text = issue_body.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RouteError(f"cannot read Issue body file {issue_body}: {exc}") from exc
+        return declared_reading_from_body(text, f"Issue body file {issue_body.name}")
+    return None
+
+
 def ancestor_agent_files(root: Path, paths: Sequence[str]) -> list[str]:
     found = {"AGENTS.md"} if (root / "AGENTS.md").is_file() else set()
     for raw in paths:
@@ -429,10 +566,16 @@ def fragment_records(
     return sorted(by_path.values(), key=lambda item: item["path"])
 
 
-def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) -> dict[str, Any]:
+def route_payload(
+    root: Path,
+    config: Config,
+    paths: Sequence[str],
+    topic: str,
+    declared: DeclaredReading | None = None,
+) -> dict[str, Any]:
     normalized_paths = sorted(set(normalize_repo_path(path) for path in paths))
-    if not normalized_paths:
-        raise RouteError("at least one --path or --changed-from result is required")
+    if not normalized_paths and declared is None:
+        raise RouteError("at least one --path, --changed-from result or --issue is required")
     index = read_json(root / DEFAULT_INDEX)
     if index.get("schema_version") != INDEX_SCHEMA:
         raise RouteError("unsupported handle index schema")
@@ -449,23 +592,38 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
         raise RouteError("normative pair receipt has no valid pair key")
 
     routes = matched_routes(config, normalized_paths, topic)
-    if not routes:
+    if not routes and declared is None:
         raise RouteError(
             "no non-baseline documentation route matched; add a route before mutating this scope"
         )
 
-    required_selectors = list(config.baseline_handles)
-    optional_selectors = list(config.baseline_optional_handles)
-    required_files = list(config.baseline_files)
-    optional_files = list(config.baseline_optional_files)
     limits = [config.max_required_bytes]
-    for route in routes:
-        required_selectors.extend(route.required_handles)
-        optional_selectors.extend(route.optional_handles)
-        required_files.extend(route.required_files)
-        optional_files.extend(route.optional_files)
-        if route.max_required_bytes is not None:
-            limits.append(route.max_required_bytes)
+    if declared is None:
+        required_selectors = list(config.baseline_handles)
+        optional_selectors = list(config.baseline_optional_handles)
+        required_files = list(config.baseline_files)
+        optional_files = list(config.baseline_optional_files)
+        for route in routes:
+            required_selectors.extend(route.required_handles)
+            optional_selectors.extend(route.optional_handles)
+            required_files.extend(route.required_files)
+            optional_files.extend(route.optional_files)
+            if route.max_required_bytes is not None:
+                limits.append(route.max_required_bytes)
+    else:
+        # The Issue names what the change needs (#5320). Only the Decision
+        # Safety Floor, the declared items and the nearest AGENTS.md files are
+        # required; everything the path routes would add stays as optional
+        # pointers that are opened only when the work crosses their boundary.
+        required_selectors = [*config.baseline_handles, *declared.handles]
+        required_files = list(declared.files)
+        optional_selectors = list(config.baseline_optional_handles)
+        optional_files = [*config.baseline_files, *config.baseline_optional_files]
+        for route in routes:
+            optional_selectors.extend(route.required_handles)
+            optional_selectors.extend(route.optional_handles)
+            optional_files.extend(route.required_files)
+            optional_files.extend(route.optional_files)
     required_files.extend(ancestor_agent_files(root, normalized_paths))
 
     # The causal property names its own governing fragment; a route table gap
@@ -513,6 +671,13 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
         "required_bytes": required_bytes,
         "required_limit_bytes": required_limit,
     }
+    if declared is not None:
+        core["declared_reading"] = {
+            "source": declared.source,
+            "body_sha256": declared.body_sha256,
+            "handles": list(declared.handles),
+            "files": list(declared.files),
+        }
     canonical = json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     core["receipt_id"] = "sha256:" + sha256_bytes(canonical)
     return core
@@ -590,6 +755,12 @@ def render_route(payload: dict[str, Any]) -> str:
         lines.append(f"- `{path}`")
     if payload["topic"]:
         lines.append(f"- Causal property: {payload['topic']}")
+    declared = payload.get("declared_reading")
+    if declared:
+        lines.append(
+            f"- Declared reading: {declared['source']} — "
+            f"{len(declared['handles'])} handle selector(s), {len(declared['files'])} file(s)"
+        )
     lines.extend(["", "## Required — read all before mutation", ""])
     for item in payload["required"]:
         handles = f" — handles `{', '.join(item['handles'])}`" if item.get("handles") else ""
@@ -614,6 +785,33 @@ def render_route(payload: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def render_issue_reading_draft(root: Path, config: Config, payload: dict[str, Any]) -> str:
+    """Draft an Issue `## Read` section from a path route for the author to trim.
+
+    The Decision Safety Floor and the nearest AGENTS.md files are always added
+    by the reader, so the draft lists only the route-specific handles and files.
+    """
+    index = read_json(root / DEFAULT_INDEX).get("handles", {})
+    floor = set(expand_selectors(config.baseline_handles, index))
+    lines = [
+        "## Read",
+        "",
+        f"<!-- Drafted by docs_router.py from routes {', '.join(payload['matched_routes'])}. "
+        "Keep only what this change needs. The Decision Safety Floor and the nearest "
+        "AGENTS.md files are added automatically. -->",
+    ]
+    for item in payload["required"]:
+        if item["kind"] == "fragment":
+            for handle in item["handles"]:
+                if handle in floor:
+                    continue
+                title = FRAGMENT_TITLE_PREFIX_RE.sub("", str(index.get(handle, {}).get("title", "")), count=1)
+                lines.append(f"- `{handle}` — {title} ({item['bytes']} B)")
+        elif item["path"] not in config.baseline_files and not item["path"].endswith("AGENTS.md"):
+            lines.append(f"- `{item['path']}` ({item['bytes']} B)")
+    return "\n".join(lines) + "\n"
 
 
 def render_routes_markdown(config: Config) -> str:
@@ -867,7 +1065,25 @@ def self_test() -> None:
         pass
     else:
         raise RouteError("path traversal self-test failed")
-    print("DOC_ROUTER_SELF_TEST: PASS cases=5")
+
+    body = (
+        "## Problem\n\nText.\n\n```text\n## Read\n- `I9.9`\n```\n\n"
+        "## Читать\n\n- `I1.1..I1.8` — process topology\n- A4.*\n"
+        "- [policy](docs/DEPENDENCY_POLICY.md#admission)\n- `I1.1..I1.8` duplicate\n\n"
+        "## Done when\n\n- `I7.7` is not reading\n"
+    )
+    if parse_issue_reading(body) != (("I1.1..I1.8", "A4.*"), ("docs/DEPENDENCY_POLICY.md",)):
+        raise RouteError("Issue reading section self-test failed")
+    if parse_issue_reading("## Problem\n\nNo reading.\n") is not None:
+        raise RouteError("missing Issue reading section self-test failed")
+    for bad in ("## Read\n\n- read everything\n", "## Read\n\n- https://example.com/doc\n", "## Read\n\nnone\n"):
+        try:
+            parse_issue_reading(bad)
+        except RouteError:
+            pass
+        else:
+            raise RouteError(f"unrecognized Issue reading item was accepted: {bad!r}")
+    print("DOC_ROUTER_SELF_TEST: PASS cases=8")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -879,7 +1095,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     route_parser.add_argument("--path", action="append", default=[])
     route_parser.add_argument("--changed-from")
     route_parser.add_argument("--topic", default="")
-    route_parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    route_parser.add_argument("--issue", help="Issue number whose `## Read` section declares the reading")
+    route_parser.add_argument("--issue-body", type=Path, help="Issue body file (offline alternative to --issue)")
+    route_parser.add_argument("--format", choices=("markdown", "json", "issue"), default="markdown")
     route_parser.add_argument("--output", type=Path)
 
     check_parser = sub.add_parser("check")
@@ -909,12 +1127,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.changed_from:
                 paths.extend(git_changed_paths(root, args.changed_from))
             config = load_config(root)
-            payload = route_payload(root, config, paths, args.topic)
-            rendered = (
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-                if args.format == "json"
-                else render_route(payload)
-            )
+            declared = load_declared_reading(root, args.issue, args.issue_body)
+            payload = route_payload(root, config, paths, args.topic, declared)
+            if args.format == "json":
+                rendered = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            elif args.format == "issue":
+                rendered = render_issue_reading_draft(root, config, payload)
+            else:
+                rendered = render_route(payload)
             if args.output:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 args.output.write_text(rendered, encoding="utf-8", newline="")

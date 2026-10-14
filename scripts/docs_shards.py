@@ -48,27 +48,36 @@ def routing_block(
 ) -> str:
     return f"""## Mandatory documentation routing
 
+Every implementation Issue lists what to read in a `## Read` section: handle
+selectors (`I5.19`, `I1.1..I1.8`, `A4.*`, `APPENDIX-L`) and repository files,
+one per list item. Draft it with `python scripts/docs_router.py route --path
+<repository/path> --format issue` and keep only what the change needs.
+
 Before changing code, configuration, tests, workflows, or normative prose, run
 from the repository root:
 
 ```text
-python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+python scripts/docs_read.py read --issue <number> --path <repository/path> --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Repeat `--path` for every mutable path family, or use `--changed-from
-origin/main` for the complete branch delta, including deletions. Open the
-verified bundle and read every required item before mutation. A route alone is
-navigation, not reading evidence.
+With `--issue`, the required reading is the Decision Safety Floor, the items the
+Issue declares and the nearest `AGENTS.md` files; path routes become optional
+pointers. Without an Issue, use `--path <repository/path> --topic "<causal
+property>"` for every mutable path family, or `--changed-from origin/main` for
+the complete branch delta. Open the verified bundle and read every required
+item before mutation. A route alone is navigation, not reading evidence.
 
-Record the route receipt ID, read receipt ID, matched routes, required handles,
-fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
-attestation in the work unit or pull request. Optional fragments are loaded only
-when the current decision crosses their stated boundary. A legacy `ELIOT_*`
-compatibility map is never an acceptable read receipt.
+Record the route receipt ID, read receipt ID, declared reading or matched
+routes, required handles, fragment paths and SHA-256 values, verified bundle
+SHA-256, and explicit reading attestation in the work unit or pull request.
+Optional fragments are loaded only when the current decision crosses their
+stated boundary. A legacy `ELIOT_*` compatibility map is never an acceptable
+read receipt.
 
-If no non-baseline route matches, a required item is stale or missing, or scope
-expands beyond the receipt, stop and rerun or repair the route; silence is not
-permission. See [`{relative_protocol}`]({relative_protocol})."""
+If the Issue has no `## Read` section, a declared item does not resolve, no
+non-baseline route matches a path read without an Issue, a required item is
+stale or missing, or scope expands beyond the receipt, stop and repair the Issue
+or the route; silence is not permission. See [`{relative_protocol}`]({relative_protocol})."""
 
 
 def patch_navigation_surfaces(root: Path) -> None:
@@ -129,23 +138,36 @@ The documentation is a routed contract graph, not a book-shaped prompt.
 
 1. Resolve current repository authority through `AGENTS.md`, `WORKFLOW.md`, and
    `workstreams/ACTIVE.toml`.
-2. Run the verified reader from the repository root:
+2. The owning Issue lists what to read in a `## Read` (or `## Читать`)
+   section: one handle selector (`I5.19`, `I1.1..I1.8`, `A4.*`, `APPENDIX-L`)
+   or one repository file per list item, optionally followed by a comment.
+   Draft it from the path routes and keep only what the change needs:
 
    ```text
-   python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+   python scripts/docs_router.py route --path <repository/path> --format issue
    ```
 
-   Repeat `--path` for every mutable path family, or use `--changed-from
-   origin/main` for the complete branch delta, including deletions.
-3. Open the verified bundle and read every required file/fragment before
+3. Run the verified reader from the repository root:
+
+   ```text
+   python scripts/docs_read.py read --issue <number> --path <repository/path> --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+   ```
+
+   With `--issue` (or `--issue-body <file>` offline), the required reading is
+   the Decision Safety Floor, the items the Issue declares and the nearest
+   `AGENTS.md` files; path routes become optional pointers. Without an Issue,
+   repeat `--path` for every mutable path family with a `--topic`, or use
+   `--changed-from origin/main` for the complete branch delta, including
+   deletions.
+4. Open the verified bundle and read every required file/fragment before
    mutation. A route alone is navigation, not reading evidence.
-4. Inspect optional one-hop fragments only when the current decision crosses
+5. Inspect optional one-hop fragments only when the current decision crosses
    their boundary.
-5. Record the route/read receipt IDs, matched routes, required handles, fragment
-   paths and SHA-256 values, verified bundle SHA-256, and explicit reading
-   attestation in the work unit or pull request.
-6. Re-run the reader when the changed path, causal property, authority boundary,
-   or evidence scope expands.
+6. Record the route/read receipt IDs, declared reading or matched routes,
+   required handles, fragment paths and SHA-256 values, verified bundle SHA-256,
+   and explicit reading attestation in the work unit or pull request.
+7. Re-run the reader when the Issue reading, changed path, causal property,
+   authority boundary, or evidence scope changes.
 
 Current normative pair: `{pair_key_value}`.
 
@@ -153,7 +175,8 @@ Current normative pair: `{pair_key_value}`.
 
 Do not mutate the repository when:
 
-- no non-baseline route matches a material path;
+- the Issue has no `## Read` section or a declared item does not resolve;
+- no non-baseline route matches a material path read without an Issue;
 - a required handle cannot be resolved;
 - a routed file/fragment hash or byte count differs from the read receipt;
 - the verified bundle cannot be materialized;

@@ -230,6 +230,8 @@ def build_read_bundle(root: Path, route: dict[str, Any]) -> tuple[str, dict[str,
         "bundle_bytes": len(bundle.encode("utf-8")),
         "attestation_required": True,
     }
+    if route.get("declared_reading"):
+        receipt_core["declared_reading"] = route["declared_reading"]
     receipt = dict(receipt_core)
     receipt["read_receipt_id"] = "sha256:" + canonical_sha256(receipt_core)
     return bundle, receipt
@@ -385,6 +387,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     read_parser.add_argument("--path", action="append", default=[])
     read_parser.add_argument("--changed-from")
     read_parser.add_argument("--topic", default="")
+    read_parser.add_argument("--issue", help="Issue number whose `## Read` section declares the reading")
+    read_parser.add_argument("--issue-body", type=Path, help="Issue body file (offline alternative to --issue)")
     read_parser.add_argument("--output", type=Path)
     read_parser.add_argument("--receipt-out", type=Path)
 
@@ -406,15 +410,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not delta:
                 delta_empty = True
             paths.extend(delta)
-        if not paths:
+        declared = docs_router.load_declared_reading(root, args.issue, args.issue_body)
+        if not paths and declared is None:
             # An empty delta with no explicit --path has no scope to route. Say
             # so precisely rather than raising the router's "at least one
             # --path" error, which reads as a configuration fault.
             if delta_empty:
                 return report_empty_delta(args.changed_from)
-            raise ReadError("no --path and no --changed-from scope was given")
+            raise ReadError("no --path, --changed-from or --issue scope was given")
         config = docs_router.load_config(root)
-        route = docs_router.route_payload(root, config, paths, args.topic)
+        route = docs_router.route_payload(root, config, paths, args.topic, declared)
         bundle, receipt = build_read_bundle(root, route)
         if args.output:
             output = args.output if args.output.is_absolute() else root / args.output
@@ -432,9 +437,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             )
         governing = receipt.get("governing_handles", [])
+        declared_source = (receipt.get("declared_reading") or {}).get("source", "-")
         print(
             f"DOC_READ: PASS receipt={receipt['read_receipt_id']} "
             f"route={receipt['route_receipt_id']} required={len(receipt['required'])} "
+            f"bundle_bytes={receipt['bundle_bytes']} declared={declared_source!r} "
             f"governing={','.join(governing) if governing else '-'} "
             f"bundle_sha256={receipt['bundle_sha256']}",
             file=sys.stderr,
