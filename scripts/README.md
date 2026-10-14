@@ -32,6 +32,7 @@ committed as repository authority.
 | `verify-process-deadline-owner.py` | Source-shape discriminator for the #83 failure where a resumed process receives a start receipt while the wall-deadline owner thread is never spawned | Static source-shape evidence only; not Windows containment or wall-time proof |
 | `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
 | `audit-architecture-boundaries.py` | Detect forbidden dependencies, SurrealDB leakage, untracked direct process launch, placeholders, and exact tracked debt | Static source/build architecture evidence only |
+| `audit-context-measurement-ownership.py` | Audit context measurement case ownership and frozen denominator classification | Static source/inventory classification only |
 | `verify-agent-guardrails.py` | Require bounded nearest-path owner/proof/stop instructions for declared source subtrees | Routing/control-plane evidence only |
 | `verify-core-daemon-inventory.py` | Verify the core-daemon inventory identity, owner references, proof requirements, exclusions, and fixed proof ceiling | Static inventory/routing evidence only |
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration signals | Static source-quality evidence only |
@@ -41,6 +42,7 @@ committed as repository authority.
 | `verify-github-workflows.py` | Verify GitHub workflows, action SHA pinning, minimal permissions, hash-locked Python/NuGet dependencies (including the Operator harness lock), pip hash discipline, and test execution | Static workflow and dependency-input evidence only |
 | `verify-agent-host-surfaces.py` | One manual verification entrypoint for all agent host surfaces (issue #250) | Manual source and fake-runtime integration evidence only |
 | `verify-release-claim-boundary.py` | Verify the build-success claim boundary stays bound to source and build identity (issue #1855) | Static release-claim policy evidence only |
+| `verify-retired-authority-surfaces.py` | Verify that retired authority and campaign surfaces remain absent from the repository tree | Static authority-surface retirement evidence only |
 | `migration_inventory_1860.py` | Publish required migration inventory, dispositions, impact graph, and Product Proof plan (issue #1860) | Static migration inventory evidence only |
 | `verify-dependency-policy.py` | Verify multi-ecosystem dependency admission, scanner tool pinning, inventory completeness, lockfiles, and advisory evidence | Static and advisory admission evidence only |
 | `verify-branch-protection.py` | Read back live branch protection/rulesets and compare against the retained merge-enforcement rule (#3004) | Live enforcement readback evidence only; never configures protection |
@@ -58,6 +60,7 @@ committed as repository authority.
 | `capture_clippy_diagnostics.py` | Run `cargo clippy --locked --workspace --all-targets --message-format=json` once (#838 W1) and store the complete untruncated JSON stream with its source revision, tool identity, complete declared target denominator and the cfg predicates this run did not compile | Single-run source-capture evidence only; no lint-cleanliness, build-success or acceptance claim, and it never carries `-D warnings` |
 | `audit_host_diagnostic_coverage.py` | Bounded Host diagnostic coverage and identity validator (#985) | Static host diagnostic coverage evidence only |
 | `documentation_evidence_check.py` | Frozen outer documentation evidence package verifier (I18.31 W4) | Documentation evidence package re-extraction evidence only |
+| `gen_capability_cell_registry.py` | Generate CapabilityCell registry projection from capability cell manifests | Generated CapabilityCell registry projection only |
 | `gen_operator_schedule_contract.py` | Generate C# mirror of Kernel UserAutomation schedule contract (#2865) | Generated C# schedule contract mirror only |
 | `gen_user_automation_zone_table.py` | Generate pinned IANA zone table for Kernel UserAutomation occurrence validator (#2805) | Pinned IANA zone table generation only |
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
@@ -210,6 +213,7 @@ be promoted to live multi-agent/runtime proof.
 | Script | Purpose | Boundary |
 |---|---|---|
 | `provision-surrealdb-release.py` | Materialize pinned SurrealDB evidence into project-local ignored state | Local evidence provision only |
+| `prepare-dependency-policy-inputs.py` | Materialize approved dependency-policy inputs into project-local state for offline gating (#3004) | Local dependency input materialization only |
 | `provision-dependency-scanner.py` | Materialize the exact dependency-policy scanner version/archive/executable digests declared in `config/dependency-policy.toml` into project-local ignored state (#3004/#1229/#1225) | Local scanner-input provision only; never "latest", never a lock/receipt/verdict write |
 | `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
 | `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
