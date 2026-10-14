@@ -271,6 +271,16 @@ path = "scripts/docs_router_core.py"
 token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
 reason = "The router resolves the stable compatibility-map paths as legacy-anchor entry points so incoming links keep working; the route table is the current read path."
 
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "The retired authority surface record lists retired paths to enforce their absence."
+
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "The retired authority surface record lists retired paths to enforce their absence."
+
 [script_inventory]
 directory = "scripts"
 documentation = "scripts/README.md"
@@ -336,6 +346,111 @@ ignore_globs = [
   ".github/workflows/repository-policy.yml",
 ]
 handle_index = "docs/architecture/handle-index.json"
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/AGENTS.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_package_reader_closure.py"
+path = "docs/architecture/A.md"
+reason = "Self-test fixture path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_package_reader_closure.py"
+path = "docs/architecture/H.md"
+reason = "Self-test fixture path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_wasm_component_lane.py"
+path = "docs/unrelated.md"
+reason = "Self-test fixture path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/verify-github-workflows.py"
+path = "docs/note.md"
+reason = "Self-test fixture path in workflow verifier."
+
+[[repository_paths.allow_missing]]
+source = "scripts/work_unit_gate/fixtures/pr_prose_override.md"
+path = "docs/architecture/ARCHITECTURE_CONTRACT.md"
+reason = "Sanitized PR prose override test fixture."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/conformance.toml"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/UNIMPLEMENTED.md"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/BRANCH_INTEGRATION_CLEANUP_HANDOFF_2026-08-28.md"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/M5_OPERATIONS_RUNBOOK.md"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/PRODUCTION_CUTOVER_RUNBOOK.md"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "workstreams/security/retired-authority-surfaces.toml"
+path = "docs/operations/RUNTIME_LIVE_V3_HANDOFF_2026-08-22.md"
+reason = "Retired authority surface record lists paths to enforce absence."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/ARCHITECTURE.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/IMPLEMENTATION.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/BUILD.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/TESTING.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/SCHEMA.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/CHANGELOG.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
+
+[[repository_paths.allow_missing]]
+source = "crates/foundation/eliot-bootstrap/src/capture.rs"
+path = "docs/implementation/README.md"
+reason = "The bootstrap documentation capture lists legacy fallback documentation paths."
 
 [[repository_paths.allow_missing]]
 source = "scripts/docs_shards_core.py"

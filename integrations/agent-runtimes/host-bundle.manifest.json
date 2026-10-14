@@ -95,7 +95,7 @@
       "route_profile_sha256": "0f5c089a6bb801e61329992c08e428472bfcbf8cd5ed56b6dbc730e3b828e692",
       "bundle_generation": "1217-A.1",
       "adapter_contract": "integrations/opencode/plugin-bridge-contract.json",
-      "adapter_contract_sha256": "ffb3fb10bd77608df5d9f06e4a8760cd2ff8ab51c1ea93d5e7bd921d17eb1b09",
+      "adapter_contract_sha256": "62db6ba77ead2e4fc20099b6a611a47f22205f0ebb5c81bb4073a2f2123cfc11",
       "adapter_generation": "eliot.opencode-plugin-bridge.v1",
       "adapter_note": "compatibility_fallback only_when_loopback_http_is_not_configured; cross_transport_failover_after_http_attempt is false; unprobed and requires live probe; contract presence is not admission.",
       "host_runtime_version": null,
@@ -115,7 +115,7 @@
           "destination": "plugins/eliot.js",
           "kind": "file",
           "mode": "verbatim_copy",
-          "sha256": "f09b2e70f998e94e361b6efbdb6facb0e9170fd7aab53a523f48199b074b8de0"
+          "sha256": "af008b76d7018ac2813932d38a79b2fb594b70e659e10402f9c144d5f608ec31"
         },
         {
           "source": "integrations/opencode/instructions/eliot.md",

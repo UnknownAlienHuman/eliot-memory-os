@@ -136,6 +136,12 @@ Manual Windows integration run on one admitted SHA/profile (`workflow_dispatch` 
 
 Proof ceiling: manual structural integration run only.
 
+### `wasm-modules.yml`
+
+Manual WASM modules build/test lane run on one admitted module (`workflow_dispatch` only).
+
+Proof ceiling: affected-component WASM build/test lane execution only.
+
 ## Branch and integration rules
 
 Normal branches use:
