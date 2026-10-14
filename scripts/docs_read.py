@@ -176,6 +176,8 @@ def language_for(path: str) -> str:
     suffix = Path(path).suffix.casefold()
     return {
         ".json": "json",
+        ".md": "markdown",
+        ".markdown": "markdown",
         ".toml": "toml",
         ".yaml": "yaml",
         ".yml": "yaml",
@@ -193,14 +195,13 @@ def render_item(record: dict[str, Any], text: str) -> str:
         f"\n---\n\n## Required item `{record['path']}`\n\n"
         f"SHA-256: `{record['sha256']}`; bytes: `{record['bytes']}`{handle_note}.\n\n"
     )
-    if Path(record["path"]).suffix.casefold() in (".md", ".markdown"):
-        return header + text.rstrip("\n") + "\n"
-    # A declared source file may itself contain fenced Markdown examples. Keep
-    # those examples inside this one verified item rather than letting a fixed
-    # fence expose them as headings or instructions of the enclosing bundle.
+    markdown = Path(record["path"]).suffix.casefold() in (".md", ".markdown")
+    content = text.rstrip("\n") if markdown else text.rstrip()
+    # Keep every required source inside an item-local fence. Choose a delimiter
+    # longer than every backtick run so source Markdown cannot close the fence.
     longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
     fence = "`" * max(4, longest + 1)
-    return header + f"{fence}{language_for(record['path'])}\n{text.rstrip()}\n{fence}\n"
+    return header + f"{fence}{language_for(record['path'])}\n{content}\n{fence}\n"
 
 
 def build_read_bundle(root: Path, route: dict[str, Any]) -> tuple[str, dict[str, Any]]:

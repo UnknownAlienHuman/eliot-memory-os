@@ -22,6 +22,12 @@ class IssueReadingTests(unittest.TestCase):
         # WORK_UNIT_CASE: 5320/1
         body = "## Read\n- I0.14\n```text\n- I9.9\n- unrelated.md\n```\n"
         self.assertEqual(router.parse_issue_reading(body), (("I0.14",), ()))
+        for indent in ("  ", "   "):
+            with self.subTest(indent=indent), self.assertRaisesRegex(router.RouteError, "flat"):
+                router.parse_issue_reading("## Read\n- I0.14\n" + indent + "- I5.19\n")
+        for indent in ("    ", "\t"):
+            with self.subTest(indent=indent):
+                self.assertEqual(router.parse_issue_reading("## Read\n- I0.14\n" + indent + "- I5.19\n"), (("I0.14",), ()))
 
     def test_02_short_or_named_fence_does_not_close(self):
         # WORK_UNIT_CASE: 5320/2
@@ -41,6 +47,16 @@ class IssueReadingTests(unittest.TestCase):
     def test_05_hidden_or_hash_suffixed_heading_is_not_declaration(self):
         # WORK_UNIT_CASE: 5320/5
         self.assertIsNone(router.parse_issue_reading("<!--\n## Read\n- I9.9\n-->\n## Read#\n- I0.14\n"))
+        for level in (3, 4, 5, 6):
+            with self.subTest(level=level):
+                self.assertIsNone(router.parse_issue_reading("## Plan\n" + "#" * level + " Read\n- I9.9\n"))
+        hidden = "Intro <!-- hidden\n## Read\n- I9.9\n-->\n"
+        self.assertIsNone(router.parse_issue_reading(hidden))
+        self.assertEqual(router.parse_issue_reading(hidden + "## Read\n- I0.14\n"), (("I0.14",), ()))
+        # Literal delimiters in code cannot hide a later real declaration.
+        for code in ("```html <!-- literal\n```\n", "    <!-- literal\n", "Literal `<!--` example\n", "Literal ``code `<!--` `` example\n"):
+            with self.subTest(code=code):
+                self.assertEqual(router.parse_issue_reading(code + "## Read\n- I0.14\n"), (("I0.14",), ()))
 
     def test_06_exact_live_body_bytes_not_stdout_framing(self):
         # WORK_UNIT_CASE: 5320/6
@@ -107,6 +123,12 @@ class IssueReadingTests(unittest.TestCase):
         rendered = reader.render_item({"path": "sample.py", "sha256": "a" * 64, "bytes": len(source)}, source)
         self.assertIn("`````python\n", rendered)
         self.assertTrue(rendered.endswith("`````\n"))
+        next_item = reader.render_item({"path": "next.md", "sha256": "b" * 64, "bytes": 6}, "# Next")
+        for source, fence in (("<!-- unterminated", "````"), ("````\nunterminated fence", "`````")):
+            with self.subTest(source=source):
+                rendered = reader.render_item({"path": "sample.md", "sha256": "a" * 64, "bytes": len(source)}, source)
+                self.assertIn(fence + "markdown\n" + source, rendered)
+                self.assertIn("\n" + fence + "\n\n---\n", rendered + next_item)
 
     def test_14_protocol_sync_preserves_rules_and_machine_template(self):
         # WORK_UNIT_CASE: 5320/14
@@ -143,6 +165,12 @@ class IssueReadingTests(unittest.TestCase):
         for value in ("C:/Windows/win.ini", "D:relative.md", "//server/share/file.md", "../outside.md", "bad\x00.md"):
             with self.subTest(value=value), self.assertRaises(router.RouteError):
                 router.declared_reading_from_body(f"## Read\n- `{value}`\n", "fixture")
+        declared = router.declared_reading_from_body("## Read\n- LICENSE\n", "fixture")
+        route = router.route_payload(ROOT, router.load_config(ROOT), [], "", declared)
+        self.assertIn("LICENSE", {item["path"] for item in route["required"]})
+        missing = router.declared_reading_from_body("## Read\n- no-such-extensionless-read-target-5320\n", "fixture")
+        with self.assertRaises(router.RouteError):
+            router.route_payload(ROOT, router.load_config(ROOT), [], "", missing)
 
     def test_16_resolved_external_file_cannot_enter_route_or_bundle(self):
         # WORK_UNIT_CASE: 5320/16

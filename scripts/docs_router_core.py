@@ -407,8 +407,8 @@ def parse_issue_reading(body: str) -> tuple[tuple[str, ...], tuple[str, ...]] | 
     Each list item names one handle selector (`I5.19`, `I1.1..I1.8`, `A4.*`,
     `APPENDIX-L`) or one repository file as its first token, optionally in
     backticks or as a Markdown link; the rest of the line is a free comment.
-    Returns ``None`` when the body has no such section. An unrecognized item
-    fails closed instead of being silently skipped. Fenced code
+    Returns ``None`` when the body has no such section. An invalid item fails
+    closed in parsing or repository resolution instead of being skipped. Fenced code
     blocks are tracked explicitly: list items and headings inside a
     fence are ignored, and a fence closes only with a run of the
     same character at least as long as the opening run. A second
@@ -422,31 +422,52 @@ def parse_issue_reading(body: str) -> tuple[tuple[str, ...], tuple[str, ...]] | 
     in_section = False
     level = 0
     in_comment = False
+    list_indent: int | None = None
     for line in body.replace("\r\n", "\n").split("\n"):
         # The declaration grammar is a visible ATX heading and flat list, not
         # list-shaped examples inside fenced/indented code or HTML comments.
-        if in_comment:
-            if "-->" in line:
-                in_comment = False
-            continue
         if fence is not None:
             closed = re.fullmatch(r" {0,3}(`{3,}|~{3,})[ \t]*", line)
             if closed and closed[1][0] == fence[0] and len(closed[1]) >= fence[1]:
                 fence = None
             continue
-        if re.match(r" {0,3}<!--", line):
-            in_comment = "-->" not in line
-            continue
-        opened = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", line)
-        if opened and not (opened[1][0] == "`" and "`" in opened[2]):
-            fence = (opened[1][0], len(opened[1]))
-            continue
+        if not in_comment:
+            if line.startswith("    ") or line.startswith("\t"):
+                continue
+            opened = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", line)
+            if opened and not (opened[1][0] == "`" and "`" in opened[2]):
+                fence = (opened[1][0], len(opened[1]))
+                continue
+        # Comments may begin after prose, not only at column zero. Preserve
+        # visible columns so removing a comment cannot manufacture a heading.
+        visible: list[str] = []
+        offset = 0
+        code_spans = [match.span() for match in re.finditer(r"(?<!`)(`+)(?!`)(.*?)\1(?!`)", line)]
+        while offset < len(line):
+            if in_comment:
+                end = line.find("-->", offset)
+                stop = len(line) if end < 0 else end + 3
+                visible.append(" " * (stop - offset))
+                offset = stop
+                in_comment = end < 0
+            else:
+                start = line.find("<!--", offset)
+                for first, last in code_spans:
+                    if first <= start < last:
+                        start = line.find("<!--", last)
+                if start < 0:
+                    visible.append(line[offset:])
+                    break
+                visible.append(line[offset:start])
+                offset = start
+                in_comment = True
+        line = "".join(visible)
         if line.startswith("    ") or line.startswith("\t"):
             continue
         heading = re.fullmatch(r" {0,3}(#{1,6})[ \t]+(.*?)[ \t]*", line)
         if heading:
             title = re.sub(r"[ \t]+#+[ \t]*$", "", heading[2]).casefold()
-            is_read = len(heading[1]) >= 2 and title in ISSUE_READING_HEADINGS
+            is_read = len(heading[1]) == 2 and title in ISSUE_READING_HEADINGS
             if is_read:
                 if found:
                     raise RouteError("ambiguous duplicate `## Read` section; keep exactly one")
@@ -459,6 +480,11 @@ def parse_issue_reading(body: str) -> tuple[tuple[str, ...], tuple[str, ...]] | 
         item = re.match(r" {0,3}(?:[-*+]|\d+[.)])[ \t]+(.*)$", line)
         if not item:
             continue
+        indent = len(line) - len(line.lstrip(" "))
+        if list_indent is None:
+            list_indent = indent
+        elif indent != list_indent:
+            raise RouteError("Issue reading list must be flat; nested items are ambiguous")
         token = _reading_item_token(item.group(1))
         if not token:
             raise RouteError("empty Issue reading list item")
@@ -468,8 +494,8 @@ def parse_issue_reading(body: str) -> tuple[tuple[str, ...], tuple[str, ...]] | 
         if "://" in token:
             raise RouteError(f"Issue reading item must be a handle or repository file, not a URL: {token}")
         path = normalize_repo_path(token.split("#", 1)[0])
-        if "/" not in path and "." not in path:
-            raise RouteError(f"Issue reading item is neither a handle selector nor a file path: {token}")
+        # Repository resolution, not punctuation, decides whether this is a
+        # file. Root files such as LICENSE and Justfile have no extension.
         files.append(path)
     if not found:
         return None
@@ -1182,7 +1208,9 @@ def self_test() -> None:
         raise RouteError("Issue reading section self-test failed")
     if parse_issue_reading("## Problem\n\nNo reading.\n") is not None:
         raise RouteError("missing Issue reading section self-test failed")
-    for bad in ("## Read\n\n- read everything\n", "## Read\n\n- https://example.com/doc\n", "## Read\n\nnone\n"):
+    if parse_issue_reading("## Read\n- LICENSE\n") != ((), ("LICENSE",)):
+        raise RouteError("extensionless Issue reading file self-test failed")
+    for bad in ("## Read\n\n- ../outside\n", "## Read\n\n- https://example.com/doc\n", "## Read\n\nnone\n"):
         try:
             parse_issue_reading(bad)
         except RouteError:
