@@ -22,6 +22,11 @@ property>"` for every mutable path family, or `--changed-from origin/main` for
 the complete branch delta. Open the verified bundle and read every required
 item before mutation. A route alone is navigation, not reading evidence.
 
+An Issue-only read without paths is declaration-only navigation. Before editing,
+supply the actual mutable `--path` families or `--changed-from` scope. Reading
+references do not grant write scope. An offline `--issue-body` capture preserves
+its exact body identity; it does not prove that the Issue is current.
+
 Record the route receipt ID, read receipt ID, declared reading or matched
 routes, required handles, fragment paths and SHA-256 values, verified bundle
 SHA-256, and explicit reading attestation in the work unit or pull request.

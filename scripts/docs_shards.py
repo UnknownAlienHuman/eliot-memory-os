@@ -46,6 +46,20 @@ _core_self_test = _core.self_test
 def routing_block(
     relative_protocol: str = "docs/architecture/READING_PROTOCOL.md",
 ) -> str:
+    if relative_protocol != "docs/architecture/READING_PROTOCOL.md":
+        return f"""## Mandatory documentation reading
+
+Follow the [verified reading protocol]({relative_protocol}). From the repository
+root, read the owning Issue's `## Read` with the actual mutable paths:
+
+```text
+python scripts/docs_read.py read --issue <number> --path <repository/path> --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Open the verified bundle and read every required item before editing. Record its
+route/read identities, hashes and reading attestation. Reroute when scope changes;
+without an owning Issue, use the protocol's path/topic mode. Reading references
+do not grant write scope. Do not substitute a legacy compatibility map for a read."""
     return f"""## Mandatory documentation routing
 
 Every implementation Issue lists what to read in a `## Read` section: handle
@@ -66,6 +80,11 @@ pointers. Without an Issue, use `--path <repository/path> --topic "<causal
 property>"` for every mutable path family, or `--changed-from origin/main` for
 the complete branch delta. Open the verified bundle and read every required
 item before mutation. A route alone is navigation, not reading evidence.
+
+An Issue-only read without paths is declaration-only navigation. Before editing,
+supply the actual mutable `--path` families or `--changed-from` scope. Reading
+references do not grant write scope. An offline `--issue-body` capture preserves
+its exact body identity; it does not prove that the Issue is current.
 
 Record the route receipt ID, read receipt ID, declared reading or matched
 routes, required handles, fragment paths and SHA-256 values, verified bundle
@@ -159,6 +178,9 @@ The documentation is a routed contract graph, not a book-shaped prompt.
    repeat `--path` for every mutable path family with a `--topic`, or use
    `--changed-from origin/main` for the complete branch delta, including
    deletions.
+   An Issue-only read with no paths is declaration-only navigation; before
+   editing, supply the actual mutable paths. An offline body capture preserves
+   exact bytes but does not establish current Issue authority.
 4. Open the verified bundle and read every required file/fragment before
    mutation. A route alone is navigation, not reading evidence.
 5. Inspect optional one-hop fragments only when the current decision crosses
@@ -191,6 +213,10 @@ The reader returns decision-sufficient fragments, not every related section.
 The compatibility maps, full handle index, Decision Anchor index, and assembled
 books are navigation or audit surfaces. They are prohibited as default agent
 context.
+
+Human routes summarize optional pointers by default. Use `--full-pointers` or
+`--format json` only when inspecting an optional boundary; the reader bundle
+contains required content only.
 
 To inspect all changed paths at once:
 
@@ -464,6 +490,64 @@ def _refresh_indexes(argv: Sequence[str]) -> int:
         return 1
 
 
+def sync_reading_protocol(root: Path, *, check: bool = False) -> list[str]:
+    """Refresh managed reading instructions without migrating the books.
+
+    The PR template carries a separate machine-evidence contract and is not a
+    routing-block target. Historical navigation snapshots are not rewritten.
+    """
+    root = root.resolve()
+    pair = _core.load_simple_toml(root / "docs/normative-pair.toml")
+    pair_identity = _core.pair_key(
+        str(pair["architecture_sha256"]), str(pair["implementation_sha256"])
+    )
+    if pair.get("pair_key") != pair_identity:
+        raise DocsError("reading protocol requires the current normative pair")
+    wanted: dict[Path, str] = {}
+    for path in sorted(root.rglob("AGENTS.md")):
+        relative = path.relative_to(root)
+        if any(part in LINK_SCAN_SKIP_PARTS or part == "navigation-history" for part in relative.parts):
+            continue
+        if not path.resolve().is_relative_to(root):
+            raise DocsError(f"reading instruction escapes repository: {relative}")
+        old = path.read_bytes().decode("utf-8")
+        if _core.ROUTING_START not in old:
+            continue
+        protocol = os.path.relpath(root / "docs/architecture/READING_PROTOCOL.md", path.parent).replace("\\", "/")
+        wanted[path] = _core.insert_or_replace_block(old, routing_block(protocol))
+    for name in ("WORKFLOW.md", "START.md"):
+        path = root / name
+        if path.is_file():
+            old = path.read_bytes().decode("utf-8")
+            if _core.ROUTING_START in old:
+                wanted[path] = _core.insert_or_replace_block(old, routing_block())
+    wanted[root / "docs/architecture/READING_PROTOCOL.md"] = render_reading_protocol(pair_identity)
+    changed = [str(path.relative_to(root)).replace("\\", "/") for path, text in wanted.items()
+               if path.read_bytes() != text.encode("utf-8")]
+    if check and changed:
+        raise DocsError("reading protocol surfaces are stale: " + ", ".join(changed))
+    if not check:
+        for path, text in wanted.items():
+            if path.read_bytes() != text.encode("utf-8"):
+                _core.write_utf8(path, text)
+    return changed
+
+
+def _sync_reading_protocol(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(prog="docs_shards.py sync-reading-protocol")
+    parser.add_argument("--root", type=Path, default=Path("."))
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args(list(argv))
+    try:
+        changed = sync_reading_protocol(args.root, check=args.check)
+        print("DOC_READING_PROTOCOL: PASS action=" + ("CHECK" if args.check else "WRITE")
+              + f" changed={len(changed)}")
+        return 0
+    except (DocsError, OSError, UnicodeError, KeyError) as exc:
+        print(f"DOC_READING_PROTOCOL_FAIL: {exc}", file=sys.stderr)
+        return 1
+
+
 _core.routing_block = routing_block
 _core.patch_navigation_surfaces = patch_navigation_surfaces
 _core.render_reading_protocol = render_reading_protocol
@@ -479,6 +563,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "refresh-indexes":
         return _refresh_indexes(arguments[1:])
+    if arguments and arguments[0] == "sync-reading-protocol":
+        return _sync_reading_protocol(arguments[1:])
     return _core.main(arguments)
 
 

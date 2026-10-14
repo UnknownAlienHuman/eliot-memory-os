@@ -8,10 +8,9 @@ and their executable negative fixtures.
 
 from __future__ import annotations
 
-import re
 import subprocess
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Sequence
 
 import docs_router_core as _core
@@ -19,25 +18,11 @@ from docs_router_core import *  # noqa: F403
 
 DRIVE_QUALIFIED_PATH_REJECTED = "eliot-doc-router-drive-qualified-path-v1"
 _core_self_test = _core.self_test
+_core_normalize_repo_path = _core.normalize_repo_path
 
 
 def normalize_repo_path(value: str) -> str:
-    value = value.strip().replace("\\", "/")
-    while value.startswith("./"):
-        value = value[2:]
-    value = re.sub(r"/+", "/", value)
-    if value in ("", "."):
-        return "."
-    if re.match(r"^[A-Za-z]:", value):
-        raise RouteError(  # noqa: F405
-            f"path must be repository-relative and non-traversing: {value!r}"
-        )
-    pure = PurePosixPath(value)
-    if pure.is_absolute() or ".." in pure.parts:
-        raise RouteError(  # noqa: F405
-            f"path must be repository-relative and non-traversing: {value!r}"
-        )
-    return pure.as_posix()
+    return _core_normalize_repo_path(value)
 
 
 def git_changed_paths(root: Path, changed_from: str) -> list[str]:

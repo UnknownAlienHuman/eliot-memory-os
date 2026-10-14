@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
 SCHEMA = "eliot-doc-routes-v1"
@@ -122,7 +122,7 @@ def normalize_repo_path(value: str) -> str:
     if value in ("", "."):
         return "."
     pure = PurePosixPath(value)
-    if pure.is_absolute() or ".." in pure.parts:
+    if pure.is_absolute() or PureWindowsPath(value).drive or ".." in pure.parts or any(ord(char) < 32 for char in value):
         raise RouteError(f"path must be repository-relative and non-traversing: {value!r}")
     return pure.as_posix()
 
@@ -408,45 +408,60 @@ def parse_issue_reading(body: str) -> tuple[tuple[str, ...], tuple[str, ...]] | 
     `APPENDIX-L`) or one repository file as its first token, optionally in
     backticks or as a Markdown link; the rest of the line is a free comment.
     Returns ``None`` when the body has no such section. An unrecognized item
-    fails closed instead of being silently skipped.
+    fails closed instead of being silently skipped. Fenced code
+    blocks are tracked explicitly: list items and headings inside a
+    fence are ignored, and a fence closes only with a run of the
+    same character at least as long as the opening run. A second
+    real `## Read` section is ambiguous and rejected instead of
+    silently shadowed.
     """
-    lines = body.replace("\r\n", "\n").split("\n")
-    fence: str | None = None
-    start: int | None = None
-    level = 0
-    end = len(lines)
-    for number, line in enumerate(lines):
-        stripped = line.strip()
-        marker = re.match(r"(`{3,}|~{3,})", stripped)
-        if marker:
-            if fence is None:
-                fence = marker.group(1)[0]
-            elif stripped.startswith(fence * 3):
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        heading = re.match(r"(#{1,6})\s+(.*?)\s*#*\s*$", stripped)
-        if not heading:
-            continue
-        if start is None:
-            if heading.group(2).casefold() in ISSUE_READING_HEADINGS and len(heading.group(1)) >= 2:
-                start, level = number + 1, len(heading.group(1))
-        elif len(heading.group(1)) <= level:
-            end = number
-            break
-    if start is None:
-        return None
-
     handles: list[str] = []
     files: list[str] = []
-    for line in lines[start:end]:
-        item = re.match(r"\s*(?:[-*+]|\d+[.)])\s+(.*)$", line)
+    fence: tuple[str, int] | None = None
+    found = False
+    in_section = False
+    level = 0
+    in_comment = False
+    for line in body.replace("\r\n", "\n").split("\n"):
+        # The declaration grammar is a visible ATX heading and flat list, not
+        # list-shaped examples inside fenced/indented code or HTML comments.
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if fence is not None:
+            closed = re.fullmatch(r" {0,3}(`{3,}|~{3,})[ \t]*", line)
+            if closed and closed[1][0] == fence[0] and len(closed[1]) >= fence[1]:
+                fence = None
+            continue
+        if re.match(r" {0,3}<!--", line):
+            in_comment = "-->" not in line
+            continue
+        opened = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", line)
+        if opened and not (opened[1][0] == "`" and "`" in opened[2]):
+            fence = (opened[1][0], len(opened[1]))
+            continue
+        if line.startswith("    ") or line.startswith("\t"):
+            continue
+        heading = re.fullmatch(r" {0,3}(#{1,6})[ \t]+(.*?)[ \t]*", line)
+        if heading:
+            title = re.sub(r"[ \t]+#+[ \t]*$", "", heading[2]).casefold()
+            is_read = len(heading[1]) >= 2 and title in ISSUE_READING_HEADINGS
+            if is_read:
+                if found:
+                    raise RouteError("ambiguous duplicate `## Read` section; keep exactly one")
+                found, in_section, level = True, True, len(heading[1])
+            elif in_section and len(heading[1]) <= level:
+                in_section = False
+            continue
+        if not in_section:
+            continue
+        item = re.match(r" {0,3}(?:[-*+]|\d+[.)])[ \t]+(.*)$", line)
         if not item:
             continue
         token = _reading_item_token(item.group(1))
         if not token:
-            continue
+            raise RouteError("empty Issue reading list item")
         if HANDLE_SELECTOR_RE.fullmatch(token):
             handles.append(token)
             continue
@@ -456,6 +471,8 @@ def parse_issue_reading(body: str) -> tuple[tuple[str, ...], tuple[str, ...]] | 
         if "/" not in path and "." not in path:
             raise RouteError(f"Issue reading item is neither a handle selector nor a file path: {token}")
         files.append(path)
+    if not found:
+        return None
     if not handles and not files:
         raise RouteError("the Issue `## Read` section lists no handles or files")
     return tuple(dict.fromkeys(handles)), tuple(dict.fromkeys(files))
@@ -478,10 +495,21 @@ def declared_reading_from_body(body: str, source: str) -> DeclaredReading:
 
 
 def fetch_issue_body(root: Path, issue: str) -> str:
+    """Return the live Issue body with its exact bytes.
+
+    `gh --jq .body` prints the body with an appended formatting
+    newline, which would change `body_sha256` for every Issue. The
+    reader requests the raw JSON document instead and decodes the
+    `body` field verbatim, so the receipt hashes the exact Issue
+    body bytes with no remapping. The authoritative `number` field
+    must identify the requested Issue; anything else fails closed.
+    An offline `--issue-body` file keeps its own provenance and is
+    never labeled as the live Issue.
+    """
     number = issue.strip().lstrip("#")
     if not number.isdigit():
         raise RouteError(f"--issue expects an Issue number: {issue!r}")
-    command = ["gh", "issue", "view", number, "--json", "body", "--jq", ".body"]
+    command = ["gh", "issue", "view", number, "--json", "body,number"]
     try:
         completed = subprocess.run(
             command, cwd=root, capture_output=True, text=True, encoding="utf-8", check=False
@@ -492,7 +520,18 @@ def fetch_issue_body(root: Path, issue: str) -> str:
         raise RouteError(
             f"gh issue view {number} failed: {completed.stderr.strip()}; use --issue-body <file>"
         )
-    return completed.stdout
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RouteError(
+            f"gh returned a non-JSON Issue document for #{number}: {exc}; use --issue-body <file>"
+        ) from exc
+    if not isinstance(payload, dict) or type(payload.get("number")) is not int or payload["number"] != int(number):
+        raise RouteError(f"gh response does not identify the requested Issue #{number}")
+    body = payload.get("body")
+    if not isinstance(body, str):
+        raise RouteError(f"gh returned no body for Issue #{number}; use --issue-body <file>")
+    return body
 
 
 def load_declared_reading(root: Path, issue: str | None, issue_body: Path | None) -> DeclaredReading | None:
@@ -502,10 +541,20 @@ def load_declared_reading(root: Path, issue: str | None, issue_body: Path | None
         number = issue.strip().lstrip("#")
         return declared_reading_from_body(fetch_issue_body(root, number), f"Issue #{number}")
     if issue_body:
+        # Read the capture as raw bytes and decode UTF-8 explicitly:
+        # a text-mode read would universal-newline-normalize CRLF away
+        # before hashing, so a verbatim offline capture would not hash
+        # identically to the live JSON body. The final newline is part
+        # of the capture and is never stripped, and the offline source
+        # label stays distinct from the live Issue provenance.
         try:
-            text = issue_body.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+            raw = issue_body.read_bytes()
+        except OSError as exc:
             raise RouteError(f"cannot read Issue body file {issue_body}: {exc}") from exc
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RouteError(f"Issue body file {issue_body} is not UTF-8: {exc}") from exc
         return declared_reading_from_body(text, f"Issue body file {issue_body.name}")
     return None
 
@@ -522,13 +571,25 @@ def ancestor_agent_files(root: Path, paths: Sequence[str]) -> list[str]:
     return sorted(found)
 
 
-def file_record(root: Path, relative: str, role: str) -> dict[str, Any]:
+def repository_file(root: Path, relative: str, role: str) -> Path:
+    """Resolve a reading file without granting external path authority."""
     relative = normalize_repo_path(relative)
     if relative in LEGACY_BOOKS:
         raise RouteError(f"legacy compatibility map cannot be routed as {role}: {relative}")
     path = root / relative
+    try:
+        if not path.resolve().is_relative_to(root.resolve()):
+            raise RouteError(f"routed {role} file escapes repository: {relative}")
+    except (OSError, ValueError) as exc:
+        raise RouteError(f"invalid routed {role} file: {relative}") from exc
     if not path.is_file():
         raise RouteError(f"routed {role} file does not exist: {relative}")
+    return path
+
+
+def file_record(root: Path, relative: str, role: str) -> dict[str, Any]:
+    relative = normalize_repo_path(relative)
+    path = repository_file(root, relative, role)
     return {
         "kind": "file",
         "role": role,
@@ -564,6 +625,26 @@ def fragment_records(
         target["handles"].append(handle)
         target["anchors"].append(str(record["anchor"]))
     return sorted(by_path.values(), key=lambda item: item["path"])
+
+
+def coalesce_records(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One verified payload per path, retaining every indexed handle."""
+    by_path: dict[str, dict[str, Any]] = {}
+    for item in items:
+        path = str(item["path"])
+        previous = by_path.get(path)
+        if previous is None:
+            by_path[path] = dict(item)
+            continue
+        if (previous["sha256"], previous["bytes"]) != (item["sha256"], item["bytes"]):
+            raise RouteError(f"reading item identity disagreement: {path}")
+        if item["kind"] == "fragment":
+            previous["kind"] = "fragment"
+        for field in ("handles", "anchors"):
+            values = set(previous.get(field, ())) | set(item.get(field, ()))
+            if values:
+                previous[field] = sorted(values, key=handle_key) if field == "handles" else sorted(values)
+    return list(by_path.values())
 
 
 def route_payload(
@@ -624,17 +705,26 @@ def route_payload(
             optional_selectors.extend(route.optional_handles)
             optional_files.extend(route.required_files)
             optional_files.extend(route.optional_files)
-    required_files.extend(ancestor_agent_files(root, normalized_paths))
+    agent_scope = [*normalized_paths, *(declared.files if declared is not None else ())]
+    required_files.extend(ancestor_agent_files(root, agent_scope))
 
     # The causal property names its own governing fragment; a route table gap
     # must not silently demote it to one-hop optional material (#929, #958,
     # #1730, #2970). Resolved from the prose title, so it names the governing
     # fragment without widening any glob, keyword, or required byte ceiling.
     governing = governing_handles(handles, topic)
-    required_handles = sorted(
-        set(expand_selectors(required_selectors, handles)) | set(governing),
-        key=handle_key,
-    )
+    selected_handles = set(expand_selectors(required_selectors, handles))
+    if declared is not None:
+        absent = set(governing) - selected_handles
+        if absent:
+            raise RouteError(
+                "the topic names governing handles absent from the Issue `## Read`: "
+                + ", ".join(sorted(absent, key=handle_key))
+                + "; declare them explicitly rather than silently expanding the context"
+            )
+    else:
+        selected_handles.update(governing)
+    required_handles = sorted(selected_handles, key=handle_key)
     optional_handles = [
         handle for handle in expand_selectors(optional_selectors, handles)
         if handle not in set(required_handles)
@@ -648,6 +738,10 @@ def route_payload(
         required_items.append(file_record(root, relative, "required"))
     for relative in sorted(set(optional_files) - set(required_files)):
         optional_items.append(file_record(root, relative, "optional"))
+
+    required_items = coalesce_records(required_items)
+    required_paths = {item["path"] for item in required_items}
+    optional_items = coalesce_records([item for item in optional_items if item["path"] not in required_paths])
 
     required_items.sort(key=lambda item: (0 if item["kind"] == "file" else 1, item["path"]))
     optional_items.sort(key=lambda item: (0 if item["kind"] == "file" else 1, item["path"]))
@@ -739,7 +833,7 @@ def assert_required_handles(
             )
 
 
-def render_route(payload: dict[str, Any]) -> str:
+def render_route(payload: dict[str, Any], *, full_pointers: bool = False) -> str:
     lines = [
         "# Documentation read route",
         "",
@@ -769,11 +863,15 @@ def render_route(payload: dict[str, Any]) -> str:
         )
     lines.extend(["", "## Optional one-hop expansion", ""])
     if payload["optional"]:
-        for item in payload["optional"]:
-            handles = f" — handles `{', '.join(item['handles'])}`" if item.get("handles") else ""
-            lines.append(
-                f"- `{item['path']}`{handles} — `{item['bytes']}` bytes — SHA-256 `{item['sha256']}`"
-            )
+        if full_pointers:
+            for item in payload["optional"]:
+                handles = f" — handles `{', '.join(item['handles'])}`" if item.get("handles") else ""
+                lines.append(
+                    f"- `{item['path']}`{handles} — `{item['bytes']}` bytes — SHA-256 `{item['sha256']}`"
+                )
+        else:
+            lines.append(f"- {len(payload['optional'])} optional pointers; no optional content is included.")
+            lines.append("- Inspect them only at a boundary crossing with `--full-pointers` or `--format json`.")
     else:
         lines.append("- None.")
     lines.extend(
@@ -1098,6 +1196,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     route_parser.add_argument("--issue", help="Issue number whose `## Read` section declares the reading")
     route_parser.add_argument("--issue-body", type=Path, help="Issue body file (offline alternative to --issue)")
     route_parser.add_argument("--format", choices=("markdown", "json", "issue"), default="markdown")
+    route_parser.add_argument("--full-pointers", action="store_true", help="Include the full optional pointer inventory in human output")
     route_parser.add_argument("--output", type=Path)
 
     check_parser = sub.add_parser("check")
@@ -1134,7 +1233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.format == "issue":
                 rendered = render_issue_reading_draft(root, config, payload)
             else:
-                rendered = render_route(payload)
+                rendered = render_route(payload, full_pointers=args.full_pointers)
             if args.output:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 args.output.write_text(rendered, encoding="utf-8", newline="")

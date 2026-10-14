@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -83,7 +84,7 @@ def verified_item(root: Path, item: dict[str, Any]) -> tuple[dict[str, Any], str
     relative = docs_router.normalize_repo_path(str(item.get("path", "")))
     if relative in docs_router.LEGACY_BOOKS:
         raise ReadError(f"legacy compatibility map cannot satisfy reading: {relative}")
-    path = root / relative
+    path = docs_router.repository_file(root, relative, "required")
     if not path.is_file():
         raise ReadError(f"required routed item does not exist: {relative}")
     raw = path.read_bytes()
@@ -160,7 +161,7 @@ def assert_governing_fragments(
         if str(item["sha256"]) != str(record["fragment_sha256"]):
             absent.append(f"{handle} -> {index_path} (bundle hash is not the indexed hash)")
             continue
-        if sha256_bytes((root / index_path).read_bytes()) != str(record["fragment_sha256"]):
+        if sha256_bytes(docs_router.repository_file(root, index_path, "governing").read_bytes()) != str(record["fragment_sha256"]):
             absent.append(f"{handle} -> {index_path} (stale on disk)")
     if absent:
         raise ReadError(
@@ -194,7 +195,11 @@ def render_item(record: dict[str, Any], text: str) -> str:
     )
     if Path(record["path"]).suffix.casefold() in (".md", ".markdown"):
         return header + text.rstrip("\n") + "\n"
-    fence = "````"
+    # A declared source file may itself contain fenced Markdown examples. Keep
+    # those examples inside this one verified item rather than letting a fixed
+    # fence expose them as headings or instructions of the enclosing bundle.
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(4, longest + 1)
     return header + f"{fence}{language_for(record['path'])}\n{text.rstrip()}\n{fence}\n"
 
 
@@ -209,6 +214,26 @@ def build_read_bundle(root: Path, route: dict[str, Any]) -> tuple[str, dict[str,
         f"Normative pair: `{route.get('pair_key', '')}`\n\n",
         "> Every item below was verified against the route immediately before rendering.\n",
     ]
+    declared = route.get("declared_reading")
+    if declared is not None:
+        if not isinstance(declared, dict):
+            raise ReadError("declared reading provenance is not an object")
+        source = declared.get("source")
+        body_sha = declared.get("body_sha256")
+        if not isinstance(source, str) or not source.strip():
+            raise ReadError("declared reading provenance has no source")
+        if not isinstance(body_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", body_sha):
+            raise ReadError("declared reading provenance has no exact body SHA-256")
+        chunks.append(
+            "\nReading declaration: "
+            + json.dumps(source, ensure_ascii=False)
+            + f"; body SHA-256: `{body_sha}`.\n"
+        )
+        if not route.get("paths"):
+            chunks.append(
+                "\nDeclaration-only read: no mutable path scope was supplied. "
+                "Before editing, rerun with the actual --path families or --changed-from.\n"
+            )
     for item in required:
         if not isinstance(item, dict):
             raise ReadError("route required item is not an object")
@@ -292,6 +317,22 @@ def self_test() -> None:
         second_bundle, second_receipt = build_read_bundle(root, route)
         if first_bundle != second_bundle or first_receipt != second_receipt:
             raise ReadError("read bundle or receipt is not deterministic")
+        declared_route = dict(route)
+        declared_route["declared_reading"] = {
+            "source": "Issue #5320",
+            "body_sha256": "a" * 64,
+            "handles": ["A1"],
+            "files": [],
+        }
+        declared_bundle, declared_receipt = build_read_bundle(root, declared_route)
+        if 'Reading declaration: "Issue #5320"' not in declared_bundle:
+            raise ReadError("Issue declaration source was lost from the readable bundle")
+        if declared_receipt["declared_reading"] != declared_route["declared_reading"]:
+            raise ReadError("Issue declaration identity was lost from the receipt")
+        sample = "example\n````\n## Read\n- unrelated.md\n````\n"
+        rendered = render_item({"path": "example.py", "sha256": "a" * 64, "bytes": len(sample)}, sample)
+        if "`````python\n" not in rendered or not rendered.endswith("`````\n"):
+            raise ReadError("source examples escaped the verified item's outer fence")
         target.write_text("tampered\n", encoding="utf-8", newline="")
         try:
             build_read_bundle(root, route)
@@ -375,7 +416,7 @@ def self_test() -> None:
                 raise
         else:
             raise ReadError("missing governing fragment did not fail closed")
-    print("DOC_READ_SELF_TEST: PASS cases=6")
+    print("DOC_READ_SELF_TEST: PASS cases=8")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:

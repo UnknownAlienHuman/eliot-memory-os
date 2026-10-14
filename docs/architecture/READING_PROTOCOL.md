@@ -28,6 +28,9 @@ The documentation is a routed contract graph, not a book-shaped prompt.
    repeat `--path` for every mutable path family with a `--topic`, or use
    `--changed-from origin/main` for the complete branch delta, including
    deletions.
+   An Issue-only read with no paths is declaration-only navigation; before
+   editing, supply the actual mutable paths. An offline body capture preserves
+   exact bytes but does not establish current Issue authority.
 4. Open the verified bundle and read every required file/fragment before
    mutation. A route alone is navigation, not reading evidence.
 5. Inspect optional one-hop fragments only when the current decision crosses
@@ -60,6 +63,10 @@ The reader returns decision-sufficient fragments, not every related section.
 The compatibility maps, full handle index, Decision Anchor index, and assembled
 books are navigation or audit surfaces. They are prohibited as default agent
 context.
+
+Human routes summarize optional pointers by default. Use `--full-pointers` or
+`--format json` only when inspecting an optional boundary; the reader bundle
+contains required content only.
 
 To inspect all changed paths at once:
 
