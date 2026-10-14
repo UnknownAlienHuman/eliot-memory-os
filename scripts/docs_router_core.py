@@ -603,11 +603,14 @@ def fragment_records(
     handles_selected: Sequence[str],
     handles: dict[str, dict[str, Any]],
     role: str,
+    *,
+    root: Path,
 ) -> list[dict[str, Any]]:
     by_path: dict[str, dict[str, Any]] = {}
     for handle in handles_selected:
         record = handles[handle]
         path = str(record["path"])
+        repository_file(root, path, role)
         target = by_path.setdefault(
             path,
             {
@@ -729,8 +732,8 @@ def route_payload(
         handle for handle in expand_selectors(optional_selectors, handles)
         if handle not in set(required_handles)
     ]
-    required_items = fragment_records(required_handles, handles, "required")
-    optional_items = fragment_records(optional_handles, handles, "optional")
+    required_items = fragment_records(required_handles, handles, "required", root=root)
+    optional_items = fragment_records(optional_handles, handles, "optional", root=root)
     required_fragment_paths = {item["path"] for item in required_items}
     optional_items = [item for item in optional_items if item["path"] not in required_fragment_paths]
 
@@ -825,7 +828,7 @@ def assert_required_handles(
                 f"{label}: required fragment {index_path} hash {item['sha256']} "
                 f"differs from the handle index {index_sha}"
             )
-        current = sha256_file(root / index_path)
+        current = sha256_file(repository_file(root, index_path, "required fragment"))
         if current != index_sha:
             raise RouteError(
                 f"{label}: required fragment {index_path} is stale upstream; "

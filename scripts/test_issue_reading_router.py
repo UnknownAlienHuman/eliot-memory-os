@@ -162,6 +162,17 @@ class IssueReadingTests(unittest.TestCase):
                 with self.assertRaisesRegex(router.RouteError, "escapes repository"):
                     reader.verified_item(root, {"path": "alias.md", "bytes": 17, "sha256": "a" * 64})
 
+    def test_17_indexed_fragment_paths_obey_repository_boundary(self):
+        # WORK_UNIT_CASE: 5320/17
+        for value in ("C:/Windows/win.ini", "D:relative.md", "../outside.md"):
+            handles = {"A1": {"path": value, "fragment_sha256": "a" * 64, "fragment_bytes": 1, "anchor": "example"}}
+            with self.subTest(value=value):
+                with self.assertRaises(router.RouteError):
+                    router.fragment_records(["A1"], handles, "required", root=ROOT)
+                payload = {"required": [{"kind": "fragment", "path": value, "sha256": "a" * 64, "handles": ["A1"]}], "optional": []}
+                with self.assertRaises(router.RouteError):
+                    router.assert_required_handles(ROOT, handles, payload, ["A1"], "fixture")
+
 
 if __name__ == "__main__":
     unittest.main()
