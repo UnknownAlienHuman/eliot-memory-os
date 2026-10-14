@@ -3,11 +3,11 @@
 
 Do not open the former monoliths as task context.
 
-1. Read [`READING_PROTOCOL.md`](READING_PROTOCOL.md).
-2. Run the verified reader for the exact path and causal property:
+1. Check the owning Issue's `## Read` declaration and applicable `AGENTS.md`.
+2. Run the verified reader for the owning Issue and exact mutable path:
 
    ```text
-   python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+   python scripts/docs_read.py read --issue <number> --path <repository/path> --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
    ```
 
 3. Open the verified bundle and read every required item before mutation.
@@ -16,6 +16,13 @@ Do not open the former monoliths as task context.
 
 A route alone is navigation, not reading evidence. The local
 `.eliot/docs-read-bundle.md` and read receipt are not committed.
+
+The Issue's `## Read` list, the Decision Safety Floor and applicable `AGENTS.md`
+files form the required bundle. Path routes are optional pointers. Without an
+owning Issue, use `--path <repository/path> --topic "<causal property>"` to resolve
+required reading from the paths. [`READING_PROTOCOL.md`](READING_PROTOCOL.md)
+explains this command; navigation links do not add required reading. Declare
+additional content in the Issue before rerunning the verified reader.
 
 ## Navigation
 

@@ -1,29 +1,19 @@
 # `eliot-dreamer-implementation-brief` implementation contract
 
 <!-- eliot-doc-routing:start -->
-## Mandatory documentation routing
+## Mandatory documentation reading
 
-Before changing code, configuration, tests, workflows, or normative prose, run
-from the repository root:
+Follow the [verified reading protocol](../../../docs/architecture/READING_PROTOCOL.md). From the repository
+root, read the owning Issue's `## Read` with the actual mutable paths:
 
 ```text
-python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+python scripts/docs_read.py read --issue <number> --path <repository/path> --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Repeat `--path` for every mutable path family, or use `--changed-from
-origin/main` for the complete branch delta, including deletions. Open the
-verified bundle and read every required item before mutation. A route alone is
-navigation, not reading evidence.
-
-Record the route receipt ID, read receipt ID, matched routes, required handles,
-fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
-attestation in the work unit or pull request. Optional fragments are loaded only
-when the current decision crosses their stated boundary. A legacy `ELIOT_*`
-compatibility map is never an acceptable read receipt.
-
-If no non-baseline route matches, a required item is stale or missing, or scope
-expands beyond the receipt, stop and rerun or repair the route; silence is not
-permission. See [`../../../docs/architecture/READING_PROTOCOL.md`](../../../docs/architecture/READING_PROTOCOL.md).
+Open the verified bundle and read every required item before editing. Record its
+route/read identities, hashes and reading attestation. Reroute when scope changes;
+without an owning Issue, use the protocol's path/topic mode. Reading references
+do not grant write scope. Do not substitute a legacy compatibility map for a read.
 <!-- eliot-doc-routing:end -->
 
 Owning issue: [#651 — A-09 evidence-bound Implementation self-query projection](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/651).

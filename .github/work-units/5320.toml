@@ -1,0 +1,16 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-5320"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 5320}
+unit = {value = "D-DOC-ISSUE-READ"}
+mode = "python-unittest"
+source_roots = [{value = "scripts/docs_router.py"}, {value = "scripts/docs_router_core.py"}, {value = "scripts/docs_read.py"}, {value = "scripts/docs_shards.py"}]
+test_roots = [{value = "scripts/test_issue_reading_router.py"}]
+matrix_cases = 17
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "bf1b4f8e125c7092cc8320f27c80fedf48a3c9211e52752e5c93ce509f8b9a7a"
+matrix_sha256 = "1823b371cbd8e4ed4265894bc5204600ddcc2ccefade59cbc4e5639bb30f063a"
+require_workspace_member = false
+module = {value = "scripts.test_issue_reading_router"}
+requirements = {source_floor = 1, public_floor = 0, test_floor = 17, required_guards = []}
+bounds = {wall_ms = 30000, idle_ms = 15000, output_bytes = 131072, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}

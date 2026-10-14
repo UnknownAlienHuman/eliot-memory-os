@@ -43,13 +43,17 @@ for branch validity and the forbidden sync and ref-mutation list.
 ## 4. Route docs for every change
 
 ```text
-python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+python scripts/docs_read.py read --issue <number> --path <repository/path> --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
+The owning Issue lists what to read in its `## Read` section (handle selectors and repository
+files). With `--issue`, the bundle holds the Decision Safety Floor, the declared items and the
+nearest `AGENTS.md` files. An Issue without `## Read` fails; draft the section with
+`python scripts/docs_router.py route --path <repository/path> --format issue`.
 Run routing for every mutation class (code, configuration, tests, workflows, normative prose).
-Repeat `--path` for every mutable path family. Open the verified bundle and read every required
-item before mutation. Record receipt IDs, matched routes, required handles, fragment paths and hashes,
-bundle hash, and attestation in the PR. See `docs/architecture/READING_PROTOCOL.md`.
+Open the verified bundle and read every required item before mutation. Record receipt IDs, the
+declared reading, required handles, fragment paths and hashes, bundle hash, and attestation in the
+PR. See `docs/architecture/READING_PROTOCOL.md`.
 
 ## 5. Proof is governed by the owning issue
 

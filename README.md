@@ -3,7 +3,7 @@
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
 
-Start with the [mandatory verified-reading protocol](docs/architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact repository paths and causal property being changed. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+Run `python scripts/docs_read.py read --issue <number> --path <repository/path> ...` and open the verified required bundle before mutation. The [reading protocol](docs/architecture/READING_PROTOCOL.md) explains the command; navigation links do not add required reading. If a decision needs additional workflow or contract content, declare it in the Issue's `## Read` and rerun the reader. Without an owning Issue, use path/topic mode. Record the read receipt and attestation. A route alone is navigation, not reading evidence. The stable `ELIOT_*` files are compatibility maps, not task prompts.
 <!-- eliot-doc-routing:end -->
 
 
