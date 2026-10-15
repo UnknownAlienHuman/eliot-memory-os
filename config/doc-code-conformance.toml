@@ -271,6 +271,16 @@ path = "scripts/docs_router_core.py"
 token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
 reason = "The router resolves the stable compatibility-map paths as legacy-anchor entry points so incoming links keep working; the route table is the current read path."
 
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
+reason = "The retired surfaces record intentionally lists retired authority files."
+
+[[retired_references.allow]]
+path = "workstreams/security/retired-authority-surfaces.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
+reason = "The retired surfaces record intentionally lists retired authority files."
+
 [script_inventory]
 directory = "scripts"
 documentation = "scripts/README.md"
@@ -334,6 +344,11 @@ ignore_globs = [
   "scripts/work_unit_gate/doc_read_evidence.py",
   "config/doc-code-conformance.toml",
   ".github/workflows/repository-policy.yml",
+  "workstreams/security/retired-authority-surfaces.toml",
+  "crates/foundation/eliot-bootstrap/src/capture.rs",
+  "scripts/tests/*",
+  "scripts/verify-github-workflows.py",
+  "scripts/work_unit_gate/fixtures/*",
 ]
 handle_index = "docs/architecture/handle-index.json"
 
