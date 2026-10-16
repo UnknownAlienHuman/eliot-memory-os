@@ -292,7 +292,7 @@ pub struct OperationRuntimeCheckpoint {
     #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
     // Absence of an optional identifier must keep decoding as `None`, because
-    // `I05.16` holds that fields which do not apply remain explicit `None` and
+    // `I5.16` holds that fields which do not apply remain explicit `None` and
     // are not silently omitted from the semantic model; `default` is what keeps
     // this key optional while `deserialize_with` refuses the spelled-out-empty
     // spelling of the same absent identity. The same reading applies to the five
