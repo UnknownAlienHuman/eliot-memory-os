@@ -1,76 +1,52 @@
-# START HERE
+# Start here
 
-Read this file first. It is the shortest route from a cold start to a merged change.
-It does not replace `AGENTS.md`, `WORKFLOW.md`, or the normative pair; it points to the authority you need.
+## 1. Current task: documentation for a fresh V3
 
-## 1. Priority — land the code and its proof
+The owner has frozen V1/V2 as donors. Refine V3 documentation before starting its runtime rewrite. Begin with [docs/v3/README.md](docs/v3/README.md), then read [Architecture](docs/v3/ARCHITECTURE.md), [Implementation](docs/v3/IMPLEMENTATION.md), and the relevant evidence in the [consolidated audit](docs/v3/AUDIT.md). Draft proposals are not accepted runtime capabilities.
 
-The product is a draft: write the missing code and land it on `main`. Ship the
-capability together with the proof its owning issue requires; security, negative,
-and edge proof is required from the first change and is never deferred to a later
-phase. Cut ceremony, projections, and optional hardening down to what acceptance
-asks for, not to how far along the product feels. Section 5 governs the proof.
+Existing source, shards, delivery programmes, and validation scripts describe V2. Do not resume its issue factory or import its process topology by default. The unchanged ACTIVE registry still contains V2 `active` values; this documentation revision does not migrate that machine registry or close its issues. The owner's current scope takes precedence for agent work.
 
-## 2. Roles are distinct
+## 2. Roles
 
-- **Controller (root-owned sync only):** performs the coordinated upstream fetch and
-  publishes the authority receipt (remote URL, tracked ref, commit SHA, sync result, UTC timestamp).
-- **Manager:** works in its own worktree, never runs fetch or pull, and reviews the
-  verified PR against the owning issue. It never merges that PR.
-- **Writer:** implements one owning issue inside the claimed scope only, and never merges its own work.
-- **Integration owner (root/reviewer/controller):** owns integration. A different
-  principal than the writer reviews, merges, and retires; no lane merges its own result.
-- **Independent verifier:** reviews the diff against the owning issue; never the writer.
+- **Root/controller:** owns coordinated upstream synchronization and publishes the base identity, timestamp, and result.
+- **Writer:** changes only the assigned scope; never merges its own work.
+- **Manager:** coordinates a mutating branch in its own worktree; never merges its own managed result.
+- **Independent verifier:** checks the actual diff and claims against the issue; is not the writer.
+- **Integration owner:** independently validates the candidate and merges only after the required checks; is distinct from its writer/manager.
 
-## 3. Start from the published authority
+One scope has one writer. Read-only reviewers can inspect the same tree without creating extra worktrees. Preserve unrelated user/agent changes.
 
-```powershell
+## 3. Start from current main
+
+```text
 git status --short --branch
 git rev-parse HEAD
 ```
 
-Confirm `HEAD` equals the base SHA from the published authority receipt and the tree is clean
-for your scope. Provision one worktree per mutating branch from that published SHA, then create:
+Use the root-published current-main base. Workers/managers do not fetch or pull independently. Create one issue-numbered branch and one PR for the task, in the form `<kind>/<issue>-<slug>`; see [WORKFLOW](WORKFLOW.md) for valid kinds and branch rules.
 
-```powershell
-git switch -c <kind>/<issue>-<short-slug>
-```
+## 4. Read sources appropriate to the version
 
-Form is `<kind>/<issue>-<slug>` with kind `work`, `fix`, `docs`, `chore`, `refactor`, or `test`.
-One issue, one branch, one PR. One mutable path scope has one writer. See `AGENTS.md` and `WORKFLOW.md`
-for branch validity and the forbidden sync and ref-mutation list.
+For a V3 contract change, read both V3 design documents and follow the relevant audit claims to their pinned source. Explain the preserved behavior and the proposed mechanism. Do not treat a summarized donor finding or a navigation receipt as personal comprehension.
 
-## 4. Route docs for every change
+For retained V2 source, configuration, workflows, tests, or normative fragments, use the existing verified reader before changing those surfaces:
 
 ```text
 python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Run routing for every mutation class (code, configuration, tests, workflows, normative prose).
-Repeat `--path` for every mutable path family. Open the verified bundle and read every required
-item before mutation. Record receipt IDs, matched routes, required handles, fragment paths and hashes,
-bundle hash, and attestation in the PR. See `docs/architecture/READING_PROTOCOL.md`.
+Read every required item and expand substantive descendants where the question requires them. Record the route/read receipts, source hashes, bundle hash, and reading attestation in the work unit or PR. See the [V2 reading protocol](docs/architecture/READING_PROTOCOL.md). This records donor reading; it does not establish a V3 adoption digest.
 
-## 5. Proof is governed by the owning issue
+## 5. Verify the actual change
 
-The owning-issue acceptance defines the required proof. Run the smallest proof that can fail on the
-changed path while iterating; iteration speed never waives mandatory package, edge, negative, or Product
-checks at completion. Keep iteration checks separate from completion gates.
+For the current documentation stage, check semantic consistency, preservation of requirements, source attribution, local Markdown links, and `git diff --check`. Use relevant existing verifiers if their governed surface changed. Do not use the broad V2 `just quick` pipeline as a substitute for reading a V3 design.
 
-```powershell
-cargo metadata --locked --no-deps
-cargo check --locked -p <package> --all-targets
-cargo test --locked -p <package>
-```
+For future implementation, follow the owner's sequence: product code, minimum relevant checks/Clippy, then tests after the product is built. Evidence must still support the specific reliability, privacy, learning, and completion claims made. The owning issue and actual affected behavior determine necessary checks; one local PASS does not prove the product.
 
-Use focused package and edge proofs while iterating; run wider suites only for a matching blast radius.
-Report every skipped, failed, simulated, or unavailable check exactly. An honest gap is reported and is
-not automatically mergeable; a false claim never merges. See `WORKFLOW.md` and `docs/ARCHITECTURE_CONTRACT.md`.
+Required repository CI remains in force. Do not modify or bypass a gate to make this documentation change look verified. Report unavailable, skipped, or failing checks and their scope exactly.
 
-## 6. Finish
+## 6. Integrate the reviewed result
 
-Open a PR to `main` with the authority receipt, read receipt, base and candidate revisions, scope, proof,
-and residuals. No writer or manager merges its own work; the integration owner reviews, merges after the
-gate, then retires the branch and removes the worktree. See `workstreams/ACTIVE.toml` for programme state.
+Open a PR to `main` with the issue, base/candidate identity, changed paths, source/read evidence, executed checks, independent review, and remaining questions. The independent integration owner merges after the applicable checks and retires the task branch. The requested consolidated audit belongs in `docs/v3/AUDIT.md`; temporary notes, raw downloads, generated receipts, credentials, and runtime state stay out of Git.
 
-Map: Architecture `docs/ARCHITECTURE_CONTRACT.md` · source `docs/PROJECT_MAP.md` · scripts `scripts/README.md`.
+Map: [agent rules](AGENTS.md) · [workflow](WORKFLOW.md) · [version authority](docs/ARCHITECTURE_CONTRACT.md) · [V3 design](docs/v3/README.md) · [V2 source map](docs/PROJECT_MAP.md).

@@ -1,4 +1,53 @@
-# ELIOT Memory OS
+# Eliot Memory OS
+
+> **V3: documentation and architecture design.** V1 and V2 are archived donors. V3 will be written from scratch after the documentation is refined. No V3 runtime is implemented by this documentation revision.
+
+Eliot is a memory, understanding, and learning system for people and AI agents. It should preserve experience, build useful context before the next decision, understand project relationships, learn procedures from outcomes, and revise its own mistaken memory.
+
+## Start with V3
+
+| Read | Purpose |
+|---|---|
+| [V3 documentation](docs/v3/README.md) | Current stage, reading order, decisions, and open questions |
+| [Architecture](docs/v3/ARCHITECTURE.md) | Preserved requirements and proposed compact product boundaries |
+| [Implementation](docs/v3/IMPLEMENTATION.md) | Concrete proposed memory, context, Dreamer, learning, and recovery paths |
+| [Consolidated audit](docs/v3/AUDIT.md) | Russian audit of requirements, V2, Claude's proposals, Hy-Memory, donors, and design tradeoffs |
+
+The owner selected a fresh V3 design. Revision 0.1 is a reviewable draft, not acceptance of every proposed mechanism. The current task is [documentation issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324). Source presence, a specification, and a green build do not establish a working capability.
+
+## Version boundary
+
+The existing Rust workspace, old architecture shards, scripts, and workstream records describe **V2**. They remain available for selective reuse and investigation; their checklists do not authorize continuing V2 implementation or importing its physical architecture into V3.
+
+- [V2 source snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105).
+- [V2 unfinished audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete).
+- [V1 donor snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7).
+
+This is a documentation-stage donor freeze. The repository stays available, old source bytes remain in place, and old issues are not declared completed. Data import, runtime replacement, and removal of old code are later, separately scoped work.
+
+The V2 `ACTIVE.toml` registry and its validators remain unchanged and still encode the old programmes as active. This revision does not claim a machine-enforced registry transition; the owner's documentation scope governs agent work.
+
+[Architecture authority](docs/ARCHITECTURE_CONTRACT.md) records this precedence. English Architecture/Implementation hold the V3 proposal; the Russian audit explains evidence and alternatives without making every idea a mandatory component.
+
+## Repository work
+
+Follow [AGENTS.md](AGENTS.md), [START.md](START.md), and [WORKFLOW.md](WORKFLOW.md). Work from current `main`, preserve unrelated changes, use one writer per scope, and obtain independent review before integration. A documentation edit calls for documentation checks; runtime proof must match actual runtime work and the owner's selected development order.
+
+The [documentation map](docs/README.md) distinguishes V3 from V2 donor references. [PROJECT_MAP](docs/PROJECT_MAP.md), [scripts](scripts/README.md), [workstream records](workstreams/ACTIVE.toml), and the pinned Rust toolchain describe the retained V2 tree, not V3 deployment requirements.
+
+## Related boundaries
+
+| Repository | Proposed relationship to V3 |
+|---|---|
+| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External model/embedding routing and task/harness execution; the Memory ModelJob integration still needs a real contract |
+| [eliot-search](https://github.com/UnknownAlienHuman/eliot-search) | Candidate external source preparation/retrieval adapter where a concrete path needs it |
+| [eliot-research](https://github.com/UnknownAlienHuman/eliot-research) | Candidate external research/acquisition adapter where a concrete path needs it |
+
+Eliot owns durable memory, context, provenance, and outcome-linked learning. External hosts own their goals, actions, and task execution. A provider result does not grant memory authority or demonstrate task completion.
+
+## V2 donor reading tools
+
+The generated block below routes the retained V2 documentation. Use it when inspecting or changing donor surfaces; it does not certify V3 or replace the four V3 documents above.
 
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
@@ -6,84 +55,6 @@
 Start with the [mandatory verified-reading protocol](docs/architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact repository paths and causal property being changed. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. The stable `ELIOT_*` files are compatibility maps, not task prompts.
 <!-- eliot-doc-routing:end -->
 
-
-> Pre-alpha — active development. Not ready for use.
-
-ELIOT is a governed memory, understanding, and learning system for AI agents.
-This repository owns the Rust control plane, canonical contracts, runtime
-processes, integrations, tests, and the only normative Architecture/
-Implementation pair for ELIOT core.
-
-## Work starts here
-
-- **Current source and documentation:** `main` only.
-- **Agent rules:** [`AGENTS.md`](AGENTS.md).
-- **Branch/worktree workflow:** [`WORKFLOW.md`](WORKFLOW.md).
-- **Active programmes:** [`workstreams/ACTIVE.toml`](workstreams/ACTIVE.toml).
-- **Current product/source map:** [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md).
-- **Supported repository scripts:** [`scripts/README.md`](scripts/README.md).
-- **GitHub workflows/templates:** [`.github/README.md`](.github/README.md).
-
-Do not continue work from a branch found in local history, agent memory, or an
-old conversation. Fetch/prune, fast-forward `main`, and create a fresh
-issue-numbered branch. A nonstandard branch is mutable only when
-`workstreams/ACTIVE.toml` contains an explicit temporary exception; there are no
-active exceptions currently.
-
-## Canonical documentation
-
-[`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md) establishes the
-accepted normative pair:
-
-- [ELIOT Architecture](docs/architecture/ELIOT_ARCHITECTURE.md), revision
-  `4.5-draft`;
-- [ELIOT Implementation](docs/architecture/ELIOT_IMPLEMENTATION.md), revision
-  `0.29-draft`.
-
-Exact digests and adoption identity are in
-[`docs/normative-pair.toml`](docs/normative-pair.toml). Use the
-[documentation index](docs/README.md) to load only the relevant sections.
-Documentation describes intent and target contracts; it does not prove that a
-capability is built, installed, running, or accepted.
-
-Historical audits, recovery programmes, donor research, progress diaries, and
-generated/local agent state are intentionally absent from the active checkout.
-Git history and issue/PR records preserve archaeology without presenting it to
-agents as current authority.
-
-## Related repositories
-
-| Repository | Owns |
-|---|---|
-| **eliot-memory-os** | Principal, WorkScope, tasks, authority, canonical records/history, Context Compiler, Governor, Dreamer, Watchdog, Doctor, verification and finish |
-| [**eliot-search**](https://github.com/UnknownAlienHuman/eliot-search) | Local source preparation and retrieval projections behind typed provider contracts |
-| [**eliot-research**](https://github.com/UnknownAlienHuman/eliot-research) | External-corpus acquisition and evidence-library services behind typed provider contracts |
-
-External-project design documents remain in their own repositories. Providers
-return candidates, coverage, freshness, assurance, and reason codes; they never
-receive canonical credentials, task authority, Context Compiler admission, or
-finish authority.
-
-## Development
-
-MSVC Rust 1.97.1 is pinned by `rust-toolchain.toml`.
-
-```powershell
-cargo metadata --locked --no-deps
-just quick
-```
-
-Use focused package/edge proofs while iterating. Run wider checks only for a
-matching blast radius and report every skipped or unavailable check honestly.
-Cargo output, runtime state, reports, logs, generated code-graph databases, and
-machine-local agent state stay outside Git.
-
-Windows credential operations are documented in
-[`docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md`](docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md).
-
 ## License
 
-ELIOT is licensed under the MIT License — see [`LICENSE`](LICENSE). Optional
-third-party runtimes remain separately obtained and licensed components behind
-replaceable ELIOT-owned protocol boundaries. See
-[`docs/DEPENDENCY_POLICY.md`](docs/DEPENDENCY_POLICY.md).
+Eliot is licensed under the MIT License — see [LICENSE](LICENSE). Third-party code and runtimes retain their own licenses; verify the exact revision before reuse. The existing [dependency policy](docs/DEPENDENCY_POLICY.md) remains a V2 reference until a V3 dependency decision explicitly adopts or revises it.
