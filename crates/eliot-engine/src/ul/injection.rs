@@ -4,9 +4,9 @@ use eliot_store::CanonicalStore;
 use eliot_types::{
     ActivationTrace, CapsuleFreshness, ConceptNode, CueRecordSource, InjectionReceipt,
     LegacyCueKindV1, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteStatus, ObservedCue, PendingInjectionItem, ProjectCharter, ProjectId,
-    SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock, UlFiredItem, UlInjectionMode,
-    WriteId, ul_token_estimate,
+    ObservabilityWriteReceipt, ObservabilityWriteStatus, ObservedCue, PendingInjectionItem,
+    ProjectCharter, ProjectId, SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock,
+    UlFiredItem, UlInjectionMode, WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -20,9 +20,43 @@ const MAX_TOTAL_UNITS: u32 = 400;
 const MAX_PAYLOAD_UNITS: u32 = 300;
 const MAX_LINE_BYTES: usize = 160;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingReceiptState {
+    RetryablePreEnqueue,
+    OutcomeUnknown,
+    Conflict,
+}
+
+impl PendingReceiptState {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::RetryablePreEnqueue => 0,
+            Self::OutcomeUnknown => 1,
+            Self::Conflict => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingReceiptAttempt {
+    item: PendingInjectionItem,
+    rendered: UlFiredItem,
+    receipt: InjectionReceipt,
+    envelope: ObservabilityWriteEnvelope,
+    state: PendingReceiptState,
+}
+
+impl PendingReceiptAttempt {
+    fn matches_item(&self, item: &PendingInjectionItem) -> bool {
+        self.item.item_ref == item.item_ref
+            && self.item.source_fingerprint == item.source_fingerprint
+    }
+}
+
 #[derive(Default)]
 struct PendingBatch {
     items: Vec<PendingInjectionItem>,
+    attempts: Vec<PendingReceiptAttempt>,
     overflow: usize,
 }
 
@@ -30,6 +64,13 @@ struct PendingBatch {
 struct ProjectSessionKey {
     project_id: ProjectId,
     session_id: SessionId,
+}
+
+enum ReceiptAttemptResult {
+    Confirmed,
+    RetryablePreEnqueue,
+    OutcomeUnknown,
+    Conflict,
 }
 
 pub struct InjectionPlanner {
@@ -169,6 +210,9 @@ impl InjectionPlanner {
             })
             .or_default();
         for item in &planned {
+            if batch.attempts.iter().any(|attempt| attempt.matches_item(item)) {
+                continue;
+            }
             batch.items.retain(|pending| {
                 pending.item_ref != item.item_ref
                     || pending.source_fingerprint != item.source_fingerprint
@@ -196,20 +240,95 @@ impl InjectionPlanner {
             .attach_boot(project_id, task_id, session_id, response, effective_mode)
             .await?;
 
+        let key = ProjectSessionKey {
+            project_id,
+            session_id,
+        };
         let batch = self
             .pending
             .lock()
             .map_err(|_| planner_lock_error("pending"))?
-            .remove(&ProjectSessionKey {
-                project_id,
-                session_id,
-            })
+            .remove(&key)
             .unwrap_or_default();
         let mut batch = retain_undelivered_items(&self.touched, project_id, session_id, batch);
         batch.items.sort_by(compare_pending);
+        batch
+            .attempts
+            .sort_by(|left, right| compare_pending(&left.item, &right.item));
 
-        let mut selected = Vec::new();
+        let attempted_items = batch
+            .attempts
+            .iter()
+            .map(|attempt| {
+                (
+                    attempt.item.item_ref.clone(),
+                    attempt.item.source_fingerprint.clone(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        batch.items.retain(|item| {
+            !attempted_items.contains(&(item.item_ref.clone(), item.source_fingerprint.clone()))
+        });
+
+        let mut delivered = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut selected_count = 0_usize;
         let mut total_units = 0_u32;
+        let mut failed_count = 0_usize;
+        let mut unknown_count = 0_usize;
+        let mut conflict_count = 0_usize;
+
+        for mut attempt in batch.attempts {
+            if attempt.state == PendingReceiptState::Conflict {
+                conflict_count = conflict_count.saturating_add(1);
+                unresolved.push(attempt);
+                continue;
+            }
+            if selected_count >= MAX_ITEMS
+                || total_units.saturating_add(attempt.receipt.token_cost) > MAX_TOTAL_UNITS
+            {
+                unresolved.push(attempt);
+                continue;
+            }
+            selected_count = selected_count.saturating_add(1);
+            total_units = total_units.saturating_add(attempt.receipt.token_cost);
+            let result = match attempt.state {
+                PendingReceiptState::RetryablePreEnqueue => {
+                    self.submit_receipt_attempt(&attempt).await
+                }
+                PendingReceiptState::OutcomeUnknown => {
+                    self.reconcile_receipt_attempt(&attempt).await
+                }
+                PendingReceiptState::Conflict => ReceiptAttemptResult::Conflict,
+            };
+            match result {
+                ReceiptAttemptResult::Confirmed => {
+                    self.record_confirmed_attempt(
+                        project_id,
+                        session_id,
+                        attempt,
+                        &mut committed_receipts,
+                        &mut delivered,
+                    );
+                }
+                ReceiptAttemptResult::RetryablePreEnqueue => {
+                    attempt.state = PendingReceiptState::RetryablePreEnqueue;
+                    failed_count = failed_count.saturating_add(1);
+                    unresolved.push(attempt);
+                }
+                ReceiptAttemptResult::OutcomeUnknown => {
+                    attempt.state = PendingReceiptState::OutcomeUnknown;
+                    unknown_count = unknown_count.saturating_add(1);
+                    unresolved.push(attempt);
+                }
+                ReceiptAttemptResult::Conflict => {
+                    attempt.state = PendingReceiptState::Conflict;
+                    conflict_count = conflict_count.saturating_add(1);
+                    unresolved.push(attempt);
+                }
+            }
+        }
+
         for item in batch.items {
             let line = truncate_utf8(item.preview.trim(), MAX_LINE_BYTES);
             let mut payload = if effective_mode == UlInjectionMode::HandlesOnly {
@@ -227,19 +346,15 @@ impl InjectionPlanner {
             }
             let payload_units = if payload.is_some() { payload_units } else { 0 };
             let token_cost = ul_token_estimate(&line).saturating_add(payload_units);
-            if selected.len() >= MAX_ITEMS
+            if selected_count >= MAX_ITEMS
                 || total_units.saturating_add(token_cost) > MAX_TOTAL_UNITS
             {
                 batch.overflow = batch.overflow.saturating_add(1);
                 continue;
             }
+            selected_count = selected_count.saturating_add(1);
             total_units = total_units.saturating_add(token_cost);
-            selected.push((item, line, payload, token_cost));
-        }
 
-        let candidate_count = selected.len();
-        let mut delivered = Vec::new();
-        for (item, line, payload, token_cost) in selected {
             let render_form = if payload.is_some() {
                 "payload"
             } else {
@@ -259,39 +374,61 @@ impl InjectionPlanner {
                 surface: "mcp_response_piggyback".to_owned(),
                 item_ref: item.item_ref.clone(),
                 render_form: render_form.to_owned(),
-                fired_cues: item.fired_cues,
+                fired_cues: item.fired_cues.clone(),
                 token_cost,
                 source_fingerprint: item.source_fingerprint.clone(),
                 outcome: "delivered".to_owned(),
                 policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
                     .then(|| "task_class_handles_only".to_owned()),
             };
-            if self
-                .commit_receipt(project_id, task_id, &receipt)
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            self.touched.mark_delivered(
-                project_id,
-                session_id,
-                &item.item_ref,
-                &item.source_fingerprint,
-            );
-            committed_receipts.push(receipt);
-            delivered.push(UlFiredItem {
+            let rendered = UlFiredItem {
                 item_ref: item.item_ref.clone(),
-                kind: item.record_kind,
+                kind: item.record_kind.clone(),
                 line,
                 uri: format!("eliot://memory/{}", item.item_ref),
                 payload,
-                activation_trace_ref: item.activation_trace_ref,
+                activation_trace_ref: item.activation_trace_ref.clone(),
                 activation_score_milli: item.activation_score_milli,
-            });
+            };
+            let mut attempt = PendingReceiptAttempt {
+                envelope: observability_envelope(project_id, task_id, &receipt)?,
+                item,
+                rendered,
+                receipt,
+                state: PendingReceiptState::OutcomeUnknown,
+            };
+            match self.submit_receipt_attempt(&attempt).await {
+                ReceiptAttemptResult::Confirmed => {
+                    self.record_confirmed_attempt(
+                        project_id,
+                        session_id,
+                        attempt,
+                        &mut committed_receipts,
+                        &mut delivered,
+                    );
+                }
+                ReceiptAttemptResult::RetryablePreEnqueue => {
+                    attempt.state = PendingReceiptState::RetryablePreEnqueue;
+                    failed_count = failed_count.saturating_add(1);
+                    unresolved.push(attempt);
+                }
+                ReceiptAttemptResult::OutcomeUnknown => {
+                    attempt.state = PendingReceiptState::OutcomeUnknown;
+                    unknown_count = unknown_count.saturating_add(1);
+                    unresolved.push(attempt);
+                }
+                ReceiptAttemptResult::Conflict => {
+                    attempt.state = PendingReceiptState::Conflict;
+                    conflict_count = conflict_count.saturating_add(1);
+                    unresolved.push(attempt);
+                }
+            }
         }
 
-        if !delivered.is_empty() {
+        self.merge_unresolved_attempts(key, unresolved)?;
+
+        let delivered_count = delivered.len();
+        if delivered_count > 0 {
             response_object_mut(response)?.insert(
                 "ul_fired".to_owned(),
                 serde_json::to_value(UlFiredBlock {
@@ -299,13 +436,112 @@ impl InjectionPlanner {
                     overflow: batch.overflow,
                 })?,
             );
-        } else if candidate_count > 0 {
+        }
+
+        let issue_count = failed_count
+            .saturating_add(unknown_count)
+            .saturating_add(conflict_count);
+        if issue_count > 0 {
+            let code = if delivered_count == 0 {
+                "INJECTION_RECEIPT_FAILED"
+            } else {
+                "INJECTION_RECEIPT_PARTIAL"
+            };
             response_object_mut(response)?.insert(
                 "ul_warning".to_owned(),
-                json!({"code": "INJECTION_RECEIPT_FAILED"}),
+                json!({
+                    "code": code,
+                    "failed": failed_count,
+                    "unknown": unknown_count,
+                    "conflict": conflict_count,
+                }),
             );
         }
+
         Ok(committed_receipts)
+    }
+
+    fn record_confirmed_attempt(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        attempt: PendingReceiptAttempt,
+        committed_receipts: &mut Vec<InjectionReceipt>,
+        delivered: &mut Vec<UlFiredItem>,
+    ) {
+        self.touched.mark_delivered(
+            project_id,
+            session_id,
+            &attempt.item.item_ref,
+            &attempt.item.source_fingerprint,
+        );
+        committed_receipts.push(attempt.receipt);
+        delivered.push(attempt.rendered);
+    }
+
+    fn merge_unresolved_attempts(
+        &self,
+        key: ProjectSessionKey,
+        attempts: Vec<PendingReceiptAttempt>,
+    ) -> Result<(), EngineError> {
+        if attempts.is_empty() {
+            return Ok(());
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| planner_lock_error("pending"))?;
+        let batch = pending.entry(key).or_default();
+        for attempt in attempts {
+            if let Some(existing) = batch
+                .attempts
+                .iter_mut()
+                .find(|existing| existing.envelope.write_id == attempt.envelope.write_id)
+            {
+                if existing.envelope.input_hash == attempt.envelope.input_hash {
+                    if attempt.state.rank() > existing.state.rank() {
+                        *existing = attempt;
+                    }
+                } else {
+                    existing.state = PendingReceiptState::Conflict;
+                }
+                continue;
+            }
+            batch.attempts.push(attempt);
+        }
+        Ok(())
+    }
+
+    async fn submit_receipt_attempt(
+        &self,
+        attempt: &PendingReceiptAttempt,
+    ) -> ReceiptAttemptResult {
+        match self
+            .writer
+            .submit_observability(attempt.envelope.clone())
+            .await
+        {
+            Ok(receipt) => classify_receipt(attempt, &receipt),
+            Err(EngineError::Backpressure) => ReceiptAttemptResult::RetryablePreEnqueue,
+            Err(EngineError::ObservabilityConflict | EngineError::WriteRejected(_)) => {
+                ReceiptAttemptResult::Conflict
+            }
+            Err(_) => self.reconcile_receipt_attempt(attempt).await,
+        }
+    }
+
+    async fn reconcile_receipt_attempt(
+        &self,
+        attempt: &PendingReceiptAttempt,
+    ) -> ReceiptAttemptResult {
+        match self
+            .store
+            .observability_receipt(attempt.envelope.write_id)
+            .await
+        {
+            Ok(Some(receipt)) => classify_receipt(attempt, &receipt),
+            Ok(None) | Err(_) => ReceiptAttemptResult::OutcomeUnknown,
+        }
     }
 
     async fn hydrate_delivery_state(
@@ -546,31 +782,58 @@ impl InjectionPlanner {
         task_id: Option<TaskId>,
         receipt: &InjectionReceipt,
     ) -> Result<(), EngineError> {
-        let payload = serde_json::to_value(receipt)?;
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        let write_id = WriteId::from_uuid(
-            Uuid::parse_str(&receipt.injection_id)
-                .map_err(|error| EngineError::WriteRejected(error.to_string()))?,
-        );
-        let result = self
-            .writer
-            .submit_observability(ObservabilityWriteEnvelope {
-                schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
-                write_id,
-                project_id,
-                task_id,
-                session_id: Some(receipt.session_id),
-                kind: ObservabilityKind::InjectionReceipt,
-                record_id: receipt.injection_id.clone(),
-                payload,
-                input_hash: blake3::hash(&payload_bytes).to_hex().to_string(),
-                created_at: time::OffsetDateTime::now_utc(),
-            })
-            .await?;
+        let envelope = observability_envelope(project_id, task_id, receipt)?;
+        let result = self.writer.submit_observability(envelope).await?;
         if result.status == ObservabilityWriteStatus::Rejected {
             return Err(EngineError::ObservabilityConflict);
         }
         Ok(())
+    }
+}
+
+fn observability_envelope(
+    project_id: ProjectId,
+    task_id: Option<TaskId>,
+    receipt: &InjectionReceipt,
+) -> Result<ObservabilityWriteEnvelope, EngineError> {
+    let payload = serde_json::to_value(receipt)?;
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let write_id = WriteId::from_uuid(
+        Uuid::parse_str(&receipt.injection_id)
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))?,
+    );
+    Ok(ObservabilityWriteEnvelope {
+        schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
+        write_id,
+        project_id,
+        task_id,
+        session_id: Some(receipt.session_id),
+        kind: ObservabilityKind::InjectionReceipt,
+        record_id: receipt.injection_id.clone(),
+        payload,
+        input_hash: blake3::hash(&payload_bytes).to_hex().to_string(),
+        created_at: time::OffsetDateTime::now_utc(),
+    })
+}
+
+fn classify_receipt(
+    attempt: &PendingReceiptAttempt,
+    receipt: &ObservabilityWriteReceipt,
+) -> ReceiptAttemptResult {
+    if receipt.write_id != attempt.envelope.write_id
+        || receipt.record_id != attempt.envelope.record_id
+        || receipt.project_id != attempt.envelope.project_id
+        || receipt.task_id != attempt.envelope.task_id
+        || receipt.kind != attempt.envelope.kind
+        || receipt.input_hash != attempt.envelope.input_hash
+    {
+        return ReceiptAttemptResult::Conflict;
+    }
+    match receipt.status {
+        ObservabilityWriteStatus::Committed | ObservabilityWriteStatus::IdempotentReplay => {
+            ReceiptAttemptResult::Confirmed
+        }
+        ObservabilityWriteStatus::Rejected => ReceiptAttemptResult::Conflict,
     }
 }
 
@@ -679,6 +942,14 @@ fn retain_undelivered_items(
             session_id,
             &item.item_ref,
             &item.source_fingerprint,
+        )
+    });
+    batch.attempts.retain(|attempt| {
+        !touched.was_delivered(
+            project_id,
+            session_id,
+            &attempt.item.item_ref,
+            &attempt.item.source_fingerprint,
         )
     });
     batch
@@ -942,6 +1213,7 @@ mod tests {
                     pending_item("failure:revision", "revision-one"),
                     pending_item("failure:revision", "revision-two"),
                 ],
+                attempts: Vec::new(),
                 overflow: 0,
             },
         );
@@ -966,6 +1238,7 @@ mod tests {
                     pending_item("card:restored", "stable-card"),
                     pending_item("failure:fresh", "fresh-failure"),
                 ],
+                attempts: Vec::new(),
                 overflow: 2,
             },
         );
