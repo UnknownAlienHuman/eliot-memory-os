@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 0.2 · 2026-10-19 · technical proposal; no V3 runtime has been implemented or qualified.**
+**Revision 0.3 · 2026-10-19 · technical proposal; no V3 runtime has been implemented or qualified.**
 
-[Architecture](ARCHITECTURE.md) defines purpose and preserved properties. [Audit](AUDIT.md) records findings, source pins and rejected alternatives. This document owns the proposed mechanisms. Names below are application concepts, not claims about existing controller RPCs or ready-to-run SurrealQL. The source comparison is against Memory OS `3512f6e` and controller `96a0d5a`.
+[Architecture](ARCHITECTURE.md) defines purpose and preserved properties. [Audit](AUDIT.md) records findings, source pins and rejected alternatives. This document owns runtime and integration mechanisms; [Cognition](COGNITION.md) expands the cognitive transformations inside these same modules. Names below are application concepts, not claims about existing controller RPCs or ready-to-run SurrealQL. Revision 0.3 audits Memory OS `da441352`; the controller source boundary `96a0d5a` is retained from 0.2, not newly qualified.
 
 ## 1. Initial delivery
 
@@ -76,6 +76,8 @@ For time, distinguish when an event occurred, when it was received, and a claim'
 A useful hypothesis may be delivered with its hypothesis label. `influence != none` is not a valid allowlist: it also admits quarantined or handle-only content. Restricted metadata and hidden ranking features require the same policy attention as displayed text.
 
 The first profile assumes cooperative adapters and the host's actual tool restrictions. An agent with unrestricted shell/filesystem access under the same OS account can potentially invoke administrative CLI modes or access that user's files. “Human CLI only” is not a hard sandbox. Stronger isolation requires an actual host/OS access boundary, not an extra `principal` string. Do not expose database credentials to the model or arbitrary adapters.
+
+Current-state grouping preserves subject/aspect, perspective and source context as defined in [Cognition §§2–3](COGNITION.md#2-small-claim-identity-not-a-fixed-world-ontology). Intended behavior, observed behavior and a proposed explanation are not interchangeable values. An ambiguous semantic key does not block raw capture.
 
 ### 2.3 Historical evidence, live requirements and privacy lineage
 
@@ -167,6 +169,8 @@ Derive permitted scope and live situation. Retrieve exact constraints and negati
 Apply allowed scope and presentation channels within each candidate arm and again before reveal. If the ANN plan cannot enforce the required restriction, use exact similarity inside the authorized set or another demonstrated query plan; global top-k followed by filtering is not equivalent. Do not use quarantined or private edges as hidden ranking boosts into an otherwise allowed result.
 
 Validate policy lineage and **required live** anchors as specified in §2.3. Historical evidence can be shown as history. Compose complete semantic units and give a reason for material exclusion or uncertainty. Store only the IDs/revisions, method revision and outcome linkage needed for explanation; temporary full ranking traces need not become another permanent registry.
+
+After candidate retrieval, use [scoped current-value resolution](COGNITION.md#3-resolve-current-state-independently-of-relevance-ranking) rather than selecting truth by ranking. Enumerate relevant permitted alternatives by group key; missing group coverage remains explicit. [Procedure applicability](COGNITION.md#61-three-valued-matching) is applicable, inapplicable or unknown, not a similarity threshold disguised as certainty.
 
 ### 4.2 Channels and token economy
 
@@ -305,6 +309,8 @@ An attempt names the external task when present, exact procedure/context revisio
 
 A procedure cannot execute a retrieved command by itself, disable a verifier, change permission or force the model to follow it. A feedback-only host can support provisional learning, but does not establish observed behavioral benefit.
 
+For the first API-change loop, [Cognition §6](COGNITION.md#6-applicability-before-automatic-learning) defines the applicability check and a proposed criterion: recurrence of the identified compatibility failure under the relevant API/consumer and verifier profile. An unrelated failure is not automatically evidence against every delivered procedure.
+
 ### 7.3 Evidence accounting
 
 Use one current contribution for `(procedure_revision, attempt_id, criterion/evaluator_revision)`. Redelivered feedback is idempotent. Amending a result replaces that contribution with an explicit revision; it does not increment permanent success again. Several traces from one attempt, repeated exports and copies of the same evidence are not independent trials.
@@ -331,9 +337,9 @@ A new model/tool/retrieval profile starts a new applicability evaluation; it doe
 
 ## 8. Project understanding, causality, and research
 
-Construct the initial project map from manifests, file structure and available exact references. Use the host's tools, ripgrep or one appropriate LSP/SCIP/structural adapter. Do not embed several competing code-graph stacks. Link purpose and subsystem hypotheses to concrete source revisions and mark the parts not examined.
+[Cognition §4](COGNITION.md#4-project-understanding-as-a-small-set-of-revisable-views) owns the construction and refresh algorithm: small purpose/map/area views, exact source structure, separately labelled inferred meaning, selection-membership tracking and finite target-keyed jobs. A new consumer can invalidate a complete-set claim without changing any old citation. Positive source references alone are insufficient.
 
-Incremental refresh targets actual changed anchors. Reconcile missed watcher events; a repository-wide HEAD movement is a cue to inspect changes, not a reason to discard every memory. A current view and the historical observations from which it was learned have different lifecycles.
+Use the host's tools, ripgrep or one appropriate LSP/SCIP/structural adapter, not competing embedded code-graph stacks. Exact capture/readback starts before full semantic onboarding. A repository-wide HEAD movement prompts affected-scope reconciliation; it does not erase historical observations. One running finite build and one coalesced pending successor use the queue in §5, not a new cognitive scheduler.
 
 Keep exact intermediate edits when the host exposes them. Final `git diff` does not recreate reverted or lost intermediate attempts. Reveal related events, source neighborhoods and diff history on demand instead of stuffing them into every prompt.
 
@@ -455,7 +461,7 @@ Owner's development order remains product code, minimum relevant checks/Clippy, 
 | S25 | Old backup contains pending external job or stale restriction history | Reconcile execution; keep restore isolated when current restrictions cannot be established |
 | S26 | Session replays previously injected advice | Fresh applicability is shown; no promise that a DB revoke erased an external transcript |
 
-The [audit](AUDIT.md#12-all-29-original-scenarios) retains every original A15 case; S21–S26 are additional failure walkthroughs, not claims of executed tests.
+The [audit](AUDIT.md#12-all-29-original-scenarios) retains every original A15 case; S21–S26 are additional failure walkthroughs, not claims of executed tests. [Cognition §8](COGNITION.md#8-implementation-placement-and-future-walkthroughs) adds fourteen cognitive walkthroughs without introducing another test platform.
 
 ## 13. Open decisions for the next documentation stage
 
@@ -465,7 +471,7 @@ The [audit](AUDIT.md#12-all-29-original-scenarios) retains every original A15 ca
 | O2 | Two independently available generation/embedding capabilities through existing controller execution; maintenance task optional | Select exact existing/new methods and first route; agree durable readback/retention/cancel and constraints with controller owner |
 | O3 | Bounded event-file spool, current restriction journal, quiesced export with finite cutoff | Select Windows persistence/rename APIs, concrete limits and current-journal recovery path; qualify failure handling |
 | O4 | One private Store, one client, explicit statement/cardinality checks and restart upgrades | Resolve historical no-SDK restriction versus later SDK proposal; pin actual compatible versions and concrete schema/queries |
-| O5 | Automatic narrow advisory, unique outcome contributions, later independent scoped comparison | Select first task criterion/evaluator and evidence threshold appropriate to that scope, not a universal confidence formula |
+| O5 | Three-valued applicability, automatic narrow advisory and API-compatibility recurrence criterion; unique outcome contributions | Pin the actual API/consumer and evaluator profile, collect comparable cases and select an appropriate promotion threshold; no universal confidence formula |
 | O6 | Same-binary demand-start supervisor, owned process family, independent probe, CLI inbox | Qualify Windows custody/hang/idle behavior and configured notification channel; scheduled wake remains opt-in |
 
 These remaining checks do not reopen the entire architecture or require a separate daemon, registry, approval ceremony or issue factory for every row. Documentation acceptance and runtime qualification are different stages.

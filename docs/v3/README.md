@@ -1,28 +1,31 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.2 · 2026-10-19 · documentation stage.** V1/V2 are donors. V3 will be written from scratch after documentation is agreed. No runtime, database migration or model integration is implemented by this revision.
+**Revision 0.3 · 2026-10-19 · documentation stage.** V1/V2 are donors. V3 will be written from scratch after documentation is agreed. No product runtime, database migration or model integration is implemented by this revision.
 
 ## Reading order
 
 | Document | Purpose |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Concise product manifesto: purpose, preserved cognition/learning, ownership and boundaries |
-| [IMPLEMENTATION.md](IMPLEMENTATION.md) | One concrete design for host timing, source semantics, storage, jobs, controller execution, learning and recovery |
-| [AUDIT.md](AUDIT.md) | Russian consolidated findings and rationale; 34 requirements, all 29 original scenarios and 43 donor entries |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Stable product manifesto: purpose, preserved cognition/learning, ownership and boundaries |
+| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Runtime, storage, host, controller, jobs, learning and recovery contracts |
+| [COGNITION.md](COGNITION.md) | Implementation chapter: current-value resolution, project views, applicability and criterion-specific learning inside the existing modules |
+| [AUDIT.md](AUDIT.md) | One Russian consolidated audit; prior findings, 34 requirements, all 29 original scenarios, 43 donor entries and current-pass findings in §16 |
 
-Read Architecture and Implementation together for a contract change. Use the audit to check exact sources, rejected mechanisms and evidence limits. A new donor or research result does not automatically authorize another subsystem.
+Read Architecture and the relevant Implementation chapters together for a contract change. Cognition expands the existing module responsibilities; it is not another architecture, service or audit. Use the consolidated audit for exact sources, rejected mechanisms and evidence limits. New research does not automatically authorize a new subsystem.
 
-## What revision 0.2 changes
+## What revision 0.3 adds
 
-Historical evidence is separated from current applicability so ordinary source changes do not erase experience. Advisory context is distinguished from a real pending-action gate. Local worker recovery retains the same external execution identity rather than silently repeating paid work. Learning counts distinct observed outcomes, not repeated induction examples. Embedding profiles are independent of the Dreamer model.
+The cognitive path is made concrete rather than left behind reliability machinery. Current values are resolved by subject/aspect, perspective, time and scope; relevance ranking cannot silently settle a contradiction. Intended behavior and observed code remain different views. Unknown procedure applicability stays unknown, and an unrelated task failure does not automatically discredit every delivered lesson.
 
-Backup now has a conservative quiesced-export procedure and a finite staged-input cutoff, rather than an undefined fast snapshot. Restore applies current restrictions and reconciles old external jobs. A small independent supervisor can run only while the demand-start daemon is active; the full proposed profile counts supervisor, daemon and database as three owned processes, not three memory writers.
+Project views track not just cited files but the source selection that found their members. A new consumer can invalidate a map without changing its old citations. Finite target-keyed jobs coalesce repeated changes, while exact capture and rare failure warnings never wait for a semantic cluster. Repeated summaries do not create independent support.
 
-The previous scattered §3.3/§6.4 additions are integrated into the appropriate contracts. The earlier source analysis and publication history remain available in the [preceding audit](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/3512f6e4f4c9ce59ba2959193e92c0728fadf00c/docs/v3/AUDIT.md); its old test/review statements do not certify new bytes.
+New primary-source work covers V1 current-value resolution and the Understanding Layer mission, DCPM's cognitive architecture, selected Hy-Memory System 2 helpers, and the distinction between reward annotation and a production writer. An isolated source-helper probe is recorded separately from any full donor/runtime experiment. Architecture is unchanged because these mechanisms implement its existing requirements.
+
+Revision 0.2 remains the basis for historical evidence versus live applicability, actual host timing, external execution identity, embedding profiles, unique outcome contributions, conservative backup and demand-start independent supervision. The [previous complete audit](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/da441352d98e9ea9307fa186345162bff109d605/docs/v3/AUDIT.md) remains immutable; its old review/check statements do not certify new bytes.
 
 ## Remaining decisions
 
-[Implementation §13](IMPLEMENTATION.md#13-open-decisions-for-the-next-documentation-stage) distinguishes concrete proposals from the remaining interface/version choices and future runtime qualification. The outstanding SDK versus historical direct-RPC constraint is explicit; neither client is silently declared approved or implemented. Controller-to-memory context and memory-to-controller inference are different directions.
+[Implementation §13](IMPLEMENTATION.md#13-open-decisions-for-the-next-documentation-stage) separates concrete proposals from exact interface/version choices and future runtime qualification. O5 now has a proposed first API-compatibility criterion and three-valued applicability contract; the actual evaluator/profile and empirical promotion threshold remain unqualified. Controller-to-memory context and memory-to-controller inference are distinct directions.
 
 The full product retains vectors, automatic local learning, project/concept understanding, negative memory, independent observation, privacy/restore and operator control. Exact/lexical operation during model outages is a degraded profile, not the whole product. A search-only host does not demonstrate the complete cognitive loop.
 
@@ -33,9 +36,10 @@ The full product retains vectors, automatic local learning, project/concept unde
 | V2 | [5aac094834fb5635921b550c821cb933a1196105](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105) |
 | V1 | [b5c84d4e53292dbc8996917c63448d5ee96c4bc7](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7) |
 | Incomplete audit | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete) |
-| Hy-Memory | [7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a](https://github.com/Tencent-Hunyuan/Hy-Memory/tree/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a), [paper v1](https://arxiv.org/html/2610.22196v1) |
-| Controller source boundary | [96a0d5a6632cfbd541e804d7969d3e76e716bf6a](https://github.com/UnknownAlienHuman/eliot-swarm-controller/tree/96a0d5a6632cfbd541e804d7969d3e76e716bf6a) |
-| Selected MemOS mechanism | [a7367d07e55db61099f7b4e2c1108bc5831a24f3](https://github.com/MemTensor/MemOS/tree/a7367d07e55db61099f7b4e2c1108bc5831a24f3) |
+| Hy-Memory | [7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a](https://github.com/Tencent-Hunyuan/Hy-Memory/tree/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a), [writer paper v1](https://arxiv.org/html/2610.22196v1) |
+| DCPM cognitive architecture | [2606.09483v1](https://arxiv.org/html/2606.09483v1), distinct from writer-weight training |
+| Controller source boundary inherited from 0.2 | [96a0d5a6632cfbd541e804d7969d3e76e716bf6a](https://github.com/UnknownAlienHuman/eliot-swarm-controller/tree/96a0d5a6632cfbd541e804d7969d3e76e716bf6a) |
+| Selected MemOS mechanism inherited from 0.2 | [a7367d07e55db61099f7b4e2c1108bc5831a24f3](https://github.com/MemTensor/MemOS/tree/a7367d07e55db61099f7b4e2c1108bc5831a24f3) |
 
 Old source/shards stay recoverable as donors. Do not duplicate them in an archive tree or resume their old implementation programmes. `workstreams/ACTIVE.toml`, its validators, CI and user data are unchanged; their old active values are not a machine-enforced V3 freeze. See [architecture authority](../ARCHITECTURE_CONTRACT.md).
 
