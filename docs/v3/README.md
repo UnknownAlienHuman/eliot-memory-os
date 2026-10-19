@@ -1,58 +1,31 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.4 · 2026-10-19 · documentation stage.** V1/V2 are donors. V3 will be written from scratch after documentation is agreed. No product runtime, database migration or model integration is implemented by this revision.
+**Revision 0.6 · 2026-10-19 · documentation before the greenfield rewrite.** V1/V2 are donors, not active implementation programmes. This revision includes the previously unpublished 0.5 transfer work, removes inherited V3 bureaucracy and adds Harness2's recursive-improvement mechanism. It does not implement or qualify the runtime.
 
-## Reading order
-
-| Document | Purpose |
+| Document | Read for |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Stable product manifesto: purpose, preserved cognition/learning, ownership and boundaries |
-| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Runtime, storage, host, controller, jobs, learning and recovery contracts |
-| [COGNITION.md](COGNITION.md) | Implementation chapter: current-value resolution, project views, applicability and criterion-specific learning inside the existing modules |
-| [AUDIT.md](AUDIT.md) | One Russian consolidated audit; prior findings, 34 requirements, all 29 original scenarios, 43 donor entries and current-pass findings in §17 |
+| [Architecture](ARCHITECTURE.md) | Purpose, cognitive properties, automatic learning, modularity and boundaries |
+| [Implementation](IMPLEMENTATION.md) | Store, intake, host/controller, jobs, supervision and recovery |
+| [Cognition](COGNITION.md) | Current-state resolution, project views, applicability, transfer and two recursive loops |
+| [Consolidated audit](AUDIT.md) | Source findings, alternatives, 34 requirements, 29 A15 cases and donor map including D44 |
+| [Audit map](AUDIT-MAP.md) | What was actually read, what remains and the next connected source paths |
 
-Read Architecture and the relevant Implementation chapters together for a contract change. Cognition expands the existing module responsibilities; it is not another architecture, service or audit. Use the consolidated audit for exact sources, rejected mechanisms and evidence limits. New research does not automatically authorize a new subsystem.
+The audit map is navigation requested by the owner, not a runtime registry or approval gate. Findings live in the consolidated audit; algorithms have one home in Implementation/Cognition. Reading a donor does not authorize importing its whole architecture.
 
-## What revision 0.4 adds
+## Current changes
 
-[Cognition](COGNITION.md) now specifies atomic replacement publication, explicit scoped retirement without implicit resurrection, multi-predecessor history traversal, independent lexical candidates and target-check coverage for learning. A new session summary does not supersede every claim from the preceding session. Failed or skipped verification does not become a positive outcome merely because one diagnostic was absent.
+[Audit §4](AUDIT.md#4-что-точно-не-переносить-что-извлечь-из-v2) follows V2's write-admission, notification and cue-normalization machinery. [§18](AUDIT.md#18-cross-domain-learning-audit-05) preserves the prepared 0.5 cross-domain report; [§19](AUDIT.md#19-harness2-рекурсия-для-eliot-не-новый-агентный-runtime) studies Harness2; [§20](AUDIT.md#20-где-проектировщик-сам-вернул-бюрократию-и-что-изменено) identifies and removes our own overengineering.
 
-[Audit §17](AUDIT.md#17-memory-transition-audit-04) records the pinned Hy coding reconciliation/store paths and two isolated SQL reproductions: retire-before-insert failure and an omitted history branch. It distinguishes those probes from a deployed Hy test. Current SurrealDB filtering documentation informs the query choice without qualifying an installed server. These changes refine existing operations; no new service, queue or semantic store is introduced.
+The official network SDK is the initial Store choice without an inherited V2 veto. Provisional transfer is not blocked behind a universal promotion experiment. Ordinary helpers do not require digest closures, and mutation readback need not become another generic ledger. A real existing supervisor can be reused; absent that coverage, the standalone profile retains a small independent observer.
 
-Architecture remains at 0.2 and the runtime/integration overview at 0.3; Cognition 0.4 is their implementation chapter, not a competing specification. Earlier audit sections and the 34/29/43 requirements/scenario/donor matrices are retained.
+Harness2 contributes task-local Propose–Probe–Compose and cross-task lessons about how to improve. The existing modules, jobs and controller own both loops. Baseline/no-change remains eligible; neither a selected output nor repeated reflection proves benefit. No new swarm, model-weight training or benchmark runtime is imported.
 
-## What revision 0.3 added
+## Preservation and remaining work
 
-The cognitive path is made concrete rather than left behind reliability machinery. Current values are resolved by subject/aspect, perspective, time and scope; relevance ranking cannot silently settle a contradiction. Intended behavior and observed code remain different views. Unknown procedure applicability stays unknown, and an unrelated task failure does not automatically discredit every delivered lesson.
+The consolidated audit was edited and reorganized, not merely appended. Its old detailed versions remain immutable in Git: [0.4](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c28359fc2716f3b498ea512ca24a57801d18014c/docs/v3/AUDIT.md). The 34 requirements, 29 original scenarios and original 43 donor identities remain; Harness2 is D44. Cognition retains thirty prior future cases and adds six recursive cases; Implementation retains S1–S26. They are not executed tests.
 
-Project views track not just cited files but the source selection that found their members. A new consumer can invalidate a map without changing its old citations. Finite target-keyed jobs coalesce repeated changes, while exact capture and rare failure warnings never wait for a semantic cluster. Repeated summaries do not create independent support.
+[Implementation §13](IMPLEMENTATION.md#13-remaining-concrete-integration-choices) lists exact interface/version choices still unqualified. The [map](AUDIT-MAP.md) distinguishes inherited research from fresh source reading; the archive ZIP and all donor repositories have not been re-audited wholesale.
 
-New primary-source work covers V1 current-value resolution and the Understanding Layer mission, DCPM's cognitive architecture, selected Hy-Memory System 2 helpers, and the distinction between reward annotation and a production writer. An isolated source-helper probe is recorded separately from any full donor/runtime experiment. Architecture is unchanged because these mechanisms implement its existing requirements.
+V2 remains at `5aac094834fb5635921b550c821cb933a1196105`, V1 at `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`, and audit material at [the incomplete release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete). Preserve those sources in Git/history rather than copying them into another archive tree. Runtime, dependencies, CI, validators, ACTIVE registry and user data are unchanged here.
 
-Revision 0.2 remains the basis for historical evidence versus live applicability, actual host timing, external execution identity, embedding profiles, unique outcome contributions, conservative backup and demand-start independent supervision. The [previous complete audit](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/da441352d98e9ea9307fa186345162bff109d605/docs/v3/AUDIT.md) remains immutable; its old review/check statements do not certify new bytes.
-
-## Remaining decisions
-
-[Implementation §13](IMPLEMENTATION.md#13-open-decisions-for-the-next-documentation-stage) separates concrete proposals from exact interface/version choices and future runtime qualification. O5 now has a proposed first API-compatibility criterion and three-valued applicability contract; the actual evaluator/profile and empirical promotion threshold remain unqualified. Controller-to-memory context and memory-to-controller inference are distinct directions.
-
-The full product retains vectors, automatic local learning, project/concept understanding, negative memory, independent observation, privacy/restore and operator control. Exact/lexical operation during model outages is a degraded profile, not the whole product. A search-only host does not demonstrate the complete cognitive loop.
-
-## Source pins and donor freeze
-
-| Source | Pin |
-|---|---|
-| V2 | [5aac094834fb5635921b550c821cb933a1196105](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105) |
-| V1 | [b5c84d4e53292dbc8996917c63448d5ee96c4bc7](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7) |
-| Incomplete audit | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete) |
-| Hy-Memory | [7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a](https://github.com/Tencent-Hunyuan/Hy-Memory/tree/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a), [writer paper v1](https://arxiv.org/html/2610.22196v1) |
-| DCPM cognitive architecture | [2606.09483v1](https://arxiv.org/html/2606.09483v1), distinct from writer-weight training |
-| Controller source boundary inherited from 0.2 | [96a0d5a6632cfbd541e804d7969d3e76e716bf6a](https://github.com/UnknownAlienHuman/eliot-swarm-controller/tree/96a0d5a6632cfbd541e804d7969d3e76e716bf6a) |
-| Selected MemOS mechanism inherited from 0.2 | [a7367d07e55db61099f7b4e2c1108bc5831a24f3](https://github.com/MemTensor/MemOS/tree/a7367d07e55db61099f7b4e2c1108bc5831a24f3) |
-
-Old source/shards stay recoverable as donors. Do not duplicate them in an archive tree or resume their old implementation programmes. `workstreams/ACTIVE.toml`, its validators, CI and user data are unchanged; their old active values are not a machine-enforced V3 freeze. See [architecture authority](../ARCHITECTURE_CONTRACT.md).
-
-## Publication and verification
-
-This work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Record actual changed-document checks and remote readback there. Current-pass authorship is solo; do not reuse old independent-review attestations as review of this candidate. Required CI and independent integration are not bypassed, and publication to the branch is not a merge to main.
-
-Product development starts after the documentation stage, with the owner's sequence: product code, minimum relevant checks/Clippy, tests after the product is built. The future behavioral scenarios are not claimed to have run in this pass.
+Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Report actual publication/readback and CI status there. No independent subagent review is claimed for this pass; a branch commit is not a merge. After documentation, the owner's development order remains product code, minimum relevant checks/Clippy, tests after the product is built.

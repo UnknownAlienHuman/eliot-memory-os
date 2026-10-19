@@ -1,164 +1,200 @@
 # Eliot Memory OS V3 — cognitive mechanisms
 
-**Revision 0.4 · 2026-10-19 · implementation proposal, not working runtime.**
+**Revision 0.6 · 2026-10-19 · implementation proposal, not working runtime.**
 
-This chapter expands [Implementation](IMPLEMENTATION.md) §§2, 4, 7 and 8. It specifies transformations inside the existing `memory`, `context`, `learning` and `jobs` modules. It introduces no new daemon, database, ontology engine, agent swarm, or approval platform. [Architecture](ARCHITECTURE.md) retains product authority; [Audit §§16–17](AUDIT.md#17-memory-transition-audit-04) records the findings and donor limits. Revision 0.4 reviews `0f05a939`; the runtime contracts remain in Implementation 0.3. This chapter supplies the transition and retrieval details below without creating a second owner.
+This chapter implements [Architecture](ARCHITECTURE.md) inside the modules of [Implementation](IMPLEMENTATION.md). It incorporates the previously unpublished 0.5 transfer mechanisms and adds Harness2's two recursive loops. The [audit](AUDIT.md) owns donor findings and limitations; the [map](AUDIT-MAP.md) records coverage. No new semantic database, inference service or approval platform is introduced.
 
 ## 1. One useful path and its owners
 
 ```text
-host supplies a decision frame and admissible events
-  -> capture immutable observations
-  -> extract proposed meaning off the hot path
-  -> reconcile identity, current state and contradictions
-  -> compile applicable context from existing memory
-  -> host chooses and performs its action
-  -> retain the observed outcome
-  -> update a local procedure and affected project views
+host goal and observed events
+ -> preserve source observations
+ -> propose meaning off the hot path
+ -> reconcile current claims and relevant history
+ -> assemble applicable context
+ -> host chooses and performs an action
+ -> retain the observed outcome
+ -> update procedures, project views and improvement experience
 ```
 
-`memory` owns observations and semantic revisions; `context` resolves and selects; `learning` reduces outcomes; `jobs` schedules finite transformations. The host/controller owns the actual task, execution and acceptance. The diagram does not require each arrow to be a process or a model call.
+`memory` owns observations/revisions, `context` selects and resolves, `learning` reduces outcomes, `jobs` schedules finite transformations. Actual task execution and acceptance stay in the host/controller. An arrow is not a new process or mandatory model call.
 
-A decision frame contains the host task/goal revision when available, current workspace/resource and execution profile, decision purpose, and context incarnation. Fields that the host does not observe remain unknown. The adapter preserves the source of a goal update; a quoted requirement, retrieved document or agent guess cannot replace the user's current goal. A host without task IDs can use an adapter-owned session/task handle and expose uncertain correlation. It must not silently attach all interleaved work to the latest prompt.
-
-Goal state and observed product state are different: "the API must return X" and "the API currently returns Y" can both be accurate descriptions of a discrepancy. Eliot must not reconcile them into whichever sentence was received last. An amended goal starts a new goal revision; old outcomes keep their original criteria.
+The decision frame carries available goal/task revision, workspace/resource, purpose, execution profile and context incarnation. Unknown host fields remain unknown. Interleaved work is not all assigned to the latest prompt. Quoted requirements and retrieved text do not replace the user's goal. Intended behavior and observed implementation may disagree without either observation being erased.
 
 ## 2. Small claim identity, not a fixed world ontology
 
-For a claim eligible for current-state resolution, retain the resolved subject/resource, aspect, value or exact content reference, perspective, scope, validity interval, and source/revision references already required by Implementation. Perspective distinguishes intended behavior, observed behavior and proposed explanation. Source context distinguishes an assertion about the subject from a quotation, example or hypothetical.
+Group a claim by the necessary scope, subject/resource, aspect and perspective. Retain content or exact value reference, applicable time and sources. Perspective separates intended behavior, observed behavior and proposed explanation; source context separates assertion, quote, example and hypothetical.
 
-The **comparison key** is the necessary scope plus subject, aspect and perspective. For example: one workspace/API symbol, `return_shape`, observed behavior. This is a grouping key, not proof that two sentences mean the same thing. It need not be a universal list of predicates. Deterministic source adapters can supply exact keys; a model proposes semantic identity where needed. Ambiguous identity remains a provisional claim linked to its raw observation. It does not reject capture or create a forced merge.
+The comparison key locates candidates, not proof of equivalence. Exact source adapters can provide it; models can propose uncertain semantic aliases. Ambiguous meaning stays linked to the raw observation rather than rejecting capture or forcing a merge. No universal predicate catalogue is required.
 
-A session-progress summary is not an atomic claim. Continuing the same task may update its progress summary and link its episodes; it does not supersede every earlier fact, exception or commitment. A replacement names the particular claim/aspect and temporal scope it changes. Silence about an old condition is not evidence that it stopped being true. A batch containing changes to two independent aspects may replace one while retaining the other. Model-generated subject labels are proposed aliases, not sufficient keys for destructive reconciliation.
+Continuing a task can update its progress summary; it does not supersede every fact or exception from the preceding session. A replacement identifies the claim/aspect and temporal scope it changes. Silence about an old condition is not evidence that it ended. Independent identical occurrences remain independent; repeated exports of one occurrence do not.
 
-Keep separate occurrences separate. Two identical failures on different attempts are two events; repeated exports of one event are not. Aliases and renames carry their evidence. Same spelling in another repository, branch or worktree is not the same resource by default. Uncommitted workspace state must not be labelled as identical to committed HEAD.
-
-Do not implement natural-language understanding as an expanding table of personal topics and regexes. Regexes are appropriate for documented machine formats, exact diagnostic IDs and path syntax; they are insufficient evidence that quoted first-person prose describes the speaker. Equally, model interpretation is fallible data, not a privilege to rewrite source identity.
+Keep original source spelling separate from comparison forms. Same symbol name in another worktree is not the same resource. Do not label dirty workspace state as committed HEAD. Regexes fit documented machine fields and diagnostics, not a growing catalogue of personal topics: a quoted first-person sentence is not necessarily the speaker's state.
 
 ## 3. Resolve current state independently of relevance ranking
 
-Implement `resolve_current` as one ordinary function over an explicitly scoped claim group. The caller supplies the requested time/perspective and source/profile observations; the result contains current alternatives, relevant history, unresolved conflict or missing information, and supporting handles. No model call is required on this read path.
+`resolve_current` is one ordinary function over an explicitly scoped claim group. It returns supported current alternatives, relevant history, conflict or unknown, with the corresponding source handles.
 
-1. Check visibility and allowed influence before considering content. Use only the already authorized comparison key; do not reveal an inaccessible alternative or its metadata.
-2. Resolve exact source revisions and distinguish historical evidence from live applicability. Unknown observation time is not receipt time. An old import arriving today does not become today's truth.
-3. Apply only validated revision/replacement links for the same comparison key and compatible temporal scope. A model can propose such links; shape validation alone does not make its semantic judgment infallible. A model-resolved view retains that evidential status and cannot silently override contradictory direct evidence.
-4. Compare current candidates using the actual source contract: an explicit goal revision controls the intended goal; an exact source observation controls what was observed there. Do not impose a universal authority ranking that lets a code observation rewrite a human requirement.
-5. Preserve non-conflicting values where the aspect is multi-valued. Preserve historical intervals when a value changed. Incompatible candidates that cannot be ordered remain a conflict with a proposed distinguishing observation, not a last-write-wins winner.
-6. Return the relevant qualification with the selected value. A contradicted item is not a current fact merely because it ranked first in BM25 or vector search.
+1. Consider only accessible content with the appropriate influence; hidden alternatives are not leaked as metadata.
+2. Resolve time and perspective. Receipt time does not make an old import current; historical evidence is not an expired live dependency.
+3. Apply supported replacement/revision links within the comparison group and their stated interval. A model proposal retains its evidential limits.
+4. Use actual source semantics: a user goal defines intent, a code observation describes code. Do not invent a universal authority ranking that lets one rewrite the other.
+5. Keep non-conflicting multiple values. Preserve unresolved incompatible alternatives instead of choosing a last writer or highest vector score.
+6. Return qualifications with the selected claim. Incomplete enumeration is not a confident singleton result.
 
-Retrieval first identifies candidate groups, then this function resolves the groups. Fetch relevant active alternatives/replacements by the indexed group key, not only the semantic top-k. A limit reached while enumerating a group means incomplete resolution. Return that limitation and a continuation handle rather than a confident value. Known constraints and current goal references still have their direct path outside general top-k.
-
-The initial implementation needs an indexed grouping field and ordinary links, not a second "current truth" table with its own writer. A cached projection binds to the examined sources and query membership described below; it is not another authority.
+Retrieval finds groups; indexed lookup then fetches relevant active alternatives and replacements outside the semantic top-k. Limits return partial resolution and continuation handles. Goals and exact constraints retain a direct path. A cache binds to examined source revisions and membership; it is not another current-truth writer.
 
 ### 3.1 Publish a replacement as one memory change
 
-Prepare the proposed replacement and any optional summary outside the write transaction. Use the existing memory/job application boundary: recheck the exact predecessor revisions, comparison key, temporal scope, live requirements, policy and current job claim; create the new revision and its required links, record the predecessors' scoped retirement, and enqueue required derived work in one transaction. Store the operation result in that same transaction. A conflict or failed commit leaves the preceding committed state unchanged. Lost acknowledgement follows the existing same-operation readback, not a new replacement.
+Prepare content and optional summaries outside the transaction. In the existing memory write transaction, recheck relevant predecessors, group/time, current inputs and job; publish the new revision, required links, scoped retirement, necessary follow-up jobs and readback result together. A failed commit leaves the preceding committed state intact. A lost acknowledgement uses the same mutation identity.
 
-Never retire the only active revision, await a model, and insert its successor afterward. A slow optional history summary is not a prerequisite for publishing an otherwise valid explicit correction. A failed embedding does not undo primary preservation or make the new revision inaccessible to exact/lexical lookup; deferred indexing remains visible and retryable. Old content remains available as permitted history, not as an automatic current fallback.
-
-Concurrent replacements of one predecessor are not resolved by response arrival order. Revalidate the group after a lost comparison; independent observations survive, while incompatible current claims remain a conflict. Do not blindly replay the old replacement decision against a new head. This is one conditional memory transaction, not a revision coordinator service.
+Never retire the only active value, wait for a model, then insert its successor. Optional history synthesis or embedding cannot make primary preservation dependent on model availability. New revisions remain exact/lexically accessible while an index is pending. Concurrent replacement proposals revalidate the changed group; slower arrival is not permission to overwrite a new head.
 
 ### 3.2 Withdrawal does not resurrect a retired value
 
-Removing, refuting or quarantining a successor is not a new observation that its predecessor became true again. The resolver must not derive predecessor eligibility solely from the continued existence or visibility of the successor row or edge. Preserve the permitted scoped retirement/validity decision with the existing revision/transition history, including in export/restore. If a privacy operation cannot retain enough permitted transition information, the affected resolution remains unknown until fresh admissible evidence is available; it must not reconstruct deleted content or expose hidden alternatives.
+After A→B, refuting, hiding or erasing B does not prove A current again. Preserve permitted scoped retirement/validity in the ordinary revision history, including export. Return remaining justified alternatives or unknown/conflict. Reinstating A's value needs fresh evidence or an explicit correction of the earlier replacement, not an index rebuild or Doctor action.
 
-For example, A was replaced by B and B is later refuted. Return the remaining independently supported current alternatives or an explicit unknown/conflict. Do not relabel A as current merely because B was filtered out. Restoring A's value requires an explicit evidence-backed revision or scoped correction of the earlier replacement decision. A failed *uncommitted* proposal is different: it never retired A in the first place. Doctor, index rebuild and cache eviction cannot authorize semantic reactivation.
+An uncommitted attempted replacement is different: it never retired A. If erasure cannot retain enough permitted transition metadata, resolution stays unknown until fresh admissible evidence exists; do not reconstruct deleted material or expose hidden alternatives.
 
 ### 3.3 History can have several predecessors
 
-Several revisions can contribute to one replacement or view. A history reader follows all relevant permitted predecessor edges with a visited set, not `ORDER BY time LIMIT 1` at every step. Use a bounded frontier with node/edge budgets and continuation metadata. A depth limit alone does not account for omitted siblings. Mark unexamined branches, missing sources and cycles explicitly; an incomplete history is not silently presented as the complete basis of a summary.
+Follow all relevant permitted predecessor edges using a visited set and bounded frontier. Bound nodes/edges and expose remaining branches, missing sources or cycles. Selecting one predecessor by time at each step silently loses a merge branch; a depth limit does not detect omitted siblings.
 
-Chronological display does not turn the underlying graph into a single-parent chain. Shared ancestors count once; independent branches remain distinct. A bounded history packet may still be useful when labelled partial, but a replacement requiring a missing premise cannot claim complete validation. Use ordinary indexed links and a small traversal function; no general provenance engine or all-corpus walk is needed.
+Chronological presentation does not change the graph into a chain. Shared ancestors count once, distinct branches remain distinct. A partial history can be useful when labelled partial; it cannot establish complete premises for a replacement. Ordinary indexed links and traversal suffice.
 
 ## 4. Project understanding as a small set of revisable views
 
-### 4.1 What the agent actually receives
+### 4.1 What the agent receives
 
-Use ordinary memory revisions for three scales: project purpose/boundaries, subsystem map, and a selected area card. These are presentation scales, not mandatory storage layers or a card for every symbol. An area card answers: why this area exists; inputs/outputs and neighboring responsibilities; important invariants; relevant good/bad decisions; known gaps; and where to verify the claims.
+Use memory revisions for project purpose/boundaries, a subsystem map and a selected area card. These are scales of presentation, not a mandatory layer or card for every symbol. An area card explains purpose, input/output, neighbors, invariants, relevant decisions, known gaps and where to check them.
 
-Exact structure comes from manifests, directory metadata and a selected existing source tool. Meaning and analogies can be synthesized by Dreamer. Preserve the distinction between a documented design, an observed implementation and an inferred purpose. A generated map cannot turn its own inferred purpose into an owner-approved requirement.
+Structure comes from manifests and existing source tools; meaning and analogies may use Dreamer. Documented intent, observed implementation and inferred purpose stay distinguishable. Do not turn a generated explanation into an owner-approved requirement.
 
-On first contact, capture metadata and serve exact known facts immediately. Queue only the orientation work useful for the current task or requested area; expand other areas on demand or in permitted idle work. Do not require full-repository semantic onboarding before the first context response. A large repository can be partially understood without falsely calling its map complete.
+Serve available exact facts immediately on first contact. Build the useful task/area orientation and expand other areas on demand or permitted idle work. Full-repository onboarding is not a prerequisite for the first context response.
 
 ### 4.2 Positive references do not detect new members
 
-A view can become stale even when none of its cited files changed: a new API consumer, route, test or plugin may have appeared elsewhere. A list of positive dependencies alone cannot support a claim such as "all consumers are these three files".
+A map of all consumers can become stale when a new consumer appears, even if every old cited file is unchanged. Retain the selection basis of a set-valued view: examined scope/query, relevant source-tool and source revision, and completeness. This is view metadata, not a query AST.
 
-Retain the **selection basis** for a set-valued view: the bounded source scope/query, its source-tool revision and examined revision, and whether enumeration was complete. This can be metadata on the existing view/job, not a generic query AST. When source changes can alter membership, mark the view dirty even if the previous matching files are unchanged. Negative claims require a defined and sufficiently examined scope; empty top-k never establishes absence.
-
-Use the source adapter's directory/reference-query change information where available. A missed event, incomplete listing or unavailable provider invalidates the coverage claim, not every historical observation. Reconcile the affected scope; until then show a stale/incomplete view plus still-valid exact facts and handles. A filesystem watcher is a hint, not proof that no change occurred.
+Membership-affecting changes, missed events and incomplete listing invalidate the coverage claim for that view. Reconcile the affected scope while retaining valid historical observations and exact facts. A watcher is a hint, not proof that nothing changed. An empty top-k does not establish absence.
 
 ### 4.3 Dirty work without a rebuild storm
 
-Use a stable target key such as `(project, area, view purpose)` and the existing job input/profile identity. Keep at most one running finite build and one coalesced pending successor for that target. Events update the desired source input for the successor; they do not restart a running model call forever. A repeated unchanged request reuses a valid result or a recorded no-change decision.
+Use a stable target such as project/area/view purpose. Keep one finite running build and one coalesced pending successor for that target in the existing queue. Changes update the successor instead of repeatedly aborting paid work. Reuse a valid unchanged result or no-change decision.
 
-Before publication, recheck source membership, required live anchors, policy and current target revision. A stale build cannot overwrite a newer card. If unrelated inputs changed, do not invalidate unrelated views. Process an affected child before rebuilding a parent that actually depends on its semantic output; a bookkeeping timestamp alone does not force parent regeneration.
+Recheck relevant source membership, target and restrictions before publication. A stale result cannot overwrite a newer view. Rebuild parents only when a material child result changed; bookkeeping timestamps alone do not regenerate the whole pyramid. A completed decision covers its actual input/method, not every future use of those facts.
 
-Capture, lexical lookup and exact error warnings do not wait for a semantic cluster. A single important failure or explicit unresolved commitment is already useful. Batching is an optimization of interpretation, not a prerequisite for remembering or surfacing a rare event.
-
-A completed no-change decision covers only the examined input set and method profile. New evidence, a revised method or a relevant counterexample can make the target eligible again. Never use one permanent `processed=true` flag to exempt a fact from every future cognitive operation.
+A single important failure or commitment is already useful. Exact capture and warning delivery do not wait for a semantic cluster. Batching saves interpretation cost; it is not permission to forget rare events.
 
 ## 5. Retrieval cues and the context budget
 
-Attach concrete searchable cues during capture/interpretation: resource IDs, paths, symbols, error codes, command families and explicit task classes. Prefer source adapters' identifiers; generated aliases remain proposed metadata. Do not invent a query that contains a future benchmark answer or treat training annotations as runtime memory.
+Use concrete resource IDs, paths, symbols, diagnostic codes, command families and task classes from actual sources. Proposed aliases do not supply authority or future benchmark answers.
 
-At read time: bind the decision frame; find exact requirements/negative cases; retrieve candidate groups lexically and, when available, with compatible vectors; resolve current values; evaluate procedure applicability; pack the useful semantic units. Expensive synthesis runs separately. No per-tool LLM classifier is required to choose a known card.
+Bind the decision frame; find exact constraints/negative cases; retrieve independent lexical/vector candidates; resolve claim groups; check procedure applicability; pack semantic units. A synchronous per-tool LLM classifier is unnecessary. Rich synthesis runs as separate work.
 
-Budget for the decision, not each stored record independently. When a current value is disputed, keep the qualification/counterevidence next to it; do not spend the last tokens on the positive sentence and drop its exception. If mandatory content cannot fit, expose an incomplete packet and the next needed observation. Progressive reveal revalidates both policy and current scope.
+Keep counterevidence and limiting conditions next to the claim. When essential material cannot fit, expose the incomplete packet and useful expansion/check rather than dropping only the inconvenient exception. Revealed handles recheck current scope and availability.
 
-Measure bytes/tokens injected, expansions and repeated reconstruction work alongside task outcomes. Total input accounting must include material repeatedly resent with a host transcript where it can be observed. A shorter packet is not automatically a cheaper or more useful workflow. Existing fixed requirements are not removed to win a token metric.
+Measure injection, repeated transcript input and reconstruction effort alongside outcome. Shorter text is not automatically less total cost. Do not withhold an explicit user requirement to improve a token metric.
 
 ### 5.1 Independent candidates, not a dense-only lexical reranker
 
-Exact identifiers and the lexical arm query eligible primary records independently of ANN candidates and a dense-score threshold. Merge their candidate IDs with compatible vector results afterward. A lexical-only match is not rejected merely for missing a vector score; fusion must preserve each arm's provenance rather than compare incompatible score scales. An unavailable or still-building vector index leaves exact/lexical retrieval working and reports the missing arm, not an empty memory bank.
+Exact and lexical arms query eligible primary data without prior ANN admission or a dense-score threshold. Merge IDs afterward and retain each arm's origin. A lexical-only hit can remain useful when vectors are absent. Incompatible score scales are not directly compared as if they meant the same thing.
 
-Preserving exact content is not enough if no searchable path can find it. Keep bounded source-derived identifiers and material exact values in searchable fields/cues, with a handle to their original context. A summary that omits an error code must not make that code discoverable only after the summary has already been found. Do not embed entire raw logs to solve this: use the primary store's lexical/exact facilities and explicitly scoped raw expansion/search. Report unindexed or uncaptured portions instead of asserting corpus-wide absence.
+Source-derived exact values need a searchable path; preservation in hidden details is insufficient when the relevant record cannot first be found. Use bounded cues, native lexical lookup and explicit source-neighborhood expansion/search, not embeddings of every raw log. Report uncaptured/unindexed scope rather than universal absence.
 
-Prefer the database's actual filtered-vector plan over a speculative application workaround. The [official similarity-search reference](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) describes predicate pushdown, index-assisted prefiltering since 3.3.0 and version-specific exact/approximate paths. [EXPLAIN](https://surrealdb.com/docs/reference/query-language/clauses/explain) exposes the plan. Verify the selected server/schema/query combination; a supported filter is not proof of complete semantic recall or of application-level privacy-lineage validation. Do not build a second search engine because of an untested assumption about the database.
+The [SurrealDB reference](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) describes filtered vector plans and index-assisted prefiltering; [EXPLAIN](https://surrealdb.com/docs/reference/query-language/clauses/explain) exposes actual plans. Inspect the selected server/schema/query before adding a workaround. Supported predicates do not prove complete semantic recall or application source validity.
 
 ## 6. Applicability before automatic learning
 
 ### 6.1 Three-valued matching
 
-A procedure retains a small set of relevant preconditions: operation/task family, resource/API and tool profile where material, scope, exceptions and the observation needed to establish applicability. Use existing typed comparisons rather than a new predicate language. Keep rich semantic preconditions as labelled text when code cannot evaluate them reliably.
+A procedure retains only material preconditions: task/action family, relevant API/resource/tool profile, scope, exceptions and how a missing condition could be observed. Existing typed comparisons are enough for simple cases; uncertain semantic conditions remain labelled text rather than a new predicate language.
 
-| Matching result | Allowed use |
+| Result | Use |
 |---|---|
-| Applicable | Eligible narrow advisory under existing policy; no new per-record approval |
-| Inapplicable | Do not recommend the concrete action in this frame; preserve historical evidence |
-| Unknown | Offer the missing check or a clearly conditional hypothesis when useful; do not treat it as an established instruction or an enforced block |
+| Applicable | Eligible advisory under current configuration, without per-record approval |
+| Inapplicable | Do not recommend that concrete action here; retain its historical evidence |
+| Unknown | Offer a conditional analogy or useful missing check; do not present it as established or enforce a block |
 
-Similarity finds a candidate; it never fills missing preconditions with `true`. A broad lesson such as "inspect the consumer before changing this API" can remain useful when a version-specific repair is inapplicable. The agent's next action still belongs to the host/controller.
+Similarity finds a candidate; it does not supply missing preconditions. A general method such as checking a consumer before changing an API can survive the loss of a version-specific repair.
 
-A transferred procedure is evaluated in its new scope with permitted source material. New wording or a claimed abstraction cannot declassify private examples. Wider reuse and claims of effectiveness follow Implementation §7.4; this chapter does not silently promote every local advisory to global policy.
+Provisional transfer to another permitted situation can be automatic. Applicability, allowed disclosure and demonstrated benefit are separate questions. Independent comparative evidence is needed for a broad effectiveness claim, not for every useful conditional suggestion. A more abstract formulation does not declassify its private source material. See Implementation §7.2.
 
 ### 6.2 First concrete outcome criterion
 
-For the initial API-change example, use a named criterion such as recurrence of the identified compatibility failure under the declared API/consumer and verifier profile. Where capture permits, record whether the relevant definition and consumer were available before the edit. Availability is not proof that the model understood or obeyed them.
+For the API example, compare recurrence of the named compatibility failure under the relevant API/consumer and verifier profile. Where observable, retain whether the definition and consumer were available before editing; availability is not proof that the model understood them.
 
-Do not use final task PASS as a surrogate for this criterion. A network outage or a failure in an unrelated subsystem does not prove that the API procedure was harmful. Conversely, a different failing criterion cannot be hidden merely because the selected API error disappeared.
+Do not use final task PASS as the only criterion. An unrelated network/subsystem failure does not prove the procedure harmful. Conversely, disappearance of this diagnostic must not hide another real failure.
 
-**A missing diagnostic is not a passed criterion.** Record whether the relevant check actually exercised the target on the cited revision/profile, whether its result is complete, and what it concluded. The initial reducer distinguishes a supported pass, a supported failure, an inconclusive attempted check, and a check not observed. A compiler stopped earlier in another module, a skipped consumer, a truncated log or a check against a different checkout cannot prove that the named API failure was eliminated. A documented complete check that covers the criterion can establish its pass; a matching captured diagnostic can establish the corresponding failure without claiming that every other check completed.
+Absence of a diagnostic is not a pass if the check stopped earlier, skipped the consumer, examined another revision or produced incomplete output. Retain target/profile, necessary coverage and result completeness in the existing outcome. Distinguish supported pass, supported failure, inconclusive attempted check and unobserved check. A captured matching failure can support that criterion without asserting that all other checks completed.
 
-This coverage is a few fields on the existing outcome contribution, not an evidence-schema platform. Preserve the original tool outcome and costs even when the target criterion is inconclusive. Missing coverage supplies a next useful verification or remains unknown; it neither rewards the procedure nor invents harm. Capture of an expected failing diagnostic probe is not automatically a new prohibition against running that probe. Adherence and criteria retain their distinct purposes.
+A deliberately negative diagnostic probe is not automatically a forbidden action. Preserve tool outcome and costs even when its implication for the procedure is unknown. Separate adherence, criterion outcome and attribution. One packet's task reward is not distributed to every item.
 
-Keep adherence, target-criterion outcome and attribution separately qualified. A direct counterexample can narrow an applicable rule; an unrelated or uncorrelated failure remains unassigned. There is no reward spread across every memory item in a packet and no automatic punishment of every delivered procedure.
-
-The comparison key includes procedure revision, task/operation family, relevant source/tool profile and criterion/evaluator revision. Use only the dimensions that change the claim being evaluated. Keep observational support separate from a controlled estimate of benefit. Exact outcome contributions remain unique as in Implementation §7.3; an amended outcome replaces its contribution.
+The comparison uses procedure revision, relevant task/source/tool conditions and criterion/evaluator revision. Amended results replace the corresponding unique contribution. Ordinary outcome fields implement this; no evidence-schema platform is needed.
 
 ### 6.3 Stopping self-reinforcement and wasted work
 
-A derived summary is not new independent evidence for itself. Re-reading the same episode, regenerating a paraphrase or invoking Dreamer again on the same input cannot increase support. Recompute only when input membership, a relevant source/method profile, an outcome or an explicit request changed.
+The same episode, a paraphrase and a summary of that summary are not independent evidence. Recompute when relevant input membership, method, outcome or explicit request changed. A service timestamp or read does not itself create new cognitive work.
 
-Do not decay a rarely used invariant or negative case merely because recent activity concerned another area. Limit normal exposure and backlog by usefulness and retention policy; do not confuse lack of retrieval with falsity. Retain a specific reason when a candidate is deferred, superseded or found to add no information.
+Rarely retrieved invariants and negative cases do not become false from inactivity. Exposure and retention may change without rewriting support. Cross-domain abstractions retain the underlying independent cases, not a multiplied count of intermediate links.
 
-Cross-domain analogy can propose a more general procedure, but support remains the underlying independent cases. A chain of abstractions does not multiply that support. Restrict candidate search to selected dirty/new procedures and bounded comparable groups before considering an expensive whole-corpus sweep.
+### 6.4 Cross-domain induction without forced unification
+
+Find a useful correspondence for a future decision, not a universal rule for every nearby record. Outputs are ordinary analogies, proposed procedures/revisions, justified links or no-change. Original episodes and scoped procedures remain addressable.
+
+A similarity edge suggests a pair; a connected component groups candidate work. Neither proves common conditions or mutual equivalence. Do not replace this mistake with mandatory expensive clique proofs. Inspect the actual relations proposed within a finite group; a result can use a subset, preserve alternatives or find no generalization.
+
+Before attaching a case to an existing method, compare the relevant action/effect, uncertainty, conditions, exceptions and outcome. Exact structured correspondence needs no model; unresolved semantic correspondence can receive bounded interpretation. With several existing generalizations, choosing the first set element is not a policy. Sorting IDs fixes order, not meaning.
+
+Shared sources and high cosine do not make two texts equivalent. One episode can contain competing rules and exceptions. Deduplicate actual replay or supported equivalence; otherwise retain the distinction. Carrying source IDs while discarding the important condition is not lossless compression.
+
+Transfer maps relevant roles and conditions rather than merely removing domain nouns. Retrying a read-only request differs from replaying an unknown external effect. The useful abstraction names that distinction and readback where needed, not “always retry timeout”. Keep the concrete source repair beside the conditional analogy. Do not invent a psychological profile when an engineering method is the useful object.
+
+Publish interdependent changes through the existing memory transaction and job result. Missing required links cannot be called a completed transformation; an independent valid subset must be explicitly partial. Navigation links do not become positive evidence just by existing. Conditional low-risk advice remains automatic; it does not silently become a host prohibition or new disclosure permission.
+
+### 6.5 Bound the whole induction, not only its first query
+
+Use one finite source-ID/revision set for the job's detail reads, feature lookup and prompt. A later “all records with vectors” query cannot silently replace it. Recheck current restrictions at actual dispatch/publication.
+
+An opaque ID is not source content. Hydrate permitted selected records, defer the affected result, or accurately reduce the input while accounting for omitted scope. Partial work is valid; invented evidence is not.
+
+Bound nodes, examined pair/neighbor work, loaded data, prompt and output links. A limit on the first query does not bound a later all-corpus matrix or all-to-all links. Start with existing indexed retrieval and finite candidates; small exact pair comparisons are also reasonable. No second vector engine or per-observation cross-domain sweep is required.
+
+Continue remaining scope using the same job mechanism, a stable cursor or explicit next membership. Do not mark unexamined sources processed or repeatedly serve only the first page. New inputs belong to a coalesced successor, not endless cancellation of paid inference.
+
+### 6.6 Reuse no-change and version derived features
+
+A successful “no useful generalization” completes the job for its examined inputs/method. Unchanged triggers reuse it. New evidence, revised method, material counterexample or explicit re-evaluation can reopen work. This is not a new negative-result store or a permanent exclusion of an observation from every purpose.
+
+No-change differs from invalid output, missing sources, partial scope and provider failure. An empty successful result does not need a semantic revision just to report activity.
+
+Optional abstract/behavioral features reuse existing derived-content and embedding identity: bind derived text to its actual sources/abstractor, then its vector to text revision and encoder. A bare `has_feature` Boolean does not establish compatibility. Changing the abstractor need not re-embed unchanged original memory.
+
+Start with existing lexical/vector procedure retrieval. A second representation is optional, justified by useful missed transfers and its recurring cost, not a mandatory model call per observation. Edge counts and abstraction depth are not intelligence metrics.
+
+### 6.7 Two recursive loops from Harness2
+
+**Donor D44:** [Harness2 at 1cfe254e](https://github.com/google-research/harness2/tree/1cfe254e8d25b15f37048c3730134686abe60335). Reuse its mechanism, not its Python benchmark engine, filesystem library or fixed rollout quota.
+
+**Task-local loop — Propose, Probe, Compose.** Select a concrete weakness from existing traces and a method revision. Propose a focused change; when useful, compare general execution practice and domain-specific practice separately. Probe under matching material conditions through the controller or a local pure-function comparison. Inspect actual changed behavior and delivered result, not just the new instruction text. Compose supported parts, revise conflicts or keep the baseline. Record the chosen revision, contrasting attempts, reason and limitations.
+
+The first implementation can use one relevant proposal rather than unconditionally requesting both donor proposal roles. Parallel alternatives and sequential refinement are optional uses of the same finite job mechanism. Success means the named transformation/observation occurred, not that an improver response existed. A chosen candidate may remain provisional. Early no-change, insufficient informative evidence or exhausted permitted work can end a cycle without producing a compulsory lesson.
+
+**Cross-task loop — learn how to improve.** After the local cycle, retain a memory procedure describing the diagnostic cue, change attempted, observed contrast, conditions/counterexamples and why to reuse or avoid that improvement approach. Link the chosen method/artifact revision and underlying attempts. Future Dreamer work retrieves these lessons to choose better proposals, probes and composition, rather than only retrieving the previous task's answer.
+
+Keep the improvement recipe and criteria stable during a comparison. Update its reusable lessons afterward. The next task starts from its appropriate current baseline and selectively reuses applicable material; it does not blindly inherit every previous task-specific prompt, script or exception. The loop changes external memory/methods, not model weights or the user's goal.
+
+**Smaller than the donor.** `memory` stores method and improvement-lesson revisions; `learning` reduces observations; `jobs` holds finite progress; controller executes model/harness work. Use existing IDs and source handles, not a second library database, task graph, reflection scheduler or agent for every recursion level. Pure replay/copies and suitable local calculations are cheap probes. Real irreversible external actions are not repeated simply for a better comparison.
+
+The donor's published task experiment counts 4k rollouts and 3k improvement stages, with selection/reflection and retries separately accounted. Those are experiment conventions, not a production duty to spend that amount. Count all actual Eliot/controller work and preserve no-change reuse. Do not rerun the full harness whenever a cheap memory comparison is sufficient.
+
+The inspected donor final-selection pool excludes reference executions, although a composition itself can preserve its input tree. Eliot keeps the actual baseline/no-change eligible at adoption. Anonymized model preference, a successful syntax check or a completed reflection is not independent proof of improvement. Uncertain contrast remains labelled evidence, useful for provisional adaptation without a promotion ceremony.
 
 ## 7. Attention, prediction and cognitive failure
 
-An unresolved contradiction, commitment or observation gap is an ordinary memory item with its relevant task/scope and resolution condition. A new notification, successful delivery or acknowledgement does not resolve it. Close or supersede it using the actual outcome or an authorized goal change, without creating another task manager.
+A contradiction, commitment or missing observation is an ordinary memory item with scope and a resolution condition. Notification, delivery and acknowledgement do not resolve it. Use the actual result or explicit goal revision; do not create another task manager.
 
-A prediction names the expected observable effect before an action, the conditions and the criterion that can check it. Use configured tool/verifier observations where they exist. Store hit/miss/partial/unknown with the source evidence; no universal causal-graph solver or new expression language is needed. A successful sequence is suggestive evidence, not automatically an intervention-controlled causal result.
+Predictions name an expected observable effect before an action, conditions and an available criterion. Store hit, miss, partial or unknown with the result. A successful sequence is evidence worth inspecting, not automatically an intervention-controlled causal claim.
 
 ## 8. Implementation placement and future walkthroughs
 
@@ -202,6 +238,30 @@ The fourteen cases above belong to revision 0.3. Revision 0.4 adds:
 | A session continues without mentioning an earlier exception | Continuation does not silently supersede the exception |
 | Verifier stops before exercising the target consumer | No positive learning outcome from the absent target diagnostic |
 
+Revision 0.5 adds:
+
+| Case | Required behavior |
+|---|---|
+| A resembles B and B resembles C, but A does not resemble C | Treat the component as candidates, not one proven common rule |
+| A collision group has two existing generalizations | Do not attach everything to the first target; retain alternatives or justify a specific transformation |
+| Detail/feature lookup discovers nodes outside the finite job input | Do not expand work or claim complete coverage silently |
+| A selected source cannot be hydrated | Defer or accurately reduce the input; an opaque ID is not source content |
+| Repeated unchanged induction returns no proposal | Reuse the completed no-change result without another automatic paid call |
+| The abstraction method changes but the original embedding model does not | Refresh affected derived representations, not every original vector |
+| Two notes share provenance but have different retry conditions | Preserve the distinction instead of treating overlap as semantic equality |
+| One prerequisite evidence link fails during a claimed transformation | Do not report the complete transformation as applied; use the existing atomic/explicit partial boundary |
+
+Revision 0.6 adds:
+
+| Case | Required behavior |
+|---|---|
+| All improved candidates are worse or uninformative | The actual baseline/no-change remains eligible |
+| An adopted output has no supported improvement lesson | Do not require a new experience entry or invent benefit |
+| A next task differs materially from the previous one | Select applicable lessons, not the whole last harness |
+| The improvement recipe changes during a comparison | Keep the comparison attributable; apply the new recipe in a later round |
+| A probe would repeat an irreversible external action | Use a suitable replay/copy or omit that probe, not blind execution |
+| The same finalized reflection is delivered twice | One lesson/update and outcome contribution, not another recursive trigger |
+
 These are documentation walkthroughs, not an executed V3 test suite.
 
 ## 9. Source decisions
@@ -214,3 +274,7 @@ These are documentation walkthroughs, not an executed V3 test suite.
 - [LongMemEval, 2410.10813v2, §3.2](https://arxiv.org/html/2410.10813v2): knowledge update, temporal reasoning and abstention must be evaluated separately. This motivates failure categories, not importing benchmark user-attribute ontologies into Eliot.
 
 - [Hy coding reconciliation](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/fact_reconciler.py#L737-L889) and [storage](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/store.py): borrow explicit history and scoped candidate ideas, not retire-before-insert or dense-only lexical availability. The pinned source permits several superseded facts while its ancestor helper selects one predecessor; the audit distinguishes source facts and isolated SQL probes from a full deployment test.
+
+- [Hy cross-domain sweeper](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/cross_domain_sweeper.py) and [optional schema compaction](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/system2_tools.py#L84-L209): candidate discovery is not justified merge or lossless compression. Audit §18 separates pinned source facts, synthetic control-flow probes and V3 proposals. Do not carry over an unbounded second enumeration or count association edges as independent support.
+
+- [Harness2 recursion](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/recursion.py), [selection/reflection](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/selection.py), [library](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/library.py), [ledger](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/ledger.py), and [experiment guide](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/docs/EXPERIMENTS.md): take the two improvement loops and execution contrasts, not finals-only adoption or a fixed experimental workload. [Paper 2610.14224v1](https://arxiv.org/html/2610.14224v1) distinguishes adopted configuration from verified optimality. No donor experiment was run in this pass.
