@@ -237,6 +237,16 @@ Before a request, reserve an upper estimate of permitted cost/tokens. After the 
 
 The controller's owning route obtains provider credentials from the selected OS secret store or other explicitly configured protected source; Eliot holds only its controller connection credential where needed. Do not store provider credentials in memory, prompts, or receipts. Logs retain safe route identifiers and costs. Model changes or fallback are allowed only within the user's existing policy.
 
+### 6.4 Controller integration qualification (2026-10-19)
+
+The inspected controller implementation-status document explicitly reports partial runtime coverage and no implemented Eliot Memory OS model/embedding bridge. Its generic Operation lifecycle is not a model-execution API: queued/sending/native-accepted/outcome-unknown/settled states only describe persistence, and the domain must still prove actual execution and result delivery. Do not invent a model route by treating task dispatch, Goal, or Operation acceptance as a completed inference.
+
+Implement the smallest explicit controller capability for two operations: bounded text generation with a selected route and schema, and embedding generation with a declared profile/dimension. Eliot owns its job identity, privacy decision, source freshness and candidate validation; controller owns provider selection, execution and provider-side result/usage. Request submission, polling/readback, cancellation and unknown-outcome reconciliation must use one stable request identity. An accepted request is not a generated result. A late result is usable only if its Eliot job attempt is still current and all source/policy revisions remain valid.
+
+Qualification requires a real call through controller with returned output, effective model/profile, usage or explicit unknown usage, error classification, cancellation semantics and readback after lost acknowledgement. Until this is observed, label both capabilities unavailable; continue deterministic capture and lexical recall. No fake Task, second controller scheduler, direct provider client or provider-specific Dreamer implementation is permitted.
+
+**Source boundary:** [Controller implementation status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/main/docs/implementation-status.md) and [generic Operation lifecycle](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/main/crates/swarm-kernel-host/src/store/operation_lifecycle.rs). These sources support the absence of a qualified bridge, not the existence of the proposed API.
+
 ## 7. Learning that reaches the next attempt
 
 ### 7.1 What is retained
