@@ -1,387 +1,471 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision:** 0.1, 2026-10-18. **Status:** technical proposal; V3 code has not been written, and queries/runtime have not been verified. [Architecture](ARCHITECTURE.md) defines the properties to preserve; [Audit](AUDIT.md) records the rationale and limits of the evidence.
+**Revision 0.2 · 2026-10-19 · technical proposal; no V3 runtime has been implemented or qualified.**
 
-This document proposes a sufficiently concrete design for further documentation review. Method and field names are interface proposals, not claims about an existing API. Pseudocode specifies transactional conditions; it is not ready-to-run SurrealQL.
+[Architecture](ARCHITECTURE.md) defines purpose and preserved properties. [Audit](AUDIT.md) records findings, source pins and rejected alternatives. This document owns the proposed mechanisms. Names below are application concepts, not claims about existing controller RPCs or ready-to-run SurrealQL. The source comparison is against Memory OS `3512f6e` and controller `96a0d5a`.
 
 ## 1. Initial delivery
 
-Start with one Rust package containing a library and executable; this is an initial shape, not a permanent limit. The executable provides service and CLI modes. Its ordinary modules are `memory`, `context`, `learning`, `jobs`, `adapters`, and `control`; split crates only when there is a demonstrated need.
+### 1.1 Runtime and module shape
 
-The primary database is a separate SurrealDB server, supervised as a child process of demand-started `eliotd`. A private `Store` module owns parameterized SurrealQL over the official WebSocket JSON-RPC interface as the initial implementation candidate; the Rust SDK remains an open alternative pending the documentation decision. Application-facing public types do not expose database-specific types. Do not add a generic query AST, universal operation catalogue, or separate store daemon. Keeping the bridge thin does not grant a model or host arbitrary SQL access. SurrealDB is the selected full-featured store, including vector search; vectors are part of the product, not an optional future tier.
+Use one Rust package initially, with executable modes and ordinary modules. Split a crate only for a demonstrated dependency, trust, deployment or change-cost boundary. The same executable can provide CLI, MCP/hook relay, supervisor and daemon modes; these modes do not each require their own package.
 
-The researched current stable SurrealDB line is 3.3, patch 3.3.4 dated 2026-10-13. This is a **candidate for a new V3 installation**, not Eliot's installed version or verified compatibility. Before implementation, pin actual server/client-interface versions and verify required operations; do not automatically carry over V2's 3.1/3.2 line. [Official releases](https://surrealdb.com/releases).
+| Module | Owns | Does not own |
+|---|---|---|
+| `store` | Schema, parameterized queries, atomic writes, operation readback | A general query language or a second database service |
+| `memory` | Capture, revisions, source lineage, allowed state transitions | Provider execution or task acceptance |
+| `context` | Retrieval, applicability, packet assembly and progressive reveal | Another semantic store |
+| `learning` | Procedures, outcome interpretation and evaluation projections | A parallel attempt/overlay scheduler |
+| `jobs` | Durable memory-processing intent, claims and result application | Provider-side execution state |
+| `adapters` | Actual host/source/controller interfaces | Invented capabilities or arbitrary model SQL |
+| `control` | Settings, maintenance, health/status and recovery decisions | A replacement for OS process primitives |
 
-The first target profile is local Windows operation, matching the original project. It assumes local IPC authenticated against the OS user, a protected data directory, and separate connection settings. Networked multi-tenant deployment is not enabled by a switch without implementing authentication, isolation, and operations.
+The selected database is a SurrealDB server child of `eliotd`. One private `Store` module performs application writes. Use native lexical/vector indexes, relations and transactions; no redb/SQLite semantic mirror, storage bridge process, universal operation catalogue or compatibility facade.
 
-Model and embedding work goes through `eliot-swarm-controller`, the sole provider/model routing boundary. Eliot does not call provider APIs directly. The target contract allows cloud, local, and harness-mediated routes chosen by the user, including embedding routes; their current support must be checked individually. A concrete controller client/adapter is a required working capability, not a placeholder facade: a route is reported unavailable until an end-to-end request, response, usage/unknown-cost, error, and cancellation contract works. Heavy Python/model runtimes or tools with different trust levels remain outside the Eliot process. Eliot does not load arbitrary plugins with primary database rights.
+The first deployment is local Windows. The proposed full observed profile has three owned processes while active: a small demand-start supervisor, `eliotd`, and its SurrealDB child. CLI/host relay processes are transient; the external controller and its model runtimes are additional dependencies. This is one memory writer, not a claim of one total process. The smaller launcher-only profile lacks continuous hang detection and is reported as such. Detailed custody is in §9.
 
-`eliotd` starts on demand; a CLI/host entry point starts it before serving an operation. Use a normal OS single-instance mechanism per data directory, not a new authority-epoch framework. Before an intentional idle exit, persist unfinished work, drain active mutations and stop the database child cleanly. The observer distinguishes intentional idle shutdown from a crash.
+### 1.2 Demand-start and dependency availability
 
-Future scheduled jobs require a wake source while the daemon is stopped. The first Windows profile should register the next due wake with the OS; that timer only starts Eliot, while the database job remains the work owner. Without a supported wake source, report execution as deferred until the next host invocation and do not promise scheduled delivery. Startup, shutdown, timer and hang behavior are part of O6.
+A host/CLI invocation starts the supervisor and daemon through one OS single-instance boundary per data directory. Readiness covers storage and required local operations, not every optional model route. During a model outage, capture and permitted exact/lexical reads continue; vectors remain a full-product capability with a visible degraded state when unavailable.
+
+Before idle exit, stop admission of new external work, settle short mutations, preserve pending jobs and stop the child database. The supervisor recognizes intentional shutdown and exits. There is no SCM installation or background wake registration by default. Scheduled work runs while active or at the next demand start; report overdue work honestly. An explicitly enabled OS wake may start the application later, but does not become a second scheduler or quietly change this default.
+
+### 1.3 Database client decision and error boundary
+
+Keep the client private to `Store`. The retained [Phase A ADR](../ADR/0001-phase-a-dependency-boundaries.md) excluded the SDK because of its then-current dependency/release-gate graph. The supplied Claude proposal later used `Surreal<Any>`. Neither establishes that the dependency issue persists or that a specific current SDK/server pair works.
+
+Do not silently revoke that constraint or implement both clients. O4 must record one choice: retain a narrow official WebSocket JSON-RPC transport, or explicitly replace the historical restriction with a pinned network-only SDK whose dependency cost is acceptable. Prefer reuse over recreating connection, authentication and decoding machinery, but do not present this preference as an approved SDK migration. Embedded database engines are unnecessary in the production client.
+
+The earlier audit identified server 3.3.4, dated 2026-10-13, as a V3 candidate. It is not an installed-version claim, and the exact client/server build is still unqualified. Record the selected server, client and schema versions together; avoid a moving `latest` target in implementation. These implementation choices do not modify the retained V2 dependency graph or ADR in this documentation change.
+
+For either client, transport success is not mutation success. Check all statement results, required bindings, decoded types and expected cardinality; a conditional single-row transition must affect exactly the intended row. The SDK documentation specifically exposes per-statement errors and notes that an unbound parameter becomes `NONE` rather than necessarily raising an error. A private fixed query plus a small typed parameter object is enough; do not build a query validator language. [Query documentation](https://surrealdb.com/docs/reference/rust/methods/query).
 
 ## 2. Minimal data and ownership
 
 ### 2.1 Record families
 
-| Family | Content and meaning | Mutation owner |
+| Family | Retained facts | Writer |
 |---|---|---|
-| `observation` | Source event, origin, subject, scope, bytes/blob reference, receive time, source event ID/revision, use constraints | `memory.capture` |
-| `memory` | Versioned conclusion, hypothesis, decision, procedure, negative experience, or project view; support, status, scope, influence | `memory.apply` |
-| `link` | Typed relation among records/revisions: support, depends_on, contradicts, supersedes, occurrence_of, structural, co_change, causal_hypothesis | Same transactional memory path |
-| `attempt` | Host task/attempt, delivered context, prediction, action, observed outcome, next adaptation | `memory.record_outcome`; external task lifecycle stays with host |
-| `job` | Deferred work: input IDs/revisions, policy, executor, deadline, attempt, cancellation, result | `jobs` through `Store` |
-| `operation` | Mutation idempotency, short result explanation, revisions, minimum trace for diagnosis/retry | Transaction for the corresponding operation |
+| `observation` | Source event identity, original admissible material or blob handle, origin, scope, timestamps and coverage | `memory.capture` |
+| `memory` | Immutable revisions of claims, decisions, procedures, unknowns, failures and project views; support, availability and influence | `memory.apply` |
+| `link` | Typed references between exact revisions; evidence, live requirement, contradiction, replacement or structural relation | The same memory transaction |
+| `attempt` | External task/attempt identity, applicable context revisions, prediction, available action/outcome observations | `record_outcome` |
+| `job` | One durable intention to transform memory; inputs/profile, claim, deadline, execution reference and result | `jobs` through `Store` |
+| `operation` | Local mutation identity, input fingerprint, result and minimum retry/correction explanation | The corresponding transaction |
 
-These are logical families, not a requirement for exactly six tables. A notification can be a `job` of type `notify`; embedding preparation can be another job type. Procedures and concepts are usually `memory` variants rather than new services. Not every diagnostic line becomes a durable cognitive object.
+These are logical families, not a fixed table count. Context deliveries and outcome contributions can be child records of an attempt; notifications can use jobs. Do not persist a new state machine for each view.
 
-Large source files and attachments may live as blobs with checksums and reference-based access. For two-phase persistence, materialize the blob durably first, then publish its reference in a transaction; clean up unused blobs later. A durable success must never reference bytes that have not been saved. Deletion and backup cover both storage locations.
+Preserve semantic revisions as actual application records, not merely as overwritten rows whose earlier values might exist in engine history. A material correction points to its predecessor; replacement does not destroy a distinct physical occurrence.
 
-### 2.2 Shared fields and their meaning
+For large permitted inputs, persist immutable blob bytes first and publish their reference transactionally; later garbage-collect unreferenced blobs. If only a prefix/tail or external source handle was captured, record that limit. Truncating the extractor's prompt is not the same as deleting the original error or exception. Backups and erasure cover blobs as well as database rows.
 
-`id`, `revision`, `owner_id`, `scope`, `source_refs`, `created_at`, and `content` are shared fields where applicable. An ID grants no authority. Derive `owner_id` and permitted scope from the authenticated connection and workspace binding; never accept them from model text.
+### 2.2 Identity, scope and status
 
-Scope contains only necessary dimensions: user/organization, project/workspace, and, when needed, branch, resource, and task. Project-wide memory does not inherit permission for neighboring projects. Branch history and the current checkout are distinct; transferring experience between them is a new application in the target scope.
+Derive the local user and permitted project/workspace from the connection and host binding. A model cannot set an authoritative owner or expand scope. Branch, file/symbol, task and tool profile are applicability dimensions where necessary, not separate authorities.
 
-For an event, record `observed_at` and receipt time. For a claim, `valid_from` and `valid_to` may be unknown; unknown is not replaced with INSERT time. Represent each boundary as one of `known(timestamp)`, `unknown`, or `unbounded`. A historical query that depends on an unknown boundary returns uncertainty, not a positive match. Queries may distinguish “when it applied” from “when it became known.” These fields and revisions suffice for v0.1; no universal temporal engine is proposed.
+Keep source-event identity separate from content equality. A replay uses the same `(source, event_id, source_revision)` or an adapter-assigned stable delivery ID. Equal text from independent events remains independently identifiable; distinct IDs for copies of one event do not make independent evidence.
 
-Support, availability, and influence are independent:
+For time, distinguish when an event occurred, when it was received, and a claim's validity interval. Each interval boundary can be known, unknown or unbounded. Unknown is not INSERT time. Historical queries must not manufacture certainty from absent dates.
 
-| Dimension | Proposed values | What it controls |
+| Dimension | Proposed values | Meaning |
 |---|---|---|
-| `support` | observed, hypothesis, supported, conflicted, refuted, unknown | How a conclusion is grounded; a strong status requires a source and a testable property |
-| `availability` | active, on_demand, archived | Whether it participates in ordinary search or is separately revealed |
-| `influence` | use, warn, handle, none, quarantined | Which presentation channel is permitted and whether content may guide action |
+| Support | observed, hypothesis, supported, conflicted, refuted, unknown | Evidential interpretation, with its basis |
+| Availability | active, on_demand, archived | Ordinary selection versus explicit reveal |
+| Influence | use, warn, handle, none, quarantined | Allowed presentation/action influence |
 
-`use` does not mean “true”: a hypothesis may be useful if presented as a hypothesis. `quarantined` content is excluded from ordinary content and hidden ranking features; operator review is a separate authorized request. `handle` permits only an authorized description and reference; that description must not reveal restricted content.
+A useful hypothesis may be delivered with its hypothesis label. `influence != none` is not a valid allowlist: it also admits quarantined or handle-only content. Restricted metadata and hidden ranking features require the same policy attention as displayed text.
 
-### 2.3 Support, revision, and dependency
+The first profile assumes cooperative adapters and the host's actual tool restrictions. An agent with unrestricted shell/filesystem access under the same OS account can potentially invoke administrative CLI modes or access that user's files. “Human CLI only” is not a hard sandbox. Stronger isolation requires an actual host/OS access boundary, not an extra `principal` string. Do not expose database credentials to the model or arbitrary adapters.
 
-A `depends_on` link means that this derived revision requires a specific source revision. `support` means evidence in favor of a claim and does not by itself assert logical sufficiency. Multiple support links are not automatically interpreted as AND or OR. Where sufficiency matters, make it explicit in the specific derivation type or a small list of justifications.
+### 2.3 Historical evidence, live requirements and privacy lineage
 
-A source change immediately makes dependent revisions ineligible for ordinary influence, even if background graph traversal is incomplete. Before context delivery or opening a handle, check dependency validity transitively to current source revisions. If a bounded traversal cannot establish validity, fail closed: do not deliver the old projection as `use`; mark it stale/unavailable until rechecked. A background job completes invalidation and may rebuild projections. Batch limits bound one pass, not correctness. This does not require a full ATMS or enumerate every support combination.
+Use the existing link structure with explicit meanings:
 
-If independent support remains, recompute or review the justification and derived text before publishing a new revision. Deleting an old support link does not make its old synthesis verified.
+| Link meaning | Example | What changes invalidate it |
+|---|---|---|
+| Historical evidence | This error occurred in attempt A on source revision X | Retraction, loss of evidential support, or policy/erasure affecting the source; a later unrelated HEAD does not erase the event |
+| Live requirement | This current API map or actionable instruction requires the present signature to match revision X | Change of the relevant anchor/profile, not every repository edit |
+| Supporting evidence | Another source favors the conclusion | Reconsider strength/justification; it is not automatically an alternative sufficient proof |
+| Contradiction/replacement | New evidence disputes or replaces a prior conclusion | Keep both histories and the reason for the transition |
 
-A derived record's effective read/use policy is no broader than the intersection of the policies and permitted purposes of its actual source revisions. Compute and persist that effective policy before sending derived content to a model, before saving/publishing a derivative, and again before `open` or context delivery. If policy intersection cannot be determined, do not disclose or publish into a broader scope. Removing a private link without regenerating the text does not make the text public.
+Batch or episode membership is navigation, not evidence or a live requirement. Store one batch reference rather than a Cartesian set of all-to-all support links. Explicit evidence may select a subset; an allowed citation ID still does not prove that the interpretation is true.
 
-The first profile has one application writer per data directory. Within `Store`, serialize eligibility-changing source/policy transitions with validation and publication of derivatives. Use a workspace write critical section around those transactions; a multi-writer deployment would additionally need a database conflict guard touched by both paths. Snapshot reads alone do not prevent a concurrent revocation of a different row. Direct external database mutation is outside this profile and requires reconciliation before normal service resumes.
+A procedure may use immutable evidence from X while its applicability is checked against Y. For instance, the lesson to inspect an API consumer can survive a source update while an exact instruction to call a removed symbol cannot.
 
-Order outbound disclosure against those same transitions. Immediately before handing a context response or ModelJob payload to its transport, enter the workspace gate, check the current source/policy revisions, and admit that bounded handoff. A payload still in an Eliot-owned queue must pass this check when dispatched; an earlier check is not permission to send later. Revocation acknowledgement prevents subsequent handoff admissions. A handoff already admitted to the transport is in flight and may complete after acknowledgement; its cancellation is best-effort. Do not hold a database transaction while waiting for a network response. The gate covers validation and initiation of the bounded handoff, not the remote model's execution. Disclosure to the external controller is already a disclosure; Eliot cannot promise that a controller or provider will erase or stop using bytes it has received. The controller contract must separately state cancellation/retention behavior for its queued jobs.
+For a derived revision, list required live anchors separately from historical evidence. Validate the selected candidate's relevant dependency subgraph, with memoization within the request. Unresolved cycles or exhausted validity checks produce a visible stale/unknown item, not a positive `use` decision. Background refresh continues affected work. No whole-corpus traversal is required on every read, and no bounded pass may silently declare unvisited descendants valid.
 
-Freshness refers to declared observed source revisions, not an impossible atomic snapshot of every external filesystem and provider. Before a dependent material action, the host rechecks critical live anchors where its contract requires that. Revocation stops subsequent disclosures at the controlled boundary; it cannot recall bytes already sent to a provider. A pure dependency cycle or an unresolved dependency makes the derived view unknown/stale, not implicitly valid.
+If a derivation requires several premises, all remain required. Independent alternative justifications must be identified explicitly; several citations are not an automatic OR. After losing an actual premise, review or regenerate the conclusion before publishing a new revision. Do not preserve the old text merely by deleting its inconvenient citation.
+
+**Policy lineage is separate from live freshness.** Every actual content source, historical or current, contributes its permitted read/disclosure purposes. For a model transformation, conservatively include all source material supplied to that invocation, not only the citations the model chooses to return. A derivative may not have broader effective permissions than that input lineage allows; a broader derivative is regenerated from an appropriately restricted input set. Recheck policy before model dispatch, publication and reveal. Removing a private source link without regenerating the content does not declassify the content.
+
+Serialize eligibility-changing transitions and derivative publication through a short per-workspace application write boundary. Validation and commit must be ordered against those transitions; a snapshot over different rows alone is insufficient. A future multi-writer profile needs a database conflict mechanism, not a claim that this local rule already scales to it.
+
+Before handing bytes to a transport, revalidate current policy and required live anchors at that boundary. Do not hold a database transaction while waiting for the provider. A handoff already admitted may finish after a restriction is acknowledged; cancellation is best-effort. Eliot-owned queued payloads must recheck when actually sent. A controlled boundary cannot recall bytes already in a host transcript or external provider.
 
 ## 3. Host interface and experience intake
 
-### 3.1 Operations
+### 3.1 Small application surface
 
-| Operation | Minimum input | Result |
+| Operation | Input supplied or bound by adapter | Result |
 |---|---|---|
-| `attach` | Authenticated connection, workspace, host capabilities | Binding, settings, visible capture/push/action-control limits |
-| `capture` | Event with origin/event ID and raw data or source handle | Durable ID and committed / staged / unknown / rejected |
-| `context` | Goal or task reference, situation/resource, permitted budget | Context packet, reveal handles, warnings, gaps, receipt |
-| `open` | Authorized handle and, if needed, revision | Revalidated current reveal or stale / unavailable / denied |
-| `record_outcome` | Task/attempt, action, prediction reference, artifacts, observation | Stored outcome, support level, next learning job |
-| `dream` | Background-work goal or selected experience group | Job ID/status, then candidates/result |
-| `control` | Pause, cancel, settings, correction/withdrawal, or deletion | Applied change or reason it is unavailable |
+| `attach` | Workspace and real host capabilities | Binding, settings and explicit missing capabilities |
+| `capture` | Event ID, source revision and admissible material | ID plus committed / staged / unknown / rejected |
+| `context` | Current task/goal reference, decision cue, budget | Useful packet, handles, warnings and gaps |
+| `open` | Handle and requested revision | Revalidated content or unavailable / stale / denied |
+| `record_outcome` | Attempt, criterion, available action/result evidence | Stored outcome and eligible next learning work |
+| `dream` | Question or selected memory-processing goal | Job handle and eventual candidates/result |
+| `control` | Status, pause/cancel, configuration, correction or erasure | Applied transition or its concrete unavailable/busy state |
 
-Transport endpoints may differ; MCP and CLI call the same application functions. An ordinary agent needs a compact handshake: attach/bootstrap to establish workspace and task binding; capture/observe; request/push context at relevant cues; report action/outcome; inspect status. It must not manually fill lease, receipt, classifier, or proof-profile registries. Host-bound metadata is populated automatically. A host that cannot emit cues, receive context, or report outcomes declares those capabilities unsupported; Eliot must not imply it observed or changed that work.
+CLI/MCP/hook adapters reuse these functions. Do not make an agent administer leases, fill proof profiles, query several readiness registries or repeatedly attach before every tool. Keep the model-visible surface small; internal helpers need not each become MCP tools.
 
-`attach` must not invent an unknown project ID. Recover an unambiguous binding from the authenticated workspace. If ambiguous, preserve an admissible observation in the narrow current-session scope and ask only for the necessary clarification. Binding to a task does not authorize rewriting its goal.
+For an ambiguous project, preserve admissible input in a narrow session scope rather than guessing a foreign project ID. Non-Git projects use available directory/source anchors. Setup may inspect bounded metadata for an unknown executable; it must not run it, including `--version`, or grant it secrets merely to complete setup.
 
-Bootstrap may use an authorized directory or source manifest without Git; record available anchors and unknown coverage rather than inventing a repository revision. If a setup adapter encounters an executable that the host has not authorized, it may read bounded static metadata such as path, size, digest, file format, and available signature/provenance information. It must not run that file, including a `--version` probe, load it as a library, or give it secrets. Metadata is evidence for an operator decision, not an automatic trust grant. The first supported setup adapter and its actual metadata API are part of O1.
+### 3.2 Capture and correction
 
-### 3.2 Transactional capture
+Validate storage permission, size and basic envelope shape; do not require semantic classification. In one transaction, reconcile operation identity and input bytes, store the observation, insert necessary deferred work and retain the operation result. A repeated ID with different bytes is a conflict. Return `committed` only when the transaction is confirmed.
 
-1. Validate connection, storage permission, size, and basic shape. Do not put prohibited secrets in raw logs or debug output.
-2. Normalize origin IDs without collapsing distinct physical events. For redelivery use `(owner, source, event_id, source_revision)`; if a source has no ID, the host creates a stable delivery ID. Use content hashes for similarity/byte reconciliation, not universal event identity.
-3. In one transaction, check operation ID and input digest; persist the observation, required jobs, and operation result. Same identity with different bytes is a conflict, not a silent overwrite.
-4. Return `committed` only after confirmed commit. Classification and embeddings run later.
+An error code, an explicit user decision, exact edit reference or verifier result can be recorded deterministically. A model supplies interpretation later. Correcting an observation preserves its original source identity and the amendment; it is not another independent outcome.
 
-Explicit errors, user decisions, exact diff references, and tool results can be captured deterministically. A model adds semantic interpretation; it does not authorize the source record to exist.
+### 3.3 Durable deferred intake
 
-### 3.3 Database outage and unknown commit
+Use one small **file spool for input delivery only** when the database is unavailable or mutations are paused. It is not searchable semantic memory and does not hold a second job scheduler.
 
-When offline intake is enabled, a small append-only spool stores only input envelopes and delivery identity. A write is acknowledged as `staged` after fsync or the selected OS's equivalent reliable persistence. It is not primary memory and does not enter ordinary context as confirmed knowledge. Full spool or disk failure returns an explicit error.
+Initial candidate layout: one bounded event file per stable delivery ID, grouped into an active directory and sealed directories. Create a complete temporary file outside the rotatable active directory, persist it, then atomically publish it into the currently selected active directory under an opaque safe filename using the selected Windows primitive. A short per-data-directory ingress mutex orders publication and directory rotation; concurrent hook processes never append interleaved JSON into the same text line. Existing same-ID bytes are a replay; different bytes are a conflict. Exact Windows durability/rename semantics remain an implementation qualification, not an assumed `flush()` guarantee.
 
-After recovery, replay uses the same IDs. The same input creates neither a second observation nor a second paid job. Clear spool entries only after the primary transaction is confirmed. Document its format, disk limit, and access protection during implementation; V2's entire ORS is not required.
+A `staged` acknowledgement follows durable publication. Partial temporary files are not acknowledged input. Enforce limits by bytes and item size; full disk/spool produces an explicit rejection. Recover all sealed directories and the active directory; a crash during rotation must not hide a sealed batch. Delete a spool file only after a confirmed primary commit or an authoritative erasure decision.
 
-**Deletion, replay and backup ordering (required):** A durable deletion tombstone covers the observation ID, its derived records and queued or staged intake identities. Under one local intake/erase ordering gate, erase first prevents new admission of matching identities, durably records the tombstone, then deletes primary records, edges, embeddings and pending jobs. Spool replay checks the tombstone before any insertion and again at the primary transaction boundary; a concurrent replay must not commit after deletion. Do not acknowledge deletion while any earlier staged envelope can reappear. Keep the minimal tombstone information outside an older restore image (or reapply a separately durable deletion journal), and reject restore if that journal is missing or inconsistent. Never restore directly over the live database.
+Replay calls the normal capture transaction with the same identity and current retention rules. A lost commit response is reconciled by operation/source identity before any new insertion. Same-ID database and spool copies are safe duplicates, not two observations or two model jobs. Previously staged content does not become confirmed knowledge just because it exists on disk.
 
-A backup first pauses intake/replay at the same ordering gate, drains and reconciles all acknowledged staged envelopes, and only then snapshots the database and deletion journal at a consistent boundary. If drain or durable reconciliation fails, backup fails explicitly; it must not silently omit acknowledged observations. Release the gate after the snapshot boundary, not after the whole export. An interrupted backup is not a valid restore point. These operations use one short coordinator and the existing store/spool, not another recovery service or second semantic database.
+Erasure and backup use this spool through the single ordering procedure in §10. They are not redefined here. In particular, backup does not wait for a replay worker while holding its ingress lock, and erasure need not trust a stale cached tombstone set.
 
-If the commit response is lost, query by the same operation ID. While the result is unknown, do not treat the write as either accepted or safely absent. The database path provides idempotent reconciliation; external effects depend on the external API's capabilities.
+### 3.4 First host: native Claude Code integration
 
-### 3.4 Continuation and host replacement
+**Proposal:** implement native Claude Code command hooks plus MCP first, independently of whether a controller's Claude SDK adapter exposes the same hooks. Discover and record the installed version and actual enabled events; documentation availability is not installed qualification.
 
-After compaction or a host/model change, rebuild context from durable goals as declared by their owner, decisions, active commitments, rival explanations, failed attempts, and explicitly abandoned plans. An obsolete summary must not reactivate a cancelled goal or rejected plan. Recheck the new host binding, authority, available cues/actions, context limits, and procedure/profile applicability. Do not copy a previous model's confidence or capability declaration to the new model. A context budget overrun causes selective reveal, task decomposition by the external task owner, or an allowed route change; it is not permission to drop a material exception silently. O1 must show this against a real host continuation path.
+Use SessionStart and UserPromptSubmit for bounded orientation at the next planning boundary; PostToolUse/Failure for capture; continuation/compaction events for refresh; and a separate deterministic PreToolUse policy check only where a configured rule actually needs enforcement. The official hook reference states that tool-hook `additionalContext` is read on the **next model request**, not as a new model decision before the pending tool. Do not describe this advisory channel as prevention of that call. [Hook timing](https://code.claude.com/docs/en/hooks#add-context-for-claude).
+
+Advisory timeout returns no additional advice and records degraded delivery. Mandatory enforcement follows its explicitly configured failure policy; absence of memory advice must not grant permission. Do not use generic string similarity to block shell execution. An exact permitted rule includes its relevant arguments/resource/profile and reason for reopening.
+
+Capture hook identities and immutable source references where available. If events arrive out of order, keep their linkage; do not pair a result to the latest request by timestamp. For missing IDs, the adapter creates stable delivery identity and states its correlation limit. A process crash before the hook ran is not observed capture.
+
+On resume or host/model change, reconstruct current goals, abandoned plans, unresolved commitments and live applicability; retain historical failures. Previously inserted host text may persist, so a fresh packet distinguishes withdrawn advice instead of claiming to erase it. Reset the delivery cache for the new context incarnation. Do not suppress a changed procedure forever because an older revision was delivered earlier in the session.
+
+Do not force a lesson on every Stop, make every Stop restart the conversation, or require an agent to call `finish` just to end a session. “No supported lesson” is valid. Model-visible source text is data, not a privileged instruction channel.
+
+### 3.5 Host capability limits
+
+Separate capabilities for capture, advisory insertion timing, pending-action denial, outcome observation, transcript refresh and cancellation. A search-only host remains useful but does not demonstrate proactive closed-loop behavior. Other hosts get their own adapters; similar field names are not proof of equivalent timing, persistence or cancellation.
+
+The initial controller SDK bridge has its own bounded metadata/result path. Reusing it requires checking that path, not assuming that all native Claude Code hooks pass through it. Hostless maintenance has no agent action stream; its completion is the memory transformation, not an invented host-task outcome.
 
 ## 4. Retrieval and context assembly
 
 ### 4.1 Query path
 
-1. Derive permitted scope from binding and query; load active constraints and exact negative rules.
-2. Retrieve candidates by exact references/resources, BM25, and vector retrieval. Vector search is a supported product path, not a later optional tier; a temporary route/index failure may fall back to BM25/exact and must be visible.
-3. Merge ranked lists, remove duplicate representations, and preserve distinct physical events and conflicting evidence.
-4. Expand links and neighboring source chunks within bounds, preserving scope and permissions at every hop.
-5. Immediately before composing the response, check influence, transitive dependencies, freshness, and effective privacy policy; assemble whole useful items within budget.
-6. Write a short receipt: recipe revision, used IDs/revisions, warnings, material exclusions, incomplete coverage, and cost. A full list of intermediate candidates may be a temporary diagnostic trace, not a required permanent record.
+Derive permitted scope and live situation. Retrieve exact constraints and negative guidance independently of relevance top-k; then exact identifiers, BM25, compatible vectors and limited neighboring source/relation expansion. Merge rankings without merging distinct events, contradictory claims or different revisions merely because their texts are similar.
 
-BM25 source paths already exist in V2; V3 can reuse that experience. Establish an executed lexical baseline before claiming an improvement over it; this documentation audit did not run the V2 retrieval path. [V2 SQL](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/load_memory_search_fts_candidates.surql).
+Apply allowed scope and presentation channels within each candidate arm and again before reveal. If the ANN plan cannot enforce the required restriction, use exact similarity inside the authorized set or another demonstrated query plan; global top-k followed by filtering is not equivalent. Do not use quarantined or private edges as hidden ranking boosts into an otherwise allowed result.
 
-### 4.2 Explicit admission channels
+Validate policy lineage and **required live** anchors as specified in §2.3. Historical evidence can be shown as history. Compose complete semantic units and give a reason for material exclusion or uncertainty. Store only the IDs/revisions, method revision and outcome linkage needed for explanation; temporary full ranking traces need not become another permanent registry.
 
-| Response channel | Condition |
+### 4.2 Channels and token economy
+
+| Channel | Eligibility |
 |---|---|
-| Main context | Authorized read, active/on_demand when requested, `influence=use`, current dependencies; support is shown |
-| Warnings | Authorized record with `influence=warn` or an applicable negative rule |
-| Reveal references | Authorized metadata only for `influence=handle` or eligible omitted material |
-| Operator review | Separate authorized request for quarantined/archived material; its content is not mixed into agent context |
+| Main context | Authorized, eligible availability, permitted `use`, applicable live requirements; support shown |
+| Warning | Authorized `warn` or an applicable rule; no silent truth/authority promotion |
+| Expansion handle | Permitted metadata for omitted detail; access rechecked when opened |
+| Operator review | Explicit separate request for quarantined/archived material |
 
-The filter `influence != none` is insufficient. Apply scope in the candidate query before top-k, then check it again before reveal. If the chosen ANN plan cannot enforce the required candidate restriction, use exact vector search inside the authorized set or another demonstrably bounded route. A broad search followed by late filtering is not equivalent.
+Reserve room for the current goal, criteria, material constraints and exceptions. If they do not fit, return a visible incomplete decision packet with handles rather than silently dropping them. Do not pad every response with all architectural sections.
+
+Track delivery per `(binding/context incarnation, memory revision, trigger purpose)`, not forever per memory ID. Re-deliver a changed or critically applicable item when necessary. Observe re-opened handles and repeated reconstruction work: a tiny initial packet that forces repeated full reads may cost more overall.
 
 ### 4.3 Embeddings and indexes
 
-Bind every embedding to `(model/profile, dimension, preprocessing_revision, content_revision)`. Never mix incompatible spaces even if dimensions match. A model change creates a new generation of the derived index; populate it in the background while the previous profile serves compatible queries until cutover. If no compatible query embedding is available, retain BM25/exact retrieval and report the degraded route.
+The embedding profile is independent of the text-generation/Dreamer model. It includes producer/model revision, dimension, document/query input modes or prefixes, preprocessing and normalization where required. Each vector also binds to exact content revision. Changing the Dreamer model alone does not require rebuilding all embeddings.
 
-Remote query embedding is a network model call with latency and cost, even though it does not generate text. The default context path need not wait for it: use a local/cached option, a separate bounded enhanced request, or disclose degraded quality. HyDE and generative reranking are costly enhancement paths.
+Never mix spaces merely because dimensions match. An actual embedding-profile change builds a separate derived index while compatible old queries can continue; switch only after declared coverage is sufficient. Old pending work cannot write into the new profile. A local/cached query vector is usable only under the exact compatible profile and current disclosure rules.
 
-For a small authorized corpus, exact vector scan may suffice. Add HNSW only when measurements justify it. RRF combines rankings but does not replace freshness, support, or negative-experience checks. Tune top-k, `ef`, weights, and token budgets by profile rather than treating them as universal laws.
+Validate batched results before storage: every requested item is accounted for once, IDs/order are unambiguous, values are finite, dimension/profile match and content revision is still valid. A partial batch is explicitly partial; do not zip a shorter array onto inputs, substitute zero vectors or mark the whole batch complete. Retry only missing eligible work.
 
-SurrealDB 3.3 documents prefiltering for indexed conditions and the need to create/rebuild corresponding indexes on that version. Before 3.3.1, duplicate-vector handling had defects; fixing new inserts does not repair an already damaged index. Background compaction does not make written content invisible: documentation says unmerged updates remain readable, possibly at higher cost. For V3 these are query-plan/version questions, not proven performance. [Migration 3.2→3.3](https://surrealdb.com/docs/build/migrating/from-old-surrealdb-versions/32-to-33), [DEFINE INDEX](https://surrealdb.com/docs/reference/query-language/statements/define/indexes), [INFO](https://surrealdb.com/docs/reference/query-language/statements/info).
+A remote query embedding is a model call with cost and latency. The normal context deadline need not wait for it; offer a bounded enhanced request or state lexical-only degradation. Exact vector scan is acceptable for a small authorized corpus. HNSW and rank fusion are query choices, not permission/freshness checks. Index plans and version-specific prefilter behavior require later measurement on the selected server.
 
 ## 5. One background-work queue
 
-### 5.1 Minimum job semantics
+### 5.1 Intent, claim and external execution are different
 
-A job has `job_id`, unique `job_key`, type, input IDs/revisions, scope, rule revision, available model route, budget, `not_before`, deadline, state, attempt number, current `claim_token`, lease expiry, and result reference. The schema may combine fields; every retained field must have a consumer.
+A memory job stores its purpose, exact inputs/profile, deduplication key, policy/budget, due/deadline, current state and claim, optional external execution reference and final application result. Fields without a consumer are not added.
 
-Working states: pending → running → completed; on error, bounded retry or failed; separately cancelled and waiting_for_dependency. Stale input causes input regeneration or a terminal reason, not blind retry. System failures and unusable model responses are distinct.
+| Identity | Lifetime | Must not be confused with |
+|---|---|---|
+| `job_id` / input-profile key | One memory-processing intention | Every wake or transport retry |
+| Claim token | One local worker's current right to publish | Provider request identity |
+| External request/execution reference | One dispatched inference or embedding batch | A new local worker after restart |
+| Memory operation identity | One conditional application of a result | Proof of one provider charge |
 
-### 5.2 Claim and completion
+The queue has pending, running, waiting, completed, failed and cancelled states with reasons. Views may show timeout/stale-input without adding another scheduler. Missing text generation does not stall an unrelated embedding or deterministic job.
+
+### 5.2 Claim and application
 
 ```text
-transaction:
-  select a pending job whose not_before has arrived, or a running job with expired lease
-  require remaining deadline, retry budget, and available required dependencies
-  transition an overdue job to terminal timeout instead of starting paid work
-  conditionally update the same revision and state:
-    running, new claim_token, attempt + 1, lease_until
-  if the conditional update fails: no claim
+short transaction:
+  choose eligible pending work, or reclaim an expired local claim
+  enforce input/profile, deadline, capacity and retry policy
+  conditionally change the same job row to running with a new claim token
 commit
 
-perform bounded work outside the transaction
+inspect retained external execution before doing any paid work
+perform bounded computation outside the transaction
 
-transaction:
-  verify required input revisions and current access scope
-  conditionally update the same job row to completed only if:
-    job_id, running state, and current claim_token match; not cancelled
-    database time at this transition is before lease_until and deadline
-  if no row matches: abort the result transaction
-  apply the admissible result in this same transaction
+short transaction under the relevant memory write boundary:
+  revalidate policy, required live anchors and target revisions
+  require the current running job, matching unexpired claim and deadline
+  apply admissible output and mark this job complete together
+  zero matched rows or a transaction conflict means no publication
 commit
 ```
 
-A claim transaction conflict means retry selection, not two owners. Heartbeat extends only its own unexpired claim within the deadline. Completion and cancellation/reclaim contend on the same job row; a transaction conflict rolls back the entire result and requires revalidation. An expired lease fails the final conditional transition even if nobody has reclaimed it. A timeout/cancellation transition also invalidates the claim token. An old worker may finish computation but cannot publish its result; preserve the rejection reason separately from the aborted result transaction. Use database time for these predicates and short transactions, not a worker's local clock as commit authority. Cancellation of a wait does not prove that an external action physically stopped.
+Heartbeat extends only the current unexpired claim within the deadline. An expired worker cannot publish even before another worker reclaims. Cancellation and completion contend on the same job row. Record a rejected late application outside the rolled-back result transaction; do not lose the explanation with the rejected write.
 
-`job_key` binds the processing goal to input revision/profile; repeated wakeups do not create paid duplicates. A batch of observations may produce one consolidation job rather than one LLM call per row. A new observation must not continually reset a bounded batch already in progress.
+Use database time for lease predicates. A timeout on waiting does not establish that an external execution stopped. Pure local work can be recomputed; external work follows §5.3. Batches are finite: new observations create or update the next pending batch, not continually reset an already running batch.
 
-### 5.3 Events, changefeeds, and outbox
+### 5.3 Recovery without duplicate paid requests
 
-The initial option is an explicit job INSERT in the same application transaction as the memory change. A periodic worker selects durable rows; a notification/event may accelerate wakeup, but losing it does not lose work.
+Persist a stable external request identity and immutable request fingerprint **before dispatch**. If the transport loses acknowledgement, retain an unknown outcome and query the same controller identity. A reclaimed local job first loads that reference; it does not generate a new provider request merely because its claim token changed.
 
-A synchronous `DEFINE EVENT` that only adds an outbox row can also provide atomic enqueue. It is a valid alternative, not a free job engine. Async events provide atomic enqueue but permit duplicate delivery. A changefeed is a change log within its retention window; LIVE SELECT alone does not provide catch-up. Cancellation, deduplication, late results, policy, and operation outcome remain Eliot contracts. [Events](https://surrealdb.com/docs/reference/query-language/statements/define/event), [Changefeeds](https://surrealdb.com/docs/learn/querying/real-time/changefeeds).
+Only the controller owns provider-attempt selection/retries. Eliot may poll or request cancellation of that execution; it must not independently race another provider retry. When no durable readback or idempotent submission is available, the route declares that limitation. A bounded explicitly allowed new inference may cost again and is recorded as a new external execution, not an invisible replay. Uncertain potentially effectful harness work is not blindly repeated.
 
-SurrealDB does not run table events during bulk import. After import/restore, reconcile required jobs and indexes. This reconciliation concerns derived data and does not require a second scheduler.
+Result application is idempotent even when external execution was not exactly once. Account for known late usage or uncertainty independently of whether the content may still be applied. Cancelled or stale work cannot replenish its budget by pretending its unreported cost was zero.
+
+### 5.4 Enqueue and wakeup
+
+Initial choice: insert required jobs in the same transaction as the corresponding memory change. Poll durable due rows with bounded concurrency; a notification only accelerates wakeup. There is no need for both an event-driven scheduler and a competing changefeed scheduler.
+
+A synchronous database event that inserts a row is an alternative enqueue mechanism, not a complete job engine. Changefeeds are retained change logs, not an infinite durable queue. Imports require explicit reconciliation of derived jobs/indexes; do not depend on import replaying table events. [Events](https://surrealdb.com/docs/reference/query-language/statements/define/event), [export/import behavior](https://surrealdb.com/docs/reference/cli/db/commands/export).
+
+Fairness is simple: reserve bounded service for foreground capture/control, limit each expensive class, and avoid a backlog of re-embedding starving outcome capture. Do not introduce a second capacity ledger mirroring the job table.
 
 ## 6. Dreamer interface through the controller
 
-### 6.1 Request and response contract
+### 6.1 Actual source boundary
 
-| `ModelJob` input | Purpose |
+At controller `96a0d5a6632cfbd541e804d7969d3e76e716bf6a`, [the integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/96a0d5a6632cfbd541e804d7969d3e76e716bf6a/docs/eliot-memory-os-integration.md) describes a requested **controller-to-Eliot context packet**, marked not implemented. It is not a specification of an Eliot-to-controller generation or embedding API. A generic Operation lifecycle also does not establish semantic inference completion.
+
+The examined paths do not establish a qualified Memory OS inference bridge. This is a bounded finding, not a claim that every controller file has been searched and no usable primitive exists. Reuse its ordinary execution infrastructure where it fits; do not rename Goal acceptance into a model result or duplicate its scheduler.
+
+### 6.2 Small proposed execution contract
+
+Expose two independently advertised capabilities through the controller: text/structured generation and embeddings. Exact public method names and the first implemented route remain O2; this proposal does not order source changes in the controller repository.
+
+| Request | Required meaning |
 |---|---|
-| Job/attempt ID, deadline, limits | Correlate cost, retry, and result |
-| Purpose and output-schema revision | Distinguish consolidation, conflict, procedure, project synthesis, and research |
-| Authorized source IDs/revisions and excerpts | Prevent citation of an unread source |
-| Scope, permitted-disclosure policy, selected route | Check before transmission and before save |
-| Job context and known candidates | Perform the work without inventing external control material |
+| Stable request ID and fingerprint | Same request can be reconciled after lost acknowledgement |
+| Memory job reference and optional external task reference | Maintenance does not require a fake coding task |
+| Purpose/output contract | Extraction, synthesis, procedure or embedding; schema/profile revision |
+| Authorized excerpts/item IDs and relevant revisions | Bound what the executor actually receives |
+| Route constraints, disclosure purpose, deadline and limits | No hidden provider/region/cost expansion |
 
-Eliot submits the immutable, bounded `ModelJob` envelope to `eliot-swarm-controller`; it includes job/attempt identity, deadline, purpose/schema revision, source manifest and excerpts, scope/disclosure policy, selected route, output limits, and budget ceiling. The controller operation must accept a request ID for idempotent submission, expose a durable job/result handle, and return a terminal status (`completed`, `partial`, `unavailable`, `timeout`, `cancelled`, or `failed`) with structured output when present, source references, requested/actual model and endpoint class, usage when supplied, number of network attempts, and typed error. Cancellation is best-effort and distinct from terminal completion. Missing usage remains unknown and is charged conservatively against the reserved budget. A declared provider name does not prove the actual model; opaque gateways are marked as such. This request/response/result contract must be implemented end to end against the controller before claiming the route works.
+A terminal result includes the matching identity, output or explicit partial/failure state, requested and observed model/profile where available, usage or unknown usage, execution-attempt information and a durable readback limit. A controller transport acknowledgement, a native accepted input, an execution result and a task acceptance remain different facts.
 
-The first working route must be an end-to-end controller route, not a direct provider API in Eliot and not a stub/facade. The same boundary is intended to support cloud, local, and harness-mediated models and embedding routes as their adapters implement the contract. Switching models does not change the primary-memory format. Until the actual controller integration is implemented and verified, report the route as unavailable; capture and recall continue. Do not claim that an existing controller surface already provides a generic memory-job/model-result API.
+A real synthesis task may use the controller's Task/Attempt machinery if required by that harness. What is forbidden is inventing coding goals or redundant task truth solely to satisfy a transport schema. Prefer the smallest existing execution path compatible with the actual effect.
 
-At controller commit `513f9698c268753dc6f2a6c0cf4d9a53f7f5e472`, the integration document explicitly says runtime integration is not implemented. Its task-scoped Goal does not start a model. The proposed `ModelJob` and embedding contract is therefore new boundary work, not a renamed Goal call. [Controller integration](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/513f9698c268753dc6f2a6c0cf4d9a53f7f5e472/docs/eliot-memory-os-integration.md), [Goal contract](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/513f9698c268753dc6f2a6c0cf4d9a53f7f5e472/crates/swarm-kernel-host/src/goals/mod.rs#L1-L78).
+For text-only maintenance, the executor gets no unnecessary workspace mutation tools. If a harness cannot disable such tools, it must not be presented as equivalent to a pure inference endpoint; select an appropriate constrained route or expose the limitation. Credentials remain with the controller; memory content and a `budget` field do not constrain an independently privileged remote executor by themselves.
 
-Local and remote routes differ in privacy. Eliot filters the payload before sending it and checks effective source-policy intersection and purpose. An untrusted remote executor with its own credentials cannot be technically constrained by a `budget` field. The guarantee is limited to Eliot-controlled submission, agreed external limits, and visible unknowns. Strict ceilings require a controlled transport/key/process or provider-side configuration.
+### 6.3 Validation and model independence
 
-### 6.2 Applying results
+Dreamer may propose create, revise, relation, procedure and influence changes. The application validates schema/size, candidate-set membership, scope and target revision, actual source lineage, permitted operation and current job claim. New IDs are assigned by the application. Subject resolution is a proposal requiring applicable evidence, not a prompt prohibition that prevents classification or an unchecked foreign-target write.
 
-The model proposes `create`, `revise`, `link`, `propose_procedure`, or `propose_influence_change`. Physical deletion of source data and changes to authority are not model operations.
+Physical source erasure, goal/permission changes and changing acceptance criteria are not ordinary Dreamer operations. Interdependent proposals are applied atomically; independent valid proposals may survive a partial batch when that is explicitly represented. An empty valid result means no proposal. Invalid JSON, unavailable provider, withdrawn source and exhausted deadline remain different outcomes.
 
-Before commit, the application checks:
+Every supported model uses this same memory boundary. Prompts and output adapters may differ. Compare extraction/reconciliation quality per model, rather than assuming that an OpenAI-compatible endpoint recreates Hunyuan's learned weights.
 
-- the output parses under the current schema and stays within limits;
-- every referenced ID belongs to the authorized input/candidate set or is a new server-assigned ID;
-- owner/workspace and current target revision match;
-- used sources remain available, unrevoked, and at suitable revisions;
-- the operation is allowed for this type, does not raise support without evidence, and does not broaden effective disclosure or purpose;
-- the job claim remains valid.
+### 6.4 Cost and capability qualification
 
-Prompt-level ID checking is not execution validation. Protection is required in both the result validator and conditional UPDATE/DELETE at the storage boundary. Failure of one candidate may leave independent candidates usable; interdependent candidates are applied atomically or rejected as a group.
+Reserve a conservative permitted budget before dispatch and reconcile known usage later; uncertainty consumes the reservation until resolved under policy. Record model fallback only within existing disclosure and cost constraints. Strict ceilings require control of the actual executor/key or provider configuration, not just an advisory number in JSON.
 
-An empty valid result means “no proposal.” Invalid JSON, timeout, and withdrawn source are not equivalent to that result. After bounded retries, source observations remain available; never retry forever without changed conditions.
-
-### 6.3 Budget and isolation
-
-Before a request, reserve an upper estimate of permitted cost/tokens. After the response, record actual data and uncertainty. On timeout, do not zero unknown cost and thereby let retries bypass the limit. If a provider lacks an idempotent request ID, record that retrying may cost again even when Eliot's result commit is idempotent.
-
-The controller's owning route obtains provider credentials from the selected OS secret store or other explicitly configured protected source; Eliot holds only its controller connection credential where needed. Do not store provider credentials in memory, prompts, or receipts. Logs retain safe route identifiers and costs. Model changes or fallback are allowed only within the user's existing policy.
-
-### 6.4 Controller integration qualification (2026-10-19)
-
-The inspected controller implementation-status document explicitly reports partial runtime coverage and no implemented Eliot Memory OS model/embedding bridge. Its generic Operation lifecycle is not a model-execution API: queued/sending/native-accepted/outcome-unknown/settled states only describe persistence, and the domain must still prove actual execution and result delivery. Do not invent a model route by treating task dispatch, Goal, or Operation acceptance as a completed inference.
-
-Implement the smallest explicit controller capability for two operations: bounded text generation with a selected route and schema, and embedding generation with a declared profile/dimension. Eliot owns its job identity, privacy decision, source freshness and candidate validation; controller owns provider selection, execution and provider-side result/usage. Request submission, polling/readback, cancellation and unknown-outcome reconciliation must use one stable request identity. An accepted request is not a generated result. A late result is usable only if its Eliot job attempt is still current and all source/policy revisions remain valid.
-
-Qualification requires a real call through controller with returned output, effective model/profile, usage or explicit unknown usage, error classification, cancellation semantics and readback after lost acknowledgement. Until this is observed, label both capabilities unavailable; continue deterministic capture and lexical recall. No fake Task, second controller scheduler, direct provider client or provider-specific Dreamer implementation is permitted.
-
-**Source boundary:** [Controller implementation status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/main/docs/implementation-status.md) and [generic Operation lifecycle](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/main/crates/swarm-kernel-host/src/store/operation_lifecycle.rs). These sources support the absence of a qualified bridge, not the existence of the proposed API.
+Qualification is capability-specific: an observed text route need not wait for an unrelated embedding route; deterministic work need not wait for either. Before claiming a route works, observe a real request, output/error handling, identity/readback, declared cancellation behavior and usage/uncertainty. No such live qualification occurred in this documentation pass.
 
 ## 7. Learning that reaches the next attempt
 
-### 7.1 What is retained
+### 7.1 One data model, not a learning platform
 
-A learning candidate is an ordinary memory revision with trigger/scope, a specific proposed change, source attempt references, rationale, constraints/counterexamples, expiry/rollback condition, application status, and evaluation. It may describe a context recipe, search order, procedure, or recommendation to an external harness.
+A procedure is a memory revision with trigger, local preconditions, a specific proposed behavior, historical evidence, exceptions, expected observation and withdrawal condition. Its application/evaluation links live with ordinary attempts. Aggregate counters are projections of those links, not a second authoritative LearningState database.
 
-A linked attempt records what was expected, what happened, the context/procedure revision available, observed action, unknowns, and the next step to change. Model access and hidden chain-of-thought are unnecessary.
+An attempt names the external task when present, exact procedure/context revisions, the observed action, result criterion/profile and unresolved signals. No hidden model reasoning is needed. A final task reward is not automatically attributed to every record in the packet.
 
-### 7.2 Lifecycle
+### 7.2 Concrete first automatic loop
 
-| Transition | Basis and effect |
+1. Capture an API compatibility failure and its exact source/consumer anchors, or a successful nontrivial method with evidence.
+2. Produce a local procedure, for example: inspect the definition and one affected consumer before the next comparable API edit. Retain its historical failure/success evidence and applicability conditions.
+3. If the proposal is a low-risk advisory within established policy, make it eligible automatically. It does not wait for a manual approval of every record.
+4. At the next planning boundary, `context` selects that procedure revision. The adapter records delivery timing, not an invented claim that the agent followed it.
+5. Link available action/result observations from the next attempt. An unsupported host outcome channel remains unknown.
+6. Narrow, retain or withdraw the advisory based on actual new evidence; keep the original attempt and counterexample. A successful historical lesson may remain useful after unrelated code changes.
+
+A procedure cannot execute a retrieved command by itself, disable a verifier, change permission or force the model to follow it. A feedback-only host can support provisional learning, but does not establish observed behavioral benefit.
+
+### 7.3 Evidence accounting
+
+Use one current contribution for `(procedure_revision, attempt_id, criterion/evaluator_revision)`. Redelivered feedback is idempotent. Amending a result replaces that contribution with an explicit revision; it does not increment permanent success again. Several traces from one attempt, repeated exports and copies of the same evidence are not independent trials.
+
+Keep these observations separate: offered; delivered at a relevant boundary; action observed; adherence consistent with the procedure; result; comparative benefit. Adherence is not proof of causality. Model self-report and cue overlap are evidence of a different, weaker kind. Missing feedback is neither a success nor a failed action.
+
+Induction examples can explain why a procedure was proposed. They cannot prove that the already-existing procedure caused their past successes. Do not put them into a causal “with procedure” cohort retroactively. Heuristic priors or similarity scores may rank provisional candidates; display them as heuristics, not measured improvement.
+
+Infrastructure failures stay visible in the operational denominator and cost. For a quality comparison, report which cases were excluded and why; do not quietly discard valid task failures or convert timeouts into neutral successes.
+
+### 7.4 Local use and wider transfer
+
+| Transition | Rule |
 |---|---|
-| observation/outcome → proposed | A deterministic error or Dreamer proposes a specific grounded adaptation |
-| proposed → local | Automatically apply only an advisory context hint/procedure within existing policy and scope; no new authority or verifier weakening |
-| local → reusable | Compare with baseline, independently evaluate on applicable data, and observe later use; explicitly bound transfer scope |
-| local/reusable → narrowed/disabled | Harm, counterexample, stale support, incorrect trigger, or no benefit; create a new revision and reason |
+| Proposed → local advisory | Grounded, narrow, reversible memory change within current policy; actual context consumer exists |
+| Local → reusable in declared scope | Subsequent applicable cases and independent comparison against fixed criteria, including negative cases |
+| Local/reusable → narrowed or disabled | Counterexample, adverse outcome, missing live applicability or no useful benefit under the declared criterion |
 
-Automatic narrowing of a candidate's scope is data-only; it cannot silently change permissions. Broad reuse is automatic only when declared independent acceptance criteria are met—there is no per-candidate human approval gate. Reversible here means the memory revision can be withdrawn; it does not imply an already-taken host action can be undone.
+There is no universal “two successes means general truth” threshold. For the first route, retain a provisional local rule and collect distinct future attempts; broader claims require a predeclared comparison appropriate to that task family. Do not add a general statistics service to implement this. A small deterministic reducer over attempt records can compute counts, paired differences and uncertainty.
 
-Bind an evaluated improvement to the relevant model, host, retrieval recipe, source/tool profile, and evaluator revisions. A material stack change makes that evidence stale for the new profile; re-evaluate before claiming transferable benefit. A plausible but wrong merge/procedure must be withdrawable while original observations, dissent, and relevant evaluation history remain available. Local evaluator scores do not override a failed end-to-end outcome. Experimental changes run in an isolated comparison or an explicitly permitted reversible local scope before broader adoption; this does not require live code replacement.
+Compare no added memory, raw/exact-lexical memory and the candidate method on comparable tasks, profile and budgets. Hold out cases from induction/optimization. Where live A/B is permitted, change only the advisory being evaluated; never withhold explicit user requirements, necessary safety checks or known enforced constraints. Read-only shadow comparison can assess selection, not claim a changed real-world outcome.
 
-A behavior change needs a consumer: context selects the applicable procedure/hint, host receives the specific permitted delta, then `record_outcome` links the next attempt. If the host cannot apply the delta, retain the candidate as `delivery_unsupported`; do not call it applied.
-
-A deterministic procedure is data: preconditions, steps, scope, expected result, verification method, examples, and exceptions. It does not execute arbitrary code from memory. Automation may use only capabilities already authorized by the host.
-
-### 7.3 What counts as evidence
-
-Distinguish delivery, observed action change, adherence, outcome, and causal benefit. Without action observation, do not substitute cue overlap or “it helped” feedback. Retain feedback as useful but weaker evidence.
-
-Compare a candidate on the same source tasks and constraints; evaluate results separately from the generator. Data available to Dreamer during optimization is not holdout. Do not silently change the evaluator with the candidate. Keep valid unsuccessful attempts in the denominator; report infrastructure failures separately rather than turning them into success.
-
-Evaluate benefit by result correctness, repeated errors, preserved constraints, transfer, cost, and latency. Include positive and negative cases. One success supports a local hypothesis; statistical claims require sufficient comparable data. Select formulas and thresholds by task during implementation; do not use a universal “self-learning=PASS” score.
-
-### 7.4 Concrete example
-
-After a failed API change, retain the diff, documentation revision, and incompatibility error. Eliot links the failure to the exact contract and proposes a local procedure: before the next similar edit, open the definition and check one known consumer. Context delivers the advisory before the next change. The host reports observed action and outcome. If the rule is unnecessary for another API family, narrow its scope; if it prevents the error, retain it under the confirmed conditions.
-
-This example needs an observation, procedure, context delivery, attempt, and next outcome. It does not need a separate LearningStateView daemon, HarnessOverlay store, or another scheduler. Without an observed next action, the learning loop is not closed.
+A new model/tool/retrieval profile starts a new applicability evaluation; it does not copy an old confidence score. Procedures, retrieval recipes, compression strategies and predictors can all improve through the same bounded mechanism, without giving a candidate control of its own judge or global policy.
 
 ## 8. Project understanding, causality, and research
 
-On attach or source revision change, an adapter supplies file structure, manifests, symbols/references when available, and diffs. Build a small project map from these. Connect LSP/SCIP/tree-sitter or an external code graph only for a task requiring exact extraction; do not build the same relations under five competing owners.
+Construct the initial project map from manifests, file structure and available exact references. Use the host's tools, ripgrep or one appropriate LSP/SCIP/structural adapter. Do not embed several competing code-graph stacks. Link purpose and subsystem hypotheses to concrete source revisions and mark the parts not examined.
 
-Each project view records its source revision and the dependencies actually used. A watcher accelerates refresh; periodic reconciliation against current source head detects missed events. Unsupported languages or incomplete indexes are visible in coverage; no search result does not prove that a symbol or effect is absent.
+Incremental refresh targets actual changed anchors. Reconcile missed watcher events; a repository-wide HEAD movement is a cue to inspect changes, not a reason to discard every memory. A current view and the historical observations from which it was learned have different lifecycles.
 
-Static dependency, co-change, and causal inference use different `link.kind` values. A model may propose a causal hypothesis and testable prediction. Confirmation by a particular experiment is bound to its conditions; it does not become a universal law of the system.
+Keep exact intermediate edits when the host exposes them. Final `git diff` does not recreate reverted or lost intermediate attempts. Reveal related events, source neighborhoods and diff history on demand instead of stuffing them into every prompt.
 
-For coding traces, retain sequential changes, including failed and reverted ones when the host observes them. A final git diff cannot recover lost intermediate attempts. Reveal neighboring chunks and timelines on demand rather than duplicating them in every context packet.
+Static dependency, co-change, analogy and causal hypothesis are distinct link meanings. A prediction is recorded before the relevant action with expected effect, conditions and observable criterion. Results can be hit, miss, partial or unknown. Correlated files alone do not establish an intervention result.
 
-A research job retains its question, scope boundary, versioned sources, portions actually read, findings, and links to supporting/counterevidence. `complete_for_scope`, `partial`, `inconclusive`, and `unavailable` remain distinct. For confirmatory work, fix criteria and scope before evaluation; exploratory work may change its question while retaining that change history.
+A research job records question, examined scope, source revisions and read portions, findings, counterevidence and gaps. External Search/Research may supply acquisition; Eliot handles memory and interpretation. Exploration can change its question explicitly. Confirmation keeps criteria separate from the generator. No universal science-workflow engine is required.
 
-A search API or donor pipeline may perform part of the work, but Eliot does not accept its result as verified truth. Do not build a universal science workflow engine or make V2's full research registry mandatory at this stage.
-
-The same source-grounded map may describe Eliot itself. If observed code or behavior contradicts its declared contract, retain the discrepancy, bound claims of support, and propose a code repair or an explicit documentation correction for the responsible owner. Automatically rewriting the requirement to match a failing implementation is not learning.
+Apply the same map to Eliot itself. A mismatch between contract and code becomes a grounded discrepancy and a proposed correction; the system cannot redefine the requirement silently to make itself successful.
 
 ## 9. Control, watchdog, and honest completion
 
-The operator surface calls the same control/job/memory functions as the CLI. It shows current jobs, delays/reasons, model/cost, significant memory changes, source lineage, capture status, and limits of host observability. It supports pause/resume/cancel, route/profile changes, correction/withdrawal, and deletion requests. The initial surface may be CLI plus a compact panel; responsibilities do not depend on UI framework.
+### 9.1 Independent Windows supervision
 
-Notifications are durable jobs with event-based deduplication, importance, expiry, and delivery state. A missing delivery channel is visible and is not treated as successful delivery. Acknowledgement means receipt only; it does not resolve the underlying issue or task. Keep notification delivery, recipient acknowledgement, task completion, approval resolution, and outcome helpfulness as separate states. Do not flood the operator with every internal retry.
+**Proposed profile:** the launcher starts `eliot supervise` on demand. That small process owns the daemon process handle and a Job Object covering the daemon/database family. Assign the daemon before it can start unowned children; use non-inherited ownership handles and disallow unintended breakaway. Closing the sole controlling handle with the selected kill-on-close policy handles supervisor death. Never kill by executable name or reuse an unverified PID as ownership. [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
 
-An independent observer uses a supported OS mechanism for process exit/restart and a separate responsiveness check. It must not depend on the queue or loop it observes. Internal metrics show task progress but do not prove availability after a hang. Define the health probe and notification route during the first supported profile; until then the full watchdog capability is incomplete.
+The supervisor observes exit and an independent request/response health probe. A fresh challenge must be answered by the relevant live service path; a file mtime or isolated heartbeat thread is not proof that work can proceed. Health distinguishes serving, database-degraded and controlled maintenance. Maintenance has a deadline/progress signal and does not disable hang detection forever.
 
-Workspace progress and agent/task progress are different. Compare observed workspace events with agent-reported task progress, surface missed updates or unresolved attention, and attempt bounded resynchronization. When a signal is unavailable, reduce the claimed observability rather than inventing it. Report the exact workspace/project delta, active task state, evidence and unresolved blockers separately; activity counts or notification acknowledgements are not progress or resolution.
+On a confirmed owned-process failure, stop the owned family and restart within configured intensity limits. Intentional idle shutdown does not restart. Repeated failure leaves a clear unavailable state and local diagnostic/notification rather than a storm. Native launch, nesting, custody and hang behavior require real Windows verification; this document does not claim it occurred.
 
-Diagnostic/Doctor first gathers state and proposes a bounded recovery action. Automatic restart is allowed under configured policy. Deletion, goal changes, and broad external effects are not harmless repairs.
+This observer does not contain memory, job or provider state and does not outlive the active service by default. Its own failure is discovered by the next launcher and by the owned-family termination behavior; do not build an infinite chain of watchers.
 
-On restart, establish the current policy, job claims, and operation outcomes before allowing dependent new dispatches. A database or host process surviving `eliotd` does not retain authority to commit an old result. If recovery repeatedly fails, stop repeating the same repair, record the unresolved hypothesis and budget, and escalate through the configured channel. Continue unaffected read/control paths only when their prerequisites are valid.
+### 9.2 Cognitive monitoring and operator surface
 
-`record_outcome` does not close a host task by itself. The completion view compares declared criteria with applicable results at the required revision and identifies missing/unknown items. Running one verifier helps only for the property it checks. The external host confirms its own completion; Eliot records that claim separately from its independent support level.
+Compare available host events, workspace changes and reported task progress. A heartbeat is not progress; a file change is not task completion. Missing signals reduce the declared coverage. Try a bounded resynchronization, retain the gap, then notify when it needs attention.
+
+The first operator surface is CLI status/inbox/control backed by the same functions; a later compact panel is a projection. A read-only database browser can inspect permitted data without becoming another writer. Display pending jobs, reasons, active profile, cost/unknown cost, source lineage and unresolved commitments, not dozens of proof states.
+
+Notification delivery can use an ordinary job. Acknowledgement is receipt, not resolution. Deduplicate by the underlying problem and material changes, not each retry. A broken notification channel leaves the issue visible locally; do not pretend that an undelivered message reached the human.
+
+Doctor may perform configured bounded mechanical repairs: restart an owned worker, retry eligible work, reconcile an index. It does not rewrite facts, delete user material or weaken policy to make a check pass.
+
+### 9.3 Completion and safe control
+
+`record_outcome` stores facts and claims; it does not accept a controller Task. A completion projection shows each declared criterion, relevant revision, available evidence and gaps. One verifier proves only what it checks. Passing local checks cannot erase a known failing product path.
+
+A command found in a repository or memory is not automatically authorized for execution. A configured verifier is tied to its approved command and workspace policy. Missing verification remains unknown. Goal revision, cancellation, recipient acknowledgement and memory usefulness remain different facts without requiring separate services.
 
 ## 10. Deletion, backup, and restore
 
-Deletion first stops permitted influence, then covers selected source bytes, derived revisions, embeddings, blobs, and caches. If physical deletion cannot happen immediately, show its actual state. Access revocation takes effect immediately on reads, independently of background cleanup.
+### 10.1 Restriction journal and erasure scope
 
-A backup contains consistent data and revisions; indexes can be rebuilt. A deletion/revocation journal used on restore cannot roll back with the same old snapshot: retain a current sequence separately or use another mechanism that prevents restored memory from being published before reconciliation. This is open technical decision O3 for the chosen delivery, not a completed guarantee.
+Use a minimal current restriction journal outside rollback-prone backup images. It contains opaque source/delivery identities or explicitly defined scope selectors, sequence and operation identity, not deleted text or deterministic hashes of low-entropy secrets. It is operational retention state, not a second semantic database.
 
-Restore first runs outside active retrieval, applies current restrictions and deletions, reconciles jobs and input revisions, then switches service. State backup cleanup, retention periods, and the scope of external provider copies separately. A hash of a low-entropy secret in a tombstone may leak it; deletion identifiers must not reproducibly reveal deleted content.
+The short ingress/retention ordering boundary is shared with spool publication. Before acknowledging withdrawal, durably append the restriction, prevent future matching replay/disclosure, and invalidate current application eligibility. Replay and serving must reconcile the current journal before use after a crash. Primary deletion, derivative regeneration/removal, indexes, blob/cache cleanup and controlled backup retirement can then progress in bounded work. Expose `withdrawn; purge pending` separately from completed physical erasure.
 
-V1/V2 import is a separate future operation over selected data. Historical verified status is not current truth. V3 need not support every old record type or live V2 runtime migration. No user data is imported or deleted at this documentation stage.
+Deleting a source applies through **all content lineage**, not just live dependency links. An independently supported claim may be regenerated from permitted evidence, but its old private synthesis is not made public by unlinking the source. External host/provider copies are a named boundary; cancellation is not erasure.
 
-For V3's own upgrades, keep an explicit schema version and supported application/database version range. Start serving only after checking compatibility. A migration requiring structural data changes runs with ordinary dispatch paused, a consistent pre-upgrade backup, and an explicit completion marker; an interrupted upgrade remains unavailable for dependent work until resumed or restored under the same current deletion policy. Never open a newer schema with an older binary by silently ignoring fields. Choose the concrete migration steps and backup/rollback procedure in O4; this minimum restart-based upgrade path does not recreate V2's live release-generation system.
+A finite ID-based restriction prevents resurrection of the identified material from controlled copies. It does not recognize the same sentence newly submitted under an unrelated identity. When source identity cannot support safe replay, disable that source's retained replay pending a fresh authorized import rather than claim magical content recognition.
+
+### 10.2 Conservative backup with an explicit cutoff
+
+Choose a quiesced logical export first. Do not promise a short snapshot lock before establishing an actual snapshot API for every component.
+
+1. Enter maintenance by pausing new primary mutations and external dispatch. Let already-running short transactions settle **without holding the mutex they need**. Status and backup cancellation remain responsive.
+2. Briefly take the ingress boundary, seal the current spool directory and create a fresh active directory. Retain the sealed batch identity and the current restriction sequence as the backup cutoff. Capture accepted afterward belongs to the new active batch, outside this backup.
+3. Keep primary mutations quiesced for the whole database export. Export the database, referenced immutable blobs, sealed staged input and the restriction prefix into a temporary backup directory. Including an already committed event also in the sealed spool is safe because restore deduplicates its identity; compulsory draining of the spool is unnecessary.
+4. Verify the selected export completed, required components are present and durable, then publish a small completed-backup manifest containing cutoff, component identities/checksums and schema/application versions. A partial directory is not a restore point. Unpause ordinary work afterward.
+
+Do not acknowledge a conflicting erase/cancel/configuration transition as applied during the quiesced export. Either cancel the backup and perform the requested transition, or return a clear busy/pending result without an applied acknowledgement. New ordinary observations may be durably staged subject to the same storage limits and current policy.
+
+The backup guarantees recovery through its declared cutoff, not through the eventual wall-clock end of a long export. A copy of open database-engine files is not this procedure. The conservative pause can later be replaced only by a verified consistent snapshot contract. [Official backup boundary](https://surrealdb.com/docs/manage/self-hosted/backups-and-recovery).
+
+### 10.3 Restore and old external jobs
+
+Restore into a fresh directory with ordinary retrieval and external dispatch disabled. Import the database and blobs, replay the included staged inputs through current restrictions, reconcile application revisions and derived indexes/jobs, then perform required sanity checks before switching the active data root.
+
+Apply the **current** restriction journal, not just the copy inside the backup. Keeping a journal outside a restore image prevents ordinary rollback, but does not prove freshness after the entire device and journal were lost or rolled back together. Without a trustworthy current restriction history, the restore remains quarantined; do not serve old memory as compliant. A separately preserved current journal or a deliberate fresh selective import is required. This is an explicit limit, not another checksum certificate.
+
+Treat restored external executions as requiring reconciliation. A job pending in the backup may have executed after its cutoff. Pure derived work can be recomputed; a model/harness request must be read back through its retained identity before a new dispatch. Restoring a job table is not authorization to repeat old external effects.
+
+Logical exports do not substitute for application-level immutable semantic revisions. Check statement/import failures and essential records rather than trusting only an exit code. Reconcile job/index requirements explicitly after bulk import; historical V2 statuses do not become current V3 truth. V1/V2 data import is a separate selected-data operation, not an obligation to support every old runtime format.
+
+### 10.4 Schema upgrades
+
+Keep a schema version and one supported application/server range. Structural upgrades pause dependent dispatch, use a completed pre-upgrade backup, and record a resumable or explicitly failed transition. An old binary must not open a newer schema by ignoring fields. Restore follows the same current restriction policy. No live generation/canary/compatibility plane is required for this restart-based path.
 
 ## 11. Work sequence
 
 ### Documentation now
 
-1. Consolidated audit, source-requirement matrix, Architecture, and concrete workflows are this revision.
-2. Resolve open contracts O1–O6; walk through input, response, failure, and recovery examples on paper; refine disputed mechanisms.
-3. Stabilize the agreed documentation revision and first deliverable boundary. This draft does not automatically start implementation.
+The current revision integrates the contracts instead of appending another competing paragraph. Preserve the 34 requirements and 29 A15 scenarios in the audit. Resolve remaining concrete interface/version questions in §13 without treating every unqualified runtime observation as a new architecture subsystem.
 
 ### Implementation after documentation
 
-Build a vertical product first: attach/capture → durable read/context → real model job through the controller → apply bounded output → next attempt and outcome. Then add missing project understanding, procedure transfer, supervision, UI, privacy/restore, and specialized sources. Label partial stages honestly; functions retained in Architecture remain in V3 scope.
+Build a connected path: demand start → capture/read → context at a real host boundary → actual controller-backed model work → validated local procedure → next attempt/outcome. Include minimal independent health, control and truthful degraded states rather than postponing them behind a large framework.
 
-Do not first rewrite Kernel/Host/ORS/Instrument Plane, generate all types, or distribute hundreds of donor leaf issues. One implementation task should complete a useful path or fix a specific observed failure of that path.
+Then complete remaining project understanding, wider procedure transfer, privacy/restore and additional host/source adapters. A partial slice is not the full product. Do not first reproduce Kernel/Host/ORS, every possible schema, 43 donor runtimes or hundreds of inventory-derived issues.
 
-Owner's development order: product code, minimum relevant checks/Clippy; tests after the product is built. Scenarios below describe future behavioral evaluation, not a current test-first gate. Claims of working reliability, privacy, or learning still require corresponding evidence before presenting the product as complete.
+Owner's development order remains product code, minimum relevant checks/Clippy, tests after the product is built. The next section is a future behavioral acceptance map, not tests executed now or a new test-first gate.
 
 ## 12. End-to-end scenarios for the future product
 
-| ID | Situation | Observable result |
+| ID | Situation | Required observable result |
 |---|---|---|
-| S1 | Unknown note format, model disabled, duplicate delivery | Observation stored once with provenance; exact read available; no invented classification |
-| S2 | Agent resumes after session loss/compaction, including a project without Git | Declared goal, rival explanations, decisions, open commitments, and next step recovered from available anchors; abandoned plans stay inactive; gaps are visible |
-| S3 | A familiar resource appears before an action | Relevant rule/experience arrives in time; irrelevant and restricted material has no influence |
-| S4 | A new source contradicts an old conclusion, a plausible synthesis proves wrong, or poisoning is discovered | Conflict and original observations remain; affected influence stops transitively; remaining independent support and derived text are reconsidered before reuse |
-| S5 | A file changes and watcher misses the event | Reconciliation marks project view stale; exact read remains available; refresh touches required dependencies |
-| S6 | A side-effect prediction is recorded before an edit | Afterwards hit/miss/partial/unknown is recorded against the observation; co-change is not causal proof |
-| S7 | A known error recurs in a similar but different situation | Exact rule acts within its scope; similarity warns; new conditions permit review of a false restriction |
-| S8 | Success/failure produces a procedure | Next comparable attempt changes; delivery/action/outcome remain distinct; no host feedback means no claimed benefit |
-| S9 | A local procedure transfers to another project and causes harm | Counterexample and scope are considered; transfer is narrowed/reversed; prior evaluation history remains |
-| S10 | Dreamer changes model and receives malformed output, foreign ID, old revision, or injected instructions in sources/tool metadata | Primary memory remains available; invalid operation is rejected; source instructions remain data without new authority; route, cost, and reason are visible |
-| S11 | Research source is unavailable or only part of corpus was reviewed | Report bounds coverage and links claims to read portions; absence from top-k is not treated as absolute absence |
-| S12 | Database stops after intake, commit response is lost, a lease expires, or a worker restarts | Committed/staged/unknown remain distinct; same operation IDs prevent duplicate writes; an expired/replaced claim cannot publish, even before reclaim; reconcile before dependent dispatch resumes |
-| S13 | Service hangs and internal diagnostics do not respond | Independent observer detects it and performs authorized recovery/notification; unfinished work is not called successful |
-| S14 | Forgetting, privacy deletion, and restoration of an old copy | Availability/withdrawal/deletion differ; current restrictions apply before restored data is served; uncontrolled copies are identified |
-| S15 | User cancels or asks “done?” with partial results, an unavailable verifier, or local checks passing while the product fails | Clear control and honest criteria status; unknown stays unknown; the failed end-to-end result prevents a whole-task success claim |
-| S16 | Large audit is only partly in scope and assessors disagree | Preserve scope, unique coverage, source lineage, partial findings, alternative explanations, and dissent; synthesis proposes a discriminating observation instead of averaging disagreement |
-| S17 | A guard flags a harmless but similar case as unsafe | Preserve the known dangerous case, show the harmless case as a false-positive challenge, and narrow the trigger only if evidence supports it; do not weaken the true safety boundary |
-| S18 | An optional capability fails, queues fill, or repeated repair fails | Unaffected capture/read/control continue where safe; refusal and bounded retries are visible; stop repeating failed repairs, reconsider the hypothesis, and escalate without a restart storm |
-| S19 | Workspace changes without agent reporting, a notification is missed, or setup finds an untrusted executable | Show the observation gap and resynchronize; keep unresolved attention separate from acknowledgement; inspect executable metadata without executing it or granting secrets |
-| S20 | A different host/model/tool stack takes over, or a learned method no longer fits the available context | Preserve durable goal/experience; recheck binding, capabilities, profile, and evaluation applicability; stale confidence does not transfer; reveal/decompose/change route within policy |
+| S1 | Unknown note type; model absent; duplicate delivery | Preserve one observation and exact read without invented classification |
+| S2 | Resume/compaction or non-Git project | Reconstruct the declared goal, alternatives, commitments and next step; show missing anchors |
+| S3 | Familiar resource before an action | Advisory reaches a relevant model decision; a pending tool is constrained only by a real authorized gate |
+| S4 | Contradiction, false synthesis or poisoning | Preserve history/dissent; withdraw actual affected influence and review remaining justification |
+| S5 | Missed file-change event | Refresh current views; keep valid historical observations and unrelated lessons |
+| S6 | Prediction before an edit | Compare the named effect under matching conditions; correlation is not causality |
+| S7 | Similar error in different conditions | Exact rule obeys applicability; similarity warns; false positives can be narrowed |
+| S8 | Procedure from success/failure | Next attempt is linked; delivery, action, outcome and comparative benefit are distinct |
+| S9 | Wider transfer causes harm | Retain counterexample and narrow/withdraw transfer without rewriting old results |
+| S10 | Different model, malformed result or foreign target | Reject invalid transformations; original memory and independent routes continue |
+| S11 | Partial research or missing provider | Scope and gaps remain explicit; empty top-k is not universal absence |
+| S12 | Database outage, lost reply or expired worker | Durable states remain distinct; same identities reconcile; old claim cannot publish |
+| S13 | Service hangs | Independent observer detects the owned failure and applies bounded recovery |
+| S14 | Forget, erase, restore old copy | Availability, influence and physical purge differ; current restrictions precede serving |
+| S15 | Partial completion or missing verifier | Report criteria and unknowns; no whole-task PASS from one local check |
+| S16 | Large audit and dissent | Preserve unique coverage, lineage, alternatives and a discriminating next observation |
+| S17 | False enforcement warning | Challenge/narrow only the false trigger, retaining the true safety boundary |
+| S18 | Optional failure, queue pressure, repeated repair | Keep eligible control/read/capture; expose refusal and stop ineffective retry storms |
+| S19 | Workspace changes without reports; missed notification; unknown executable | Surface gaps; acknowledgement is not resolution; do not execute an untrusted probe |
+| S20 | Host/model/tool profile changes | Recheck applicability and capabilities without erasing historical experience |
+| S21 | Worker restarts after external acceptance | Read back the same external request; do not buy a second inference because its local claim changed |
+| S22 | Feedback replay or outcome correction | One current contribution per attempt/criterion; no artificial increase in independent support |
+| S23 | Embedding response is reordered, short or incompatible | Validate item identity/profile/dimension; no silent vector misassignment or zero-vector success |
+| S24 | Backup interrupted; capture continues | Incomplete backup rejected; accepted post-cutoff input remains in the new spool segment |
+| S25 | Old backup contains pending external job or stale restriction history | Reconcile execution; keep restore isolated when current restrictions cannot be established |
+| S26 | Session replays previously injected advice | Fresh applicability is shown; no promise that a DB revoke erased an external transcript |
 
-Memory quality comparison includes a no-consolidation baseline, exact/BM25, and the selected enhanced route under comparable budget. Metrics include outcome quality, repeated errors, missed constraints, useful-retrieval precision, latency, context size, cost, recovery, and false prohibitions. Measure results on V3; line counts are not a substitute.
+The [audit](AUDIT.md#12-all-29-original-scenarios) retains every original A15 case; S21–S26 are additional failure walkthroughs, not claims of executed tests.
 
 ## 13. Open decisions for the next documentation stage
 
-| ID | Decision | Initial proposal and questions to resolve |
+| ID | Concrete proposal now | Remaining decision/evidence |
 |---|---|---|
-| O1 | First real host and its capabilities | Select one local adapter; document capture/push/outcome/identity/cancel against a real API. Other hosts get an honest degraded profile. |
-| O2 | First Dreamer/controller route | Agree the real `eliot-swarm-controller` request/response contract for model and embedding jobs, including JSON/errors/usage/cancel and verifiable privacy/budget limits. Do not use a direct provider call or stub as the first working route. |
-| O3 | Durable intake and restore protection | Specify fsync/spool limit and a current deletion history outside a rollback-prone snapshot; handle write failure and unavailable key. |
-| O4 | Exact SurrealDB interface/schema | Pin compatible versions and decide the thin parameterized SurrealQL/WebSocket JSON-RPC implementation versus official SDK; specify conditional claim, transaction retries, scoped queries, revisions, and the restart-based schema upgrade/rollback procedure in §10. Add HNSW where needed by the full vector product and measurement. |
-| O5 | Local automatic learning and transfer | Define allowed deltas, first trigger/consumer, negative cases, evaluator, and local → reusable criteria. Local automation is advisory only; broad reuse follows independent criteria, not per-candidate approval. |
-| O6 | Independent observation and operator surface | Specify Windows service/health probe/notification route, hang detection separate from exit, recovery settings, and minimum UI. |
+| O1 | Native Claude Code hooks plus MCP first; advisory timing distinct from action enforcement | Pin installed version/event fields and demonstrate capture, continuation, denied-tool and outcome correlation |
+| O2 | Two independently available generation/embedding capabilities through existing controller execution; maintenance task optional | Select exact existing/new methods and first route; agree durable readback/retention/cancel and constraints with controller owner |
+| O3 | Bounded event-file spool, current restriction journal, quiesced export with finite cutoff | Select Windows persistence/rename APIs, concrete limits and current-journal recovery path; qualify failure handling |
+| O4 | One private Store, one client, explicit statement/cardinality checks and restart upgrades | Resolve historical no-SDK restriction versus later SDK proposal; pin actual compatible versions and concrete schema/queries |
+| O5 | Automatic narrow advisory, unique outcome contributions, later independent scoped comparison | Select first task criterion/evaluator and evidence threshold appropriate to that scope, not a universal confidence formula |
+| O6 | Same-binary demand-start supervisor, owned process family, independent probe, CLI inbox | Qualify Windows custody/hang/idle behavior and configured notification channel; scheduled wake remains opt-in |
 
-O1–O6 are bounded architecture questions. They do not authorize reintroducing all of V2 or require a separate subsystem for every row.
+These remaining checks do not reopen the entire architecture or require a separate daemon, registry, approval ceremony or issue factory for every row. Documentation acceptance and runtime qualification are different stages.

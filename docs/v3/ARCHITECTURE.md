@@ -1,186 +1,153 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision:** 0.1, 2026-10-18. **Status:** draft architecture for discussion; V3 has not yet been implemented.
+**Revision 0.2 · 2026-10-19 · design proposal, not an implemented product.**
 
-The owner's decision is that V1 and V2 become donors, and V3 will be designed and then written from scratch. Documentation is being changed first. The technical choices below are proposals for iterative refinement; they are not claims that every choice has been approved or implemented.
+V1 and V2 are donors. V3 is designed and then written from scratch. This manifesto preserves the original Smart Memory OS purpose; [Implementation](IMPLEMENTATION.md) owns mechanisms, and the [consolidated audit](AUDIT.md) owns evidence and alternatives. Technical proposals below are not represented as separately approved owner decisions.
 
-This draft also reflects reported owner decisions and personal context: `eliotd` is demand-start; SurrealDB runs as a child supervised by the daemon; `eliot-swarm-controller` is the primary router for model and embedding work and provides a unified task/adapter path; vectors are part of the full product, though vector service unavailability must degrade gracefully. These are inputs to the proposal, not independent verification of their implementation or approval of every detail. V3 does not require an internal swarm-controller.
-
-This document defines purpose and preserved properties. [Implementation](IMPLEMENTATION.md) describes proposed mechanisms. The [consolidated audit](AUDIT.md) records evidence, alternatives, and reasons for changes. When a mechanism conflicts with an original requirement, revise the mechanism; the audit alone does not create new mandatory subsystems.
+The design inputs are a local-first Rust product, demand-start operation, a supervised SurrealDB child, full vector capability, external `eliot-swarm-controller` model routing, and no second swarm inside memory. Those choices do not require carrying over V2's process graph, compatibility layers, or development bureaucracy.
 
 ## 1. Purpose
 
-Eliot turns accumulated experience from people and agents into a small, current, useful state for the next decision. It preserves observations, reconstructs context, detects contradictions, connects concepts to sources, warns against repeating mistakes, and changes subsequent behavior based on outcomes.
+Eliot makes accumulated experience useful for the next decision. It preserves observations, reconstructs a situation, explains relevant relationships, exposes contradictions and unknowns, prevents repetition of applicable known failures, and improves subsequent work through observable outcomes.
 
-Smart Memory OS should support a complete loop: observation → preservation → understanding the current situation → action by an external agent → observable outcome → change to memory or working method → evaluation of usefulness on later tasks.
+The complete loop is:
 
-Quality is measured by which errors stop recurring, whether context becomes available in time, how much better work continues, and what resources it costs. The number of records, graph edges, model calls, modules, or reports is not the outcome.
+**observe → preserve → reconstruct useful context → external agent acts → observe the outcome → revise memory or method → evaluate the next comparable attempt.**
 
-Basis: [original Canonical Master, §§0–1](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Canonical_Master.md#L13-L153), [V2 A0.1](../architecture/A00-01-purpose-of-the-architecture.md).
+A searchable archive is useful but is not the complete Smart Memory OS. Neither a large knowledge graph nor a model-generated reflection proves understanding or learning. Progress means less repeated error, better continuation, relevant knowledge available at the correct decision boundary, and an acceptable total cost.
+
+Original basis: [V1 Canonical Master](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Canonical_Master.md), [V1 Understanding Layer](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md). The [audit requirement matrix](AUDIT.md#3-the-34-preserved-requirements) keeps all 34 requirements visible.
 
 ## 2. Product boundary
 
 | Responsibility | Owner |
 |---|---|
-| Current goal, task execution, launching agents and tools, swarm plan | External agent and its host/harness/controller; the human sets the goal and authority |
-| Durable memory, provenance, revision, retrieval, context delivery, outcome memory | Eliot |
-| Synthesis of hypotheses, concepts, procedures, and improvement proposals | Dreamer — a background model-work role within Eliot |
-| Persistence, transactions, and indexes | One selected primary database through Eliot's internal storage module |
-| Model and embedding routing | `eliot-swarm-controller` as the primary external router, called through a bounded job contract; Eliot does not reproduce the controller's task orchestration |
-| Code, document, research, and notification sources | Adapters with declared capabilities and limits |
-| Observation of process failure | An observer independent of the process being checked, preferably an OS-native supervisor and a small health probe |
+| Ultimate goal, authority, acceptance of externally executed work | Human and external host/controller |
+| Executing tools, managing agent sessions, scheduling a swarm | External host/controller |
+| Observations, memory revisions, provenance, retrieval, context and outcome memory | Eliot |
+| Interpretation, consolidation, concepts, procedures, proposed improvements | Dreamer: a replaceable model-work role, not another authority |
+| Model/provider selection and execution, including embeddings | External controller through an explicit execution capability |
+| Primary persistence, transactions and search indexes | SurrealDB, used by one private application storage boundary |
+| Source acquisition and host lifecycle translation | Narrow adapters with declared coverage |
+| Detecting failure of a memory process | Observation outside that process's failure domain |
 
-Eliot keeps the links among a task, an attempt, the context received, a prediction, and the outcome. It does not duplicate the swarm scheduler, IDE, browser, general-purpose tool runtime, or build dispatcher. Deterministic memory operations remain usable without the controller. Dreamer and embedding work require a working configured controller route; the controller is an external execution dependency, not another swarm implemented inside Eliot.
+Eliot remembers the relationship between a host task, an attempt, delivered context, an action, and an outcome. It does not create a competing task truth or accept a host task merely because one verification command passed.
 
-If the host does not report actions or cannot accept proactive context, Eliot states that limitation plainly. It does not claim to observe or control work it cannot see.
+Two integrations are distinct: the controller asks Eliot for context; Eliot asks the controller to execute model work. Neither direction is assumed implemented because the other has a document or a method name. Background memory maintenance does not require inventing a coding task. Model and embedding capabilities are enabled independently as their real routes work.
 
-A full integration passes the goal and task scope, resource-contact events, accepts a context offer before a dependent action, and returns available action/outcome observations. A passive host that only supports search is an allowed limited mode, but does not demonstrate proactive memory or closed-loop learning.
+## 3. Lightweight modularity
 
-### 2.1. ModelJob boundary
+Begin with one memory service and ordinary internal modules. A module exists because it owns a coherent transformation or state boundary, not because an architectural noun needs a crate. Pure computations remain functions. Long-running work uses bounded jobs. External runtimes remain external.
 
-Eliot submits model-dependent work through a typed, bounded `ModelJob` to the configured `eliot-swarm-controller` route; it does not call a provider directly from the canonical memory path. At minimum, a job identifies its job and task, operation (`dream`, `research`, or `embed`), authorized source handles and revisions, privacy/redaction limits, requested output contract, resource budget/deadline, and route constraints. The result returns the same job identity, selected route/provider, status (including unavailable, timeout, malformed, or partial), structured output or vector result, and provenance sufficient to link it to inputs. The controller handles provider/adapter routing; Eliot validates the result and source references before use or persistence.
+Use one primary memory store and one owner for each mutable fact. A context packet, dashboard, learned-policy score, or project map is a projection unless it has a genuinely independent lifecycle. Do not persist several competing versions of the same operational state.
 
-Model or embedding absence records a degraded job and never blocks deterministic capture, exact/lexical retrieval, recovery, or other eligible work. A compatible API does not promise equal quality across models. Vector retrieval remains part of the full product behavior when its service is available; its temporary unavailability degrades retrieval to a truthful exact/lexical path, rather than making vector capability an optional product feature.
+The application starts on demand. An independent supervisor may live only while the memory service is active; a separate observer adds a real process and its cost must be counted. It is not a second memory writer. No permanent system service, automatic scheduled wake, or hot replacement of arbitrary code is required by default.
 
-## 3. Simple physical form and real modularity
+The update path is controlled restart and recovery. Optional computation may fail without taking down unrelated work. A Rust module is not a memory-protection boundary: process abort, resource exhaustion, blocking native code and task errors are different failures. Use process isolation where its benefit is concrete, not for every cognitive function.
 
-Proposed initial form: one demand-start `eliotd` service with internal modules. When started, the daemon supervises SurrealDB as a child process. CLI and service can be modes of one executable. Dreamer runs as background jobs of this service; remote model calls are routed as bounded jobs through the controller and do not require Eliot to run a permanently resident model daemon.
+Replaceability means a clear module boundary and recoverable data. It does not mean building every future database, harness or plugin protocol in advance.
 
-```mermaid
-flowchart TD
-    U["Human and external agent"] --> H["Host or harness"]
-    H --> C["eliot-swarm-controller"]
-    H <--> E["Demand-start eliotd"]
-    E --> S["Supervised SurrealDB child"]
-    E --> C
-    C --> M["Model and embedding providers"]
-    E --> R["Source adapters"]
-    O["Independent OS observer"] --> E
-```
+## 4. Memory preserves distinctions
 
-Logical boundaries are memory intake and storage; retrieval and context assembly; understanding and learning; background job execution; external adapters; and control and observability. These are code responsibilities, not a requirement to create six processes or six crates.
+### Preserve before interpretation
 
-Internal details should be hidden behind ordinary modules and narrow functions. Add a crate or process when a separate heavy runtime, trust boundary, independent deployment, or demonstrated reduction in change cost requires it. The number of development subagents does not determine the number of product modules. Modularity should make mechanisms replaceable and their behavior locally understandable.
+Accept admissible observations before semantic classification. Unknown meaning is a valid state. Missing models, an incomplete ontology, or a failed consolidation must not destroy the source or block deterministic readback.
 
-Restarting the service and recovering jobs is the proposed update path. Hot-swapping arbitrary modules, distributed coordination, and a custom plugin OS are not required for the first complete product. They may be added for a demonstrated need without changing the meaning of memory. The full V2 hot-replacement design is not a preservation requirement.
+Preservation still obeys storage and privacy policy. It is not permission to collect prohibited secrets. Acknowledgements identify what actually happened: committed to primary storage, durably staged for later intake, outcome unknown, or rejected. Repeated delivery is deduplicated by source-event identity, not merely by equal text.
 
-Failure of an optional capability is localized: healthy capture, reading, and independent work continue where safe. An external observer handles unrecoverable process failure. A Rust module boundary alone does not establish an isolation guarantee.
+### History is not current applicability
 
-Basis: [V1 Production Architecture, §§0–3](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md#L17-L347), [V2 I2.23: conditions for combining or extracting crates](../architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md).
+Keep an immutable observation of a failure at revision X even when the project moves to revision Y. A historical source supports what happened then; a live dependency establishes whether a view or recommendation applies now. Treating every old source as invalid whenever HEAD changes would erase the experience the system is intended to accumulate.
 
-## 4. Memory and knowledge
+A procedure therefore carries historical evidence **and** current preconditions. Changing unrelated code does not revoke its history. Changing a relevant API or tool profile requires reconsidering applicability. Refuting or withdrawing an actual source requires reconsidering its conclusions. Privacy restrictions continue through all actual content lineage, whether historical or live. For model-generated text, the supplied source material bounds disclosure; the model cannot declassify its output by omitting a citation.
 
-### 4.1. Preserve the observation first
+### Knowledge is revisable
 
-An admissible input is preserved before semantic classification. Material that is not understood remains an observation with an unknown interpretation. Model unavailability, lack of a ready ontology, or incomplete learning does not block preservation or basic retrieval.
+Distinguish observations, claims, hypotheses, decisions, procedures, unknowns and conflicts. Keep support, search availability and permitted influence separate. Retrieval frequency, confidence, similarity and the number of paraphrases do not make a claim true.
 
-Access, permitted scope, and retention policy are checked before accepting data. A prohibition on storing a secret cannot be bypassed by a “write everything first” mode. A repeated delivery is identified by source-event identity; identical text from two distinct events does not make them the same event.
+A correction creates a new revision and a reason. Multiple citations do not automatically mean independent support; multiple premises are not automatically interchangeable. Do not remove a citation from old synthesized text and declare that text safe or independently justified.
 
-The response distinguishes a write to the primary database, a reliably preserved local deferred input, an unknown outcome, and a rejection. Do not report success until the corresponding durable preservation has occurred.
+### Forgetting has different meanings
 
-### 4.2. Preserve semantic distinctions in the data
-
-A record makes it possible to establish its source and revision, subject and permitted use scope, acquisition time and known validity time, evidential status, relations, and whether it may influence later work.
-
-Keep distinct:
-
-- an observation and its interpretation;
-- a claim, hypothesis, user decision, and procedure;
-- corroboration and independent corroboration;
-- factual validity, search availability, and permitted influence;
-- an event in the past and new knowledge about that event;
-- a structural relation, correlation, causal hypothesis, and intervention result.
-
-Similarity, recall frequency, and model confidence do not increase truth. A human instruction sets a goal or policy within that person's authority; it does not turn a claim about the world into a verified fact.
-
-Sources and material corrections are not silently overwritten. New evidence may refute, narrow, or replace a conclusion. If there are multiple independent supports, losing one requires reconsidering the justification rather than automatically deleting every conclusion. Derived text must not be left unchanged merely by removing an inconvenient citation.
-
-### 4.3. Three distinct forms of forgetting
-
-| Operation | Result |
+| Operation | Preserved distinction |
 |---|---|
-| Reduce availability | Material appears less often in ordinary context, but remains available through permitted queries |
-| Revise knowledge or revoke influence | The old conclusion no longer applies; history and rationale are retained to the permitted extent |
-| Delete for privacy | The defined data scope is deleted, accounting for derived records, indexes, copies, and restore |
+| Reduce availability | Less ordinary exposure; history may remain available on demand |
+| Refute, supersede or revoke influence | A conclusion no longer guides work under the stated conditions; retain permitted history |
+| Erase a defined privacy scope | Remove controlled data and derivatives; account for staged input, backups and external copies |
 
-Compression must not destroy the sole source of an exception, failed attempt, or open commitment. Age and low use do not by themselves prove a memory wrong. After a backup is restored, revoked influence and deleted data must not return to use. Copies held by an external provider outside Eliot's control must be identified as such.
+Compression cannot silently discard the only exception, counterexample, failed attempt or open commitment. A restored copy must not revive a current deletion or restriction. Bytes already delivered outside Eliot have a separate retention boundary; a database flag cannot recall them.
 
-## 5. Context before the next decision
+## 5. Context at the actual decision boundary
 
-Ordinary retrieval is built without waiting for generative inference. Start with exact identifiers, active constraints, known failures, and lexical search; then use vectors and bounded relation expansion where useful and available. An unavailable embedding route does not block the base path, but vector retrieval remains a capability of the full product. Apply the permitted scope before candidate selection and again before revealing content.
+Normal retrieval does not wait for generative inference. Use exact cues and lexical retrieval, compatible embeddings and bounded relation expansion. Vector capability is part of the full product; its outage is a visible degraded mode, not the absence of all memory. Scope and permitted influence constrain candidate selection and final disclosure.
 
-The packet contains only what the current decision needs: goal and completion criterion, current state, constraints, relevant experience, project relations, contradictions, unknowns, the next useful step, and how to verify the result. Do not fill empty sections with template prose. Preserve exact values, exceptions, and refutations as complete semantic units.
+A packet contains the material that can change this decision: goal and criteria, current state, applicable constraints, experience, relevant relationships, counterevidence, unknowns and the next useful verification. Empty sections need no filler. Exact values and exceptions survive as complete semantic units. Omitted material has revalidated expansion handles.
 
-Provide expansion handles for omitted material. A small retrieval record should explain inclusion, exclusion, staleness, cost, and coverage gaps. Re-fetching full content checks access again; an old handle is not permission.
+There are two different delivery mechanisms:
 
-Proactive memory activates on observable events: task start or continuation, opening a related resource, preparation for an action, an error, or a source change. An exact match for a known hazardous condition may restrict an action under an already established policy. Semantic similarity produces a warning, not an arbitrary prohibition.
+- **Advisory context:** reaches a model request before the model chooses the decision it can affect.
+- **Action enforcement:** an already authorized host gate can stop a particular pending action.
 
-## 6. Understanding, attention, and cognitive functions
+A hook executing before a tool is not proof that the model reads its text before that tool. The adapter must declare the real timing. Semantic similarity is advisory; an exact applicable rule may restrict an action only under existing policy. Do not block every tool to manufacture an opportunity for context injection.
 
-Eliot maintains a reconstructible map: project purpose → subsystems → concepts and processes → files, symbols, and sources → verifiable effects. The names of the levels and the graph form may change. The map is grounded in actual revisions and marks unknown or stale areas.
+Previously delivered context may remain in a host transcript. Refresh on continuation and show superseded guidance; do not claim remote erasure or guaranteed removal of the model's prior context. A critical action can require a fresh host-side check where the host actually supports it.
 
-Deterministic analysis provides structure, dependencies, changes, and exact locations. A model proposes purpose, boundaries, analogies, alternative explanations, and ways to distinguish them. Synthesis without support remains a hypothesis. A source change invalidates affected derived representations; missed events are detected by checking revisions.
+## 6. Understanding, attention and disagreement
 
-Before a significant action, Eliot may record a verifiable prediction: what will change, where to observe the effect, and the conditions under which comparison is meaningful. Afterward, compare the outcome with that prediction. An unverifiable comparison remains unknown. Calibration is scoped to task family, project, and mechanism, not a universal “intelligence level” for the system.
+Maintain a reconstructible map from project purpose to subsystems, concepts, resources and observable effects. Structure and exact references come from available source tools. Meaning, analogies and proposed causal explanations may require a model. The output distinguishes those two kinds of evidence and marks missing coverage.
 
-Failure memory records the trigger condition, failed action, outcome, scope of applicability, and condition for reconsidering it. Successful repetition under changed conditions may narrow a restriction. Preserve history so that correcting a false warning also becomes experience.
+Update only affected views. A missed watcher event is repaired by source reconciliation, not by trusting an old summary indefinitely. Non-Git projects remain valid projects; lack of a revision anchor reduces a claim of freshness rather than inventing a commit.
 
-In a supported integration, check applicable negative guidance before the dependent action. New evidence can challenge and revise a false restriction within actions already authorized; this does not bypass authority or privacy boundaries.
+A useful prediction names an observable consequence, the conditions and where it will be checked. Compare it with a subsequent result. Static dependency, co-change and causal evidence remain different relationships. Unknown comparison is not failure or confirmation.
 
-When people or agents disagree, Eliot preserves the distinct explanations, shared sources, and independent support; proposes a discriminating question or observation; and clearly bounds any provisional conclusion. This does not require an embedded swarm or model voting. Preserve partial results and coverage gaps from a large audit.
+Negative memory records the trigger, failed action, conditions and grounds for reopening. A false prohibition is itself useful experience. Successes contribute procedures too; a memory composed only of prohibitions would become an obstacle rather than an assistant.
 
-Attention means selecting what could change the next decision: a conflict, risk, missing support, overdue commitment, or new relevant evidence. A representation of the current task and events is enough; a separate “attention engine” is not required.
+When explanations conflict, preserve dissent and shared sources, identify what would discriminate between them, and propose a next observation. This preserves the cognitive purpose of Concilium without a voting system or an embedded swarm.
 
-## 7. Self-learning with observable behavior change
+Attention is unresolved state that matters to work: a contradiction, missing support, commitment, dangerous recurrence or missed observation. Notification delivery and acknowledgement are not resolution.
 
-V3 self-learning primarily changes external memory, procedures, context rules, and permitted routing recommendations. Training model weights is a separate capability and is not required for the product to work.
+## 7. Self-learning must reach a consumer
 
-Each useful learning loop links an original attempt, a proposed concrete change, its scope, a subsequent comparable attempt, and its outcome. A change may be a new warning, better search order, different context expansion, a procedure with preconditions, or a check for an effect previously missed.
+Initial self-learning changes external memory, procedures and permitted context methods, not model weights. Dreamer may use any configured model that supports the chosen task; protocol compatibility does not promise equal quality.
 
-Local, reversible changes within already authorized policy may be applied automatically. Provide an active path into the next context or action rather than keeping candidates indefinitely. A successful attempt cannot grant new authority, change the ultimate goal, set global policy, authorize destructive actions, or publish to other users.
+A candidate names a concrete change, trigger, evidence, scope, exceptions and withdrawal condition. A low-risk advisory can enter the next eligible context automatically under existing policy. Do not trap every candidate behind a manual approval or an unimplemented evaluation platform.
 
-Broader reuse requires a transfer evaluation: known cases, held-out comparable cases, negative examples, and real subsequent work. Criteria and counter-metrics must not be silently changed along with the candidate. Detected harm leads to rollback or a narrower scope, not rewriting the evaluation result.
+Retain the subsequent attempt and the exact procedure revision offered. Distinguish found, delivered, observed action, adherence, outcome and comparative benefit. A citation, overlapping filename or agent self-report is not causal evidence.
 
-This evaluation may run automatically under pre-established policy; every classification or procedure does not need manual approval. Retrieval, context assembly, prediction, and verification methods may also improve as separately evaluated changes. A candidate cannot choose an easier evaluator or weaken its own acceptance criteria.
+One underlying outcome contributes once to a given evaluation. Retry, duplicate hooks, several steps of one episode and restating an induction example are not new independent successes. A corrected outcome replaces the current assessment instead of permanently increasing a counter.
 
-Distinguish: material found; delivered; available to the agent; an observed behavior change; an outcome obtained; and evidence that the change caused an improvement. The final step requires comparative data. Retrieval counts, word overlap, and model self-report do not prove usefulness.
+Broader reuse requires applicable subsequent cases, negative cases and an independent evaluation against a fixed baseline. Data used to invent a rule cannot simultaneously prove its out-of-sample value. Success on one profile is not an automatic claim about every repository or model. When data are sparse, useful local adaptation can remain explicitly provisional.
 
-When outcome signals are sparse, Eliot may still preserve a hypothesis and apply a limited reversible adaptation; it must not call that a proven general improvement. Learning from successes, failures, and false warnings are equally part of the product.
+Improvements to retrieval, context assembly, prediction and verification are evaluated as separate changes. The candidate cannot weaken its own evaluator, alter the user's goal, increase authority, silently change privacy or publish itself to a broader audience. Safety constraints and explicit user requirements are not withheld for a memory experiment.
 
 ## 8. Dreamer and research
 
-Dreamer is a replaceable executor of bounded tasks: consolidation, procedure extraction, revision, concept reconstruction, contradiction search, failure analysis, and proposing checks or improvements. Scheduled, manual, and event-triggered work use one job queue.
+Dreamer performs bounded consolidation, interpretation, contradiction analysis, project orientation, procedure extraction and improvement work. It reuses the same job machinery and storage path. It does not need a dedicated always-on intelligence service or a new memory layer for each operation.
 
-The configured model is selected according to quality, privacy, availability, and cost. The controller may provide routes to local models, OpenAI-compatible endpoints, or adapters for other APIs; Eliot only submits ModelJobs through that controller boundary. Each route must actually implement the required contract. Protocol compatibility does not guarantee equal quality. An unsupported response format produces an explicit error for that job while preserving the original observations.
+The model proposes data. Eliot validates input membership, target scope, current revision, permitted transformation and current job ownership before applying it. A model may propose a subject or relationship; it cannot authorize a cross-subject merge or select a foreign write target. Unsupported output is a job failure, not loss of the original observations.
 
-The model receives an authorized set of sources and returns structured candidates. It does not receive SQL or primary-database credentials, cannot choose the record subject on its own, and cannot expand access scope. Before persistence, validate references, revisions, record ownership, and the permitted operation.
+Research acquisition can come from an external provider. The output names its examined scope, sources, counterevidence and gaps. No result in a sample or top-k search is not proof of universal absence. Exploration may change its question openly; confirmation uses fixed criteria.
 
-Research is a task type with a question, scope, sources, and result. No result in the examined sample is not evidence that none exists. Research providers may be external; their unavailability reduces declared coverage without blocking the rest of memory. A confirmatory conclusion is distinguished from an exploratory hypothesis.
+[Hy-Memory](https://github.com/Tencent-Hunyuan/Hy-Memory/tree/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a) is a mechanism donor, not V3's mandatory runtime. Its learned writer weights, training signals and application code are different artifacts. Eliot should borrow useful organization and feedback mechanisms without copying the entire hierarchy or claiming that ordinary source citations reproduce supervised reward attribution.
 
-Consider ideas from [Hy-Memory](https://github.com/Tencent-Hunyuan/Hy-Memory/tree/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a) at the mechanism level. Linking a writer to subsequent outcomes is useful; Hunyuan's specific weights, its entire memory hierarchy, and model-issued UPDATE/DELETE are not mandatory Eliot architecture.
+## 9. Reliability and control without a second operating system
 
-## 9. Reliability, control, and trust boundaries
+Persist a write and its required follow-up intent together. Reconcile an unknown response using the same identity. A local worker claim is distinct from an external model request: worker recovery is not permission to buy the same inference again.
 
-One storage module performs application-level changes to primary memory. A transaction links the record, any required follow-up job, and the operation result. This does not require the service to be globally single-threaded. Retries are allowed; operation identity and current revision control duplicate effects.
+A cancelled, expired or replaced worker cannot publish. External cancellation is best-effort unless the executor guarantees more. Account for late results and unknown cost separately from permission to use their content.
 
-Background work is bounded in time, volume, parallelism, and cost. Completion checks the current claim and its unexpired lease; an expired or replaced worker cannot publish its result. A lost write response is not proof of failure and must not trigger a blind new action with a new identity.
+During maintenance, separate pausing admission from holding a lock. Do not wait for workers while holding the resource they need to finish. Prefer a clearly bounded conservative backup procedure over an unsupported promise of an instantaneous snapshot. Recovery must not blindly replay external effects from an older backup.
 
-Model failure preserves original material; index failure leaves exact or lexical reading available; database failure leaves an honest status and, if enabled, a bounded durable intake queue. A full queue rejects explicitly. A local spool does not become a second source of truth.
+People can inspect active work, reasons for delay, recent changes, provenance and missing observations; pause or cancel; select routes and budgets; correct or erase defined memory. The same application functions serve CLI and any later panel. A separate control-plane platform is unnecessary.
 
-Independent supervision detects process termination or hangs. Internal diagnostics explain queues, errors, and lack of progress, but do not replace the external observer. Restart recovers unfinished jobs without declaring them complete.
+The initial local-user profile is not a security boundary against an arbitrary process running with the same unrestricted OS identity. Agent tool restrictions and database credentials must match the actual deployment. A CLI label saying “human only” or a Job Object does not establish such isolation.
 
-Cognitive monitoring separately compares available workspace events with agent reports, detects missed updates and unresolved attention, and reduces claimed observability when signals are missing. It attempts to resynchronize and reports persistent gaps. It does not invent an unavailable signal. Notification receipt acknowledgment is not issue resolution.
+## 10. Economy and development
 
-People can see active work, delay reasons, material proposals, and limits of observation. They can pause or cancel work, configure model and budget, inspect provenance, correct memory, and revoke influence. Important notifications persist until delivered or explicitly expired; delivery failure is visible. The UI format may change.
+Count the total supported system: Eliot, required controller work, adapters, database operation, scripts, builds, memory, latency and model attempts. Moving complexity into SQL or another repository does not eliminate its cost. A claimed 50-fold reduction requires a comparable implemented boundary.
 
-External text and memory do not become higher-level instructions. Automated actions use host capabilities that were authorized in advance; a retrieved command string does not authorize its execution. There is no hidden fallback to broader access, a different region, or a more expensive model.
+Add a mechanism because it completes a user path or removes a specific failure. No crate-per-concept, generic query language, second semantic store, duplicate scheduler, permanent compatibility facade, proof-factory or mandatory approval of every ordinary helper.
 
-Task completion is tied to acceptance criteria and observable outcomes on a specific revision. A passing test, tool call, or Dreamer report does not by itself mean the whole task is complete. Incomplete, unverified, and unknown remain distinct.
+Finish the documentation stage before rewriting the product. Then build connected vertical paths with the owner's order: product code and minimum relevant checks/Clippy; tests after the product is built. Future behavioral scenarios are requirements for truthful product acceptance, not a demand to create test infrastructure now.
 
-## 10. Cost and evolution
-
-Measure total cost: Eliot code, required external services, adapters, maintenance, builds, process memory, latency, tokens, model calls, and retries. Moving complexity into a controller or database does not make it disappear.
-
-Add new methods to a working end-to-end path. For each change, state the desired outcome, the mechanism, and why the existing path does not provide it. Add a separate card, registry, process, or mandatory check only when it has an independent reason to exist.
-
-Finish and agree on the documentation first; then write V3. Future product evaluation will use the [Implementation end-to-end scenarios](IMPLEMENTATION.md#12-end-to-end-scenarios-for-the-future-product). At this stage, these scenarios do not require creating test infrastructure or running V2. A smaller codebase should be a measured consequence of the system's shape, not an excuse to lose cognitive functions.
+All 29 original A15 scenarios remain in the [audit scenario matrix](AUDIT.md#12-all-29-original-scenarios). A first partial slice does not silently remove the remaining cognitive, privacy, supervision or control requirements.

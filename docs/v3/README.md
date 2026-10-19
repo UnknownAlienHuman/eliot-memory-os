@@ -1,45 +1,46 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.1 · 2026-10-18 · documentation stage.** V1/V2 are donors. V3 is to be implemented from scratch after the design is refined. This revision implements no runtime capability and does not mark the proposed architecture as fully accepted.
+**Revision 0.2 · 2026-10-19 · documentation stage.** V1/V2 are donors. V3 will be written from scratch after documentation is agreed. No runtime, database migration or model integration is implemented by this revision.
 
 ## Reading order
 
-| Document | Read it for |
+| Document | Purpose |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Purpose, full preserved behavior, product ownership, and proposed simple topology |
-| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Concrete operations, state changes, failures, controller boundary, learning, and recovery |
-| [AUDIT.md](AUDIT.md) | Consolidated Russian evidence and reasoning: 34 original requirements, 29 A15 scenarios, Claude corrections, Hy-Memory, SurrealDB, controller gaps, and 43 donor entries |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Concise product manifesto: purpose, preserved cognition/learning, ownership and boundaries |
+| [IMPLEMENTATION.md](IMPLEMENTATION.md) | One concrete design for host timing, source semantics, storage, jobs, controller execution, learning and recovery |
+| [AUDIT.md](AUDIT.md) | Russian consolidated findings and rationale; 34 requirements, all 29 original scenarios and 43 donor entries |
 
-Read Architecture and Implementation together before changing a contract. Use the relevant audit section to check its rationale and pinned sources. Project documentation is English; the consolidated audit is Russian for the owner. New research is evidence for a decision, not automatic permission to add a new subsystem.
+Read Architecture and Implementation together for a contract change. Use the audit to check exact sources, rejected mechanisms and evidence limits. A new donor or research result does not automatically authorize another subsystem.
 
-## Design direction
+## What revision 0.2 changes
 
-The initial proposal is one demand-start `eliotd` with ordinary internal modules, one supervised SurrealDB child, and one durable background-work queue. Dreamer and embeddings use a real external `eliot-swarm-controller` contract; deterministic capture and exact/lexical retrieval remain available during model-route outages. Vector retrieval belongs to the full product.
+Historical evidence is separated from current applicability so ordinary source changes do not erase experience. Advisory context is distinguished from a real pending-action gate. Local worker recovery retains the same external execution identity rather than silently repeating paid work. Learning counts distinct observed outcomes, not repeated induction examples. Embedding profiles are independent of the Dreamer model.
 
-Memory must influence subsequent work: preserve observations, supply proactive scoped context, build source-grounded project/concept views, distinguish hypotheses and causality, learn local procedures automatically within existing policy, evaluate wider reuse independently, and reverse harmful or stale influence. A passive search-only host is a limited integration profile.
+Backup now has a conservative quiesced-export procedure and a finite staged-input cutoff, rather than an undefined fast snapshot. Restore applies current restrictions and reconciles old external jobs. A small independent supervisor can run only while the demand-start daemon is active; the full proposed profile counts supervisor, daemon and database as three owned processes, not three memory writers.
 
-The full product also retains operator control, independent process observation, workspace/report gap detection, privacy deletion and safe restore. The first vertical path is a construction sequence, not permission to discard these requirements.
+The previous scattered §3.3/§6.4 additions are integrated into the appropriate contracts. The earlier source analysis and publication history remain available in the [preceding audit](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/3512f6e4f4c9ce59ba2959193e92c0728fadf00c/docs/v3/AUDIT.md); its old test/review statements do not certify new bytes.
 
-## Open documentation decisions
+## Remaining decisions
 
-[Implementation §13](IMPLEMENTATION.md#13-open-decisions-for-the-next-documentation-stage) defines six bounded decisions: first host, real controller/model/embedding contract, durable intake and deletion/restore protection, exact database/interface/schema behavior, first learning consumer/evaluation, and OS observer/control surface. Review concrete normal/failure/recovery examples before calling the design ready for implementation.
+[Implementation §13](IMPLEMENTATION.md#13-open-decisions-for-the-next-documentation-stage) distinguishes concrete proposals from the remaining interface/version choices and future runtime qualification. The outstanding SDK versus historical direct-RPC constraint is explicit; neither client is silently declared approved or implemented. Controller-to-memory context and memory-to-controller inference are different directions.
 
-A real controller Memory ModelJob/result/embedding integration is not established by the inspected controller source. Provider independence is a contract goal; quality across models must later be evaluated. Neither this draft nor Hy-Memory's results prove a 50-fold reduction in implementation cost.
+The full product retains vectors, automatic local learning, project/concept understanding, negative memory, independent observation, privacy/restore and operator control. Exact/lexical operation during model outages is a degraded profile, not the whole product. A search-only host does not demonstrate the complete cognitive loop.
 
-## Donor freeze and source pins
+## Source pins and donor freeze
 
-| Donor/evidence | Pinned source |
+| Source | Pin |
 |---|---|
-| V2 code and normative fragments | [5aac094834fb5635921b550c821cb933a1196105](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105) |
-| V1 original design | [b5c84d4e53292dbc8996917c63448d5ee96c4bc7](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7) |
-| Incomplete V2 audit archive | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete) |
+| V2 | [5aac094834fb5635921b550c821cb933a1196105](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105) |
+| V1 | [b5c84d4e53292dbc8996917c63448d5ee96c4bc7](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7) |
+| Incomplete audit | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete) |
 | Hy-Memory | [7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a](https://github.com/Tencent-Hunyuan/Hy-Memory/tree/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a), [paper v1](https://arxiv.org/html/2610.22196v1) |
-| Controller boundary examined | [513f9698c268753dc6f2a6c0cf4d9a53f7f5e472](https://github.com/UnknownAlienHuman/eliot-swarm-controller/tree/513f9698c268753dc6f2a6c0cf4d9a53f7f5e472) |
+| Controller source boundary | [96a0d5a6632cfbd541e804d7969d3e76e716bf6a](https://github.com/UnknownAlienHuman/eliot-swarm-controller/tree/96a0d5a6632cfbd541e804d7969d3e76e716bf6a) |
+| Selected MemOS mechanism | [a7367d07e55db61099f7b4e2c1108bc5831a24f3](https://github.com/MemTensor/MemOS/tree/a7367d07e55db61099f7b4e2c1108bc5831a24f3) |
 
-Old Rust crates, V2 shards, validation scripts, and `workstreams/ACTIVE.toml` remain historical source material. Their active/accepted language describes the old programme and does not authorize new V2 work. V3 has no adoption receipt yet. See [architecture authority](../ARCHITECTURE_CONTRACT.md).
+Old source/shards stay recoverable as donors. Do not duplicate them in an archive tree or resume their old implementation programmes. `workstreams/ACTIVE.toml`, its validators, CI and user data are unchanged; their old active values are not a machine-enforced V3 freeze. See [architecture authority](../ARCHITECTURE_CONTRACT.md).
 
-The V2 ACTIVE registry and its validators remain unchanged, with their existing active values. The current issue and owner instruction define the documentation scope; this revision does not claim a machine-enforced freeze or migrate/close the old programmes.
+## Publication and verification
 
-## Delivery record
+This work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Record actual changed-document checks and remote readback there. Current-pass authorship is solo; do not reuse old independent-review attestations as review of this candidate. Required CI and independent integration are not bypassed, and publication to the branch is not a merge to main.
 
-This stage belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324). It changes documentation and navigation only. Source code, CI, dependencies, user data, and runtime state are outside the change. The issue/PR records executed checks, independent review, and evidence limits. Future implementation starts after the documentation stage is agreed, with the owner's sequence of product code, minimum relevant checks/Clippy, and tests after the product is built.
+Product development starts after the documentation stage, with the owner's sequence: product code, minimum relevant checks/Clippy, tests after the product is built. The future behavioral scenarios are not claimed to have run in this pass.

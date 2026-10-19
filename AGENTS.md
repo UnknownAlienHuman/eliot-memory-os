@@ -6,7 +6,7 @@ The owner has frozen V1/V2 as donors and requested a fresh V3 design before
 implementation. Start with [V3 navigation](docs/v3/README.md), read
 [Architecture](docs/v3/ARCHITECTURE.md) and
 [Implementation](docs/v3/IMPLEMENTATION.md), and inspect the relevant evidence in
-the [consolidated audit](docs/v3/AUDIT.md). Revision 0.1 is a draft, not a claim
+the [consolidated audit](docs/v3/AUDIT.md). The current V3 revision is a draft, not a claim
 of completed code or acceptance of every proposal. Do not resume V2 programmes
 or start V3 runtime work from an old issue, manifest, or checklist.
 
