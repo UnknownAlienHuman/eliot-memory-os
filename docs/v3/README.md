@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.3 · 2026-10-19 · documentation stage.** V1/V2 are donors. V3 will be written from scratch after documentation is agreed. No product runtime, database migration or model integration is implemented by this revision.
+**Revision 0.4 · 2026-10-19 · documentation stage.** V1/V2 are donors. V3 will be written from scratch after documentation is agreed. No product runtime, database migration or model integration is implemented by this revision.
 
 ## Reading order
 
@@ -9,11 +9,19 @@
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Stable product manifesto: purpose, preserved cognition/learning, ownership and boundaries |
 | [IMPLEMENTATION.md](IMPLEMENTATION.md) | Runtime, storage, host, controller, jobs, learning and recovery contracts |
 | [COGNITION.md](COGNITION.md) | Implementation chapter: current-value resolution, project views, applicability and criterion-specific learning inside the existing modules |
-| [AUDIT.md](AUDIT.md) | One Russian consolidated audit; prior findings, 34 requirements, all 29 original scenarios, 43 donor entries and current-pass findings in §16 |
+| [AUDIT.md](AUDIT.md) | One Russian consolidated audit; prior findings, 34 requirements, all 29 original scenarios, 43 donor entries and current-pass findings in §17 |
 
 Read Architecture and the relevant Implementation chapters together for a contract change. Cognition expands the existing module responsibilities; it is not another architecture, service or audit. Use the consolidated audit for exact sources, rejected mechanisms and evidence limits. New research does not automatically authorize a new subsystem.
 
-## What revision 0.3 adds
+## What revision 0.4 adds
+
+[Cognition](COGNITION.md) now specifies atomic replacement publication, explicit scoped retirement without implicit resurrection, multi-predecessor history traversal, independent lexical candidates and target-check coverage for learning. A new session summary does not supersede every claim from the preceding session. Failed or skipped verification does not become a positive outcome merely because one diagnostic was absent.
+
+[Audit §17](AUDIT.md#17-memory-transition-audit-04) records the pinned Hy coding reconciliation/store paths and two isolated SQL reproductions: retire-before-insert failure and an omitted history branch. It distinguishes those probes from a deployed Hy test. Current SurrealDB filtering documentation informs the query choice without qualifying an installed server. These changes refine existing operations; no new service, queue or semantic store is introduced.
+
+Architecture remains at 0.2 and the runtime/integration overview at 0.3; Cognition 0.4 is their implementation chapter, not a competing specification. Earlier audit sections and the 34/29/43 requirements/scenario/donor matrices are retained.
+
+## What revision 0.3 added
 
 The cognitive path is made concrete rather than left behind reliability machinery. Current values are resolved by subject/aspect, perspective, time and scope; relevance ranking cannot silently settle a contradiction. Intended behavior and observed code remain different views. Unknown procedure applicability stays unknown, and an unrelated task failure does not automatically discredit every delivered lesson.
 

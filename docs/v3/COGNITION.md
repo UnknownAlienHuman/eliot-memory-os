@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — cognitive mechanisms
 
-**Revision 0.3 · 2026-10-19 · implementation proposal, not working runtime.**
+**Revision 0.4 · 2026-10-19 · implementation proposal, not working runtime.**
 
-This chapter expands [Implementation](IMPLEMENTATION.md) §§2, 4, 7 and 8. It specifies transformations inside the existing `memory`, `context`, `learning` and `jobs` modules. It introduces no new daemon, database, ontology engine, agent swarm, or approval platform. [Architecture](ARCHITECTURE.md) retains product authority; [Audit §16](AUDIT.md#16-cognitive-audit-03) records the findings and donor limits.
+This chapter expands [Implementation](IMPLEMENTATION.md) §§2, 4, 7 and 8. It specifies transformations inside the existing `memory`, `context`, `learning` and `jobs` modules. It introduces no new daemon, database, ontology engine, agent swarm, or approval platform. [Architecture](ARCHITECTURE.md) retains product authority; [Audit §§16–17](AUDIT.md#17-memory-transition-audit-04) records the findings and donor limits. Revision 0.4 reviews `0f05a939`; the runtime contracts remain in Implementation 0.3. This chapter supplies the transition and retrieval details below without creating a second owner.
 
 ## 1. One useful path and its owners
 
@@ -29,6 +29,8 @@ For a claim eligible for current-state resolution, retain the resolved subject/r
 
 The **comparison key** is the necessary scope plus subject, aspect and perspective. For example: one workspace/API symbol, `return_shape`, observed behavior. This is a grouping key, not proof that two sentences mean the same thing. It need not be a universal list of predicates. Deterministic source adapters can supply exact keys; a model proposes semantic identity where needed. Ambiguous identity remains a provisional claim linked to its raw observation. It does not reject capture or create a forced merge.
 
+A session-progress summary is not an atomic claim. Continuing the same task may update its progress summary and link its episodes; it does not supersede every earlier fact, exception or commitment. A replacement names the particular claim/aspect and temporal scope it changes. Silence about an old condition is not evidence that it stopped being true. A batch containing changes to two independent aspects may replace one while retaining the other. Model-generated subject labels are proposed aliases, not sufficient keys for destructive reconciliation.
+
 Keep separate occurrences separate. Two identical failures on different attempts are two events; repeated exports of one event are not. Aliases and renames carry their evidence. Same spelling in another repository, branch or worktree is not the same resource by default. Uncommitted workspace state must not be labelled as identical to committed HEAD.
 
 Do not implement natural-language understanding as an expanding table of personal topics and regexes. Regexes are appropriate for documented machine formats, exact diagnostic IDs and path syntax; they are insufficient evidence that quoted first-person prose describes the speaker. Equally, model interpretation is fallible data, not a privilege to rewrite source identity.
@@ -47,6 +49,26 @@ Implement `resolve_current` as one ordinary function over an explicitly scoped c
 Retrieval first identifies candidate groups, then this function resolves the groups. Fetch relevant active alternatives/replacements by the indexed group key, not only the semantic top-k. A limit reached while enumerating a group means incomplete resolution. Return that limitation and a continuation handle rather than a confident value. Known constraints and current goal references still have their direct path outside general top-k.
 
 The initial implementation needs an indexed grouping field and ordinary links, not a second "current truth" table with its own writer. A cached projection binds to the examined sources and query membership described below; it is not another authority.
+
+### 3.1 Publish a replacement as one memory change
+
+Prepare the proposed replacement and any optional summary outside the write transaction. Use the existing memory/job application boundary: recheck the exact predecessor revisions, comparison key, temporal scope, live requirements, policy and current job claim; create the new revision and its required links, record the predecessors' scoped retirement, and enqueue required derived work in one transaction. Store the operation result in that same transaction. A conflict or failed commit leaves the preceding committed state unchanged. Lost acknowledgement follows the existing same-operation readback, not a new replacement.
+
+Never retire the only active revision, await a model, and insert its successor afterward. A slow optional history summary is not a prerequisite for publishing an otherwise valid explicit correction. A failed embedding does not undo primary preservation or make the new revision inaccessible to exact/lexical lookup; deferred indexing remains visible and retryable. Old content remains available as permitted history, not as an automatic current fallback.
+
+Concurrent replacements of one predecessor are not resolved by response arrival order. Revalidate the group after a lost comparison; independent observations survive, while incompatible current claims remain a conflict. Do not blindly replay the old replacement decision against a new head. This is one conditional memory transaction, not a revision coordinator service.
+
+### 3.2 Withdrawal does not resurrect a retired value
+
+Removing, refuting or quarantining a successor is not a new observation that its predecessor became true again. The resolver must not derive predecessor eligibility solely from the continued existence or visibility of the successor row or edge. Preserve the permitted scoped retirement/validity decision with the existing revision/transition history, including in export/restore. If a privacy operation cannot retain enough permitted transition information, the affected resolution remains unknown until fresh admissible evidence is available; it must not reconstruct deleted content or expose hidden alternatives.
+
+For example, A was replaced by B and B is later refuted. Return the remaining independently supported current alternatives or an explicit unknown/conflict. Do not relabel A as current merely because B was filtered out. Restoring A's value requires an explicit evidence-backed revision or scoped correction of the earlier replacement decision. A failed *uncommitted* proposal is different: it never retired A in the first place. Doctor, index rebuild and cache eviction cannot authorize semantic reactivation.
+
+### 3.3 History can have several predecessors
+
+Several revisions can contribute to one replacement or view. A history reader follows all relevant permitted predecessor edges with a visited set, not `ORDER BY time LIMIT 1` at every step. Use a bounded frontier with node/edge budgets and continuation metadata. A depth limit alone does not account for omitted siblings. Mark unexamined branches, missing sources and cycles explicitly; an incomplete history is not silently presented as the complete basis of a summary.
+
+Chronological display does not turn the underlying graph into a single-parent chain. Shared ancestors count once; independent branches remain distinct. A bounded history packet may still be useful when labelled partial, but a replacement requiring a missing premise cannot claim complete validation. Use ordinary indexed links and a small traversal function; no general provenance engine or all-corpus walk is needed.
 
 ## 4. Project understanding as a small set of revisable views
 
@@ -86,6 +108,14 @@ Budget for the decision, not each stored record independently. When a current va
 
 Measure bytes/tokens injected, expansions and repeated reconstruction work alongside task outcomes. Total input accounting must include material repeatedly resent with a host transcript where it can be observed. A shorter packet is not automatically a cheaper or more useful workflow. Existing fixed requirements are not removed to win a token metric.
 
+### 5.1 Independent candidates, not a dense-only lexical reranker
+
+Exact identifiers and the lexical arm query eligible primary records independently of ANN candidates and a dense-score threshold. Merge their candidate IDs with compatible vector results afterward. A lexical-only match is not rejected merely for missing a vector score; fusion must preserve each arm's provenance rather than compare incompatible score scales. An unavailable or still-building vector index leaves exact/lexical retrieval working and reports the missing arm, not an empty memory bank.
+
+Preserving exact content is not enough if no searchable path can find it. Keep bounded source-derived identifiers and material exact values in searchable fields/cues, with a handle to their original context. A summary that omits an error code must not make that code discoverable only after the summary has already been found. Do not embed entire raw logs to solve this: use the primary store's lexical/exact facilities and explicitly scoped raw expansion/search. Report unindexed or uncaptured portions instead of asserting corpus-wide absence.
+
+Prefer the database's actual filtered-vector plan over a speculative application workaround. The [official similarity-search reference](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) describes predicate pushdown, index-assisted prefiltering since 3.3.0 and version-specific exact/approximate paths. [EXPLAIN](https://surrealdb.com/docs/reference/query-language/clauses/explain) exposes the plan. Verify the selected server/schema/query combination; a supported filter is not proof of complete semantic recall or of application-level privacy-lineage validation. Do not build a second search engine because of an untested assumption about the database.
+
 ## 6. Applicability before automatic learning
 
 ### 6.1 Three-valued matching
@@ -107,6 +137,10 @@ A transferred procedure is evaluated in its new scope with permitted source mate
 For the initial API-change example, use a named criterion such as recurrence of the identified compatibility failure under the declared API/consumer and verifier profile. Where capture permits, record whether the relevant definition and consumer were available before the edit. Availability is not proof that the model understood or obeyed them.
 
 Do not use final task PASS as a surrogate for this criterion. A network outage or a failure in an unrelated subsystem does not prove that the API procedure was harmful. Conversely, a different failing criterion cannot be hidden merely because the selected API error disappeared.
+
+**A missing diagnostic is not a passed criterion.** Record whether the relevant check actually exercised the target on the cited revision/profile, whether its result is complete, and what it concluded. The initial reducer distinguishes a supported pass, a supported failure, an inconclusive attempted check, and a check not observed. A compiler stopped earlier in another module, a skipped consumer, a truncated log or a check against a different checkout cannot prove that the named API failure was eliminated. A documented complete check that covers the criterion can establish its pass; a matching captured diagnostic can establish the corresponding failure without claiming that every other check completed.
+
+This coverage is a few fields on the existing outcome contribution, not an evidence-schema platform. Preserve the original tool outcome and costs even when the target criterion is inconclusive. Missing coverage supplies a next useful verification or remains unknown; it neither rewards the procedure nor invents harm. Capture of an expected failing diagnostic probe is not automatically a new prohibition against running that probe. Adherence and criteria retain their distinct purposes.
 
 Keep adherence, target-criterion outcome and attribution separately qualified. A direct counterexample can narrow an applicable rule; an unrelated or uncorrelated failure remains unassigned. There is no reward spread across every memory item in a packet and no automatic punishment of every delivered procedure.
 
@@ -155,6 +189,19 @@ No separate `WorldModelService`, `TruthRegistry`, `OntologyManager`, `LearningSt
 | Goal changes between attempts | Keep original outcomes/criteria; reconstruct the new goal explicitly |
 | A card is stale and its model route is down | Still serve valid exact observations with visible coverage gaps |
 
+The fourteen cases above belong to revision 0.3. Revision 0.4 adds:
+
+| Case | Required behavior |
+|---|---|
+| Replacement preparation or insertion fails | No committed retirement without its replacement; preserve the preceding committed state |
+| Two replacements race on one predecessor | Revalidate the group; do not apply the slower result as a last-writer winner |
+| Replacement is committed but embedding is unavailable | New revision remains readable and lexically findable; indexing is visibly pending |
+| A successor is refuted or erased | No implicit resurrection of its retired predecessor |
+| Two predecessors converge into a later revision | Preserve both history branches or expose bounded traversal incompleteness |
+| Exact diagnostic lies outside the dense candidate pool | Independent lexical/exact retrieval can still find it |
+| A session continues without mentioning an earlier exception | Continuation does not silently supersede the exception |
+| Verifier stops before exercising the target consumer | No positive learning outcome from the absent target diagnostic |
+
 These are documentation walkthroughs, not an executed V3 test suite.
 
 ## 9. Source decisions
@@ -165,3 +212,5 @@ These are documentation walkthroughs, not an executed V3 test suite.
 - [Hy-Memory optional canonical-state helpers](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/system2_agent.py#L72-L346): a source-backed counterexample to topic-specific regexes as general understanding. The branch is disabled by default in the inspected source; the isolated helper accepts quoted/example first-person equipment text. This is not a reproduced deployment failure.
 - [Hy writer paper, 2610.22196v1, §5.3](https://arxiv.org/html/2610.22196v1): two preceding chunks describe reward annotation context, not a universal production-writer requirement. Keep pipeline parameters justified by their actual purpose.
 - [LongMemEval, 2410.10813v2, §3.2](https://arxiv.org/html/2410.10813v2): knowledge update, temporal reasoning and abstention must be evaluated separately. This motivates failure categories, not importing benchmark user-attribute ontologies into Eliot.
+
+- [Hy coding reconciliation](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/fact_reconciler.py#L737-L889) and [storage](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/store.py): borrow explicit history and scoped candidate ideas, not retire-before-insert or dense-only lexical availability. The pinned source permits several superseded facts while its ancestor helper selects one predecessor; the audit distinguishes source facts and isolated SQL probes from a full deployment test.
