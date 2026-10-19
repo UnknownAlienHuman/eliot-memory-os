@@ -106,6 +106,10 @@ When offline intake is enabled, a small append-only spool stores only input enve
 
 After recovery, replay uses the same IDs. The same input creates neither a second observation nor a second paid job. Clear spool entries only after the primary transaction is confirmed. Document its format, disk limit, and access protection during implementation; V2's entire ORS is not required.
 
+**Deletion, replay and backup ordering (required):** A durable deletion tombstone covers the observation ID, its derived records and queued or staged intake identities. Under one local intake/erase ordering gate, erase first prevents new admission of matching identities, durably records the tombstone, then deletes primary records, edges, embeddings and pending jobs. Spool replay checks the tombstone before any insertion and again at the primary transaction boundary; a concurrent replay must not commit after deletion. Do not acknowledge deletion while any earlier staged envelope can reappear. Keep the minimal tombstone information outside an older restore image (or reapply a separately durable deletion journal), and reject restore if that journal is missing or inconsistent. Never restore directly over the live database.
+
+A backup first pauses intake/replay at the same ordering gate, drains and reconciles all acknowledged staged envelopes, and only then snapshots the database and deletion journal at a consistent boundary. If drain or durable reconciliation fails, backup fails explicitly; it must not silently omit acknowledged observations. Release the gate after the snapshot boundary, not after the whole export. An interrupted backup is not a valid restore point. These operations use one short coordinator and the existing store/spool, not another recovery service or second semantic database.
+
 If the commit response is lost, query by the same operation ID. While the result is unknown, do not treat the write as either accepted or safely absent. The database path provides idempotent reconciliation; external effects depend on the external API's capabilities.
 
 ### 3.4 Continuation and host replacement
