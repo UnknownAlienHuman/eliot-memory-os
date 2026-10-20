@@ -1,8 +1,10 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.15 · 20 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.16 · 20 октября 2026 · документация до переписывания продукта.**
 
-**Новый результат — [§29](#29-magma-and-letta-relations-and-continuation-015):** прочитаны D42 MAGMA и действующий D17 Letta Code. MAGMA полезна выбором отношений под вопрос, но её рассмотренный query path делает полный проход даже при готовых результатах, повторно кодирует тексты, отсекает промежуточные узлы по словам и неверно объединяет несколько типов связей. Letta показывает отдельный рабочий путь сжатия контекста и отдельную reflection-подготовку. Для Eliot выбраны адресное раскрытие нужной связи и сводка продолжения без второго graph/context runtime.
+**Новый результат — [§30](#30-everos-and-evermemos-anticipation-and-evidence-coverage-016):** сопоставлены историческая статья EverMemOS и действующий EverOS. Проверены default-off Foresight и стандартный search consumer, полная загрузка области в AGENTIC, отдельный multi-round retrieval и разделение foreground/background embeddings. Для Eliot уточнены условное предвосхищение в обычном контексте, выборка участников выбранной группы, покрытие частей вопроса и доступность интерактивного поиска. Новых сервисов и обязательного модельного маршрутизатора нет.
+
+**Результат 0.15 — [§29](#29-magma-and-letta-relations-and-continuation-015):** прочитаны D42 MAGMA и действующий D17 Letta Code. MAGMA полезна выбором отношений под вопрос, но её рассмотренный query path делает полный проход даже при готовых результатах, повторно кодирует тексты, отсекает промежуточные узлы по словам и неверно объединяет несколько типов связей. Letta показывает отдельный рабочий путь сжатия контекста и отдельную reflection-подготовку. Для Eliot выбраны адресное раскрытие нужной связи и сводка продолжения без второго graph/context runtime.
 
 Этот файл остаётся общим аудитом. В 0.15 прежние разделы сведены по механизмам, а не удалены как «закрытые»: сохранены 34 требования, 29 исходных сценариев, D01–D44, основные находки, ограничения и решения. Это **редакционная консолидация, не побайтное сохранение**. Полные формулировки, диапазоны чтения и прежние изолированные пробы доступны в неизменных [0.14](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/841c807659727cd7fb5730331190ee27cd50f47d/docs/v3/AUDIT.md), [0.9](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md), [0.4](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c28359fc2716f3b498ea512ca24a57801d18014c/docs/v3/AUDIT.md) и [ранней редакции](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/3512f6e4f4c9ce59ba2959193e92c0728fadf00c/docs/v3/AUDIT.md). Их эксперименты не выдаются за выполненные заново.
 
@@ -14,7 +16,7 @@
 |---|---|
 | V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: исходные требования и донор |
 | V2 | `5aac094834fb5635921b550c821cb933a1196105`: замороженные нормативы и код |
-| База текущей документации | `841c807659727cd7fb5730331190ee27cd50f47d`, PR #5325 |
+| База текущей документации | `48a622457c826eed3f539d9a870e3521da644527`, PR #5325 |
 | Claude audit | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения и исторические измерения, не безошибочный норматив |
 | Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы исследования, не обязательный backlog V3 |
 | Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer/reconciliation/store/System 2 пути |
@@ -30,6 +32,8 @@
 | Subcog D03 | `0cd2d4f0cff04938c9f865353fbfefa1b4e3f754`: recall/fusion, выбранные consolidation/lifecycle functions |
 | MAGMA D42 | `467cb70b67ac337b22fdb42194d37c04ad701b62`: README и связанный `memory/query_engine.py`; [статья v1](https://arxiv.org/html/2601.03236v1) отдельно от source findings |
 | Letta Code D17 | ref `e8073d4e475ab7f56e76f9aaeea81a7618a92575`, возвращённый connector: local compaction/backend/store и выбранная reflection-подготовка; не весь прежний Letta server |
+| EverOS D10 | `c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18`: текущие docs, foresight strategy, HTTP/service/search paths, episode recaller, выбранный multi-round loop и embedding provider/factory (§30) |
+| EverMemOS D11 | [Статья 2601.02163v1](https://arxiv.org/html/2601.02163v1), 5 января 2026: исторический MemCell/MemScene/Foresight design; соответствующий исторический runtime здесь не квалифицирован |
 
 Владелец требует новый V3 после документации: самообучение, понимание, модульность, гибкость, лёгкость и заменяемый Dreamer. Принятые проектные направления — local-first Rust, demand-start, SurrealDB server child и модельные маршруты через controller без собственного роя. Конкретные будущие SDK/API и параметры не объявляются уже работающими.
 
@@ -216,8 +220,8 @@ Owner-selected restore работает даже при утраченном ф�
 | 07 | Pichay / demand paging | Цена повторного чтения; не paging OS заранее |
 | 08 | Graphiti | Duplicate/contradiction candidates и temporal intervals; не весь managed Zep (§26) |
 | 09 | Hindsight | Facet update, saved questions, retention без собственного echo; conditional delta (§§26–27) |
-| 10 | EverOS | Пропущенные события и replacement прежде retirement |
-| 11 | EverMemOS historical | Episodes/facts/foresight; различать версии |
+| 10 | EverOS | Пропущенные события и replacement прежде retirement; 0.16: actual foresight/search wiring, scoped group fetch, question coverage и foreground embeddings (§30) |
+| 11 | EverMemOS historical | Episodes/facts/foresight статьи v1 отдельно от нынешнего EverOS; качественные foresight cases не измеренный coding benefit (§30) |
 | 12 | Cloudflare managed Agent Memory | Raw рядом с derived; service не бесплатная library |
 | 13 | Cloudflare Agents SDK Sessions | Immutable turns, branch-local compaction |
 | 14 | SurrealFS | Source/indexer/content identities; не сама SurrealDB |
@@ -543,3 +547,59 @@ Eliot берёт подходящие already-saved episode slices и relevant m
 Несколько попыток получить предполагаемые reflection paths оказались неудачными; после проверки имён через code search прочитаны реально существующие helper/command files. Неуспешные fetches не засчитаны как чтение и не использованы как доказательство отсутствия функции. Точно так же локальная сеть не дала загрузить рабочую копию: публикация идёт доступным GitHub API, без выдуманного локального diff-check.
 
 Новых runtime, model, database, synthetic или продуктовых тестов не запускалось; нет независимого субагентного review. Следующий конкретный источник — полезная автоматическая адресация/предвосхищение из D10/D11 EverOS/EverMemOS либо ещё не завершённый Eliot capture→interpretation trigger. Выбор определяется пробелом продукта, а не обязанностью импортировать очередного донора.
+
+## 30. EverOS and EverMemOS: anticipation and evidence coverage 0.16
+
+**20 октября 2026; база документации `48a62245`.** Текущий EverOS прочитан на `c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18`; историческая статья EverMemOS — отдельно. Сходные имена типов не устанавливают одинаковый runtime или одинаковые результаты.
+
+### 30.1 Две версии источника, а не одна обещанная система
+
+[EverMemOS 2601.02163v1, §§3.2–3.5](https://arxiv.org/html/2601.02163v1) описывает MemCell с Episode, Atomic Facts, Foresight и source metadata; MemScenes группируют материал для последующего раскрытия. Foresight имеет временную область, а chat context дополнен профилем и подходящими прогнозами. В §3.5/Appendix A.1 авторы прямо отделяют это от обычной количественной оценки episodes-only: Foresight показан качественными примерами, не измеренным предотвращением ошибок coding-агента.
+
+Нынешние [architecture](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/docs/architecture.md) и [write/index/read guide](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/docs/how-memory-works.md) описывают Markdown-память, SQLite state, derived index и offline strategies. MemCell/Foresight здесь тоже существуют; это не повод объявлять старую схему целиком исчезнувшей или текущую реализацию подтверждением всех свойств статьи. Часть алгоритмов импортируется из отдельных `everalgo` packages, исходники которых в этом проходе не прочитаны. Топология донора не меняет выбранную SurrealDB/Rust основу Eliot.
+
+### 30.2 Предвосхищение без потребителя остаётся платной записью
+
+В [extract_foresight.py](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/memory/strategies/extract_foresight.py) фактический decorator задаёт `enabled=False`. Автор объясняет: один LLM call на user sender на MemCell создаёт данные, которые стандартная выдача не потребляет. Тело функции действительно обходит user senders, вызывает extractor отдельно для каждого и пакетирует запись по owner. Сохраняются parent/session, Evidence и отдельный Foresight, опционально start/end/duration. Исправленная фильтрация `ChatMessage` не обращается к отсутствующему role у tool-result; прежний crash из комментария не выдаётся за нынешний дефект.
+
+Проверена не только эта декларация. [HTTP route](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/entrypoints/api/routes/search.py) вызывает [service.search](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/service/search.py), который создаёт [SearchManager](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/memory/search/manager.py). User path формирует episodes/profile/unprocessed, agent path — cases/skills/unprocessed. Foresight recaller и поле его выдачи в этом построении отсутствуют. Это конкретный стандартный consumer, не исчерпывающий поиск каждого возможного custom reader или доказательство невозможности прочитать сохранённый Markdown.
+
+**Для Eliot:** существующая интерпретация эпизода может сохранить условную будущую потребность или риск рядом с основанием, а обычный `context` показывает его при релевантном решении. Уже явный план не требует ещё одного предсказательного вызова. Формат «при этих условиях полезно проверить X, поскольку в эпизоде Y произошло Z» даёт действие и ограничение; отдельная ForesightDatabase или бесконечный predictor на каждом сообщении не нужны. Без пути до контекста генератор не считается законченной когнитивной функцией.
+
+### 30.3 Срок прогноза не превращается в факт исполнения
+
+Это **наше проектное различие**, а не найденный end-to-end дефект EverOS. В записи отделяются исходно названная дата, модельная оценка периода полезности и наблюдённый исход. Истечение inferred window может уменьшить навязчивую выдачу, но не отменить явное обязательство или доказать изменение мира.
+
+Пример: «мигрировать в пятницу» без результата в субботу означает неизвестный статус миграции. Это не «миграция состоялась», не бесконечное повторение тревоги и не основание забыть требование. При следующей связанной работе полезен адресный статус/проверка; реальный результат или изменение цели обновляет прежнюю запись. Existing attention dedup, time comparison и обычный context suffices; отдельный timer/expiry runtime не требуется. [Cognition §7](COGNITION.md#7-attention-prediction-and-cognitive-failure).
+
+### 30.4 Раскрыть выбранную группу, не загрузить сначала всю область
+
+В настоящем `_search_episodes` [manager](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/memory/search/manager.py#L330-L490) режим `AGENTIC` вызывает [search_episodes_agentic](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/memory/search/agentic.py). До cluster selection эта функция получает cluster snapshot и `fetch_all_for_owner(where)`. [Реализация recaller](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/memory/search/recall/episode.py) вызывает `episode_repo.scan(where)` без limit, материализуя всю подходящую область. `where` сохраняется: это не утверждение о чтении всех проектов без фильтра.
+
+Далее полная коллекция передаётся imported cluster helper. Предел финальных результатов не ограничивает уже загруженные данные. Константа child_candidates=100000 здесь sentinel для retrieval, а не измеренные сто тысяч API calls. Обычные KEYWORD/VECTOR/HYBRID paths отдельные; их нельзя обвинять в этом prefetch по аналогии.
+
+**Малое решение Eliot:** группа помогает найти связанные эпизоды, но их IDs выбираются до hydration; native query читает нужных участников. Existing views/links достаточны. Тематическая близость не означает одну текущую истину и не добавляет независимое подтверждение. Не переносить полный in-memory corpus и затем строить cache для его ускорения. [Cognition §5.3](COGNITION.md#53-recover-the-episode-not-just-the-matching-fragment).
+
+### 30.5 Разные части вопроса нельзя заменять голосованием похожих запросов
+
+У текущего EverOS есть отдельный `LLM_MULTIROUND`, вызываемый тем же manager, не тождественный `AGENTIC`. В [llm_multiround.py](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/memory/search/llm_multiround.py#L700-L1005) каждый sub-query получает свои sparse/dense candidates и свой RRF block. Decider видит исходный вопрос, блоки и сохранённое core; indices переводятся обратно в реальные IDs. Есть предел rounds и остановка после отсутствия новых core/следующих queries. Это реально вызываемый цикл, но его модельные решения и качество здесь не запускались.
+
+Полезен принцип **сохранять роль найденного источника в ответе**. Источник, найденный только вопросом об исключении, не хуже от того, что десять общих перефразировок его не нашли. Для Eliot конкретный missing aspect обосновывает адресное раскрытие или дополнительный поиск; дорогая модельная доработка остаётся отдельным конечным запросом, не допуском перед каждым чтением.
+
+Есть важная граница обещания «всё core и по источнику на каждый sub-query». Фактический finalizer при `core_overflow=false` ограничивает core по top_k, а per-query guarantee заполняет лишь оставшиеся места. Полное core может занять весь бюджет, и последующая «гарантия» ничего не добавит. Это не само по себе ошибка соблюдения лимита; ошибка была бы заявить полноту после потери единственного нужного основания. Несколько удачных intermediate selections не равны delivered coverage.
+
+В Eliot сборщик сохраняет необходимые premises/исключения, делает qualified compression или показывает оставшийся пробел и `open`. Не назначается обязательная квота каждому искусственному sub-query. Model sufficiency, отсутствие новых hits и исчерпание бюджета — разные причины остановки, а не три доказательства полного ответа. [Cognition §5.7](COGNITION.md#57-cover-the-missing-aspect-not-more-copies-of-the-same-answer).
+
+### 30.6 Фоновая работа не должна занимать всю интерактивную ёмкость
+
+В [embedding provider](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/component/embedding/openai_provider.py) `embed_query` передаёт отдельный semaphore в тот же `_embed_chunk`; batch writes используют write semaphore. [Factory](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/component/embedding/factory.py) действительно передаёт оба параметра, а прочитанный search path вызывает `embed_query`. Это не только release-note рекомендация. Разделение снимает ожидание за локальной write-очередью, но не гарантирует отсутствие задержек у самого endpoint; максимумы двух групп суммируются.
+
+**Eliot:** использовать уже существующие возможности controller для foreground/background или ограничить background dispatch так, чтобы запросу оставалась ёмкость в общем лимите. Batching сохранённых совместимых inputs уменьшает давление. Недоступный vector path не выключает exact/lexical. Не заводить второго provider scheduler и не считать разделённые очереди дополнительной квотой сервиса. [Cognition §5.1](COGNITION.md#51-independent-candidates-not-a-dense-only-lexical-reranker).
+
+### 30.7 Что изменено и предел проверки
+
+Изменены конкретные механизмы Cognition §§5.1,5.3,5.7,7 и source decisions; D10/D11 и карта уточнены. Architecture 0.6, Implementation 0.11, исходные 34 требования, 29 A15 cases и 36 cognitive walkthroughs не перерабатываются этим донором. Предыдущие находки не объявляются заново проверенными. Новых record families, сервисов, approval stages и runtime dependencies нет.
+
+Прочитаны current README/docs; foresight strategy; HTTP→service→SearchManager; agentic и episode recaller; multi-round header и actual loop/finalizer; embedding provider/factory. Не прочитаны все OME jobs, `everalgo` extraction/ranking internals, полный persistent intake/recovery и исторический runtime статьи. Поэтому декларации о rebuildability, отсутствие всех custom consumers и качество предсказаний глобально не квалифицированы. Несовпадение имён/версий и неудачный fetch не заменяют такой проверки.
+
+Это source reading и проектные выводы: доноры, модели, БД, benchmarks, synthetic tests и Rust/Clippy не запускались; независимого субагентного review нет. Предыдущий CI run 39431478163 проверен отдельно и завершился failure; причина не приписывается автоматически старым CI-находкам. Новая публикация и её фактический workflow status отражаются в PR. Следующий приоритет карты — реальный Eliot capture→interpretation trigger и оставшаяся исходная автономность, не очередной обязательный memory runtime.
