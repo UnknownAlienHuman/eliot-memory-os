@@ -1,35 +1,31 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.7 · 2026-10-19 · documentation before the greenfield rewrite.** V1/V2 remain donors. This pass follows connected control and retained MCP/context paths and refines the existing implementation contract. It does not implement the V3 runtime or change V2 code/CI.
+**Revision 0.8 · 2026-10-19.** Documentation before the greenfield rewrite; V1/V2 remain donors. This revision removes dependencies that prevent useful memory from working. It does not change or implement the product runtime.
 
-| Document | Read for |
+| Document | Purpose |
 |---|---|
-| [Architecture](ARCHITECTURE.md) | Purpose, cognition, automatic learning, modularity and boundaries; remains revision 0.6 |
-| [Implementation](IMPLEMENTATION.md) | Runtime and data contracts, now including direct control, attention recurrence and truthful optional enrichment/delivery |
-| [Cognition](COGNITION.md) | Current-state resolution, views, applicability, transfer and two recursive loops; remains revision 0.6 |
-| [Consolidated audit](AUDIT.md) | Source findings, alternatives, 34 requirements, 29 A15 cases and D01–D44 |
-| [Audit map](AUDIT-MAP.md) | Actually read paths/ranges, inherited findings, remaining gaps and next actions |
+| [Architecture](ARCHITECTURE.md) | Product purpose, cognition, automatic learning and module boundaries; remains 0.6 |
+| [Implementation](IMPLEMENTATION.md) | Working capture/read path, independent background work, host/controller integration and practical recovery; now 0.8 |
+| [Cognition](COGNITION.md) | Current-state resolution, project views, procedures, transfer and Harness2 recursion; remains 0.6 |
+| [Consolidated audit](AUDIT.md) | Sources, rejected designs, 34 original requirements, 29 A15 cases and donors D01–D44 |
+| [Audit map](AUDIT-MAP.md) | What was actually examined and the next connected paths |
 
-The map is navigation, not a runtime registry or approval gate. Findings have one home in the audit; changed algorithms and contracts belong to their existing chapters.
+## What changed
 
-## Revision 0.7
+[Audit §23](AUDIT.md#23-working-memory-without-global-gates-08) follows the Store's 10,000-record refusal, optional graph/trace dependency, strict project-head job queue and session orientation cache. It also compares D16 LangMem's delayed-processing guide with its actual executor.
 
-[Audit §22](AUDIT.md#22-connected-control-and-context-audit-07) traces broker dispatch and acknowledgement, NotificationState persistence, retained MCP response enrichment, old cue normalization and source hydration. It records both failures and rejected suspicions: the SQL already uses revision CAS, valid directory cues require Prefix, and not every MCP branch propagates every telemetry failure.
+[Implementation](IMPLEMENTATION.md) now starts from native indexes over primary records. Ordinary reads do not await an entire project rebuild, fresh proof of every source, a graph threshold or diagnostic writes. Graph/vector enrichment remains useful but independent. Broad enumeration uses pages; a page size is not the total capacity of a project.
 
-[Implementation §9.4](IMPLEMENTATION.md#94-direct-local-control-and-attention-recurrence) makes local control operation-specific and separates an underlying problem from a new episode and late acknowledgement. Current-state updates do not replay/rewrite all historical events. [§§3.5–3.6](IMPLEMENTATION.md#35-optional-enrichment-cannot-rewrite-a-completed-operation) preserve a known primary result when optional enrichment fails, distinguish prepared from observed handoff, and avoid permanent repeat suppression from pre-send accounting. [§2.5](IMPLEMENTATION.md#25-exact-cues-and-advisory-aliases) separates exact resource identity from search aliases; [§4.1](IMPLEMENTATION.md#41-independent-candidates-and-truthful-resolution) hydrates selected IDs rather than project-wide payloads after a small match set.
+Independent jobs do not queue behind an unrelated blocked project operation. Debouncing combines pending work signals, not the source observations that must still be processed. Negative-memory advice does not automatically install a per-tool approval gate.
 
-These are changes inside the existing modules. No new delivery service, approval engine, semantic store or planner is ordered. A failed primary write and a real disclosure restriction still cannot be ignored merely by calling them optional logging.
+[Restore](IMPLEMENTATION.md#103-restore-usable-data-not-an-unattainable-proof) makes intact primary data available before rebuilding optional indexes. Known deletions are applied. If the owner restores a selected backup after losing deletion history, explain the gap and permit recovery rather than requiring an unobtainable proof or a new selective-import system. Old external jobs are reconciled separately, not automatically replayed.
 
-## Preserved work and coverage
+No new service, semantic database, permission platform or checklist family is added. The 34 requirements, 29 A15 cases, D01–D44 and S1–S32 remain represented; the recovery scenario explicitly reflects the removed blanket restriction. The earlier cognitive and recursive cases remain in Cognition.
 
-Audit sections 1–21 retain the preceding report with an explicit historical-scope notice; section 22 holds new findings. The 34 requirements, all 29 A15 scenarios and D01–D44 remain. Implementation retains S1–S26 and adds six future cases S27–S32. Cognition's thirty-six existing cases and Harness2 loops are unchanged; none is claimed as an executed product test.
+## Continuing work
 
-Revision 0.6 remains the basis for removal of the inherited SDK veto, automatic provisional transfer, smaller operation readback and non-duplicated supervision. It also published the previously local 0.5 Hy transfer findings and added D44 Harness2. The [immutable 0.6 audit](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/73c34dcb906637f782e667a4ca4c347227806aa5/docs/v3/AUDIT.md) preserves that publication context. No fresh donor benchmark or whole-archive audit occurred in 0.7.
+[Implementation §13](IMPLEMENTATION.md#13-remaining-concrete-integration-choices) lists the actual interface/version choices left for implementation. The [map](AUDIT-MAP.md) prioritizes a connected success/failure → procedure → later useful context path, then remaining source/transport and ORS/process responsibilities. It is a reading aid, not a gate.
 
-[Implementation §13](IMPLEMENTATION.md#13-remaining-concrete-integration-choices) retains exact interface/version choices still unqualified. The next source readings in the map target source-loader truncation, producer path bases, delivery-cache/transport boundaries and ORS/process ownership rather than repeating prior declarations.
+V2 source: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. Earlier complete documentation remains in [Git history](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/81a9848bccd95bc9778c4f9e92c210d6349eb298/docs/v3); archived research remains in the [incomplete audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete).
 
-## Source and publication boundaries
-
-V2 donor: `5aac094834fb5635921b550c821cb933a1196105`; V1 donor: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`; archived research: [incomplete audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete). Those sources remain in Git/history, not copied into another archive tree. Runtime, schema, dependencies, CI, validators, ACTIVE registry, main and user data are unchanged by this pass.
-
-Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Record actual commit/ref readback and current CI there. Source-level failures, four isolated ASCII helper examples and arithmetic history-work counts are not Windows, Rust, SurrealDB or full-product runs. No independent GPT Luna review is claimed; a branch commit is not a merge. After documentation, the owner's sequence remains product code, minimum relevant checks/Clippy, tests after the product is built.
+Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Source reading is not a runtime test; publication is not a merge. This pass does not change CI, runtime, schemas, the old ACTIVE registry or user data, and does not claim independent subagent review. Product implementation follows documentation and the owner's code/minimum-Clippy/tests-later sequence.

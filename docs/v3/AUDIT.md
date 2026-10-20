@@ -1,6 +1,8 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.7 · 19 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.8 · 19 октября 2026 · документация до переписывания продукта.**
+
+**Текущий результат:** [§23](#23-working-memory-without-global-gates-08) разбирает ограничения, которые выключают полезную память: полный project-wide scan с отказом после 10 000 записей, общий порядок независимых фоновых заданий, зависимость поиска от графа/трассы и мой прежний запрет восстановления при потере журнала удалений. [Implementation](IMPLEMENTATION.md) изменён непосредственно: основной путь работает без этих зависимостей. Добавлено предметное чтение D16 LangMem. Ниже сохранены прежние выводы с их историческими границами; положения о безусловной изоляции восстановленной копии в старых разделах заменены решением §23.6 и Implementation §10.3.
 
 **Обновление 0.7:** [§22](#22-connected-control-and-context-audit-07) продолжает карту A02/A05/A06: broker control → уведомление → БД и retained MCP → cue → контекст. Введение и разделы 1–21 ниже сохранены как отчёт редакции 0.6; их слова «текущий проход» и прежние ограничения относятся к той редакции. Новые чтения, выводы и их пределы указаны отдельно в §22 и актуальной карте.
 
@@ -249,7 +251,7 @@ Maintenance не требует fake coding Goal. Легитимная огра�
 
 Небольшой spool подтверждает сохранённый input, а не смысловую память. Backup имеет конечный cutoff, quiesced DB export, blobs и запечатанный input batch. Новые события относятся к новому batch. Пауза записи на время экспорта честнее несуществующего короткого snapshot primitive. Не ждать worker под нужным ему mutex.
 
-Текущие ограничения replay/delete хранятся вне откатываемой копии; physical purge и withdrawal различаются. Восстановленный pending job мог выполниться после cutoff: сначала external readback. Если вместе с устройством утрачен current deletion history, checksum не устанавливает актуальность; recovery остаётся изолированным или применяется явный новый selective import. Это предел гарантии, не повод создавать external attestation service.
+Текущие ограничения replay/delete хранятся вне откатываемой копии; physical purge и withdrawal различаются. Восстановленный pending job мог выполниться после cutoff: сначала external readback. **Поправка 0.8:** если current deletion history утрачен, владелец всё равно может явно восстановить выбранную копию с обозначенным пробелом; отсутствие этого журнала не блокирует весь доступ к данным и не требует новой selective-import системы. Известные удаления применяются, неизвестные прошлые удаления не объявляются гарантированно сохранёнными. Старые внешние действия не запускаются автоматически. Подробно — §23.6.
 
 Независимость Watchdog требует внешнего наблюдения за failure domain, но не автоматически нового обязательного демона в каждой среде. Если существующий host/controller реально обеспечивает custody/health Eliot, повторный supervisor не строится. Иначе используется маленький demand-start режим того же бинаря. Standalone supervisor+daemon+DB — три процесса; это не enterprise Host/Kernel/generation stack.
 
@@ -284,7 +286,7 @@ Job Object и CLI label не изолируют от произвольного 
 | 13 | Cloudflare Agents SDK Sessions | Immutable turns и branch-local compaction overlays |
 | 14 | SurrealFS | Source/indexer/content/profile revision, не вся SurrealDB |
 | 15 | MentisDB | Версии skills/procedures и source-linked reveal; проверить lifecycle |
-| 16 | LangMem | Extraction/diff и кандидаты prompts; не queue/runtime целиком |
+| 16 | LangMem | В 0.8 прочитан ReflectionExecutor: отдельные submit/search и debounce; объединять отложенные сигналы, не терять старые сообщения заменой payload. См. §23.5 |
 | 17 | Letta Code current | Candidate/cancel и защита от позднего результата |
 | 18 | Letta V1 archive | История по требованию, цена truncation; не current Code |
 | 19 | Nocturne Memory | Stable node, revision, path alias; review до разрушения |
@@ -349,7 +351,7 @@ MemGPT/HiAgent полезны для подцелей и раскрытия; Lon
 | 19 | Уведомление пропущено | Attention остаётся до решения, ack не resolution |
 | 20 | Setup нашёл executable | Metadata отдельно от права запуска; не исполнять даже probe автоматически |
 | 21 | Privacy deletion | Withdrawal, controlled purge и внешние копии различаются |
-| 22 | Старый backup | Current restrictions до serving, uncertainty не маскируется |
+| 22 | Старый backup | Известные current restrictions применяются; владелец может восстановить выбранную копию при явно обозначенном пробеле удалений |
 | 23 | Прерванная migration | Restart-based upgrade с понятным результатом, не весь V2 live migration |
 | 24 | Код против Architecture | Grounded discrepancy; явная правка нужного источника |
 | 25 | Экспериментальный модуль | Ограниченный data/isolated comparison; не arbitrary hot replacement |
@@ -358,7 +360,7 @@ MemGPT/HiAgent полезны для подцелей и раскрытия; Lon
 | 28 | Недостаточное окно | Progressive reveal/decomposition; исключения не выбрасываются молча |
 | 29 | Meta candidate пережил смену стека | Проверить применимость; старый score не становится новым доказательством |
 
-Implementation сохраняет S1–S26, Cognition — 30 прежних ситуаций и дополнительные случаи рекурсии. Это не отдельные test engines.
+Implementation сохраняет S1–S32; сценарий восстановления уточнён в 0.8 без удаления исходного требования. Cognition сохраняет свои прежние когнитивные и рекурсивные примеры. Это не отдельные test engines.
 
 ## 13. Процесс разработки и публикация
 
@@ -640,9 +642,9 @@ Stable event ID предотвращает дубли; expected revision и curr
 
 [InjectionPlanner::attach](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L190-L310) создаёт `outcome: delivered`, сохраняет InjectionReceipt и отмечает touched-state **до** добавления `ul_fired` в response. Если запись receipt не удалась, item пропускается; useful payload зависит от наблюдательной записи. Boot-путь аналогично сохраняет receipt перед вставкой `ul_boot`.
 
-[hydrate_delivery_state и commit_receipt](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L310-L590) восстанавливают suppression из сохранённых receipts. Следовательно, падение после commit receipt и до отправки ответа может оставить «доставлено» для фактически не переданного item, а восстановление той же сессии продолжит его подавлять. Это source-backed crash interval, не запущенная fault injection в V2. Даже успешная передача в stdout сама по себе не доказывает чтения моделью.
+[hydrate_delivery_state и commit_receipt](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L310-L590) восстанавливают suppression из сохранённых receipts. Следовательно, падение после commit receipt и до отправки ответа может оставить «доставленное» в памяти, хотя хост не получил контекст. Это вывод по порядку операций, не выполненная транспортная fault-injection проверка.
 
-Нужна не новая криптоквитанция, а точное значение факта: prepared packet, наблюдённый transport handoff, неизвестный исход, фактический host feedback при его наличии. Optional accounting не должно блокировать допустимый контекст. Presentation dedup ограничивается incarnation/revision и не превращается в необратимую semantic memory. При потерянной доставке допустима ограниченная повторная ориентация, а не вечное молчание или рассылка всего на каждом tool. [Implementation §3.6](IMPLEMENTATION.md#36-delivery-observations-and-repeat-suppression).
+Нужна не новая криптоквитанция, а точное значение факта: prepared packet, наблюдённый transport handoff, неизвестный исход, фактический host feedback при его наличии. Optional accounting не должно блокировать допустимый контекст. Presentation dedup ограничивается incarnation/revision и не превращается в необратимую semantic memory. При потерянной доставке допустима ограниченная повторная ориентация, а не вечное молчание или рассылка всего на каждом tool. [Implementation §3.6](IMPLEMENTATION.md#36-delivery-and-repeat-suppression).
 
 ### 22.6 Новый нормализатор не заменил старый алгоритм в реальном retained пути
 
@@ -686,3 +688,65 @@ V3 после candidate selection загружает нужные IDs, необ�
 Добавлены будущие S27–S32: доступный local control; повтор проблемы и запоздалый ack; failure после успешного primary handler; crash перед handoff; case/root identity; выборочная загрузка источников. Это walkthroughs для последующей реализации, не исполнявшиеся продуктовые тесты. Architecture/Cognition и все прежние требования/сценарии/доноры остаются.
 
 **Предел проверки:** четыре ASCII-пары и формула числа history entries проверены локально; V2/Rust/Windows/SurrealDB приложение и transport fault injection не запускались. Нового чтения всех donors или независимого GPT Luna review не было. Проверка текущего legacy MCP path не квалифицирует все новые V2 interfaces. Карта обновляется прочитанными диапазонами и точными остатками: после этого прохода важнее store wrapper/revision rebuild/activation и ORS ownership, чем очередное повторение определения normalizer.
+
+## 23. Working memory without global gates 0.8
+
+**Основание:** продолжено чтение опубликованной V3 `81a9848b`, выбранных V2 Store/activation/touched путей и D16 LangMem. Здесь не проектируется новый набор страховочных сервисов. Исправление — разорвать ненужные зависимости и использовать уже имеющиеся данные. Исторический код V2 не меняется; меняется то, что будет построено в V3.
+
+### 23.1 Рост полезной памяти превращён в отказ доступа к ней
+
+В 0.7 оставалась непроверенной обработка флага `truncated`. Теперь прочитан [CanonicalStore, 2385–2500](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/canonical_store.rs#L2385-L2500). `load_cue_rows`, `load_cue_records` и `load_injection_receipts` при `truncated=true` возвращают `StoreError::PolicyViolation`: предел 10 000 относится соответственно к проектному индексу, источникам проекта и квитанциям сессии. Они не возвращают полезную страницу с продолжением.
+
+В уже прослеженном `plan_after_tool` полный loader вызывается после отбора малого числа совпадений. Поэтому появление лишней несвязанной записи может превратить запрос подходящего контекста в отказ этого пути. Это не сообщение об измеренном сбое установленной системы и не утверждение, что все другие способы чтения Eliot не работают. Но локальный контроль потока и конкретный общий предел теперь установлены.
+
+**Убираем причину:** primary indexed query выбирает нужные IDs; текст загружается для них. Большой список обрабатывается страницами. Размер одной порции не становится пожизненной вместимостью проекта. Удаление квитанций ради возобновления выдачи или увеличение 10 000 до миллиона было бы лечением симптома. В V3 context не зависит от полной истории квитанций вообще. [Implementation §§1.2,4.1](IMPLEMENTATION.md#41-independent-candidates-and-truthful-resolution).
+
+### 23.2 Необязательное расширение графом стоит перед готовым ответом
+
+Прочитан [ActivationEngine, 1–300](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/activation.rs#L1-L300): `activate` сначала читает readiness inventory; при достаточном числе рёбер загружает graph, вычисляет результат, сериализует и сохраняет observability envelope, и только после этого возвращает trace. Ошибка чтения/сохранения проходит через `?`; rejected observability даёт `ObservabilityConflict`. В [InjectionPlanner](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L40-L170) обычный конструктор передаёт порог 500, а расширение ожидается после уже собранных direct matches.
+
+Порог включает только ассоциативную ветвь: было бы неверно говорить, что до 500 рёбер вообще невозможен любой поиск. Проблема в том, что полезность конкретного ребра определяется общим размером проекта, а необязательная ассоциация и её трасса способны сорвать путь уже найденных записей. Изменение порога и новая надёжная очередь trace-записей сохранят неправильную зависимость.
+
+**V3:** точные/лексические совпадения возвращаются сами. Если нужны связи — прочитать соседей релевантных seeds и добавить полезное. Нет seeds, подходящих соседей или working graph — остаётся direct result. Не нужно загружать весь graph, набирать 500 рёбер или предварительно сохранять ActivationTrace. Расход на объяснение решения не должен быть условием получения решения. [Implementation §4.3](IMPLEMENTATION.md#43-pack-a-decision-not-unrelated-snippets).
+
+### 23.3 Общий порядок создаёт остановку независимых работ
+
+[claim_cognitive_projection_project.surql](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/claim_cognitive_projection_project.surql) исключает candidate, если в том же проекте существует более ранняя запись со статусом не `applied`. Predicate не ограничен совпадением family/target. Отдельно исключается проект с действующей lease. Поэтому более ранний blocked row или ещё не наступивший retry является барьером для последующих строк этого проекта. Другой проект может продолжать работу — глобальную остановку всех проектов исходник не доказывает.
+
+[Store wrapper, 1860–2090](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/canonical_store.rs#L1860-L2090) прямо описывает strict per-project head и отмечает, что `batch_limit` оставлен для совместимости при ещё не реализованном batching. Новый слой состояний для остановившейся очереди не нужен.
+
+**V3:** первичные записи и их native searchable fields не ожидают этих projection jobs. Независимые задания выбираются по сроку/состоянию и конкретной цели; порядок сохраняется только при действительной зависимости результатов. Ошибка построения карты не запрещает обработать другой эпизод. Это уточнение существующей очереди, не запрос отдельного workflow engine. [Implementation §5.2](IMPLEMENTATION.md#52-independent-work-stays-independent).
+
+### 23.4 Кэш не должен решать, существует ли память
+
+Ранее прочитанный [CueIndexService](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/cue_index.rs#L230-L315) отдаёт пустой `fired` при отсутствии shard или отставании его revision, честно отмечая unavailable/stale. Явная отметка лучше ложного «ничего нет», но сама по себе не возвращает пользователю сохранённое знание. Для V3 не требуется переносить этот барьер и затем строить fallback framework: первым путём будут запросы primary БД, дополнительный кэш — только измеренная оптимизация.
+
+Свежепрочитанный [TouchedSetRegistry, 1–260](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/touched.rs#L1-L260) хранит `boot_sent` как Boolean. [attach_boot/hydrate_delivery_state](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L310-L460) отмечают boot отправленным даже для `not_onboarded`; при следующем attach ранний выход стоит перед повторной загрузкой charter/map. Этот путь сам не показывает переход «теперь карта готова» в той же сессии. Другие возможные reset callers здесь не проверялись.
+
+**V3:** cache отражает, какой материал показывался, а не вечное разрешение больше не ориентировать агента. Новая доступная карта или изменившееся содержимое допускают обновлённую выдачу. Уже известную полезную структуру можно показать как устаревшую/частичную, а актуализировать отдельно. Недостаток свежей проверки не лишает доступа ко всем историческим сведениям. [Implementation §§2.3,3.6,8](IMPLEMENTATION.md#23-read-remembered-knowledge-without-re-proving-the-world).
+
+### 23.5 D16 LangMem: брать отделение фона, не терять вход при debounce
+
+В этом проходе прочитаны [Background Quickstart](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/docs/docs/background_quickstart.md), [Delayed Processing](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/docs/docs/guides/delayed_processing.md) и [reflection.py](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/reflection.py) — рассмотренная версия `48e3c11f`. LangMem остаётся D16, новый донорский номер не создаётся.
+
+Полезный механизм конкретен: `LocalReflectionExecutor.submit` возвращает Future, worker исполняет reflection отдельно, `search/asearch` обращаются к store без ожидания завершения reflection. Это тот тип развязки, который нужен Eliot; LangGraph runtime и вторая очередь вместе с ним не нужны.
+
+Есть важное различие между описанием и кодом примеров. В basic guide используется `await memory_manager.ainvoke(...)` перед `return response.content`, то есть именно этот пример ждёт extraction. Название «background» само не делает путь асинхронным. Delayed guide использует `submit` и отмену старого pending по thread, но передаёт только текущую пару user/assistant. В local `submit` новый `PendingTask` получает переданный payload без объединения со старым; отменённый старый payload может не дойти до reflector. Гарантия полного контекста требует, чтобы caller передал накопленный контекст или взял его из сохранённой истории. Это анализ данного executor/example, не заявление о потере всех LangMem memories в любом приложении.
+
+**V3:** capture сохраняет все исходные события независимо от debounce. Pending сигнал можно заменить, но processing читает необработанную часть соответствующего эпизода; не только последнее сообщение. Progress относится к действительно обработанному вводу. Работа идёт порциями и не откладывается бесконечно из-за непрерывного разговора. Применяется уже существующий job, без отдельного ReflectionStore, permission gate или receipt перед каждым сообщением. [Implementation §5.2](IMPLEMENTATION.md#52-independent-work-stays-independent).
+
+### 23.6 Мой запрет восстановления удалён, а не обложен исключениями
+
+В [Implementation 0.7 §10.3](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/81a9848bccd95bc9778c4f9e92c210d6349eb298/docs/v3/IMPLEMENTATION.md#103-restore-is-not-permission-to-replay-past-effects) восстановленная копия оставалась изолированной до получения current restriction history либо отдельного selective import. Там же доступ к основной памяти был поставлен после согласования производных индексов/jobs. Для личной локальной памяти это превращало утрату вспомогательных metadata в запрет восстановить целые пользовательские данные — моё избыточное решение.
+
+**Замена:** выбранная владельцем копия восстанавливается в новый каталог, известные удаления применяются, целые primary records становятся доступны. Отсутствие части deletion history явно обозначается; неизвестные прошлые удаления нельзя обещать восстановленными, но это не причина блокировать всё и строить ещё один импортный продукт. Embeddings/maps восстанавливаются в фоне. Старые внешние jobs сами не перезапускаются: доступ к памяти и повтор paid/tool effects — разные действия. [Новый Implementation §10.3](IMPLEMENTATION.md#103-restore-usable-data-not-an-unattainable-proof).
+
+Одновременно удалена подразумеваемая необходимость всякий раз доказывать актуальность всего source graph. Обычный recall может сообщить известное с оговоркой; конкретное текущее утверждение перепроверяется при необходимости. Негативная память по умолчанию подсказывает, а не запрещает tool calls. Включаемое владельцем конкретное host enforcement остаётся отдельной возможностью, не скрытым обязательным звеном памяти.
+
+### 23.7 Что получится вместо новых обходных систем
+
+Начальный read path: **прямой/лексический запрос primary записей → нужные данные → полезный контекст**. Векторы и связи могут дополнить результат. Запись: **сохранить наблюдение → независимо обработать накопленный эпизод → использовать полученный метод при следующем решении**. Никакой обязательной цепочки «восстановить все projections → дождаться graph readiness → записать trace → получить право показать».
+
+В Implementation сокращены повторяющиеся запретительные и квалификационные абзацы, но не удалены требования к истории, пониманию проекта, обучению, восстановлению и управлению. S1–S32 сохранены как ситуации, без очередного семейства checklist; сценарий restore прямо изменён. Исторический аудит продолжен, D16 уточнён, карта фиксирует оставшиеся source paths.
+
+**Проверка этого прохода:** source-level чтение названных Rust/SQL/Python путей и review документации; V2/V3, LangMem, Windows и SurrealDB не запускались, численный выигрыш не измерялся. Текст и опубликованный diff проверяются отдельно. Самостоятельная проверка не называется независимым субагентным review. Продуктовый код и CI этим изменением не переписываются.
