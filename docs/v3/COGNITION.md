@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — cognitive mechanisms
 
-**Revision 0.6 · 2026-10-19 · implementation proposal, not working runtime.**
+**Revision 0.9 · 2026-10-20 · implementation proposal, not working runtime.**
 
-This chapter implements [Architecture](ARCHITECTURE.md) inside the modules of [Implementation](IMPLEMENTATION.md). It incorporates the previously unpublished 0.5 transfer mechanisms and adds Harness2's two recursive loops. The [audit](AUDIT.md) owns donor findings and limitations; the [map](AUDIT-MAP.md) records coverage. No new semantic database, inference service or approval platform is introduced.
+This chapter implements [Architecture](ARCHITECTURE.md) inside the modules of [Implementation](IMPLEMENTATION.md). This revision makes the episode-to-advice path concrete, separates semantic conditions from search matches, and keeps later learned revisions reachable. Harness2's recursive loops and the earlier transfer mechanisms remain. The [audit](AUDIT.md) owns donor findings and limitations; the [map](AUDIT-MAP.md) records coverage. No new semantic database, inference service or approval platform is introduced.
 
 ## 1. One useful path and its owners
 
@@ -27,7 +27,7 @@ Group a claim by the necessary scope, subject/resource, aspect and perspective. 
 
 The comparison key locates candidates, not proof of equivalence. Exact source adapters can provide it; models can propose uncertain semantic aliases. Ambiguous meaning stays linked to the raw observation rather than rejecting capture or forcing a merge. No universal predicate catalogue is required.
 
-Continuing a task can update its progress summary; it does not supersede every fact or exception from the preceding session. A replacement identifies the claim/aspect and temporal scope it changes. Silence about an old condition is not evidence that it ended. Independent identical occurrences remain independent; repeated exports of one occurrence do not.
+Continuing a task can update its progress summary; it does not supersede every fact or exception from the preceding session. A replacement identifies the claim/aspect and temporal scope it changes. Silence about an old condition is not evidence that it ended. Independent identical occurrences remain independent; repeated exports of one occurrence do not. A job can produce several distinct lessons. Its ID groups processing, not semantic identity. Update a named lesson by its own ID/revision; do not collapse different conditions merely because two lessons share a job or a similarly worded core. Count distinct source episodes, not repeated references in one batch.
 
 Keep original source spelling separate from comparison forms. Same symbol name in another worktree is not the same resource. Do not label dirty workspace state as committed HEAD. Regexes fit documented machine fields and diagnostics, not a growing catalogue of personal topics: a quoted first-person sentence is not necessarily the speaker's state.
 
@@ -104,6 +104,14 @@ Source-derived exact values need a searchable path; preservation in hidden detai
 
 The [SurrealDB reference](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) describes filtered vector plans and index-assisted prefiltering; [EXPLAIN](https://surrealdb.com/docs/reference/query-language/clauses/explain) exposes actual plans. Inspect the selected server/schema/query before adding a workaround. Supported predicates do not prove complete semantic recall or application source validity.
 
+### 5.2 Select useful candidates before packing
+
+Read searchable current records and the relevant history, not a fixed oldest prefix of physical records. A later lesson or correction must remain discoverable after the corpus grows; direct ID lookup must not depend on a whole-project scan. Page broad enumeration with the existing Store.
+
+Keep candidate examination separate from the final packet budget. When high-ranked candidates are unsuitable, consider the next candidates within the request's normal work budget, then pack the useful results. Three displayed items does not mean inspect only three before applicability. A stopped scan describes its examined scope; it does not prove that the entire memory contains nothing useful.
+
+Use available task facts and concrete cues without requiring a complete TaskMeaningFrame. Filled form fields do not prove understanding or the absence of useful experience. Explicit memory requests, relevant resources and recent corrections remain direct retrieval inputs. Optional semantic ranking can improve selection, but ordinary recall does not wait for a model to certify it.
+
 ## 6. Applicability before automatic learning
 
 ### 6.1 Three-valued matching
@@ -116,7 +124,7 @@ A procedure retains only material preconditions: task/action family, relevant AP
 | Inapplicable | Do not recommend that concrete action here; retain its historical evidence |
 | Unknown | Offer a conditional analogy or useful missing check; do not present it as established or enforce a block |
 
-Similarity finds a candidate; it does not supply missing preconditions. A general method such as checking a consumer before changing an API can survive the loss of a version-specific repair.
+Similarity finds a candidate; it does not supply missing preconditions. Token overlap is not a truth test: “transaction not committed” does not satisfy “transaction committed”, and mentioning “run cargo check” is not its result. Keep versions and negation intact. Use observed typed values when available; an unobserved natural-language condition stays conditional rather than being classified as false from absent words. Neither unknowns nor requested checks are positive evidence. This calls for useful qualified advice, not a general predicate prover or a model call before every tool. A general method such as checking a consumer before changing an API can survive the loss of a version-specific repair.
 
 Provisional transfer to another permitted situation can be automatic. Applicability, allowed disclosure and demonstrated benefit are separate questions. Independent comparative evidence is needed for a broad effectiveness claim, not for every useful conditional suggestion. A more abstract formulation does not declassify its private source material. See Implementation §7.2.
 
@@ -189,6 +197,22 @@ Keep the improvement recipe and criteria stable during a comparison. Update its 
 The donor's published task experiment counts 4k rollouts and 3k improvement stages, with selection/reflection and retries separately accounted. Those are experiment conventions, not a production duty to spend that amount. Count all actual Eliot/controller work and preserve no-change reuse. Do not rerun the full harness whenever a cheap memory comparison is sufficient.
 
 The inspected donor final-selection pool excludes reference executions, although a composition itself can preserve its input tree. Eliot keeps the actual baseline/no-change eligible at adoption. Anonymized model preference, a successful syntax check or a completed reflection is not independent proof of improvement. Uncertain contrast remains labelled evidence, useful for provisional adaptation without a promotion ceremony.
+
+### 6.8 One episode to a useful next attempt
+
+The minimum learning path is an actual episode or correction, a useful retained lesson, and its availability in the next relevant context. It does not require a Raw→Case→Schema→TransferValidated→Procedure promotion chain. A useful observation, conditional method and demonstrated improvement are different claims, not compulsory production stages.
+
+**Input.** Capture the relevant actions, results and user corrections through the existing host adapter. Group the material already saved for the episode; coalescing a work signal never drops earlier observations. A meaningful failure, successful repair, cheaper successful path or explicit request can trigger interpretation. Do not require a formal task ID, verifier or known causal explanation before remembering useful material. Preserve unknowns instead of inventing them to complete a form.
+
+**Interpretation.** When meaning is not explicit, one ordinary Dreamer job receives the relevant episode slice, optional feedback and a small set of related existing lessons. It proposes a concise observation/method, an amendment of a named lesson, or no change. The output explains the situation, useful next action and material limitations with source handles; these are useful contents, not a compulsory questionnaire. An explicit user correction or already structured rule may be saved directly without another model call. One episode can justify a provisional suggestion; it cannot by itself establish a general causal law.
+
+**Storage and use.** Save the result as ordinary searchable memory and make it eligible for advisory context immediately under its stated scope. No separate skill registration or evaluator approval is required. At the next matching resource/task/decision boundary, retrieve it through the normal context path, with the relevant exception and optional episode expansion. Missing a specific condition can produce a conditional suggestion rather than silence. The advice does not run its suggested command itself.
+
+**Revision.** A later observed outcome, contradiction or correction updates the relevant lesson and retains its history. Replayed input does not add independent support. A no-change response keeps the current text; an empty proposed replacement is not permission to erase it. Change the named method or context instruction, not the user's goal or the entire agent prompt. No useful new lesson is a legitimate result and does not create an obligatory reflection paragraph.
+
+**Worked design example, not a runtime result.** An API change breaks a consumer. The saved episode contains the signature change, failed check, consumer repair and later successful check. Dreamer can retain “inspect consumers before changing this API; check the affected consumer after the edit,” linked to those observations. A subsequent relevant edit receives that note before planning. Its later result supplies a new observation; a skipped check supplies none. If the cause was never established, the original failed/successful sequence remains useful as an example without a fabricated explanation. A directly stated user correction can follow the same read path sooner, without waiting for this analysis.
+
+The existing `capture`/`record_outcome` functions supply inputs, `jobs` invokes Dreamer when needed, `memory` stores the lesson, and `context` delivers it. The first implementation must connect these owners, not merely expose form/abstract/promote tools that require an external agent to supply every semantic step. Missing an automatic producer or the ordinary context consumer is an unfinished loop even when all record types exist.
 
 ## 7. Attention, prediction and cognitive failure
 
@@ -278,3 +302,5 @@ These are documentation walkthroughs, not an executed V3 test suite.
 - [Hy cross-domain sweeper](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/cross_domain_sweeper.py) and [optional schema compaction](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/system2_tools.py#L84-L209): candidate discovery is not justified merge or lossless compression. Audit §18 separates pinned source facts, synthetic control-flow probes and V3 proposals. Do not carry over an unbounded second enumeration or count association edges as independent support.
 
 - [Harness2 recursion](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/recursion.py), [selection/reflection](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/selection.py), [library](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/library.py), [ledger](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/ledger.py), and [experiment guide](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/docs/EXPERIMENTS.md): take the two improvement loops and execution contrasts, not finals-only adoption or a fixed experimental workload. [Paper 2610.14224v1](https://arxiv.org/html/2610.14224v1) distinguishes adopted configuration from verified optimality. No donor experiment was run in this pass.
+
+- [LangMem D16 prompt-memory implementation](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/prompts/stateless.py) and [response contract](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/prompts/prompt.py): take trajectory/feedback-based scoped proposals; honor no-change instead of blindly replacing a method with `new_prompt`. Audit §24 distinguishes these source findings from model/runtime experiments.

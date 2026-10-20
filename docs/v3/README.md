@@ -1,31 +1,29 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.8 · 2026-10-19.** Documentation before the greenfield rewrite; V1/V2 remain donors. This revision removes dependencies that prevent useful memory from working. It does not change or implement the product runtime.
+**Revision 0.9 · 2026-10-20.** Documentation before the greenfield rewrite; V1/V2 remain donors. This pass makes the useful learning path concrete rather than adding another qualification stage.
 
 | Document | Purpose |
 |---|---|
 | [Architecture](ARCHITECTURE.md) | Product purpose, cognition, automatic learning and module boundaries; remains 0.6 |
-| [Implementation](IMPLEMENTATION.md) | Working capture/read path, independent background work, host/controller integration and practical recovery; now 0.8 |
-| [Cognition](COGNITION.md) | Current-state resolution, project views, procedures, transfer and Harness2 recursion; remains 0.6 |
-| [Consolidated audit](AUDIT.md) | Sources, rejected designs, 34 original requirements, 29 A15 cases and donors D01–D44 |
-| [Audit map](AUDIT-MAP.md) | What was actually examined and the next connected paths |
+| [Implementation](IMPLEMENTATION.md) | Primary capture/read, background work, host/controller integration and practical recovery; remains 0.8 |
+| [Cognition](COGNITION.md) | Current-state resolution, views, procedures and recursive improvement; 0.9 adds the connected episode-to-advice path |
+| [Consolidated audit](AUDIT.md) | Sources and findings, 34 original requirements, 29 A15 cases and donors D01–D44 |
+| [Audit map](AUDIT-MAP.md) | Actual coverage, missing producers/consumers and next reading |
 
-## What changed
+## Current result
 
-[Audit §23](AUDIT.md#23-working-memory-without-global-gates-08) follows the Store's 10,000-record refusal, optional graph/trace dependency, strict project-head job queue and session orientation cache. It also compares D16 LangMem's delayed-processing guide with its actual executor.
+[Audit §24](AUDIT.md#24-from-an-episode-to-useful-learned-behavior--09) follows the retained V2 experience formation, abstraction, retrieval and applicability path, including its real SQL loader. It separates a supplied structured episode from actual semantic extraction; identifies word-overlap conditions, unreachable analogy branches, the oldest-512 window, filtering after the top-three cutoff and overbroad logical deduplication. D16 LangMem contributes a simpler trajectory-to-method proposal, with its no-change response handled explicitly.
 
-[Implementation](IMPLEMENTATION.md) now starts from native indexes over primary records. Ordinary reads do not await an entire project rebuild, fresh proof of every source, a graph threshold or diagnostic writes. Graph/vector enrichment remains useful but independent. Broad enumeration uses pages; a page size is not the total capacity of a project.
+[Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt) connects a captured episode or explicit correction to a searchable provisional lesson and the next relevant context. One useful case need not pass a Case/Schema/Pattern/Transfer/Procedure ladder. Missing cause or verification stays unknown, not a reason to discard the example or invent missing fields. A no-change result retains the current method. Advice does not automatically execute a command.
 
-Independent jobs do not queue behind an unrelated blocked project operation. Debouncing combines pending work signals, not the source observations that must still be processed. Negative-memory advice does not automatically install a per-tool approval gate.
+[§5.2](COGNITION.md#52-select-useful-candidates-before-packing) separates candidate examination from final context size and keeps later corrections reachable. [§6.1](COGNITION.md#61-three-valued-matching) distinguishes observed conditions from mentions, negation and unknowns without a universal predicate prover. No new daemon, store, approval protocol or checklist family is added.
 
-[Restore](IMPLEMENTATION.md#103-restore-usable-data-not-an-unattainable-proof) makes intact primary data available before rebuilding optional indexes. Known deletions are applied. If the owner restores a selected backup after losing deletion history, explain the gap and permit recovery rather than requiring an unobtainable proof or a new selective-import system. Old external jobs are reconciled separately, not automatically replayed.
-
-No new service, semantic database, permission platform or checklist family is added. The 34 requirements, 29 A15 cases, D01–D44 and S1–S32 remain represented; the recovery scenario explicitly reflects the removed blanket restriction. The earlier cognitive and recursive cases remain in Cognition.
+The 0.8 removal of global readiness dependencies remains: native primary reads work without a whole-project rebuild, graph threshold or diagnostic write; owner-selected recovery is not blocked by lost auxiliary history. Architecture, Implementation and their existing scenarios are unchanged. All previous audit sections and the thirty-six cognitive cases remain; the new worked learning example is a design illustration, not an executed V3 run.
 
 ## Continuing work
 
-[Implementation §13](IMPLEMENTATION.md#13-remaining-concrete-integration-choices) lists the actual interface/version choices left for implementation. The [map](AUDIT-MAP.md) prioritizes a connected success/failure → procedure → later useful context path, then remaining source/transport and ORS/process responsibilities. It is a reading aid, not a gate.
+The next missing edge is the automatic episode producer from real host outcomes and the ordinary packet consumer of learned methods, beyond the manually supplied MCP form. The [map](AUDIT-MAP.md) also retains the remaining Harness2 executor/context and ORS/process reading; a search result does not mark those complete.
 
-V2 source: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. Earlier complete documentation remains in [Git history](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/81a9848bccd95bc9778c4f9e92c210d6349eb298/docs/v3); archived research remains in the [incomplete audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete).
+V2 source: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. Earlier complete documentation remains in [Git history](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/feb5d814fcdfaeb5998b7b18da83d4995db1e433/docs/v3); archived research remains in the [incomplete audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete).
 
-Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Source reading is not a runtime test; publication is not a merge. This pass does not change CI, runtime, schemas, the old ACTIVE registry or user data, and does not claim independent subagent review. Product implementation follows documentation and the owner's code/minimum-Clippy/tests-later sequence.
+Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Actual publication and checks are reported there. Local ASCII/control-flow examples are not Rust, model or donor-runtime tests. No independent subagent review is claimed. Runtime, schemas, CI, the old ACTIVE registry and user data are unchanged; product implementation follows the documentation stage and the owner's code/minimum-Clippy/tests-later sequence.
