@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — cognitive mechanisms
 
-**Revision 0.10 · 2026-10-20 · implementation proposal, not working runtime.**
+**Revision 0.12 · 2026-10-20 · implementation proposal, not working runtime.**
 
-This chapter implements [Architecture](ARCHITECTURE.md) inside the modules of [Implementation](IMPLEMENTATION.md). Revision 0.10 follows the actual packet and skill consumers: lessons are read independently of project maps, their useful content reaches the agent, and recorded outcomes come from real observations or identified reports rather than demonstrations. The [audit](AUDIT.md) owns donor findings; the [map](AUDIT-MAP.md) tracks remaining reading. No new service or approval stage is introduced.
+This chapter implements [Architecture](ARCHITECTURE.md) inside the modules of [Implementation](IMPLEMENTATION.md). Revision 0.12 adds concrete donor mechanisms: scoped incremental consolidation, source-episode expansion and question-shaped project views. [Audit §26](AUDIT.md#26-donor-mechanisms-for-useful-memory-012) separates the inspected donor behavior from these Eliot choices; the [map](AUDIT-MAP.md) records coverage. Existing storage, retrieval and jobs own the changes; no new service or approval stage is introduced.
 
 ## 1. One useful path and its owners
 
@@ -44,6 +44,8 @@ Keep original source spelling separate from comparison forms. Same symbol name i
 
 Retrieval finds groups; indexed lookup then fetches relevant active alternatives and replacements outside the semantic top-k. Limits return partial resolution and continuation handles. Goals and exact constraints retain a direct path. A cache binds to examined source revisions and membership; it is not another current-truth writer.
 
+For changing state, preserve both when the source says the state applied and when Eliot learned of it. Contradiction candidates may concern the same subject/aspect with a different value or target: a database migration cannot be found by searching only the new subject–target pair. Equal text is not necessarily the same occurrence; a real A→B→A sequence needs the new A interval, not reuse of a retired A merely because its wording matches. Known dates can order the affected history with ordinary comparisons; unknown dates do not prevent storing or recalling qualified knowledge.
+
 ### 3.1 Publish a replacement as one memory change
 
 Prepare content and optional summaries outside the transaction. In the existing memory write transaction, recheck relevant predecessors, group/time, current inputs and job; publish the new revision, required links, scoped retirement, necessary follow-up jobs and readback result together. A failed commit leaves the preceding committed state intact. A lost acknowledgement uses the same mutation identity.
@@ -68,6 +70,8 @@ Chronological presentation does not change the graph into a chain. Shared ancest
 
 Use memory revisions for project purpose/boundaries, a subsystem map and a selected area card. These are scales of presentation, not a mandatory layer or card for every symbol. An area card explains purpose, input/output, neighbors, invariants, relevant decisions, known gaps and where to check them.
 
+A useful view can be a saved answer to a recurring question: “How does this subsystem work?”, “What decisions govern this API?”, or “Which approaches failed here?”. Store the question, examined scope, answer and source handles in that ordinary view. Read the available answer and refresh it through existing jobs when relevant material changes; do not generate a fresh report on every request or require a card for every resource. An explicit user request or a repeatedly useful task question can justify the view without a manual curation ceremony.
+
 Structure comes from manifests and existing source tools; meaning and analogies may use Dreamer. Documented intent, observed implementation and inferred purpose stay distinguishable. Do not turn a generated explanation into an owner-approved requirement.
 
 Serve available exact facts immediately on first contact. Build the useful task/area orientation and expand other areas on demand or permitted idle work. Full-repository onboarding is not a prerequisite for the first context response.
@@ -77,6 +81,8 @@ Serve available exact facts immediately on first contact. Build the useful task/
 A map of all consumers can become stale when a new consumer appears, even if every old cited file is unchanged. Retain the selection basis of a set-valued view: examined scope/query, relevant source-tool and source revision, and completeness. This is view metadata, not a query AST.
 
 Membership-affecting changes, missed events and incomplete listing invalidate the coverage claim for that view. Reconcile the affected scope while retaining valid historical observations and exact facts. A watcher is a hint, not proof that nothing changed. An empty top-k does not establish absence.
+
+Relevant change includes correction and removal, not only a newer insertion timestamp. Reuse the application's existing mutation/source-change events to refresh affected views, including changes to sources that the view actually read. No separate freshness service or synchronous proof is required. A failed refresh leaves the last useful qualified view and direct source lookup available; it does not disable ordinary memory.
 
 ### 4.3 Dirty work without a rebuild storm
 
@@ -115,6 +121,12 @@ Use available task facts and concrete cues without requiring a complete TaskMean
 Read relevant lessons independently of project-map preparation. An unavailable map does not turn stored episodes into an empty experience set. Ordinary context includes useful provisional methods with their qualifications; a comparison or certification mode is not the route required to see newly learned advice. Evaluation controls may deliberately hide memory for an experiment, but must not decide normal product exposure.
 
 A selected method must contribute something the agent can use: the proposed action and its material condition or exception, plus a handle for details. A list of skill IDs, scores and verifier names alone is not a delivered procedure. Expand the actual saved record through the existing `open` path when needed; inspection must not fabricate a demonstration card for the requested ID. Estimate the text actually sent, rather than charging the full administrative record and then returning only its ID. No separate skill-delivery service is needed.
+
+### 5.3 Recover the episode, not just the matching fragment
+
+A short fact, cue or summary is a search entrypoint, not a replacement for its source. When the decision needs an example or explanation, follow its source handle to the actual episode and a small relevant neighborhood. A matching failure may need the following repair and check, not only the preceding conversation. Use episode/session order and available action/result links; nearby timestamps across unrelated work do not create one story.
+
+Deduplicate overlapping expansions by source identity and preserve their order. Rank the useful episode context when a reranker is already available; ordinary source expansion does not require one. Deliver the compact lesson first when sufficient, and expose the episode through existing `open`/context expansion when useful. Native queries and existing source links implement this; no second episodic store or dedicated context-expansion service is needed.
 
 ## 6. Applicability before automatic learning
 
@@ -172,7 +184,7 @@ An opaque ID is not source content. Hydrate permitted selected records, defer th
 
 Bound nodes, examined pair/neighbor work, loaded data, prompt and output links. A limit on the first query does not bound a later all-corpus matrix or all-to-all links. Start with existing indexed retrieval and finite candidates; small exact pair comparisons are also reasonable. No second vector engine or per-observation cross-domain sweep is required.
 
-Continue remaining scope using the same job mechanism, a stable cursor or explicit next membership. Do not mark unexamined sources processed or repeatedly serve only the first page. New inputs belong to a coalesced successor, not endless cancellation of paid inference.
+Continue remaining scope using the same job mechanism, a stable cursor or explicit next membership. Do not mark unexamined sources processed or repeatedly serve only the first page. New inputs belong to a coalesced pending successor, not endless cancellation of paid inference.
 
 ### 6.6 Reuse no-change and version derived features
 
@@ -215,6 +227,8 @@ The minimum learning path is an actual episode or correction, a useful retained 
 Group the material already saved for the episode; coalescing a work signal never drops earlier observations. A meaningful failure, successful repair, cheaper successful path or explicit request can trigger interpretation. Do not require a formal task ID, verifier or known causal explanation before remembering useful material. Background work uses the observed episode boundary or saved unprocessed portion; it need not wait for a ceremonial whole-task completion.
 
 **Interpretation.** When meaning is not explicit, one ordinary Dreamer job receives the relevant episode slice, optional feedback and a small set of related existing lessons. It proposes a concise observation/method, an amendment of a named lesson, or no change. The output explains the situation, useful next action and material limitations with source handles; these are useful contents, not a compulsory questionnaire. An explicit user correction or already structured rule may be saved directly without another model call. One episode can justify a provisional suggestion; it cannot by itself establish a general causal law.
+
+For incremental updates, find the current item for the same subject/aspect and its closest relevant alternatives before deciding to create a sibling. Use existing keys and retrieval; answer-oriented reranking need not determine this update candidate set. Preserve other facets, conditions and historical occurrences. Related new material can share one interpretation batch and one deduplicated set of existing records; batch compatible embedding requests rather than making a request for every fragment. This is reuse of the current jobs/controller, not an obligatory second consolidation stage after every lesson. Inference and calculation remain allowed; label a derived conclusion instead of presenting it as a verbatim source fact.
 
 **Storage and use.** Save the result as ordinary searchable memory and make it eligible for normal advisory context immediately under its stated scope. Read it independently of map/graph readiness. No separate skill activation, certification mode or evaluator approval is required. At the next matching resource/task/decision boundary, show the useful instruction and exception, with episode expansion when needed. A missing prerequisite can produce a conditional suggestion or the next useful check instead of silence. A missing execution verifier may prevent claiming a verified result; it does not by itself prevent reading the method. Advice and executing a packaged tool action remain separate operations.
 
@@ -317,3 +331,6 @@ These are documentation walkthroughs, not an executed V3 test suite.
 
 - [V2 actual packet caller](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/task_handlers.rs#L195-L460), [MCP skill surface](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/skill.rs), and [skill packet/proof helpers](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/skill.rs#L640-L735): distinguish actual consumers, synthesized demonstration output and observed execution. Do not port the fixture-producing facade or make project-map availability a condition for reading experience.
 - [Harness2 context](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/context.py#L1-L260) and [proposer](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/proposer.py): take short missions with expandable real evidence. Reuse of cached output must retain its actual execution identity; a changed configured model is not established by old response bytes. See Audit §25 for the source scope and benchmark-directory mitigation.
+- [Hindsight consolidation](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py), [facet instructions](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/consolidation/prompts.py) and [saved mental-model queries](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-docs/docs/developer/api/mental-models.mdx): take selective incremental updates, compatible batching and saved useful questions. The donor's synthesized `observation` is not Eliot's raw observation; source counts are not independent successful attempts.
+- [MemMachine declarative retrieval](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/declarative_memory/declarative_memory.py): take derivative-to-source lookup and contextual episode expansion, not its entire backend topology or an embedding prerequisite for primary capture.
+- [Graphiti edge resolution](https://github.com/getzep/graphiti/blob/3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f/graphiti_core/utils/maintenance/edge_operations.py): take affected-fact updates and temporal distinctions. Duplicate candidates and contradiction candidates need not have the same endpoints; wording alone does not establish the same temporal occurrence. Audit §26 records the limits of the inspected path.
