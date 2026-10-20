@@ -1,8 +1,10 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.16 · 20 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.17 · 20 октября 2026 · документация до переписывания продукта.**
 
-**Новый результат — [§30](#30-everos-and-evermemos-anticipation-and-evidence-coverage-016):** сопоставлены историческая статья EverMemOS и действующий EverOS. Проверены default-off Foresight и стандартный search consumer, полная загрузка области в AGENTIC, отдельный multi-round retrieval и разделение foreground/background embeddings. Для Eliot уточнены условное предвосхищение в обычном контексте, выборка участников выбранной группы, покрытие частей вопроса и доступность интерактивного поиска. Новых сервисов и обязательного модельного маршрутизатора нет.
+**Новый результат — [§31](#31-real-interpretation-not-validation-shaped-learning-017):** прослежены сохранение наблюдения и следующий projection worker V2, фактический вход Dreamer и его локальная «модельная» стадия. Обновление индексов не оказалось интерпретацией, а проверка пустого draft — вызовом модели. Для сравнения прочитан реальный extraction-путь D20 Mem0. Решение V3 — соединённая работа с исходным эпизодом, настоящим controller response и обычной памятью, без добавления нового слоя удостоверений.
+
+**Результат 0.16 — [§30](#30-everos-and-evermemos-anticipation-and-evidence-coverage-016):** сопоставлены историческая статья EverMemOS и действующий EverOS. Проверены default-off Foresight и стандартный search consumer, полная загрузка области в AGENTIC, отдельный multi-round retrieval и разделение foreground/background embeddings. Для Eliot уточнены условное предвосхищение в обычном контексте, выборка участников выбранной группы, покрытие частей вопроса и доступность интерактивного поиска. Новых сервисов и обязательного модельного маршрутизатора нет.
 
 **Результат 0.15 — [§29](#29-magma-and-letta-relations-and-continuation-015):** прочитаны D42 MAGMA и действующий D17 Letta Code. MAGMA полезна выбором отношений под вопрос, но её рассмотренный query path делает полный проход даже при готовых результатах, повторно кодирует тексты, отсекает промежуточные узлы по словам и неверно объединяет несколько типов связей. Letta показывает отдельный рабочий путь сжатия контекста и отдельную reflection-подготовку. Для Eliot выбраны адресное раскрытие нужной связи и сводка продолжения без второго graph/context runtime.
 
@@ -16,7 +18,7 @@
 |---|---|
 | V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: исходные требования и донор |
 | V2 | `5aac094834fb5635921b550c821cb933a1196105`: замороженные нормативы и код |
-| База текущей документации | `48a622457c826eed3f539d9a870e3521da644527`, PR #5325 |
+| База текущей документации | `966650aa71d24cd75a6d214a4f46ab2d832af36a`, PR #5325 |
 | Claude audit | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения и исторические измерения, не безошибочный норматив |
 | Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы исследования, не обязательный backlog V3 |
 | Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer/reconciliation/store/System 2 пути |
@@ -34,6 +36,7 @@
 | Letta Code D17 | ref `e8073d4e475ab7f56e76f9aaeea81a7618a92575`, возвращённый connector: local compaction/backend/store и выбранная reflection-подготовка; не весь прежний Letta server |
 | EverOS D10 | `c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18`: текущие docs, foresight strategy, HTTP/service/search paths, episode recaller, выбранный multi-round loop и embedding provider/factory (§30) |
 | EverMemOS D11 | [Статья 2601.02163v1](https://arxiv.org/html/2601.02163v1), 5 января 2026: исторический MemCell/MemScene/Foresight design; соответствующий исторический runtime здесь не квалифицирован |
+| Mem0 OSS D20 | `0724291bd864cf807e88ee8981c8226644e8fb42`: текущий синхронный `Memory.add`, extraction/persistence и formatter сообщений; не managed platform и не весь AsyncMemory (§31) |
 
 Владелец требует новый V3 после документации: самообучение, понимание, модульность, гибкость, лёгкость и заменяемый Dreamer. Принятые проектные направления — local-first Rust, demand-start, SurrealDB server child и модельные маршруты через controller без собственного роя. Конкретные будущие SDK/API и параметры не объявляются уже работающими.
 
@@ -230,7 +233,7 @@ Owner-selected restore работает даже при утраченном ф�
 | 17 | Letta Code current | Свежая 0.15: реальный local compaction caller и отдельная reflection-подготовка. Continuation не durable lesson; не второй host (§29) |
 | 18 | Letta V1 archive | История по требованию и truncation; в 0.15 не выдана за current Code |
 | 19 | Nocturne Memory | Stable node/revision/alias и короткие recall clues, не обязательный boot/persona (§28) |
-| 20 | Mem0 OSS | Batch extraction/embedding; ошибка не empty result |
+| 20 | Mem0 OSS | 0.17: реальный single extraction и batch persistence; tool results теряются в выбранном formatter, parse failure неотличим от empty result; не перенос hosted scores или ADD-only как весь resolver (§31) |
 | 21 | OpenMemory historical MCP | Membership/access ideas historical продукта |
 | 22 | OpenMemory session CLI | Перенос сессий; roadmap не runtime |
 | 23 | Cavira LongMemory | Decay/supersedes/checkpoint; не смешивать с mem0 |
@@ -603,3 +606,84 @@ Eliot берёт подходящие already-saved episode slices и relevant m
 Прочитаны current README/docs; foresight strategy; HTTP→service→SearchManager; agentic и episode recaller; multi-round header и actual loop/finalizer; embedding provider/factory. Не прочитаны все OME jobs, `everalgo` extraction/ranking internals, полный persistent intake/recovery и исторический runtime статьи. Поэтому декларации о rebuildability, отсутствие всех custom consumers и качество предсказаний глобально не квалифицированы. Несовпадение имён/версий и неудачный fetch не заменяют такой проверки.
 
 Это source reading и проектные выводы: доноры, модели, БД, benchmarks, synthetic tests и Rust/Clippy не запускались; независимого субагентного review нет. Предыдущий CI run 39431478163 проверен отдельно и завершился failure; причина не приписывается автоматически старым CI-находкам. Новая публикация и её фактический workflow status отражаются в PR. Следующий приоритет карты — реальный Eliot capture→interpretation trigger и оставшаяся исходная автономность, не очередной обязательный memory runtime.
+
+## 31. Real interpretation, not validation-shaped learning 0.17
+
+**20 октября 2026; база документации `966650aa`.** Новое чтение V2 `5aac0948` продолжает незакрытый вопрос §25.7: что происходит после сохранения реального наблюдения и какие данные в действительности интерпретирует Dreamer. D20 Mem0 на `0724291b` рассмотрен как конкретный работающий по исходнику extraction path, не как обещание качества или готовая замена Eliot.
+
+### 31.1 После capture действительно есть работа — но это проекции
+
+[dispatch_observe](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/verification.rs#L20-L155) передаёт observation payload как `ClaimPropose` в `WriterHandle::submit`. В [writer.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/writer.rs#L2005-L2410) обработчик вызывает `store.apply_write_envelope`; после принятой записи `handle_store_receipt` отмечает commit и уведомляет настроенный `projection_notifier`. Это реальный вызов, не только объявленный интерфейс.
+
+[Coordinator](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/cognitive_projection.rs#L260-L530) выполняет очередь через `background_step` → `process_claimed_lease` → `process_family`. Последний исчерпывающе разбирает Search, Cue, DependencyDirty; Utility возвращает отказ до Phase 2. Эти ветви перестраивают/обновляют поиск, cues и зависимости. Они не вызывают модель и не формируют опыт из исходного эпизода.
+
+**Вывод ограничен этой цепочкой:** post-commit maintenance существует, но это не найденный автоматический Dreamer producer. Не заявляется отсутствие любого другого scheduler во всём V2. Полная регистрация всех workers и альтернативные daemon paths ещё не прочитаны. Полезное свойство сохранено: notification здесь служит ускоряющим сигналом поверх durable работы, а не основанием объявить raw потерянным при заполненном канале.
+
+В V3 searchable capture и смысловая интерпретация остаются разными полезными операциями. Завершение индексации не должно помечать эпизод интерпретированным; наоборот, отсутствие модели не должно откатывать уже сохранённое и доступное наблюдение. Второй coordinator для удостоверения этого различия не нужен.
+
+### 31.2 Снять ранний отказ недостаточно: дальше нет модельной интерпретации
+
+В [main.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/main.rs#L25-L95) staged input направляется в `service.submit`, а отсутствие input — в `service.status`. Успешно отданный status не доказывает исполненного inference. В [реальном submit](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/lib.rs#L740-L810) Curation отделён ранней ветвью; остальные классы проходят `resolve_cycle_inputs`, bundle и `run_admitted_pipeline`.
+
+Ранее найденный [resolve_cycle_inputs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/controller.rs#L58-L88) после проверки аргументов безусловно возвращает Err об отсутствующем Governor-resolved material. `controller.rs` в этом бинаре — внутренний pure cycle, **не** доказанный вызов внешнего `eliot-swarm-controller`.
+
+Новый предметный результат — что находится дальше этого отказа. [model_stage.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/model_stage.rs#L45-L220) сам строит `StructuredModelDraft` с пустыми `claims` и `non_material_claims`. `run_admitted_model` вызывает только `draft.validate()`, пересчитывает digest и возвращает тот же draft. В этой реализации нет provider call, controller execution или чтения полученного извне модельного ответа. `raw_output_digest` вычислен из job/question/scope/request, не из bytes ответа модели.
+
+Это не утверждение, что deployed процесс уже сохранял фиктивный результат: non-Curation путь ранее останавливается, Curation имеет отдельный carrier. Это показывает, почему замена одного Err на Ok не восстанавливает продукт. Дальнейшая функция с названием «model» всё равно не совершает требуемого преобразования. Нужен настоящий вызов над данными, а не ещё один адаптер допуска к этой локальной проверке.
+
+### 31.3 Ссылки на материал не заменили сам материал
+
+[admitted_material.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/admitted_material.rs#L1-L310) формирует пустой reference manifest. Evidence handles включаются в bundle обычно с `bytes=0` и hash строки handle; отдельный первый Orientation handle описывает локально построенный frame, не загруженный source. Memory/architecture/implementation/conformance handles переходят в omissions, если уже не перечислены как evidence. `PartialForScope` честно обозначает неполноту, но не создаёт доступ к содержимому.
+
+В [v1_model_of](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/admitted_material.rs#L465-L550) поле `statement` получает `job.exact_question.clone()`: вопрос оказывается единственной гипотезой. Последующий residue помечен Partial, а не подтверждённым фактом. Следовательно, проблема не обязательно в завышенном epistemic статусе; **полезного модельного ответа вообще не появилось**.
+
+Для V3 источник передаётся как реальный нужный текст/структурированное событие либо как handle с реально доступным модели `open`. Один hash, имя файла или ID не считается прочитанным содержимым. Исправление — загрузить выбранный эпизод и нужные existing lessons через обычный Store; не строить новую систему доказательств чтения.
+
+### 31.4 Проверялась форма операции, а не её смысл
+
+В [usage_of и preservation_of](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/admitted_material.rs#L365-L455) первая функция подставляет бюджетные пределы в usage, включая положительные model_calls/attempts/candidates; вторая ставит всем перечисленным измерениям `passed=true, known=true` с оговоркой о candidate-only сохранении handles. `run_admitted_pipeline` передаёт в validation наблюдаемое время `Some(0)`. Эти значения характеризуют собранную локальную форму, не измеренные inference, смысловую сохранность исходного эпизода или реальную длительность обработки.
+
+Нельзя расширять вывод до «весь учёт провайдера подделан»: отдельный `ModelRouteUsage::measured` принимает явное число calls, а найденный вызов в `dispatch_stage.rs` передаёт 0. Есть и явные Partial/candidate-only ограничения. Именно сосуществование этих разных смыслов под именами model/usage/preservation опасно для дальнейшего разработчика.
+
+В существующем [тесте owner_model_call_runs_exactly_once_per_admission](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/model_stage.rs#L515-L560) счётчик считает вызов closure над локальной валидацией. Такой тест проверяет ровно свою функцию, но не наличие inference. Исходник не доказывает намерений автора или историю возникновения дефекта; он доказывает несовпадение проверенной операции с продуктовым смыслом её названия.
+
+**Решение:** удалить подменяющие смысл формы из V3-пути, а не добавить проверяющий их проверяющего. Фактический controller result и известное usage приходят от исполнителя. Неизвестное остаётся неизвестным. Детерминированное сохранение прямой поправки пользователя полезно без LLM и называется именно сохранением поправки, а не успешно выполненным модельным обучением.
+
+### 31.5 D20 Mem0: реальное извлечение короче аппарата его удостоверения
+
+Текущий [README](https://github.com/mem0ai/mem0/blob/0724291bd864cf807e88ee8981c8226644e8fb42/README.md#L55-L85) описывает ADD-only алгоритм и прямо относит свои benchmark scores к managed platform с недоступными в OSS оптимизациями. Числа не переносятся на библиотеку или Eliot. Устаревшая формулировка docstring про UPDATE/DELETE также не важнее фактически вызываемого тела.
+
+Прослежен [Memory.add → _add_to_vector_store](https://github.com/mem0ai/mem0/blob/0724291bd864cf807e88ee8981c8226644e8fb42/mem0/memory/main.py#L840-L1110): берутся recent messages и похожие существующие memories, формируется текст и вызывается настоящий `self.llm.generate_response`. Затем тексты результата пакетно embedding/persist; в выдачу ADD включаются подтверждённые этой ветвью сохранённые records. Это реальная по исходнику передача материала и обработка ответа, не renderer статуса. Синхронный метод не объявляется автоматическим background worker.
+
+**Берём:** компактное преобразование нового материала вместе с относящейся памятью, один явный extraction call на такую порцию, пакетирование совместимых последующих операций. **Не берём целиком:** отдельные vector/history/entity stores, hosted показатели, обязательный ADD-only как решение current-state Eliot или приравнивание agent narration к наблюдённому результату. Сохранение истории и адресная поправка обычного lesson уже согласованы; ещё один update/delete framework не требуется.
+
+### 31.6 У простого донора тоже нужно проверять настоящий вход и неуспех
+
+В вызываемом [parse_messages](https://github.com/mem0ai/mem0/blob/0724291bd864cf807e88ee8981c8226644e8fb42/mem0/memory/utils.py#L62-L80) выводятся только textual system/user/assistant. `content=None` пропускается, и role `tool` не имеет ветви даже при наличии content. Значит, обычное tool-result сообщение и связь call/result не входят в этот extraction text. Host может заранее переложить их в другой текст или иметь иной путь; эта находка не утверждает потери каждого инструмента во всех интеграциях Mem0. Для coding-памяти Eliot adapter сохраняет и рендерит реальные результаты с доступными call IDs, не требует модели угадывать выполнение по рассказу агента.
+
+В том же [extraction block](https://github.com/mem0ai/mem0/blob/0724291bd864cf807e88ee8981c8226644e8fb42/mem0/memory/main.py#L930-L1010) provider exception уже поднимается как `LLMError` — это полезный countercheck. Но ошибка разбора ответа логируется и превращается в `extracted_memories=[]`; далее исходные messages сохраняются и API возвращает пустой результат, как при законном отсутствии новых фактов. Ошибка и no-change различаются в логе, но не в этом возвращаемом результате. В V3 такой случай остаётся причиной незавершённой интерпретации существующего job, не успешным завершением диапазона.
+
+Это также не готовый raw-first capture: normal path выполняет embedding/search/model до завершающего `save_messages`, а `infer=False` всё ещё получает embedding до `_create_memory`. Внешний host может сохранять оригинал независимо, однако сам рассмотренный helper этого не гарантирует. Сначала сохранить событие в Eliot, затем интерпретировать — уже выбранное простое решение; дополнительный admission протокол не нужен.
+
+### 31.7 Конкретная соединённая реализация V3
+
+Ниже **проектное применение**, не найденный готовый V2 API и не выполненный V3. Оно уточняет существующие [Implementation §§3,5,7](IMPLEMENTATION.md#3-host-interface-and-experience-intake) и [Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt), не создаёт новых владельцев.
+
+| Операция | Кто и что реально делает |
+|---|---|
+| Сохранить | `capture` записывает исходное событие и необходимый pending intent в той же primary transaction. Session/call/source identity достаточно; не выдумывается отдельный task ради формы |
+| Взять материал | Уже существующий job worker получает сохранённую необработанную часть эпизода и небольшой подходящий контекст. Job обслуживается обычным startup/polling; wake ускоряет работу, но не является её единственной памятью |
+| Интерпретировать | Adapter controller передаёт выбранное содержимое действительной модели и получает её ответ. Tool results не исчезают в chat-only formatter. Прямая явная поправка может обойти этот вызов, не притворяясь inference |
+| Сохранить и использовать вывод | Обычный memory write сохраняет полезные lessons/amendments либо настоящий keep и обработанный диапазон. `context`/`open` читают эти же записи. Дополнительные embeddings и views не держат primary advice закрытым |
+
+Worker не должен ждать, когда другой будущий сервис заполнит причинность, готовый урок или «доказательство понимания»: извлечение этих полезных сведений и есть его работа. Отсутствующее основание остаётся неизвестным. После новых событий coalescing меняет сигнал/следующий диапазон, не удаляет ещё не разобранные observations. Повторная индексация не запускает бесконечное переобучение той же порции. Эти правила используют уже предусмотренные source IDs и job progress, не новые сертификаты полноты.
+
+Пример: host сохранил изменение API, фактический failed check, ремонт consumer и следующий результат. Dreamer получает эту последовательность, а не четыре hash строки; может выделить «перед изменением сигнатуры проверить consumers» с существенным ограничением. Следующее обращение к этому API получает сам совет через обычный контекст. JSON parse error оставляет интерпретацию незавершённой, но исходные события всё равно доступны. Это содержательная работа от входа до следующего действия, не цепь локальных PASS над пустыми носителями.
+
+### 31.8 Охват и оставшийся вопрос
+
+Свежие V2 reads: observe 1–260; writer 1–320,1000–1340,1570–1840,1910–2470; cognitive_projection 1–690; Dreamer main 1–230, lib 1–240 и640–850, controller 1–170, model_stage 1–540, admitted_material 1–555. Navigation в MCP и dispatch показывает направления, но не заменяет полного чтения регистрации или альтернативных workers. Исходная блокировка и отсутствие содержательной работы за ней различены; Curation не объединён с non-Curation.
+
+Свежие D20 reads: README45–135, Memory main 1–250,480–1120,1170–1255 и utils1–130; не весь AsyncMemory, retrieval, entity cleanup или hosted platform. Следующий связанный вопрос — конкретный production controller route и другой реальный producer, если он нужен для оценки донора; затем возвращение к исходной автономности и долговременному использованию уроков. Нельзя вновь отмечать «модель подключена» только по наличию `ModelRouteRequest`.
+
+Продукт, модель, БД, Rust/Clippy, synthetic probes и donor benchmarks не запускались; независимого субагентного review нет. Тестовый исходник прочитан как свидетельство того, что он считает, не как новая тестовая программа. Новых services, stores, dependencies, workflow gates или runtime изменений нет. Architecture, Implementation и Cognition не переписываются ради повторения уже принятых правил; конкретный разбор и соединение сведены здесь. Публикация и реальный CI status отражаются в PR, не подменяются сертификатом чтения.
