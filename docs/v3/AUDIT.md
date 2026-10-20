@@ -1,8 +1,10 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.17 · 20 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.19 · 20 октября 2026 · документация до переписывания продукта.**
 
-**Новый результат — [§31](#31-real-interpretation-not-validation-shaped-learning-017):** прослежены сохранение наблюдения и следующий projection worker V2, фактический вход Dreamer и его локальная «модельная» стадия. Обновление индексов не оказалось интерпретацией, а проверка пустого draft — вызовом модели. Для сравнения прочитан реальный extraction-путь D20 Mem0. Решение V3 — соединённая работа с исходным эпизодом, настоящим controller response и обычной памятью, без добавления нового слоя удостоверений.
+**Новый результат — [§32](#32-host-capture-and-non-destructive-continuation-019):** прочитаны ранее пропущенные claude-mem и OpenHands Software Agent SDK. Проверены реальные hook handlers, захват до фоновой обработки, выдача контекста и границы сжатия по связям вызовов/результатов. В реестр добавлены D45–D46; исходные D01–D44 не перенумерованы. Субагенты в этой сессии не запущены: доступного вызова их исполнения не оказалось. Это самостоятельное чтение, не независимая проверка четырьмя агентами.
+
+**Результат 0.17 — [§31](#31-real-interpretation-not-validation-shaped-learning-017):** прослежены сохранение наблюдения и следующий projection worker V2, фактический вход Dreamer и его локальная «модельная» стадия. Обновление индексов не оказалось интерпретацией, а проверка пустого draft — вызовом модели. Для сравнения прочитан реальный extraction-путь D20 Mem0. Решение V3 — соединённая работа с исходным эпизодом, настоящим controller response и обычной памятью, без добавления нового слоя удостоверений.
 
 **Результат 0.16 — [§30](#30-everos-and-evermemos-anticipation-and-evidence-coverage-016):** сопоставлены историческая статья EverMemOS и действующий EverOS. Проверены default-off Foresight и стандартный search consumer, полная загрузка области в AGENTIC, отдельный multi-round retrieval и разделение foreground/background embeddings. Для Eliot уточнены условное предвосхищение в обычном контексте, выборка участников выбранной группы, покрытие частей вопроса и доступность интерактивного поиска. Новых сервисов и обязательного модельного маршрутизатора нет.
 
@@ -18,7 +20,7 @@
 |---|---|
 | V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: исходные требования и донор |
 | V2 | `5aac094834fb5635921b550c821cb933a1196105`: замороженные нормативы и код |
-| База текущей документации | `966650aa71d24cd75a6d214a4f46ab2d832af36a`, PR #5325 |
+| База текущей документации | `815f51e5a6839263ce6e310a42392c7810eb8218`, PR #5325 |
 | Claude audit | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения и исторические измерения, не безошибочный норматив |
 | Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы исследования, не обязательный backlog V3 |
 | Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer/reconciliation/store/System 2 пути |
@@ -37,6 +39,8 @@
 | EverOS D10 | `c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18`: текущие docs, foresight strategy, HTTP/service/search paths, episode recaller, выбранный multi-round loop и embedding provider/factory (§30) |
 | EverMemOS D11 | [Статья 2601.02163v1](https://arxiv.org/html/2601.02163v1), 5 января 2026: исторический MemCell/MemScene/Foresight design; соответствующий исторический runtime здесь не квалифицирован |
 | Mem0 OSS D20 | `0724291bd864cf807e88ee8981c8226644e8fb42`: текущий синхронный `Memory.add`, extraction/persistence и formatter сообщений; не managed platform и не весь AsyncMemory (§31) |
+| claude-mem D45 | `9e4f313a89236f7fb593a639a77ee02e21e94469`, commit 19.10.2026: hooks, observation/spool/context handlers и выбранный generator caller; не все provider/DB paths (§32) |
+| OpenHands Software Agent SDK D46 | `0996c33916c2a977ea9fe38deee660ff0e1389f2`: condenser, view/event и tool-call boundaries, реальный message-preparation helper; не весь агентный runtime (§32) |
 
 Владелец требует новый V3 после документации: самообучение, понимание, модульность, гибкость, лёгкость и заменяемый Dreamer. Принятые проектные направления — local-first Rust, demand-start, SurrealDB server child и модельные маршруты через controller без собственного роя. Конкретные будущие SDK/API и параметры не объявляются уже работающими.
 
@@ -208,9 +212,11 @@ Owner-selected restore работает даже при утраченном ф�
 
 ## 11. Доноры и аудиты: карта, не обязательная программа переносов
 
-Исторический реестр: 43 D-поверхности, 27 P-работ, 187 S-записей — 257 строк, не 257 независимых прочитанных источников. Добавленный D44 сохраняет старые IDs. Архив и все upstreams целиком не перечитаны. Конкретное копирование кода требует условий соответствующей версии; исследование механизма не импортирует продукт.
+Исторический реестр: 43 D-поверхности, 27 P-работ, 187 S-записей — 257 строк, не 257 независимых прочитанных источников. Добавленные D44–D46 сохраняют старые IDs. Архив и все upstreams целиком не перечитаны. Конкретное копирование кода требует условий соответствующей версии; исследование механизма не импортирует продукт. Сверка охвата в [AUDIT-MAP](AUDIT-MAP.md) остаётся отдельной от решения использовать механизм.
 
 ### 11.2 D01–D44
+
+Заголовок сохраняет исторический anchor; D45–D46 добавлены ниже без перенумерации прежних строк.
 
 | D | Донор | Решение/механизм |
 |---|---|---|
@@ -258,6 +264,8 @@ Owner-selected restore работает даже при утраченном ф�
 | 42 | MAGMA | Свежая 0.15: отношения под вопрос, реальный query/traversal/packing; не полные scans и hardcoded dataset routing (§29) |
 | 43 | A-MEM | Evolution реально индексируемых описаний и связей; library/paper различаются (§28) |
 | 44 | Harness2 | Два improvement loops и реальные раскрываемые материалы; cache не новый опыт (§§19,25) |
+| 45 | claude-mem | Hook→локальное сохранение→фоновая работа; стабильный неизменённый контекст и адресные уточнения. Не копировать весь Bun/SQLite/provider runtime или подавление ценных событий ради цены inference (§32) |
+| 46 | OpenHands Software Agent SDK | Разрез по связанным tool calls/results и производная View над исходными событиями. Не копировать второй host, provider-specific ограничения в общую память или пустой summary как успешное сокращение (§32) |
 
 Hy-Memory отдельно углублён в §§6,16–18. MemGPT/HiAgent, LongMemEval/MemoryArena/Mem2Act, LightMem/MemDelta, ATMS и Meta-Harness исследуются по пробелу продукта, не ради обязательных карточек. Достаточны source, механизм, consumer, цена и решение взять/не брать. Самописный аналог не должен проходить легче зрелой библиотеки только потому, что донору назначена лишняя церемония.
 
@@ -687,3 +695,73 @@ Worker не должен ждать, когда другой будущий се
 Свежие D20 reads: README45–135, Memory main 1–250,480–1120,1170–1255 и utils1–130; не весь AsyncMemory, retrieval, entity cleanup или hosted platform. Следующий связанный вопрос — конкретный production controller route и другой реальный producer, если он нужен для оценки донора; затем возвращение к исходной автономности и долговременному использованию уроков. Нельзя вновь отмечать «модель подключена» только по наличию `ModelRouteRequest`.
 
 Продукт, модель, БД, Rust/Clippy, synthetic probes и donor benchmarks не запускались; независимого субагентного review нет. Тестовый исходник прочитан как свидетельство того, что он считает, не как новая тестовая программа. Новых services, stores, dependencies, workflow gates или runtime изменений нет. Architecture, Implementation и Cognition не переписываются ради повторения уже принятых правил; конкретный разбор и соединение сведены здесь. Публикация и реальный CI status отражаются в PR, не подменяются сертификатом чтения.
+
+## 32. Host capture and non-destructive continuation 0.19
+
+**20 октября 2026; база `815f51e5`.** В ответ на просьбу о субагентах проверены доступные инструменты/исполнители; вызова запуска GPT Luna или другого подходящего субагента в этой сессии нет. Новые агенты не созданы и независимое review не заявляется. Вместо имитации параллельной проверки выполнено предметное чтение двух пропущенных доноров: D45 claude-mem и D46 OpenHands Software Agent SDK. Другие ранее названные направления не отмечаются завершёнными.
+
+### 32.1 claude-mem: полезна развязка захвата и дорогой обработки
+
+На `9e4f313a` прочитаны [архитектура](https://github.com/thedotmack/claude-mem/blob/9e4f313a89236f7fb593a639a77ee02e21e94469/docs/public/architecture/overview.mdx), настоящая [регистрация hooks](https://github.com/thedotmack/claude-mem/blob/9e4f313a89236f7fb593a639a77ee02e21e94469/plugin/hooks/hooks.json), [observation handler](https://github.com/thedotmack/claude-mem/blob/9e4f313a89236f7fb593a639a77ee02e21e94469/src/cli/handlers/observation.ts) и [spool handoff](https://github.com/thedotmack/claude-mem/blob/9e4f313a89236f7fb593a639a77ee02e21e94469/src/cli/spool-hook-event.ts). PostToolUse и PostToolUseFailure ведут в observation. В worker-ветви сохраняются реальные input/result, session, agent и tool-use IDs, затем `HookSpool.enqueue` вызывается **до** best-effort nudge. Handler не ждёт запуска модели или готовности semantic worker. Выход hook всё же может подождать ограниченный poke до250мс: «никакого ожидания вообще» было бы неточно.
+
+Есть отдельная server-ветвь с сетевым `recordEvent` и собственными правилами ошибок/fallback. Вывод о локальном spool нельзя распространять на все режимы. Низкоуровневые file durability primitives HookSpool не проверены, поэтому исходный комментарий «durable» не является нашим power-loss испытанием.
+
+В [GeneratorRunner](https://github.com/thedotmack/claude-mem/blob/9e4f313a89236f7fb593a639a77ee02e21e94469/src/services/worker/session/GeneratorRunner.ts#L140-L240) прочитан настоящий выбор provider и вызов `agent.startSession` с состоянием очереди. Это не полный просмотр транспортного запроса/ответа каждой модели и не доказательство ровно одного model call на событие. Достаточно установить полезную границу: приём источника и дорогое толкование не одна синхронная операция.
+
+**Для Eliot:** сохранять исходный event обычным Store либо уже предусмотренным spool при его недоступности; будить существующий worker; читать необработанный связный диапазон для интерпретации. Не переносить Express/Bun, SQLite+Chroma, все provider adapters и remote-spool protocol вместе с этой идеей. Не нужна вторая очередь над уже сохранённым pending intent.
+
+### 32.2 Экономить интерпретацию, не терять работу субагентов по умолчанию
+
+В [should-skip-agent-observation.ts](https://github.com/thedotmack/claude-mem/blob/9e4f313a89236f7fb593a639a77ee02e21e94469/src/shared/should-skip-agent-observation.ts) описана нагрузка от fan-out: много дочерних tool events вызывают дорогое наблюдение и давят на квоту. В коде есть общий переключатель и список типов для пропуска subagent events **до** записи через hook. Важный countercheck: default toggle выключен, список пуст, поэтому нельзя говорить «claude-mem всегда выбрасывает работу субагентов». Event считается дочерним при нужной комбинации agent ID/type, не по одному случайному полю.
+
+**Выбор V3:** различать разрешённый захват исходников и решение тратить inference. Сохранённая работа конкретного ребёнка с его session/call связями может быть полезной даже без немедленного отдельного урока. Coalescing объединяет поводы/диапазоны обработки, не независимые события и не все дети в один причинный эпизод. Повторы транспорта можно убрать по настоящей identity, а read-back собственной памяти — не считать новым подтверждением. Явное исключение владельцем источника остаётся исключением, но обычное исчерпание модельного бюджета не должно молча подменять capture policy.
+
+Это не поручение строить собственный swarm manager. Владелец исполнения остаётся controller/host; Eliot получает уже известные идентификаторы и реальные результаты. Частоту interpretation регулирует существующая фоновая работа, а не классификатор перед каждым tool.
+
+### 32.3 Стабильный контекст дешевле постоянного пересоздания, но не запрещает поправки
+
+[Коммит claude-mem от19.10.2026](https://github.com/thedotmack/claude-mem/commit/9e4f313a89236f7fb593a639a77ee02e21e94469) переносит Antigravity injection с каждого PreInvocation на SessionStart. Авторы связывают динамические повторные вставки с потерей prefix cache; их численные замеры не воспроизводились и не считаются обещанным выигрышем Eliot.
+
+Проверено настоящее поведение Claude-ветви: hooks регистрируют `context` на startup/clear/compact, но не resume; [context handler](https://github.com/thedotmack/claude-mem/blob/9e4f313a89236f7fb593a639a77ee02e21e94469/src/cli/handlers/context.ts#L170-L260) дополнительно возвращает пустой результат на resume, чтобы не менять прежний prefix. Отдельный file-context hook остаётся; этот early return не доказывает отсутствия всех последующих путей выдачи нового знания.
+
+**Наше применение:** не переписывать неизменённую orientation и не добавлять бессодержательные timestamps на каждом вызове модели. При реальном изменении важного метода или появлении результата подавать небольшое актуальное дополнение на поддерживаемой границе решения. Не копировать blanket правило «на resume ничего нового»: новая поправка может иметь больший смысл, чем сохранение старого cache. Отправлять дельту или current view — работа существующего `context`, а не CachePermissionService. Эффект на стоимость зависит от конкретного host/provider и не установлен одним чтением.
+
+### 32.4 OpenHands: разрез определяется связями событий, не десятью репликами
+
+На `0996c339` прочитаны [condenser documentation](https://github.com/OpenHands/software-agent-sdk/blob/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-sdk/openhands/sdk/context/condenser/README.md), [LLMSummarizingCondenser](https://github.com/OpenHands/software-agent-sdk/blob/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-sdk/openhands/sdk/context/condenser/llm_summarizing_condenser.py), [ToolCallMatchingProperty](https://github.com/OpenHands/software-agent-sdk/blob/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-sdk/openhands/sdk/context/view/properties/tool_call_matching.py) и [ToolLoopAtomicityProperty](https://github.com/OpenHands/software-agent-sdk/blob/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-sdk/openhands/sdk/context/view/properties/tool_loop_atomicity.py). `_get_forgotten_events` выбирает начало/конец через допустимые manipulation indices. Pending set конкретных call IDs не позволяет разрезать незавершённую пару action/result; отдельные правила учитывают provider-specific непрерывные tool loops и сохранённый prefix. Это обычная обработка событий, не модельный поиск границы каждого сообщения.
+
+Реальное применение condenser найдено в [prepare_llm_messages/aprepare_llm_messages](https://github.com/OpenHands/software-agent-sdk/blob/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-sdk/openhands/sdk/agent/utils.py#L570-L700): helper вызывает condense/acondense и возвращает изменённую View либо событие Condensation. Полный runtime всех агентов не запускался. Поиск symbol использовался только для нахождения этой функции.
+
+**Eliot:** при подготовке эпизода держать связанные действия и результаты вместе по их настоящим IDs, учитывая interleaving нескольких вызовов. Фиксированное «примерно10 реплик» из прежнего предложения — возможный размер порции, не смысловая граница. Большой результат можно адресно сократить с handle к исходнику; недостающий результат остаётся неизвестным и не блокирует сохранение всех остальных событий.
+
+Provider-specific требования к сериализованному transcript не становятся общими запретами памяти. OpenHands может удалить orphan из модельной View ради формата API; Eliot не обязан удалять исходное наблюдение без пары. Для его понимания не требуется собирать скрытое рассуждение модели или переносить checksums thinking blocks в собственный формат событий.
+
+### 32.5 Сжатие — новая View, не уничтожение источника и не новое evidence
+
+В [Condensation.apply](https://github.com/OpenHands/software-agent-sdk/blob/0996c33916c2a977ea9fe38deee660ff0e1389f2/openhands-sdk/openhands/sdk/event/condenser.py) забываемые IDs фильтруются из списка для модели, а summary добавляется как производное событие. Документированный исходный журнал остаётся append-only. Полезно разделение источника и рабочего представления, но Eliot не нужен второй журнал рядом с его уже сохранёнными observations: он хранит source range/handles в обычной continuation view.
+
+Есть конкретная граница корректности. `_generate_condensation` и async-вариант извлекают текст только из первого content block. При пустом content или первом не-TextContent `summary` остаётся None, однако возвращается объект с непустыми forgotten IDs. Пустая строка также не отклоняется. `RollingCondenser` возвращает этот объект без проверки содержательной непустоты, а `Condensation.apply` сначала убирает названные события и лишь при наличии summary metadata вставляет сводку. Поэтому **в этом пути допустимо сокращение рабочего контекста без полезного заменяющего текста**. Исходный журнал этим не стирается; частота такого ответа модели и дальнейшее восстановление во всём приложении не проверены. Это source-level последовательность, не reproduced deployment incident.
+
+**Прямое решение V3:** не подменять существующую полезную continuation view пустым или неразобранным ответом. Это проверка результата обычной функции, не LLM-оценщик качества и не proof service. При реальном исчерпании окна нельзя просто снова послать заведомо слишком большой prompt: хост выбирает поддерживаемое сокращение/новый handoff, а Eliot предоставляет доступные цель, недавние факты и source handles с честным обозначением неполноты. Старые sources остаются читаемыми. Успешное создание summary не повышает support долговременного урока.
+
+### 32.6 Что берём и чего не создаём
+
+| Нужная работа | Механизм внутри существующей V3 |
+|---|---|
+| Принять реальный результат, пока модель недоступна | Сохранить event; существующий job интерпретирует позже. Nudge ускоряет, не удостоверяет сохранение |
+| Учесть работу нескольких агентов без взрыва inference | Идентичности потоков и диапазоны исходных событий; batching выбранного материала, не обязательный model call на каждый hook |
+| Не повторять один дамп бесконечно | Повторно использовать неизменённую orientation; показывать содержательно новые уточнения, не текущую дату ради новизны |
+| Подготовить связный эпизод | Соотнести actual call/result IDs и границы работы; incomplete input не удаляется ради красивого протокола |
+| Продолжить после сжатия | Производная view с источниками; не пустая замена и не второй владелец host context window |
+
+Эти применения уточняют [Implementation §§3,5](IMPLEMENTATION.md#3-host-interface-and-experience-intake) и [Cognition §5.6](COGNITION.md#56-continuation-is-not-durable-learning), где owners уже определены. В этот проход они не переписываются ради повторения принципов. Нет новой службы допуска, отдельного scheduler, второй БД, обязательного self-reflection и тестовой инфраструктуры.
+
+### 32.7 Охват и честный остаток
+
+claude-mem: архитектурное описание, hook registry, observation handler и spool handoff целиком; skip-agent helper; context1–260; GeneratorRunner1–260; название/содержимое свежего cache-related commit. Полный HookSpool fs implementation, provider response processing, все runtime modes и итоговое измерение стоимости не проверены. Две цели захвата и интерпретации различены, но весь продукт не объявлен прошедшим аудит.
+
+OpenHands: condenser README, token helpers, LLMSummarizingCondenser, Condensation.apply, matching/loop properties; RollingCondenser70–300 и actual message-preparation helper в agent/utils. Чтение соседних tool-argument функций не засчитано как аудит всего agent runtime. BatchAtomicity и другие downstream provider constraints отдельно не проверены. Доноры, модельные ответы, БД и продуктовые/синтетические тесты не запускались.
+
+Попытки получить архив/локальную копию не дали проверенного полного корпуса; missing work-system report от14.10 тоже не найден поиском по имени. Найденный соседний отчёт о донорах controller не подставлен вместо него. Полная исходная автономность, controller request/result и все старые аудиты остаются открытыми по карте. Из46 нумерованных поверхностей15 теперь имеют конкретные source findings,3 — doc/paper treatment,28 — прежний неподтверждённый comparable review; это не процент завершённости и не полный объединённый список источников владельца.
+
+Независимых субагентных заключений нет. Запись результатов в GitHub подтверждает публикацию, не запуск V3 или автоматическое слияние PR. Работа с кодом продукта по-прежнему следует после документации.

@@ -1,35 +1,33 @@
 # Eliot Memory OS V3 — documentation
 
-**Navigation revision 0.18 · 2026-10-20.** Documentation before the greenfield rewrite. V1/V2 are donors; this is not an implemented product.
+**Revision 0.19 · 2026-10-20.** Documentation before the greenfield rewrite. V1/V2 remain donors. The requested subagents were not launched because no usable invocation was available in this session; this is a solo source review, not independent multi-agent validation.
 
 | Document | Purpose |
 |---|---|
-| [Architecture](ARCHITECTURE.md) | Purpose and ownership; remains 0.6 |
-| [Implementation](IMPLEMENTATION.md) | Native Store/host/controller paths and connected product work; remains 0.11 |
-| [Cognition](COGNITION.md) | Cognitive mechanisms within the same modules; remains 0.16 |
-| [Consolidated audit](AUDIT.md) | Source findings through §31; remains 0.17, including the 34 grouped requirements, 29 A15 cases and D01–D44 |
-| [Audit map](AUDIT-MAP.md) | 0.18 reconciles actual donor/audit coverage and the remaining V3 design decisions |
+| [Architecture](ARCHITECTURE.md) | Product purpose and ownership; remains 0.6 |
+| [Implementation](IMPLEMENTATION.md) | Native Store/host/controller paths; remains 0.11 |
+| [Cognition](COGNITION.md) | Cognitive mechanisms in the same owners; remains 0.16 |
+| [Consolidated audit](AUDIT.md) | Findings, 34 requirements, 29 original A15 cases; adds §32 and donors D45–D46 |
+| [Audit map](AUDIT-MAP.md) | Actual coverage, unfinished audit/design work and next concrete reads |
 
-## Coverage is not complete
+## Current result
 
-The owner's question is answered directly in the [coverage map](AUDIT-MAP.md#1-what-can-honestly-be-claimed): not all donors or audits have been checked, and the V3 implementation model is not finished merely because its central concept is clear.
+[Audit §32](AUDIT.md#32-host-capture-and-non-destructive-continuation-019) examines the previously omitted claude-mem and OpenHands Software Agent SDK at named source revisions.
 
-The [D01–D44 census](AUDIT-MAP.md#2-d01d44-conservative-coverage-census) distinguishes selected code excerpts, documentation/paper evidence and inherited/unreconciled entries. Thirteen entries have identifiable function-level findings in the maintained audit; this does not mean thirteen complete product audits. Hy-Memory, V1/V2 and additional candidates named in the supplied Claude report are outside that tally. In particular, claude-mem, OpenHands and several other explicitly named sources were missing from the D table's denominator.
+claude-mem's local observation handler saves through its spool before a best-effort worker wake; provider processing is separate. Its current context registration preserves an unchanged conversation prefix, while optional child-agent filters expose the distinction between capture policy and inference cost. Eliot retains useful real events and coalesces processing, rather than making every tool result wait for a model or suppressing all new corrections for the sake of caching.
 
-The [audit-of-audits](AUDIT-MAP.md#4-audit-of-audits-what-is-and-is-not-checked) records the supplied Claude report, October owner/swarm reports, older Memory OS analyses and release archive separately. A historical recommendation is not automatically an instruction for V3. The September Cloudflare/D1 report belongs to the adjacent Research project; it is not a completed Memory OS audit. Full archive contents were not obtained in this pass.
+OpenHands chooses condensation boundaries using actual call/result relationships and keeps the source event log separate from the model's View. Its selected summarizer/apply path can accept an absent textual summary while removing events from that View; this is a source-level conditional finding, not reproduced source-data loss. Eliot keeps its captured originals and distinguishes a usable continuation from failed or empty synthesis, without becoming another owner of the host's context window.
 
-[Remaining design work](AUDIT-MAP.md#5-what-remains-for-an-implementable-v3-model) is concrete: reconcile original purpose, choose actual host/controller request/result paths, specify minimal native storage operations, settle autonomous work selection and its next-context consumer, ground project views in a chosen source tool, and finish practical lifecycle/consistency choices. No new permission gate, registry, service or testing programme is introduced by listing that work. Current controller documentation still describes the Memory OS integration as requested and unimplemented; that context request does not qualify the reverse inference/embedding route.
+The findings apply existing capture/jobs/context and continuation contracts. No new scheduler, proof service, memory database, compulsory reflection, tests or runtime dependency is added. Architecture, Implementation and Cognition are not rewritten merely to repeat their existing ownership.
 
-## Product findings retained
+## Coverage is still partial
 
-[Audit §31](AUDIT.md#31-real-interpretation-not-validation-shaped-learning-017) follows capture into real projection maintenance and distinguishes it from the unconnected semantic interpretation path. The inspected Dreamer model stage validates a locally constructed draft rather than calling a model; its earlier refusal, candidate-only/partial fields and separate zero-call accounting limit the finding. Mem0 provides a concrete extraction/batched-write mechanism with its own tool-input and error-handling limitations.
+The table now has D01–D46: fifteen entries with identifiable function-level findings, three with documentation/paper treatment and twenty-eight unreconciled for comparable current source review. These are not forty-six complete audits or a completeness percentage. Hy-Memory, V1/V2 and other named material remain outside that denominator. The full archive and all older audits have not been checked.
 
-The intended V3 path remains: preserve real events, interpret the relevant saved episode through an actual controller route when useful, save a lesson or a genuine keep, and deliver those same records through ordinary context/open. Direct corrections do not need a model. Index maintenance, shape validation and learning are not interchangeable.
+[Map §5](AUDIT-MAP.md#5-what-remains-for-an-implementable-v3-model) preserves the six real design questions: original-purpose reconciliation, actual host/controller routes, minimal Store operations, autonomous work selection, grounded project views and practical lifecycle consistency. This pass informs the input/continuation parts; it does not establish Eliot's external inference/embedding API or close the other questions.
 
-Earlier donor findings and all existing requirement/scenario tables are unchanged by this coverage revision. Complete previous reading ranges remain linked from the map; unread callers are not silently marked reviewed.
+Earlier substantive findings remain in [Audit §31](AUDIT.md#31-real-interpretation-not-validation-shaped-learning-017) and preceding sections. The 34 requirements, 29 A15 cases and 36 cognitive walkthroughs remain design expectations, not executed tests. V2 source is `5aac094834fb5635921b550c821cb933a1196105`; V1 is `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. The [incomplete release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete) remains research input, not a mandatory implementation programme.
 
 ## Publication
 
-V2: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. Historical research remains in the [incomplete audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete).
-
-Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). This pass updates only the map and navigation, not runtime, schemas, dependencies, CI, ACTIVE registry or user data. It does not claim a new donor experiment, product test, independent subagent review or main merge. Product implementation follows documentation and the owner's product-code/minimum-Clippy/tests-later order.
+Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Actual diff/ref/readback and workflow status are reported there. No independent subagent review, donor/model/DB runtime, synthetic test, benchmark or Clippy run occurred. Source-described performance is not measured Eliot performance. Runtime, schemas, dependencies, CI, validators, ACTIVE registry, main and user data are unchanged. Product work follows documentation and the owner's product-code/minimum-Clippy/tests-later order.
