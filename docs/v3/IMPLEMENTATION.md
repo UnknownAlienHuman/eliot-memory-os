@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 0.8 · 2026-10-19 · design for the greenfield implementation.**
+**Revision 0.11 · 2026-10-20 · design for the greenfield implementation.**
 
-[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §23](AUDIT.md#23-working-memory-without-global-gates-08) explains the latest removals of blocking machinery. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. This is documentation, not a claim that V3 is implemented.
+[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §§23–25](AUDIT.md#25-real-experience-input-and-normal-context-010) explains the blocking machinery and fabricated skill surfaces being replaced. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. This revision makes the native implementation choices and connected work sequence explicit. It is documentation, not a claim that V3 is implemented.
 
 ## 1. Initial delivery
 
@@ -20,7 +20,7 @@ Begin with one Rust package, an executable with service/CLI/relay modes, and ord
 | `adapters` | Actual host, source and controller interfaces |
 | `control` | Configuration, maintenance, status and recovery |
 
-SurrealDB is the server child of `eliotd`. One private Store owns application writes and uses native indexes, relations and transactions. Do not reproduce Kernel, storage bridge, named-operation catalogue, generic query language or a second semantic database.
+SurrealDB is the server child of `eliotd`. One private Store owns application writes and uses native indexes, relations and transactions. Do not reproduce Kernel, storage bridge, named-operation catalogue, generic query language or a second semantic database. These module names organize code; they are not seven servers or seven mandatory service interfaces. Start with concrete functions and add an adapter only at an actual external boundary.
 
 The first target is local Windows. Reuse a host/controller supervisor when it actually observes Eliot's process and failures. Otherwise a small supervisor mode of the same binary owns daemon and database. The standalone profile has three owned processes; the relay is transient. Do not build two supervisors for the same tree.
 
@@ -92,11 +92,13 @@ Symbols follow their source language. Case-insensitive and punctuation aliases c
 | `capture` | Preserve an event; return committed, staged, unknown or rejected |
 | `context` | Assemble useful context for a goal/decision and budget |
 | `open` | Expand a stored handle or report the specific missing material |
-| `record_outcome` | Retain an observed result and subsequent learning work |
+| `record_outcome` | Submit an observed result or explicit report through the capture path |
 | `dream` | Request interpretation, consolidation or improvement |
 | `control` | Inspect, pause/cancel, configure, correct, restore or erase defined memory |
 
 CLI, MCP and hooks reuse these functions. Metadata comes from adapters where available; agents do not administer claims, manufacture proof objects or complete a questionnaire before ordinary capture. An ambiguous project can use a narrow session scope. Non-Git sources use available anchors.
+
+`record_outcome` is a convenience input to capture, not a second execution ledger or a proof-producing service. A host result is retained once and referenced by learning, history and status views. Explicit human/agent reports retain their source as reports; they do not become independently observed execution. Do not generate successful steps, verifier names or new project IDs to fill a result form. Missing execution is not a successful execution record.
 
 ### 3.2 Capture and deferred input
 
@@ -108,11 +110,13 @@ Replay uses normal capture and the same IDs. Remove staged input after primary c
 
 ### 3.3 First host and actual timing
 
-Native Claude Code hooks plus MCP are the first integration choice. Confirm installed events and identifiers during implementation. Orientation belongs at a planning boundary; tool results and failures feed capture; continuation reconstructs the current task.
+Use native Claude Code hooks for events and context delivery, with MCP for requested lookup/expansion. The [official hook reference](https://code.claude.com/docs/en/hooks), consulted 2026-10-20, documents `PostToolUse`/`PostToolUseFailure` inputs including call identity and result/error. Preserve those actual inputs with their bound session/workspace; read an additional transcript segment only when needed for the episode. Do not ask a model to manufacture an execution proof for an event the host already emitted. Tool completion is not whole-task success.
 
-The [hook reference](https://code.claude.com/docs/en/hooks#add-context-for-claude) separates a tool hook from the next model request. Advice in PreToolUse cannot be assumed to change an already chosen call. **Negative memory is advisory by default.** Eliot does not insert an automatic approval or denial gate before every tool. A specific host-enforced rule is opt-in and separate from memory retrieval.
+Serve orientation on `SessionStart`/`UserPromptSubmit`. When the installed host supports `PostToolBatch`, use its native after-batch/before-next-model boundary for context informed by several tool results, rather than inserting repeated per-tool coordination. On hosts without that event, retain the existing supported boundaries; do not build a compatibility scheduler merely to imitate it. This is a documented integration choice, not a claim that the owner's installed host was exercised.
 
-Use available call/event IDs instead of pairing interleaved results by latest timestamp. Unknown correlation stays unknown. No compulsory lesson, finish ritual or model acknowledgement is required after each interaction.
+The hook path captures and retrieves; it does not wait for Dreamer. New saved episode material makes existing background work due. A turn-end signal may wake that work, but does not force another agent turn or a compulsory reflection. Model processing happens off the foreground path.
+
+Advice in `PreToolUse` cannot be assumed to change an already chosen call. **Negative memory is advisory by default.** Eliot does not insert an automatic approval or denial gate before every tool. A specific host-enforced rule is opt-in and separate from memory retrieval. Use available call/event IDs instead of pairing interleaved results by latest timestamp; unknown correlation stays unknown.
 
 ### 3.4 Independent capabilities
 
@@ -212,7 +216,9 @@ Use the actual executor's configured limits and count all attempts. Unknown usag
 
 A procedure contains trigger, relevant conditions, behavior, evidence, exceptions and expected effect. Attempts reference the method actually offered/used and observed results. Aggregate estimates are views, not another learning database.
 
-First path: a real API/consumer failure or useful success is captured; a method is extracted; a suitable advisory becomes eligible automatically; it is offered at a later decision; the resulting action/outcome improves or narrows the method. Existing historical evidence survives unrelated project changes.
+First path: a real API/consumer failure or useful success is captured; a method is extracted; a suitable advisory becomes eligible automatically; it is offered at a later decision; the resulting action/outcome improves or narrows the method. Existing historical evidence survives unrelated project changes. [Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt) describes the producer and consumer.
+
+The working interpretation is a normal controller request over saved episode material and relevant current lessons. Its result creates a lesson, amends a named lesson or keeps the existing content. Save that content in the same searchable memory used by `context` and `open`. Do not copy it into a separate skill registry or wait for a qualification pipeline. Listing/inspection reads those actual records; an empty store returns an empty list, not generated demonstration cards. Semantic checks and wider generalization can improve the lesson later without being prerequisites for its first qualified use.
 
 ### 7.2 Applicability, not a universal promotion barrier
 
@@ -298,11 +304,30 @@ Use one current schema and supported application/server range, a completed backu
 
 ## 11. Work sequence
 
-This task remains documentation before the rewrite. [AUDIT-MAP](AUDIT-MAP.md) tracks the remaining source reading; it is not an implementation permission registry.
+This task remains documentation before the rewrite. [AUDIT-MAP](AUDIT-MAP.md) tracks remaining source reading, not implementation permissions. Once implementation starts, build connected behavior rather than all DTOs, then all mocks, then a future integration project.
 
-After documentation, build the connected path: demand start → capture/read → context at the host decision → controller-backed interpretation → automatic provisional method → subsequent action/outcome. Complete richer understanding, recursive improvement, additional adapters and recovery around that useful path, not before it through a framework of gates.
+### 11.1 Use the component that already owns the operation
 
-Follow the owner's order: product code, minimum relevant checks/Clippy, tests after the product is built. The scenarios below describe expected behavior; they are not executed tests or a separate platform.
+| Need | Direct implementation | Machinery not required |
+|---|---|---|
+| Remember a tool result | Host event → capture → the original saved observation | Fabricated execution proof, second executor or a model inferring whether the tool ran |
+| List/open a learned method | Query its actual stored record and content | Template-card factory, separate skill registry or proof needed to read advice |
+| Deduplicate an observed event | Existing source identity as record key or a native unique index; short DB transaction | Hashed admission plan and process-wide coordination service |
+| Search and publish memory | Native full-text/vector indexes; commit related primary changes together | Mirrored search database with its own publication and recovery protocol |
+| Interpret an episode | Existing due job → real controller call → create/update/keep ordinary memory | Mandatory maturity ladder, second model scheduler or success-shaped stub |
+| Show status/history | Read the same saved events and job state | Reports that become another authoritative mutable database |
+
+The native index and transaction choices are supported by [SurrealDB index documentation](https://surrealdb.com/docs/reference/query-language/statements/define/indexes) and [transaction guidance](https://surrealdb.com/docs/learn/querying/concepts-and-guides/transactions), consulted 2026-10-20. Database uniqueness handles concurrent storage conflicts, not exactly-once external provider execution. Keep that distinction without introducing another platform. Native capabilities still need concrete domain queries and small adapters; avoiding scaffolding is not pretending application logic disappears.
+
+### 11.2 Build a working path, then extend it
+
+Start with actual capture into the selected SurrealDB instance and retrieval of that same content after restart. Add the host's real event and context boundaries so another interaction can receive that memory. Then connect one real controller route to an episode transformation and make its saved lesson appear through the same context/open path. These are successive useful product capabilities, not a new certification workflow. Richer cognition, vectors, recursive improvement, additional adapters and the remaining recovery requirements complete the same product; the first path does not redefine the full scope.
+
+Cheap deterministic work stays in ordinary functions. Persist only work that actually continues later or across failure. Use a narrow adapter for a real host/provider difference; do not design a generic plugin, query or workflow framework around one implementation. A new control is warranted by a specific real failure, not by an invented prerequisite of another control.
+
+An unconnected capability remains unfinished and returns its actual local limitation. Do not replace missing database/model/host behavior with generated cards, successful outcomes or a production branch selected by a test fixture. Other connected functions continue. Demonstration data belongs outside ordinary user data and cannot be evidence of product execution.
+
+Follow the owner's sequence: product code, minimum relevant checks/Clippy, tests after the product is built. Later tests exercise the same production entrypoints and real domain behavior; fixtures may replace an external boundary in those tests, not establish a second implementation inside the product. A false expectation should be corrected, not satisfied by weakening the feature or manufacturing a result. No new test suite, mock platform or acceptance-report generator is part of this documentation change.
 
 ## 12. End-to-end scenarios for the future product
 
