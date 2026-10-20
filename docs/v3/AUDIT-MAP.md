@@ -1,59 +1,134 @@
-# V3 audit map
+# V3 audit map — coverage and remaining design work
 
-**Revision 0.17 · 2026-10-20.** Reading coverage and next useful action. [AUDIT.md](AUDIT.md) holds findings; [Implementation](IMPLEMENTATION.md) and [Cognition](COGNITION.md) own mechanisms. This map is not runtime state or an approval gate.
+**Revision 0.18 · 2026-10-20.** This answers the owner's coverage question. It does not declare the design complete, add a runtime registry or require a new approval process. [AUDIT.md](AUDIT.md) holds source findings; [Architecture](ARCHITECTURE.md), [Implementation](IMPLEMENTATION.md) and [Cognition](COGNITION.md) hold the product design.
 
-Base: `966650aa71d24cd75a6d214a4f46ab2d832af36a`, PR #5325. V2: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. This pass follows capture/write/projection and the actual Dreamer model-stage composition, with current D20 Mem0 as a contrasting extraction path. See [Audit §31](AUDIT.md#31-real-interpretation-not-validation-shaped-learning-017). The [0.16 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/966650aa71d24cd75a6d214a4f46ab2d832af36a/docs/v3/AUDIT-MAP.md), [0.15 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/48a622457c826eed3f539d9a870e3521da644527/docs/v3/AUDIT-MAP.md) and [0.14 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/841c807659727cd7fb5730331190ee27cd50f47d/docs/v3/AUDIT-MAP.md) retain earlier detailed coverage, not new re-reads.
+Base: `4a0616ccb087a4edb8018f1ae07c348d4b1e2dc6`, PR #5325. V2 donor: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. Detailed earlier reading ranges remain in the immutable [0.17 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/4a0616ccb087a4edb8018f1ae07c348d4b1e2dc6/docs/v3/AUDIT-MAP.md), [0.16 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/966650aa71d24cd75a6d214a4f46ab2d832af36a/docs/v3/AUDIT-MAP.md) and their linked predecessors. This reconciliation does not turn that partial reading into whole-repository review.
 
-| Track | Covered | Still missing / next connected read | Decision |
+## 1. What can honestly be claimed
+
+- **All donors studied: no.** D01–D44 is an inventory of surfaces, not 44 completed source audits. Thirteen entries have identifiable function-level source findings in the maintained V3 audit; three have documentation/paper-level treatment in this accounting; the other twenty-eight remain inherited or insufficiently reconciled for a current source-review claim. These categories describe recorded coverage, not a percentage of total understanding or a claim that the thirteen products were read in full.
+- **All audits checked: no.** The supplied Claude revision 4, earlier owner reports and selected archive findings have informed the design. There is no complete audit-by-audit, finding-by-finding reconciliation against the chosen V3 boundary. Historical fixes and recommendations are not automatically current requirements.
+- **V3 concept understood: the central design is explicit.** Preserve actual observations; interpret useful episode material through a real model; retain revisable knowledge; deliver applicable content; observe subsequent outcomes. Owners and rejected V2 machinery are stated.
+- **Complete implementation model: not yet.** Specific external request/result routes, concrete storage operations, host event mapping, the practical learning/refresh policy and the remaining original-purpose reconciliation still need a connected treatment. Those are design tasks, not reasons to create another qualification framework.
+
+The retained 34 requirement groups and 29 A15 scenarios are navigation and preservation aids. Their presence does not prove that every original requirement has been independently reconciled or implemented. The supplied Claude audit uses 63 Architecture anchors and eight hard boundaries; those are different denominators and cannot be silently equated with the 34 grouped rows.
+
+## 2. D01–D44: conservative coverage census
+
+**Source excerpts** means named functions/callers were inspected and findings recorded; surrounding paths may remain unread. **Docs/paper** does not qualify the implementation. **Unreconciled** means the current V3 record does not establish a comparable function-level review; it does not assert that nobody ever read anything about this donor in an earlier audit. Selecting a mature tool need not entail auditing its entire implementation.
+
+| D | Donor surface | Recorded level | Useful next question / retained limit |
 |---|---|---|---|
-| A01 Purpose/learning | Original 34/29 maps, selected V1/UL/I12, experience/skill consumers; real distinction between projection and interpretation | Original autonomy details and alternative semantic producers | A useful next-action lesson, not a validated empty carrier |
-| A02 Control/notification | Broker no-success gate, acknowledgement gap, history/CAS and recurrence; forecast expiry versus completion | Alternative intake and actual delivery feedback | Direct operations; expiry does not resolve a commitment |
-| A03 Process ownership | I1.2 and selected lifetime paths; Dreamer actual binary entry | Complete startup/worker registration, generations and recovery callers | One actual observer; a status-only successful exit is not inference |
-| A04 Store/recovery | Native Store/SDK/restore/queues; WriterWorker apply/receipt/optional notifier | ORS duties, full primary/purge/backup; all alternative writer compositions | Preserve source first and reuse native transactions |
-| A05 Retrieval | Earlier V2 and D01/D03/D08/D09/D10/D19/D42/D43 reads; projection family's actual operations | Graphiti temporal filters, broader donor callers and final Eliot rendering | Working indexing does not establish extracted knowledge |
-| A06 Producers/consumers | Observe→writer→projection callback; exhaustive Search/Cue/DependencyDirty/Utility match; Dreamer main→submit and downstream model/material helpers; Mem0 actual add→extraction→persistence | Other V2 semantic scheduling, full MCP registration and actual external controller route | This post-write path is maintenance; the inspected model stage is not inference. Do not generalize to every V2 path |
-| A07 Development overhead | Old receipt/CI findings; existing once-call test counts local validation closure | Actual integration resolution, not a new test program | Verify the product operation's meaning; never convert a local validation count into an inference claim |
-| A08 Own V3 design | Native connected paths; Audit §31.7 makes saved input→actual model result→ordinary lesson concrete | Implement within existing ownership after documentation | No new proof producer, task fabrication, source-reading certificate or stage manager |
-| A09 Hy coding | Prior writer/reconciliation/history/lexical findings | Relevant uncovered source paths | Preserve source and independent retrieval |
-| A10 Hy transfer | Prior finite inputs/no-change/compaction findings | Concrete later quality comparison | Similarity is candidate discovery |
-| A11 Harness2 D44 | Two loops, selection/reflection/library/ledger/schedule/context/proposer | Remaining pool/mission and benchmark adapters/reset | Existing jobs/controller, real execution contrasts |
-| A12 Donors/archive | Fresh D20 Mem0 synchronous extraction; D10/D11 and earlier donor coverage retained | Mem0 async/complete retrieval not reviewed; historical D11/D18 and full archive remain partial | Take actual extraction/batching, not hosted scores or an entire extra runtime |
-| A13 Interfaces | Host/DB/OS references, EverOS provider/factory; Dreamer internal cycle distinguished from external controller | Concrete supported controller request/result and installed host event mapping | Material and real response cross the boundary, not only route-shaped DTOs |
-| A14 Publication | Existing branch/head and push permission read; prior CI 39442398569 failed on missing PR evidence block | New commit compare/ref/readback and actual workflow status in PR | No inherited PASS, automatic merge claim or gate bypass |
+| 01 | MemMachine | Source excerpts, §§26–27 | Actual configured backend and remaining segmenter/ingestion details; do not generalize one backend |
+| 02 | MemPalace | Unreconciled | Source identities and repeated export handling |
+| 03 | Subcog | Source excerpts, §28 | Selected fusion/lifecycle functions, not complete runtime quality |
+| 04 | MemOS local plugin | Source excerpts, §9 | L2/gain attribution only; not the complete learning pipeline |
+| 05 | Claude Code memory/tool search | Docs/paper | Installed event/decision timing and actual integration, not source audit of the host |
+| 06 | ClawVM | Unreconciled | What compression actually preserves and what the next reader sees |
+| 07 | Pichay / demand paging | Unreconciled | Repeated expansion cost and reconstruction behavior |
+| 08 | Graphiti | Source excerpts, §26 | Temporal filters and actual add_episode caller before broadening helper findings |
+| 09 | Hindsight | Source excerpts, §§26–27 | Remaining retain-to-consolidation/storage paths and broader retrieval |
+| 10 | Current EverOS | Source excerpts, §30 | Imported everalgo internals and unreviewed intake/recovery paths |
+| 11 | Historical EverMemOS | Docs/paper, §30 | Historical implementation matching the paper is not established |
+| 12 | Cloudflare managed Agent Memory | Unreconciled | Actual service boundary and useful capture/update mechanism |
+| 13 | Cloudflare Agents SDK Sessions | Unreconciled | Session/branch/compaction semantics relevant to source intake |
+| 14 | SurrealFS | Unreconciled | Source/indexer identity and incremental indexing, not another Store |
+| 15 | MentisDB | Unreconciled | Versioned procedure lookup/update and actual consumers |
+| 16 | LangMem | Source excerpts, §§23–24 | Selected executor and prompt-memory path, not all backends |
+| 17 | Current Letta Code | Source excerpts, §29 | Full automatic/server reflection and replay remain unqualified |
+| 18 | Archived Letta V1 | Unreconciled | Historical scope remains separate from D17 |
+| 19 | Nocturne Memory | Source excerpts, §28 | Read/alias/version mechanisms; do not import persona or boot doctrine |
+| 20 | Mem0 OSS | Source excerpts, §31 | Synchronous extraction/formatter; async, full retrieval and hosted platform not qualified |
+| 21 | Historical OpenMemory MCP | Unreconciled | Exact historical product and consumer |
+| 22 | OpenMemory session CLI | Unreconciled | Real import/export/session path versus roadmap |
+| 23 | Cavira LongMemory | Unreconciled | Supersession/decay/checkpoint behavior; distinguish product identities |
+| 24 | ripgrep | Unreconciled | Choose concrete source-span use; whole-tool source audit is not necessary |
+| 25 | ast-grep | Unreconciled | Specific structural queries and source coordinates for project understanding |
+| 26 | SCIP | Unreconciled | Actual producer/version/encoding and definition-reference integration |
+| 27 | GitHub Copilot Memory | Unreconciled | Publicly supportable citation/reuse behavior, not an assumed open runtime |
+| 28 | Docling | Unreconciled | Relevant document ingestion needs before selecting a parser |
+| 29 | Docling Core | Unreconciled | Hierarchy/provenance for the chosen document path |
+| 30 | DocETL | Unreconciled | Useful transformation/error handling without importing its runtime |
+| 31 | Vector / VRL | Unreconciled | Concrete transform-preservation mechanism; no DSL by default |
+| 32 | Kreuzberg v4 LTS | Unreconciled | Exact branch and required native extraction behavior |
+| 33 | Current Kreuzberg | Unreconciled | Do not inherit D32's properties by name |
+| 34 | Cedar | Unreconciled | No current baseline need for a policy engine; omission is not source review |
+| 35 | OPA | Unreconciled | Same: do not add a second policy owner just to use a donor |
+| 36 | redb | Unreconciled | Historical recovery ideas only unless a concrete need changes the one-DB choice |
+| 37 | duroxide | Unreconciled | Activity identity may be useful; workflow runtime is not selected |
+| 38 | Flawless | Unreconciled | Unknown external outcome/retry distinctions |
+| 39 | FoundationDB testing | Unreconciled | Not a prerequisite to design or build V3; no new testing platform |
+| 40 | Wasmtime | Unreconciled | Only a real extension/isolation need could justify it |
+| 41 | SurrealDB Agent Memory / Spectron | Docs/paper | Application-tier descriptions are not a code/runtime audit; native DB is a separate dependency |
+| 42 | MAGMA | Source excerpts, §29 | Actual query path inspected, broader ingestion/callers remain partial |
+| 43 | A-MEM | Source excerpts, §28 | Library, research implementation and paper must remain distinct |
+| 44 | Harness2 | Source excerpts, §§19,25 | Remaining pool/mission/benchmark adapters; no reproduced experiment |
 
-## Fresh source coverage
+Hy-Memory has extensive selected source findings outside this D numbering. V1 and V2 are also donors outside the external D tally. None was read entirely. The old 43 D + 27 P + 187 S = 257-row inventory is inherited from the supplied/previous audits, not a fresh parsing of the release archive in this pass. It is not 257 distinct software projects or 257 verified experiments.
 
-| Source/version | Actually read in 0.17 | Limit |
+## 3. The source list is larger than D01–D44
+
+The supplied **`eliot-documentation-audit(1)(1).md`, revision 4, §10.2** explicitly includes material omitted from the maintained D table. Its §§15 and 17 rely on some of those mechanisms. These omissions prevent using D01–D44 as the complete denominator for the owner's request.
+
+| Additional named material | Current status / why it matters |
+|---|---|
+| claude-mem | Proposed host capture, context reveal and handoff mechanisms have not received a comparable first-hand code pass in the maintained V3 audit. High relevance to the unfinished host-to-memory path. The supplied audit's dated description is not a current implementation guarantee. |
+| OpenHands / software-agent-sdk | Supplied audit proposes preserving tool-call/result pairs when cutting context. Exact algorithm and caller still need review before transfer. |
+| mcp-memory-service | Supplied audit proposes natural memory triggers; actual current producer/consumer not reconciled. |
+| basic-memory | Mentioned as a contrasting Markdown-source design, not selected as Eliot's storage. Source review remains open; no need to import its topology. |
+| codebase-memory-mcp | Named external structural source for project understanding. Need one concrete integration choice, not a new embedded code graph. |
+| Codex hooks and OpenCode plugins | Additional host surfaces, not interchangeable with Claude hooks by similar event names. First-host work does not qualify them. |
+| Surrealist | Existing inspection UI candidate. Choosing an existing tool is different from implementing another operator application. |
+| Cloudflare OS, Switchyard, Unsloth, cognee, Perplexity Portable Computer | The supplied audit itself marks these names as requiring clarification/research. Product identity and relevance are not established here. They are not silently accepted dependencies. |
+
+The same section additionally names research families such as MemGPT/HiAgent, Retrieve then Solve, LightMem/MemDelta, STALE/ATMS, Memp/ACON, GraphRAG/CodexGraph/RepoGraph/HippoRAG 2, MemLineage/Selection Integrity/TOKI/MemTX and Meta-Harness. Some overlap old P/S rows. The full deduplicated union has not been established; do not sum names and registry rows as independent coverage. Reading all of them is a research task, not permission to reproduce each framework inside Eliot.
+
+## 4. Audit-of-audits: what is and is not checked
+
+The source filenames below refer to the owner's supplied/Library materials; they are not new files created in this repository. Multiple revisions/copies of one report are not independent corroboration.
+
+| Audit family | Material examined / status | Remaining reconciliation |
 |---|---|---|
-| V2 `5aac094834fb5635921b550c821cb933a1196105`, capture and writer | `mcp_stdio/verification.rs` 1–260; `writer.rs` 1–320,1000–1340,1570–1840,1910–2470; `cognitive_projection.rs` 1–690 | Source call chain only. Optional projection notifier is not all possible post-commit work; complete MCP startup/worker registration and every alternative scheduler were not read |
-| Same V2, Dreamer | `main.rs` 1–230; `lib.rs` 1–240,640–850; `controller.rs` 1–170; `model_stage.rs` 1–540; `admitted_material.rs` 1–555; targeted dispatch usage search | Non-Curation stops before downstream local model/grounding composition. Curation is separate. No live execution or claim that all external model/accounting paths share this behavior |
-| D20 Mem0 `0724291bd864cf807e88ee8981c8226644e8fb42` | README45–135; `mem0/memory/main.py` 1–250,480–1120,1170–1255; `utils.py` 1–130 | Synchronous Memory.add and its formatter, not the entire AsyncMemory/backend/hosted platform. The selected source excludes tool-role text from extraction; other host preprocessing may differ |
+| Claude documentation audit, revision 4, 2026-10-18 | Previously used throughout V3; this pass rereads donor §10.2 and proposed implementation/original-purpose §§15–17. It reports 968 release files and explicitly limits what was semantically read. | Check remaining recommendations against actual source and the chosen V3 boundary. Its 63-anchor mapping, line budgets, fixed counts and claimed closure are proposals, not implementation evidence. |
+| `ELIOT_AUDIT_2026-10-08_v9(1).md` (v8 also located) | Historical base `04eec326...`; this pass reads scope, issue changes, corrections and blocker-map interpretation in §§1–3. | Full T01–T31 and subsequent fixes are not reconciled here. In particular, this report already retracts claims that deferred tests are the established root cause and that a new dependency/status registry is needed. Do not revive those claims. |
+| `ELIOT-Swarm-AUDIT-2026-10-06(2).md` | Controller base `40591a2`; introduction and G1/initial G2 read. It spans controller, Memory OS and swarm practice. | Separate historical controller findings from current interfaces and from Memory OS responsibilities. Do not transfer its task-control machinery into memory. |
+| `Аудит репозитория eliot-memory-os относительно /docs/architecture` | Base `15d6b40d...`, 2026-08-31; scope, findings and recommendations reread. | Source findings need their version context. The report praised formal routing/proof machinery and proposed additional typed/coverage mechanisms; those recommendations require reconsideration under the explicit lightweight rewrite, not automatic adoption. |
+| `Eliot Memory OS: почему проект остаётся незавершённым` | Summary retrieved; no full fresh source reconciliation. | Undated/current-main wording and historical manual-only CI cannot be promoted to present status. |
+| `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` | Referenced by the supplied Claude audit at §§5,10; complete text not obtained in this pass. | Retrieve the actual report, then compare its recommendations and original donor paths. A citation to it is not a reading of it. |
+| Release `audit-2026-10-16-incomplete` | Release metadata and named assets were obtained. Full ZIP bytes and all report bodies were not read in this pass. Earlier selected findings remain in AUDIT. | Reconcile actual audit reports, donor-transfer decisions and research entries. Manifest/coverage/ledger presence is not substantive review of all entries. |
+| `audit-2026-09-14.md` | Opening read establishes a Cloudflare/D1 `eliot-research` context, not the Memory OS runtime. | Keep as adjacent-system lessons, not another completed Memory OS audit or evidence about SurrealDB. |
 
-The writer's real notifier reaches a coordinator that updates search, cues and dependency state; no interpreter is present in that exhaustive family dispatch. This narrows the formerly open edge without proving global absence of every automatic producer.
+The release contains separately named MANIFEST, execution/intake coverage, blockers, publication and research-join assets. That establishes available artifact names, not that their contents are complete or correct. Archive transfer failed in the available paths; a failed download is not evidence that an asset is missing. No new archive-wide count or completeness percentage is claimed.
 
-The inspected Dreamer production model-stage closure validates and hashes a locally constructed empty draft. Its bundle contains handles/omissions rather than loaded episode content, and a text helper returns the question as its hypothesis. A05 usage derived from limits and blanket preservation flags are not observed semantic work. Counterchecks matter: earlier refusal prevents this normal submitted route from reaching those helpers, Partial/candidate-only flags exist, and a separate route-usage call records zero provider calls.
+## 5. What remains for an implementable V3 model
 
-Mem0 actually invokes its configured LLM over new text/recent context/existing memories and batches persistence. Provider exceptions are raised; parse failure still becomes an empty returned extraction. The infer=false path remains embedding-dependent. Useful extraction code does not provide a raw-first guarantee or substitute for coding tool-result capture.
+This is an order of useful design work, not six new subsystems or gates. Each result belongs in the existing Implementation/Cognition text and should remove an ambiguity, not multiply forms.
 
-## Prior reads retained
+| Work to finish | Already chosen | Concrete remaining result |
+|---|---|---|
+| Original-purpose reconciliation | Greenfield local-first memory; original history, cognition, transfer and 29 scenarios retained in grouped form | Compare the remaining V1 Canonical/UL and Architecture requirements with actual mechanisms, especially autonomous understanding, non-code sources, disagreement and self-improvement. Record genuine deliberate departures without claiming every field name implements a capability. |
+| Real host/controller boundary | Native first-host events; one existing controller for models and embeddings | One actual host event→saved input example and one supported text request/result plus embedding request/result route, including their real limitations. Select the existing method or name the specific missing implementation in its owner; do not invent another executor. |
+| Concrete storage and reads | One SurrealDB Store, primary source preservation, native indexes/relations/transactions | Minimal record layout and representative domain operations: capture with follow-up work, retrieve current and historical material, revise one lesson, load only selected sources. Tie these to a compatible SDK/server choice rather than leaving only logical record-family names. |
+| Autonomous work selection and learning | Finite episode work; useful provisional advice; no-change; outcome-linked recursive improvement | Explain what makes work due, which saved episode and prior lessons it reads, what it actually changes, and how the next ordinary context receives it. Separate expensive interpretation from cheap event grouping and from optional evaluation. No worker per cognitive noun. |
+| Grounded project understanding | Small purpose/area views and source-linked explanations | Choose a concrete existing structural source for the first path. Connect actual changed resources/consumers to affected views and useful next-action context. Similarity alone is not program structure; source-tool choice is still more specific work than listing ripgrep/ast-grep/SCIP. |
+| Practical lifecycle and final consistency | Demand start, usable degraded reads, one observer, simple recovery and direct control | Settle process ownership, specific file/DB recovery choices and first-use configuration; then reconcile Architecture/Implementation/Cognition as one connected design. Windows behavior, performance and quality claims are observed later in implementation, not certified by this map. |
 
-D10 current EverOS `c4a20a28` and D11 historical paper were distinguished in 0.16: default-off foresight, standard search consumer, eligible-corpus hydration, final evidence packing and foreground capacity. D42 MAGMA's query/adaptive/neighbor/packing and D17 Letta's real local compaction versus reflection preparation remain the 0.15 findings. D01/D03/D08/D09/D16/D19/D43 ranges remain in earlier maps and the maintained audit. None is silently promoted to complete review by this pass.
+No blanket research completion is required before an unrelated decided component can be implemented after the documentation stage. Conversely, a stack of donor findings does not substitute for the above product decisions. Quantitative effectiveness and a promised fifty-fold reduction cannot be established by reading alone; no test campaign is ordered to compensate for missing design or missing code.
 
-## Transfer and verification limits
+### Current controller boundary rechecked
 
-Local downloads did not provide a current checkout. Attempting to materialize a GitHub response through Files also failed because that connector response is not a Files attachment; no successful transfer or local diff-check is claimed. Further editing/publication uses GitHub objects directly rather than repeating the failed download. Large source results were expanded where needed; uncovered file ranges remain uncovered.
+On controller `main@eeea3558d66a1525c9f5c2d9f3b4f75c62714bf8`, the [README](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/eeea3558d66a1525c9f5c2d9f3b4f75c62714bf8/README.md) and [Memory OS integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/eeea3558d66a1525c9f5c2d9f3b4f75c62714bf8/docs/eliot-memory-os-integration.md) still describe requested, unimplemented runtime integration and preparation-only owner scope. The concrete request documented there is controller→Memory OS context. It is not a reverse text/embedding API contract. A limited `embedding` search mostly found embedding-as-host-composition references; this is not proof that no suitable execution interface exists anywhere. The actual method/caller decision remains open, rather than being treated as solved by that integration filename.
 
-No product, provider/model, donor, database, Rust/Clippy or synthetic behavior test ran. Existing test source was read to determine what its counter measures, not executed or extended. No independent subagent review occurred. The paper/README performance of a managed service is not measured OSS or Eliot performance.
+## 6. Next work, without restarting the entire audit
 
-## Next connected reads
+First complete the original-source/audit reconciliation and the real host/controller/Store spine; use claude-mem/OpenHands and the relevant structural-source donor where they answer those gaps. Then settle the learning/refresh policy and finish the remaining practical lifecycle choices. Continue other donor reads against explicit unresolved questions, with a supported decision to use, defer or reject the mechanism. Do not invent a crate or issue for every row.
 
-1. Identify the actual external controller inference request/result used by an existing real caller, and compare its input content with the available saved episode. An internal `controller.rs`, a `ModelRouteRequest` or a status receipt is not enough. Record any remaining installed/API gap without building another executor.
-2. Read other V2 semantic producers and complete startup registration only where needed to determine whether there is an alternative real learning path. The tested writer→projection route is already understood; do not repeat it as fresh evidence or claim whole-repo absence.
-3. Return to original autonomy/understanding and ORS/process ownership where they affect the chosen connected V3 path. A useful observation and a provisional lesson remain available before optional analysis finishes.
-4. Finish D08 temporal filters/add_episode and D09 commit-to-consolidation where a stronger donor claim is necessary. Mem0 AsyncMemory, Letta full automatic reflection and historical EverMemOS runtime remain explicit partial coverage, not prerequisites to implement the selected simple mechanisms.
+The former A01–A14 tracks are still represented: requirements/learning; control/notification; process ownership; storage/recovery; retrieval/applicability; producers/consumers; development overhead; own V3 design; Hy coding; Hy transfer; Harness2; donors/archive; interfaces; publication. Their exact earlier inspected ranges remain in the linked maps. In particular, Graphiti temporal filtering, Hindsight complete retain/consolidation, Letta automatic reflection, historical EverMemOS and ORS ownership are still partial—not closed by this census.
 
-## Preservation
+## 7. This pass and publication boundary
 
-Revision 0.17 adds Audit §31 and updates its header/source/D20 navigation. It does not repeat 0.15's editorial consolidation. The 34 requirements, 29 A15 cases, D01–D44 and all prior audit sections remain; the 36 cognitive walkthroughs are unchanged. Architecture 0.6, Implementation 0.11 and Cognition 0.16 remain unchanged because the new evidence applies their existing connected-path design rather than requiring another rule family.
+Fresh work: read the supplied audit's additional donor list and implementation/original-purpose sections; locate and inspect the named historical audit families; distinguish the adjacent Research audit; reread current V3 Architecture, relevant Implementation choices, map/navigation/AGENTS; check current controller README/integration and scoped search. This exposes an incomplete source denominator and explicit design residue. It is not another source audit of all 44 donors.
 
-Runtime, schema, dependencies, CI, validators, ACTIVE registry, main and user data are untouched. Actual changed paths, commit and workflow result belong in the PR. Product work still follows documentation and the owner's product-code/minimum-Clippy/tests-later sequence.
+No product/donor/model/DB run, benchmark, new test program or independent subagent review occurred. Some local execution/asset-transfer paths failed; no local repository checkout or whole-repository diff check is claimed. GitHub compare/ref/readback establish the published change. No audit finding is promoted because a source file was merely located.
+
+This revision changes only the reading map and navigation. Architecture 0.6, Implementation 0.11, Cognition 0.16, consolidated Audit 0.17 and their requirement/scenario tables remain unchanged. Runtime, schemas, dependencies, CI, validators, ACTIVE registry, main and user data are untouched. Product work follows documentation and the owner's product-code/minimum-Clippy/tests-later sequence.
