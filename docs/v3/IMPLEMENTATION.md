@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 0.6 · 2026-10-19 · technical design; no V3 runtime or query has been qualified.**
+**Revision 0.7 · 2026-10-19 · technical design; no V3 runtime or query has been qualified.**
 
-[Architecture](ARCHITECTURE.md) defines the product. [Cognition](COGNITION.md) owns the algorithms for resolving claims, project understanding, transfer and recursive improvement. [Audit](AUDIT.md) separates source findings, proposals and unverified behavior. [Audit map](AUDIT-MAP.md) tracks remaining work. This revision removes inherited donor vetoes and unnecessary control machinery; it does not change V2 code, CI or user data.
+[Architecture](ARCHITECTURE.md) defines the product. [Cognition](COGNITION.md) owns the algorithms for resolving claims, project understanding, transfer and recursive improvement. [Audit](AUDIT.md) separates source findings, proposals and unverified behavior. [Audit map](AUDIT-MAP.md) tracks remaining work. Revision 0.7 refines exact cue identity, optional enrichment, delivery observations and direct control/attention recurrence after reading their connected V2 paths; V2 code, CI and user data are unchanged.
 
 ## 1. Initial delivery
 
@@ -82,6 +82,12 @@ Do not copy V2's policy/manifest/request/result digest closure around an in-proc
 
 The profile assumes cooperative adapters and actual host tool restrictions. An unrestricted process under the same OS account can access that user's files or administrative CLI; a `human_only` flag cannot make it a sandbox. State the limitation rather than invent an ineffective security subsystem.
 
+### 2.5 Exact cues and advisory aliases
+
+Resolve paths from the adapter's actual source syntax and base before deriving project-relative keys. Preserve whether the input is relative, rooted, drive-relative, drive-absolute or UNC when that distinction has not yet been resolved. Never make two resources equal merely by removing leading separators or lowercasing their spelling. Unknown base or filesystem semantics means unresolved identity, not rejected raw capture or invented equivalence. Use native/library path handling rather than a new cross-platform path language.
+
+Symbols follow their source language's identifier rules. Case-insensitive search and punctuation aliases can discover candidates, but remain separate advisory forms; they are not exact symbol identity, a merge key or authority to block an action. Capture and lookup use the same selected normalization/profile. A command-family cue may retrieve a lesson but cannot replace the actual program/arguments/resource checks of an exact host rule. Changing normalization affects the derived index, not the preserved observation.
+
 ## 3. Host interface and experience intake
 
 ### 3.1 Small application surface
@@ -122,6 +128,20 @@ On continuation, reconstruct goal, discarded approaches, commitments and applica
 
 Capture, advisory timing, tool denial, outcome observation, transcript refresh and cancellation are separate capabilities. A search-only host remains useful without demonstrating the complete loop. Native hooks and a controller's SDK metadata bridge are different surfaces; similar JSON fields do not prove identical timing or coverage. Hostless maintenance completes a memory transformation, not an invented coding task.
 
+### 3.5 Optional enrichment cannot rewrite a completed operation
+
+Perform mandatory scope, permission and primary-state checks at the real operation boundary. Once the primary tool/operation has returned a known result, optional context planning, usage measurement, delivery logging or response decoration must not convert that result into a generic failure suggesting nothing ran. Preserve the primary result and add a bounded diagnostic about the missing enrichment when useful. Do not retry the underlying effect to repair its telemetry.
+
+The rule does not turn failed primary capture into success or permit disclosure after a real restriction. If necessary persistence fails after an external effect, report the known effect and the persistence gap (or the genuinely unknown outcome) separately, with the existing reconciliation identity. No new status service or alternate writer is required.
+
+### 3.6 Delivery observations and repeat suppression
+
+Build the permitted packet before optional delivery accounting. A locally prepared packet is not a received message. A successful write to the adapter's own transport establishes only that handoff, not host receipt, model attention or use. Record the strongest event actually observed; stronger feedback stays absent when the host supplies none.
+
+Do not durably mark advice delivered before inserting it into a response, then hydrate that mark on restart as proof the host received it. A telemetry write failure need not suppress otherwise permitted advice. Attempt records may carry a small prepared/handoff/unknown observation where useful; they do not require another Receipt schema, two-phase delivery protocol or mandatory acknowledgement from every model turn.
+
+Repeat suppression is a bounded presentation cache keyed by context incarnation and material memory revision, not an irreversible knowledge state. At the actual observed handoff, suppress redundant presentations within that incarnation; a failed/unknown handoff must not become permanent suppression. On resume or loss of the cache, a current bounded orientation/re-offer is preferable to silently losing needed guidance. Do not resend every item on every call, claim exactly-once delivery, increase learning support because it was offered again, or bypass fresh disclosure/applicability checks.
+
 ## 4. Retrieval and context
 
 ### 4.1 Independent candidates and truthful resolution
@@ -131,6 +151,8 @@ Exact identifiers and lexical search query eligible primary records independentl
 Preserve useful exact source values in searchable fields/cues, with a handle to their context. A value hidden only in details must not become findable solely after an unrelated summary was found. Permit bounded source-neighborhood/raw lookup where needed; do not embed every raw log or claim universal absence from an unindexed portion.
 
 Limit each arm by relevant project, state and influence before exposing content. Use native filtered vector plans where supported; examine the actual server/query plan before implementing a workaround. Small scoped exact vector search is legitimate. A filtered ANN result still does not prove complete recall. [Similarity search](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search).
+
+After selecting candidate IDs, hydrate those records and the explicitly required group alternatives or bounded neighbors. An output limit of eight items does not justify loading thousands of unrelated project payloads for every request, including requests with no hits. Keep broad onboarding/rebuild scans on their separate finite maintenance path. Missing selected records remain visible gaps, not a reason to reload the whole project silently. Use existing indexed queries and batched ID lookup, not another cache/database solely to compensate for a broad query.
 
 ### 4.2 Embedding identity and failure
 
@@ -263,13 +285,23 @@ Use standard [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win
 
 Compare available host events, source changes and reported progress; heartbeat is not progress and a file change is not completion. Missing observation triggers bounded resynchronization and an explicit gap. A small CLI status/inbox/control uses the same stored facts; a later UI is a view.
 
-Deduplicate notifications by the underlying problem and material change, not by retry or newly hashed timestamp. Acknowledgement records delivery, not problem resolution. A failed channel leaves the problem visible locally. Mechanical Doctor repairs may restart an owned worker or reconcile an index; they do not alter meaning, delete material or weaken the goal to make a check pass.
+Deduplicate notifications by the underlying problem and material change, not by retry or newly hashed timestamp. Acknowledgement records delivery, not problem resolution. A failed channel leaves the problem visible locally. Mechanical Doctor repairs may restart an owned worker or reconcile an index; they do not alter meaning, delete material or weaken the goal to make a check pass. Section 9.4 defines how a new episode and late acknowledgement are distinguished without another notification platform.
 
 ### 9.3 Honest completion
 
 `record_outcome` records facts and claims; external task acceptance stays in the host/controller. Show each declared criterion, relevant revision and observed result. One successful verifier covers only its actual check. Missing verification is unknown, not whole-task success.
 
 No requirement to call a ritual finish sequence, generate a lesson or collect separate proof objects on every ordinary interaction. A source-discovered command is not automatically authorized for execution; use the host's existing permitted tool path.
+
+### 9.4 Direct local control and attention recurrence
+
+The existing local control boundary checks the authenticated connection, addressed target and operation-specific permission. Reading status/readback, acknowledging an attention item, pausing new work and requesting cancellation of owned work do not depend on a model, optional evaluator, installed toast binary or unavailable critical-action approval producer. These operations do not thereby gain permission to execute a new destructive action. Report database or executor unavailability honestly; an accepted cancellation request is not proof an external effect stopped.
+
+Treat a stable problem key, a source event/attempt, the current episode and the displayed revision as distinct pieces of the same attention record. Repeated polls or redelivery of the same event are not new incidents. New observations can update the current summary, evidence and last-seen information without minting another problem or requiring every old display field to remain equal. A process restart by itself is not a new human obligation.
+
+Acknowledgement covers the episode/revision the person saw and suppresses repeated presentation of that material, not resolution. Actual recovery or an explicit disposition records why the episode closed; dismissal is not evidence of technical recovery. A later supported recurrence reopens the problem in a new episode/revision. A late acknowledgement of the old episode cannot silence it. Material escalation may require renewed attention; neither every timestamp change nor every repeated warning should do so. These are ordinary local decisions, not separate grant or approval workflows.
+
+Update the current record conditionally and append any retained material history in the same existing transaction. Use stable event/action identity for repeats and the record revision for concurrent changes. Do not replay the full history, revalidate old cryptographic receipts or rewrite an ever-growing history array before each current-state update. History remains available on demand; optional diagnostics can be bounded without silently deleting required semantic history. Rebuild from history, if ever needed, is a recovery operation, not the ordinary write path.
 
 ## 10. Deletion, backup and restore
 
@@ -341,8 +373,14 @@ Use the owner's development order: product code, minimum relevant checks/Clippy,
 | S24 | Interrupted backup while capture continues | Incomplete copy rejected; post-cutoff input remains in fresh spool |
 | S25 | Old pending external job or stale restrictions | Execution reconciled; uncertain recovery not served as current |
 | S26 | Host replays old injected advice | Current applicability clarified; no remote-erasure promise |
+| S27 | Valid local acknowledgement/cancel while optional approval infrastructure is absent | Operation-specific control still reaches its owner or reports actual storage/executor failure |
+| S28 | A resolved problem recurs before an old acknowledgement arrives | A new episode remains actionable; the stale acknowledgement cannot silence it |
+| S29 | A successful primary tool is followed by an enrichment/logging failure | Preserve the known primary result and the observation gap; do not imply the effect never ran |
+| S30 | Process stops after preparing advice but before transport handoff | No permanent delivered claim or suppression from a prepared-only observation |
+| S31 | Same spelling denotes case-distinct symbols or different path roots | Exact identity remains distinct; broad aliases stay advisory |
+| S32 | A small cue result needs source text from a large project | Hydrate selected IDs and necessary bounded alternatives, not the whole project payload set |
 
-All [29 original A15 scenarios](AUDIT.md#12-all-29-original-scenarios) remain. [Cognition §8](COGNITION.md#8-implementation-placement-and-future-walkthroughs) retains its prior cognitive cases and adds recursive-learning cases. These tables do not create separate test platforms.
+All [29 original A15 scenarios](AUDIT.md#12-all-29-original-scenarios) remain. S27–S32 are the new 0.7 walkthroughs; prior S1–S26 are retained. [Cognition §8](COGNITION.md#8-implementation-placement-and-future-walkthroughs) retains its cognitive and recursive-learning cases. These tables do not create separate test platforms.
 
 ## 13. Remaining concrete integration choices
 

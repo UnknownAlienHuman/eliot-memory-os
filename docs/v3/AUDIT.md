@@ -1,6 +1,8 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.6 · 19 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.7 · 19 октября 2026 · документация до переписывания продукта.**
+
+**Обновление 0.7:** [§22](#22-connected-control-and-context-audit-07) продолжает карту A02/A05/A06: broker control → уведомление → БД и retained MCP → cue → контекст. Введение и разделы 1–21 ниже сохранены как отчёт редакции 0.6; их слова «текущий проход» и прежние ограничения относятся к той редакции. Новые чтения, выводы и их пределы указаны отдельно в §22 и актуальной карте.
 
 В этой редакции опубликованное ранее состояние V3 сверяется с V1/V2, собственными усложнениями проектировщика и новым донором Harness2. Включён подготовленный, но не опубликованный ранее материал 0.5 о переносе опыта. [Architecture](ARCHITECTURE.md) — манифест; [Implementation](IMPLEMENTATION.md) — устройство продукта; [Cognition](COGNITION.md) — алгоритмы внутри тех же модулей; [AUDIT-MAP](AUDIT-MAP.md) — запрошенная владельцем карта прочитанного и оставшегося.
 
@@ -593,3 +595,94 @@ Stable event ID предотвращает дубли; expected revision и curr
 Следующий наиболее ценный проход — связать notification identity/callers/DB write и реально потребляемый capture/context, затем разложить ORS/process lifecycle по ненужным ролям и полезным failure cases. Параллельно по карте возвращаться к неохваченным требованиям обучения и донорским shortlist, а не снова начинать весь аудит с README.
 
 Проверки текстов, ссылок, публикации и CI сообщаются в PR по факту. Не выполнялись продуктовые тесты, новый model inference, полный Harness2/Hy pipeline или независимое субагентное review. Изменения документации не означают слияние в main и не закрывают всю задачу #5324.
+
+## 22. Connected control and context audit 0.7
+
+**19 октября 2026; база — `73c34dcb906637f782e667a4ca4c347227806aa5`.** По карте A02/A05/A06 продолжено чтение V2 `5aac094834fb5635921b550c821cb933a1196105`: уведомление через broker и daemon до модели состояния/SQL; прежний MCP handler через InjectionPlanner и CueIndexService до нормализации и загрузки источников. Это конкретные связанные поверхности, не полный аудит всех альтернативных V2 adapters. Architecture и Cognition 0.6 не переписываются: исправления принадлежат существующему Implementation.
+
+### 22.1 Подтверждён не только дорогой, но и безусловно запрещающий контроль
+
+В [broker main, 455–570](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-user-broker/src/main.rs#L455-L570) доставка/подтверждение уведомления, отмена и reconciliation проходят через `admit_human_state_change` прямо или через `admit_authenticated_human`. После проверки actor/session этот [общий допуск](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-user-broker/src/lib.rs#L2380-L2520) безусловно заканчивается `HumanApprovalActionDigestUnverifiable`: ожидаемый hash одобренного Critical action ему недоступен. Успешной ветви нет.
+
+**Граница вывода:** названные dispatch-ветви не могут выполнить нормальное действие даже с подходящими входами предыдущих проверок. Это следует из управления в исходнике, без запуска Windows. Не утверждается, что любой внутренний метод broker или любая другая поверхность всего Eliot недоступны. Отказ честно возвращается как отказ, а не как ложный успех; дефект — отсутствующий полезный путь и чрезмерная область Critical-approval требования.
+
+Второй независимый разрыв найден глубже: [launch_notify_acknowledge, 1835–1915](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-user-broker/src/lib.rs#L1835-L1915) валидирует вход, строит `_line`, выбрасывает её и возвращает `notify acknowledgement not completed: canonical acknowledgement is owned by eliotd`. Даже устранение первого gate не доставит acknowledgement владельцу записи. В daemon есть [emit_notification_acknowledgement](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliotd/src/notification_acknowledge_emit.rs), но файл прямо отмечает отсутствие соединения с intake; выполненный поиск имени показал определение и re-export, а не реальный caller. Поиск сам по себе не доказывает отсутствие всех динамических маршрутов, зато названная broker-ветвь проверена напрямую.
+
+**Меньшее решение V3 — [Implementation §9.4](IMPLEMENTATION.md#94-direct-local-control-and-attention-recurrence):** один operation-specific локальный контроль и прямой вызов владельца состояния. Readback, acknowledgement, pause и cancel собственного задания не зависят от модели, toast executable или отсутствующего производителя critical approval. Это не разрешение новой разрушительной операции: её реальное полномочие проверяется отдельно. Недоступная БД и неопределённая внешняя отмена остаются честными состояниями, а не маскируются «успехом».
+
+### 22.2 Дедупликация проблемы не должна замораживать её навсегда
+
+Прочитан [notification_state_emit.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliotd/src/notification_state_emit.rs#L360-L985). `notification_already_recorded` запрашивает и закрытые записи и при совпадении ключа/StateFence прекращает emission. Ключ намеренно исключает часть меняющихся деталей попытки, которые входят в summary/evidence. Это предотвращает шум от повторных polls, но не обновляет этим путём сведения о новой попытке и не открывает уже resolved запись с тем же ключом/fence.
+
+В [NotificationStore](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/kernel/eliot-kernel-core/src/module/notification_state.rs#L380-L660) `upsert` отдельно отказывает resolved record и требует совпадения всех полей draft, включая summary, evidence и severity. Нет основания исправлять это простым удалением предварительного exists-check: новая подробность тогда станет IdentityConflict. [I11.12](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I11-12-userautomation.md) требует одну обновляемую persistent notification и повторное открытие при материальном изменении/восстановлении/решении человека. Рассмотренный emission/update-путь сам этого не завершает; иные владельцы reopening по всему репозиторию здесь не квалифицированы.
+
+Нужны не новые grant/fence сущности, а различие **problem key / source event / episode / displayed revision** в существующей записи. Повтор чтения статуса не новый инцидент. Новая подтверждённая попытка может обновить открытую проблему; после реального закрытия повторное возникновение начинает следующую episode/revision. Acknowledgement старой версии не гасит новую. Dismissal и техническое восстановление не одно и то же. Process restart не должен сам создавать ещё одну человеческую обязанность. Обновление и история идут одним доменным путём; не каждый timestamp требует нового уведомления.
+
+Важно: этот automation emitter выбирает `ControlBoard` как канал. Запись board item не является доказательством отправленного native toast. Блокировка broker delivery и свойства daemon board emission — разные находки.
+
+### 22.3 История уведомления превращена в обязательную полную работу на каждом изменении
+
+В [surreal_notification.rs, 1–320](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/storage/eliot-store-surreal-adapter/src/apply/surreal_notification.rs#L1-L320) каждый lifecycle leg читает текущую строку, создаёт новый in-memory NotificationStore, повторно проигрывает весь `history`, применяет один переход, клонирует историю и добавляет запись. [Продолжение, 320–610](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/storage/eliot-store-surreal-adapter/src/apply/surreal_notification.rs#L320-L610) повторно декодирует/проверяет старые receipts и сериализует `record + history` для полного UPDATE CONTENT. При этом текущий record уже сохраняется рядом с историей.
+
+**Цена по исходному алгоритму:** при N принятых одношаговых изменениях одной записи от пустого состояния воспроизводится N(N−1)/2 прежних переходов и сериализуется N(N+1)/2 history entries. Для N=1000 это 499 500 и 500 500 соответственно. Это расчёт количества обработанных элементов, не измерение времени, диска или production RSS. Существующий emitter подавляет повторный poll, поэтому нельзя утверждать, что он сам генерирует тысячу таких writes: расчёт относится к действительно принятым lifecycle legs.
+
+Положительное свойство не потеряно: SQL проверяет expected revision внутри канонической транзакции. Поэтому находка — не доказанный lost update, а избыточная реконструкция и полная перезапись растущего JSON. V3 обновляет текущую строку и при необходимости добавляет отдельное событие истории в той же транзакции. История читается по запросу; recovery replay не является обязательным предварительным действием каждого обычного write. Это не заказ нового event-sourcing engine.
+
+### 22.4 Успешное действие может стать ошибкой из-за последующего украшения ответа
+
+Проверен retained legacy MCP consumer: [dispatch.rs, 350–790](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/dispatch.rs#L350-L790) сначала получает `Ok(mut structured)` от основного handler. Затем обычные пути используют `?` на observation/planning/attachment, а окончательный `tool_success` строится позже. Ошибка необязательного enrichment может выйти через общий error response после уже полученного результата основного действия. Из этого следует риск ненужного повторения эффекта клиентом, но реальная двойная операция здесь не воспроизводилась.
+
+Есть важные исключения в самом коде: admitted `eliot_compile_packet_l3` сохраняет свой результат при части observation/planning failures; отдельный ledger write игнорирует ошибку; recall не получает позднее attachment. Нельзя расширять вывод до «любой лог всегда ломает любой MCP result». Найденная архитектурная ошибка относится к названным обычным ветвям и моменту после primary success.
+
+**V3 — [Implementation §3.5](IMPLEMENTATION.md#35-optional-enrichment-cannot-rewrite-a-completed-operation):** результат основного действия и состояние его измерения/совета разные. Сбой optional decorator не переписывает результат в «ничего не выполнено». Необходимая проверка scope/permission остаётся до реального действия; неудачная primary persistence не становится успехом. Если обязательная запись исхода сорвалась после внешнего эффекта, возвращаются известный эффект и пробел сохранения либо действительно unknown outcome, а не приглашение слепо выполнить эффект снова.
+
+### 22.5 Квитанция выдачи сначала блокирует пользу, затем опережает саму выдачу
+
+[InjectionPlanner::attach](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L190-L310) создаёт `outcome: delivered`, сохраняет InjectionReceipt и отмечает touched-state **до** добавления `ul_fired` в response. Если запись receipt не удалась, item пропускается; useful payload зависит от наблюдательной записи. Boot-путь аналогично сохраняет receipt перед вставкой `ul_boot`.
+
+[hydrate_delivery_state и commit_receipt](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L310-L590) восстанавливают suppression из сохранённых receipts. Следовательно, падение после commit receipt и до отправки ответа может оставить «доставлено» для фактически не переданного item, а восстановление той же сессии продолжит его подавлять. Это source-backed crash interval, не запущенная fault injection в V2. Даже успешная передача в stdout сама по себе не доказывает чтения моделью.
+
+Нужна не новая криптоквитанция, а точное значение факта: prepared packet, наблюдённый transport handoff, неизвестный исход, фактический host feedback при его наличии. Optional accounting не должно блокировать допустимый контекст. Presentation dedup ограничивается incarnation/revision и не превращается в необратимую semantic memory. При потерянной доставке допустима ограниченная повторная ориентация, а не вечное молчание или рассылка всего на каждом tool. [Implementation §3.6](IMPLEMENTATION.md#36-delivery-observations-and-repeat-suppression).
+
+### 22.6 Новый нормализатор не заменил старый алгоритм в реальном retained пути
+
+Цепочка подтверждена: `dispatch.call_tool` → `InjectionPlanner::plan_after_tool` → `CueIndexService::fire` → прежние `normalize_cue_value` и `eliot_types::normalize_path/normalize_symbol`. [CueIndexService](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/cue_index.rs#L230-L430), [старые helpers](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-types/src/ul/normalize.rs#L50-L205).
+
+В отдельной A-11 семье уже существует новая normalization и её вызов через `smart/eliot-cues/src/legacy_adapter.rs`; она не объявляется полностью мёртвой по поиску одного alias. Но существование этого нового owner не изменило рассмотренный старый consumer: путь использует иную семантику, включая universal lowercasing и стирание начальных разделителей пути. Это конкретное проявление параллельных систем, а не только дублирование имён crate.
+
+Выполнен маленький Python-перенос **ASCII-ветвей** старых pure helpers, без Rust toolchain, доступа к файловой системе Windows и полного приложения:
+
+| Разные входы | Один полученный ключ |
+|---|---|
+| `Parser::read` и `parser::read` | `parser::read` |
+| `Type.method` и `Type::method` | `type::method` |
+| `\\server\share\A.rs` и `server/share/a.rs` | `server/share/a.rs` |
+| `/src/File.rs` и `src/file.rs` | `src/file.rs` |
+
+Это коллизии строкового преобразования, не доказательство, что всякая такая пара относится к разным объектам во всех языках и средах. Но универсальной exact identity такое преобразование быть не может. Официальные [правила путей Windows](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file) различают корни/UNC/relative и особенности регистра, а [Rust Reference](https://doc.rust-lang.org/stable/reference/identifiers.html) описывает NFC-сравнение идентификаторов, не произвольное lowercase-сведение.
+
+**V3 — [Implementation §2.5](IMPLEMENTATION.md#25-exact-cues-and-advisory-aliases):** исходная форма и base разрешаются adapter/native library, затем получается пригодный scoped exact key. Case-insensitive/punctuation aliases могут искать кандидатов, но не сливать сущности и не запрещать действие. Не пишем универсальный path language или подтверждающий digest; неизвестная семантика оставляет исходник сохранённым.
+
+### 22.7 Маленький ответ скрывает большую работу до его сборки
+
+`CueIndexService::fire` возвращает до восьми records с явным overflow. Затем [plan_after_tool](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L104-L165) запрашивает `load_cue_records(project_id)` целиком, строит HashMap и только потом выбирает исходники по совпавшим ID. Даже при нуле совпадений этот вызов есть, если входные cues непустые.
+
+[SurrealQL](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/load_cue_records.surql) выбирает четыре project-wide семейства с payload, каждое до 10 001, объединяет и ограничивает результат 10 000 записями с `truncated`. Поэтому называть запрос безграничным или молча обрезанным было бы неверно. Rust wrapper обработки truncation в этом проходе не квалифицирован. Доказан ненужный масштаб **выбранного запроса**, а не измеренная задержка или universal silent loss.
+
+V3 после candidate selection загружает нужные IDs, необходимые альтернативы конкретной claim group и ограниченных соседей. Полный onboarding/rebuild остаётся отдельной finite maintenance работой. Не нужно добавлять второй cache/store, чтобы компенсировать широкий запрос на каждом interaction. Это дополнение к [Implementation §4.1](IMPLEMENTATION.md#41-independent-candidates-and-truthful-resolution).
+
+### 22.8 Что не оказалось дефектом и что остаётся полезным
+
+- Подозрение «Directory Exact превращается в Prefix» не подтверждено для валидного input: [normalize_binding](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-types/src/ul/cue.rs#L250-L290) требует Exact для FilePath и Prefix для DirPath. Нельзя оценивать matcher без его producer contract.
+- `path_segment_prefix` проверяет границу `/`, а не строковый starts_with: каталог `src/a` не должен матчить `src/abc`. Это небольшой полезный алгоритм.
+- Notification persistence имеет revision CAS; acknowledgement отделён от resolution; существующее delivery failure не стирается coalescing upsert. Эти свойства сохраняются, не удаляются вместе с proof machinery.
+- Cue firing показывает unavailable/stale/overflow, а не всегда выдаёт пустоту как «ничего нет». Полезные explicit gaps сохраняются; новые доктрины ради каждого gap не нужны.
+- В проверенном MCP существуют исключения, сохраняющие успешный packet и игнорирующие отдельный telemetry failure. Это подтверждает возможность узкого исправления, а не переписывания всего транспорта ради наблюдаемости.
+
+### 22.9 Исправляем и собственную 0.6
+
+Прежние общие фразы «dedup по проблеме», «доставка не доказывает использование», «одна нормализация» и «optional failure не роняет приложение» были недостаточны. Они оставляли агенту возможность снова построить вечный acknowledged flag, записать delivered до send, смешать fuzzy/exact key и сделать лог обязательным после успешного эффекта. Новые §§2.5,3.5,3.6,9.4 и уточнение §4.1 задают конкретные небольшие решения внутри тех же modules, без новых процессов, схем-квитанций и планировщиков.
+
+Добавлены будущие S27–S32: доступный local control; повтор проблемы и запоздалый ack; failure после успешного primary handler; crash перед handoff; case/root identity; выборочная загрузка источников. Это walkthroughs для последующей реализации, не исполнявшиеся продуктовые тесты. Architecture/Cognition и все прежние требования/сценарии/доноры остаются.
+
+**Предел проверки:** четыре ASCII-пары и формула числа history entries проверены локально; V2/Rust/Windows/SurrealDB приложение и transport fault injection не запускались. Нового чтения всех donors или независимого GPT Luna review не было. Проверка текущего legacy MCP path не квалифицирует все новые V2 interfaces. Карта обновляется прочитанными диапазонами и точными остатками: после этого прохода важнее store wrapper/revision rebuild/activation и ORS ownership, чем очередное повторение определения normalizer.
