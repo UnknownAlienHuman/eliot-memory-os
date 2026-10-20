@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — cognitive mechanisms
 
-**Revision 0.14 · 2026-10-20 · implementation proposal, not working runtime.**
+**Revision 0.15 · 2026-10-20 · implementation proposal, not working runtime.**
 
-This chapter implements [Architecture](ARCHITECTURE.md) inside the modules of [Implementation](IMPLEMENTATION.md). Revision 0.14 makes associative recall, multiple entrances to one lesson and reduced proactive exposure concrete. [Audit §28](AUDIT.md#28-associations-and-useful-forgetting-014) distinguishes the A-MEM, Nocturne and Subcog source findings from these Eliot choices; the [map](AUDIT-MAP.md) records coverage. Existing storage, retrieval and jobs own the changes; no new service or approval stage is introduced.
+This chapter implements [Architecture](ARCHITECTURE.md) inside the modules of [Implementation](IMPLEMENTATION.md). Revision 0.15 adds targeted relation expansion and distinguishes working-context continuation from durable learning. [Audit §29](AUDIT.md#29-magma-and-letta-relations-and-continuation-015) separates the inspected MAGMA/Letta mechanisms from these Eliot choices; the [map](AUDIT-MAP.md) records coverage. Existing storage, retrieval and jobs own the changes; no new service or approval stage is introduced.
 
 ## 1. One useful path and its owners
 
@@ -139,6 +139,22 @@ Deduplicate overlapping expansions by source identity and preserve their order. 
 An orientation view can include the useful current answer and a few related handles with short descriptions of when their detail matters. “When changing this API's return type” explains a reason to open a consumer-repair lesson; it is not a permission rule or a condition that must be proven before reading. The same lesson can be reached from the API, a failure code or a project-area view without copying its text into each location.
 
 Use normal context selection to surface relevant clues, then existing `open` for detail. The agent need not guess an exact URI, read a complete tree or perform a compulsory boot/read-confirm sequence before work. Missing a clue never prevents raw capture or direct search. The useful rendering is plain content and links, not a second memory hierarchy or a model call per navigation step.
+
+### 5.5 Expand the relation that supplies missing information
+
+Start with ordinary exact/lexical/vector candidates. When an answer needs order, a consumer, an explanation or an outcome, follow the corresponding existing typed relation from those records. Select actual types, subtypes and direction with a normal indexed query; several requested types form a union, not mutually exclusive classifier branches. A useful direct answer does not require graph traversal or a model-selected query plan.
+
+An intermediate node can matter because of the relation even when it does not repeat the question's words. Do not make every hop pass an exact-word or monotonically increasing similarity test. Keep the expansion finite through the relevant scope, purpose and existing work budget; do not compensate by scanning all nodes or links. Reuse stored compatible embeddings for unchanged content instead of encoding every visited node again. No second graph store or in-memory mirror is required.
+
+Pack the useful connection with its qualification: question/answer, failure/repair or claim/exception. Expansion that is appended behind an already full list and cut off again does not reach the agent. A compact explanation with source handles can suffice; no fixed quota of graph nodes is mandated. An inferred causal link retains its status as an explanation, not an observed causal proof.
+
+### 5.6 Continuation is not durable learning
+
+A continuation view answers what the current work is, what actually happened, what remains open and which source handles recover important detail. Preserve the user's goal, relevant exact identifiers, recent corrections and pending action/result distinctions. It can summarize an older portion while recent source events remain available; mark partial material rather than inventing the omitted middle. This uses the existing project/session view, not a second task database.
+
+The host/controller owns its conversation window and compaction. Eliot supplies useful continuation/context at supported boundaries; it does not run another independent host transcript eviction mechanism. Its own captured source events remain the basis for later lookup and interpretation. A summary is a derived representation of those events, not a fresh observation or additional support for a lesson.
+
+Durable learning asks what will help another suitable attempt. It may use the relevant original slice and current methods through an existing Dreamer job, but neither every compaction nor every continuation requires another reflection. Explicitly re-examining an old slice can improve an analogy without counting the slice again as independent experience. A known changed episode does not require a separate model to select it from every conversation in the archive.
 
 ## 6. Applicability before automatic learning
 
@@ -363,3 +379,5 @@ These are documentation walkthroughs, not an executed V3 test suite.
 - [A-MEM paper v11, §§3.1–3.4](https://arxiv.org/html/2502.12110v11) and [library memory_system.py](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py): take local evolution of useful descriptions/relations, not search-rank IDs or neighbors discarded after packing. The research mechanism and this library's actual retrieval are distinct; its benchmark experiments were not reproduced.
 - [Nocturne models](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/db/models.py) and [system views](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/system_views.py): take stable content identity and short recall clues pointing to real content. `disclosure` here means when to recall, not authorization. No mandatory boot ritual or forced conflict elimination is imported.
 - [Subcog retrieval](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/recall.rs), [lifecycle service](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/consolidation.rs) and [score model](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/models/consolidation.rs): take independent native retrieval and retained summary sources; distinguish relative ranking, observed usefulness and lifecycle decisions. Audit §28 gives the limited arithmetic/source findings rather than a claim about every deployed Subcog path.
+- [MAGMA actual query and traversal](https://github.com/FredJiang0324/MAGMA/blob/467cb70b67ac337b22fdb42194d37c04ad701b62/memory/query_engine.py): take question-relevant typed relations, not mandatory full scans, repeated encoding or query-word gates on every intermediate node. The inspected caller uses adaptive traversal; the neighboring probabilistic helper is not assumed to be that caller's implementation.
+- [Letta local compaction](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/backend/local/compaction.ts), [actual caller](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/backend/local/local-backend.ts#L680-L950), and [reflection input](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/cli/helpers/reflection-transcript.ts#L1-L250): distinguish context continuation from learning reusable knowledge. Eliot provides source-linked continuation without becoming a second host context manager. Full automatic/server reflection execution was not qualified in this pass; see Audit §29.

@@ -1,864 +1,545 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.14 · 20 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.15 · 20 октября 2026 · документация до переписывания продукта.**
 
-**Новый результат — [§28](#28-associations-and-useful-forgetting-014):** изучены другие доноры — D43 A-MEM, D19 Nocturne Memory и D03 Subcog. Отобраны эволюция поискового представления старого знания, несколько входов к одной записи, раскрытие подробностей и уменьшение лишней выдачи без потери истории. Проверены реальные функции: обнаружены несовпадение search rank с identity, отсечение добавленных соседей, относительный score вместо уверенности и недостижимая ветвь архивирования. Проектные решения помещены в существующие операции Cognition, не в новые службы.
+**Новый результат — [§29](#29-magma-and-letta-relations-and-continuation-015):** прочитаны D42 MAGMA и действующий D17 Letta Code. MAGMA полезна выбором отношений под вопрос, но её рассмотренный query path делает полный проход даже при готовых результатах, повторно кодирует тексты, отсекает промежуточные узлы по словам и неверно объединяет несколько типов связей. Letta показывает отдельный рабочий путь сжатия контекста и отдельную reflection-подготовку. Для Eliot выбраны адресное раскрытие нужной связи и сводка продолжения без второго graph/context runtime.
 
-**Результат 0.13 — [§27](#27-episodes-incremental-learning-and-memory-feedback-013):** продолжено чтение D01 MemMachine и D09 Hindsight до конкретных обработчиков входа, фоновой интерпретации и интеграции с хостом. Разделены технические фрагменты поиска и рабочие эпизоды; отобраны обработка нового материала и исключение собственной вставленной памяти из повторного извлечения. Найдены случаи, где неполная интерпретация считается завершённой, а ограниченный набор старых фактов мешает обновить подходящий новый. Решения уточняют существующие операции Eliot, не добавляя ещё один runtime.
+Этот файл остаётся общим аудитом. В 0.15 прежние разделы сведены по механизмам, а не удалены как «закрытые»: сохранены 34 требования, 29 исходных сценариев, D01–D44, основные находки, ограничения и решения. Это **редакционная консолидация, не побайтное сохранение**. Полные формулировки, диапазоны чтения и прежние изолированные пробы доступны в неизменных [0.14](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/841c807659727cd7fb5730331190ee27cd50f47d/docs/v3/AUDIT.md), [0.9](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md), [0.4](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c28359fc2716f3b498ea512ca24a57801d18014c/docs/v3/AUDIT.md) и [ранней редакции](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/3512f6e4f4c9ce59ba2959193e92c0728fadf00c/docs/v3/AUDIT.md). Их эксперименты не выдаются за выполненные заново.
 
-**Результат 0.12 — [§26](#26-donor-mechanisms-for-useful-memory-012):** предметно изучены D09 Hindsight, D01 MemMachine и D08 Graphiti. Отобраны обновление отдельного аспекта знания, восстановление исходного эпизода, сохранённые ответы на повторяющиеся вопросы и временное разрешение изменений. Разобраны реальные функции, ограничения переноса и место каждого механизма в существующих модулях Eliot. Это не предложение установить три дополнительных memory runtime.
-
-**Результат 0.10 — [§25](#25-real-experience-input-and-normal-context-010):** обычный сборщик контекста действительно вызывает поиск опыта, но чтение случаев связано с готовностью карты проекта; стандартный режим отсекает только что сформированный опыт. В retained MCP обнаружены карточки навыков, создаваемые из шаблона вместо чтения хранилища, и обработчик, конструирующий успешное «доказательство исполнения» без исполнения. У Harness2 дочитаны доступ к материалам и модельный executor/cache. Решения внесены в [Cognition](COGNITION.md), не в новую платформу проверок.
-
-Этот документ — один поддерживаемый аудит. Повторяющиеся отчёты о публикации и оговорки прошлых проходов сведены; предметные находки, 34 требования, 29 исходных сценариев и D01–D44 сохранены как содержание, а не как обещание побайтной идентичности. Полные подробные версии и результаты прежних проб остаются неизменными в [аудите 0.9](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md), [0.4](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c28359fc2716f3b498ea512ca24a57801d18014c/docs/v3/AUDIT.md) и [ранней редакции](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/3512f6e4f4c9ce59ba2959193e92c0728fadf00c/docs/v3/AUDIT.md). Сокращение повторов не является новым выполнением старых проверок.
-
-[Architecture](ARCHITECTURE.md) определяет назначение и границы; [Implementation](IMPLEMENTATION.md) — устройство; [Cognition](COGNITION.md) — когнитивные операции внутри тех же модулей; [карта аудита](AUDIT-MAP.md) — прочитанные пути и следующий предметный шаг. Ни один из этих файлов не заменяет работающий продукт.
+[Architecture](ARCHITECTURE.md) — назначение и границы; [Implementation](IMPLEMENTATION.md) — устройство; [Cognition](COGNITION.md) — алгоритмы; [AUDIT-MAP](AUDIT-MAP.md) — реально прочитанное и следующие вопросы. Проектные решения здесь не являются реализованным V3.
 
 ## 1. Источники, решения и границы проверки
 
-| Источник | Версия и роль |
+| Источник | Прочитанная версия и роль |
 |---|---|
-| V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: Canonical Master, Production Architecture, Understanding Layer; исходные требования и донор |
-| V2 | `5aac094834fb5635921b550c821cb933a1196105`: старые нормативы, исходники и незавершённые программы |
-| База текущего изменения V3 | `f82b7ff884c57412becb747e4fb673495c2df271`: опубликованная документация 0.13 в PR #5325 |
-| Аудит Claude | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения, измерения и сообщённые решения; не безошибочная спецификация |
-| Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы анализа и доноров, не обязательный backlog V3 |
-| Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer, reconciliation, store, System 2 и transfer пути прежних проходов |
-| MemOS local plugin | `a7367d07e55db61099f7b4e2c1108bc5831a24f3`: выбранные `l2.ts` и `gain.ts`, не полный продукт |
-| Eliot Swarm Controller | `96a0d5a6632cfbd541e804d7969d3e76e716bf6a`: прежняя ограниченная проверка integration document; другие старые findings сохраняют собственные ссылки |
-| Harness2, D44 | `1cfe254e8d25b15f37048c3730134686abe60335`, commit 14.10.2026; [статья 2610.14224v1](https://arxiv.org/html/2610.14224v1), 09.10.2026 |
-| LangMem, D16 | `48e3c11f5bb527282c7d5339c6a87a0b35abccfc`: background/reflection и prompt optimization, рассмотренные в 0.8–0.9 |
-| Hindsight, D09 | `c5f585f8f8568ed0677eb2e70fe830c4c483e2a2`: consolidation и mental-model mechanisms в §26; дополнительные retain/integration paths в §27 |
-| MemMachine, D01 | `d5a39a8e774e977fb1e6c22efb03555c4e51e05e`: declarative retrieval и вызывающие facade в §26; event/semantic ingestion и реальный storage в §27 |
-| Graphiti, D08 | `3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f`: извлечение/сопоставление связей и temporal invalidation, §26 |
-| A-MEM, D43 | `ceffb860f0712bbae97b184d440df62bc910ca8d`: библиотека `agiresearch/A-mem`; отдельно [статья 2502.12110v11](https://arxiv.org/html/2502.12110v11), §28 |
-| Nocturne Memory, D19 | `1858957bf797722a9b731fb197bd9530f7ae67e4`: tool docs, model identity, actual renderer/MCP read and alias paths, §28 |
-| Subcog, D03 | `0cd2d4f0cff04938c9f865353fbfefa1b4e3f754`: native recall/fusion, selected consolidation/lifecycle functions and score model, §28 |
+| V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: исходные требования и донор |
+| V2 | `5aac094834fb5635921b550c821cb933a1196105`: замороженные нормативы и код |
+| База текущей документации | `841c807659727cd7fb5730331190ee27cd50f47d`, PR #5325 |
+| Claude audit | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения и исторические измерения, не безошибочный норматив |
+| Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы исследования, не обязательный backlog V3 |
+| Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer/reconciliation/store/System 2 пути |
+| MemOS local plugin | `a7367d07e55db61099f7b4e2c1108bc5831a24f3`: выбранные L2/gain функции |
+| Eliot Swarm Controller | `96a0d5a6632cfbd541e804d7969d3e76e716bf6a`: прежняя ограниченная проверка integration document |
+| Harness2 D44 | `1cfe254e8d25b15f37048c3730134686abe60335`; [статья 2610.14224v1](https://arxiv.org/html/2610.14224v1) |
+| LangMem D16 | `48e3c11f5bb527282c7d5339c6a87a0b35abccfc`: reflection/extraction и prompt optimization |
+| Hindsight D09 | `c5f585f8f8568ed0677eb2e70fe830c4c483e2a2`: consolidation, views, выбранные retain и host paths |
+| MemMachine D01 | `d5a39a8e774e977fb1e6c22efb03555c4e51e05e`: declarative/event retrieval, semantic ingestion и выбранный storage |
+| Graphiti D08 | `3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f`: edge extraction/resolution/temporal helpers |
+| A-MEM D43 | `ceffb860f0712bbae97b184d440df62bc910ca8d`: библиотека `agiresearch/A-mem`; отдельно [статья v11](https://arxiv.org/html/2502.12110v11) |
+| Nocturne D19 | `1858957bf797722a9b731fb197bd9530f7ae67e4`: модели, реальные MCP read/alias и renderer |
+| Subcog D03 | `0cd2d4f0cff04938c9f865353fbfefa1b4e3f754`: recall/fusion, выбранные consolidation/lifecycle functions |
+| MAGMA D42 | `467cb70b67ac337b22fdb42194d37c04ad701b62`: README и связанный `memory/query_engine.py`; [статья v1](https://arxiv.org/html/2601.03236v1) отдельно от source findings |
+| Letta Code D17 | ref `e8073d4e475ab7f56e76f9aaeea81a7618a92575`, возвращённый connector: local compaction/backend/store и выбранная reflection-подготовка; не весь прежний Letta server |
 
-Прямое поручение владельца: V1/V2 становятся донорами, V3 пишется с нуля после документации; сохраняются самообучение, когниция, модульность, гибкость и лёгкость; Dreamer заменяем по модели. Приложение Claude сообщает дополнительные решения: Rust, demand-start, SurrealDB child, модели и embeddings через controller, векторы в полном продукте, отсутствие собственного роя. Точные будущие версии SDK, API и численные параметры не объявляются уже согласованными или работающими.
+Владелец требует новый V3 после документации: самообучение, понимание, модульность, гибкость, лёгкость и заменяемый Dreamer. Принятые проектные направления — local-first Rust, demand-start, SurrealDB server child и модельные маршруты через controller без собственного роя. Конкретные будущие SDK/API и параметры не объявляются уже работающими.
 
-Различаются **факт исходника**, **вывод из порядка операций**, **изолированная проба** и **работа установленного приложения**. Поиск имени не доказывает глобальное отсутствие реализации. Прочитанный DTO не доказывает наличие его автоматического producer. Реальный caller важнее объявления интерфейса; даже он не подтверждает успешный live вызов без такого наблюдения.
-
-Текущий проход не запускает V2/V3, БД, Windows-процессы или модели и не выдаёт собственное повторное чтение за независимый review. Полные GitHub write-actions и push permission доступны; ветка публикуется через API независимо от недоступной сети локального окружения. Не требуется новая квитанция чтения, чтобы назвать проверенную функцию и её конкретный недостаток.
+Различаем факт исходника, вывод из порядка операций, отдельную пробу и установленный продукт. Поиск имени — навигация, не доказательство отсутствия всех альтернатив. Прочитанный prompt — не выполненный фоновый агент. Ревизии идентифицируют источники аудита, а не назначают обязательные зависимости.
 
 ## 2. Где началось разрастание
 
 ### 2.1 Масштаб и предел арифметики
 
-Ниже сохранены измерения первого прохода, а не новый пересчёт.
+Исторический подсчёт первого прохода:
 
 | Показатель | V1 | V2 |
 |---|---:|---:|
 | Rust-файлы | 139 | 2 472 |
-| Физические строки Rust, включая комментарии, пустые строки и inline tests | 172 579 | 2 638 670 |
+| Физические строки Rust, включая комментарии/пустые/inline tests | 172 579 | 2 638 670 |
 | Tracked files | Не пересчитано | 4 999 |
-| Cargo package manifests | Не пересчитано | 199 |
+| Cargo manifests | Не пересчитано | 199 |
 | Package manifests под bins | Не пересчитано | 15 |
 | Markdown | Не пересчитано | 850 файлов / 47 012 строк |
 | Python | Не пересчитано | 150 файлов / 144 845 строк |
 | TOML | Не пересчитано | 421 файл / 587 866 строк |
 
-Package не равен постоянно работающему процессу. Подсчёт физических строк не равен объёму production logic. Деление 2 638 670 на 50 даёт около 52 773 строк, но не доказывает бюджет работающей V3. Оценки «26,5 тысячи кода плюс 15 тысяч тестов» и «60–100 раз» остаются прогнозами с другим знаменателем. Считать нужно обязательный controller, адаптеры, SQL, эксплуатацию и реальные model calls, а не переместить расходы в соседний репозиторий.
+Package не равен постоянно работающему процессу, physical LOC — production logic. Деление 2 638 670 на 50 даёт около 52 773 строк, но не бюджет законченного V3. Оценки «26,5 тысячи кода плюс 15 тысяч тестов» и «60–100 раз» не подтверждены одинаковым функциональным знаменателем. Считать надо весь необходимый controller, SQL, адаптеры, эксплуатацию и model calls.
 
-### 2.2 V1 не следует клонировать целиком
+### 2.2 V1 — тоже донор, не идеальный runtime
 
-[V1 Production Architecture §0–1](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md#L1-L155) полезно отделяет инструментальный Governor от модели и использует серверную БД вместо нескольких competing stores. Но рядом уже предписывает redb Control WAL, leases, proof bookkeeping и продвижение policy/skills/retrieval. Компактная топология и аппарат доказательств — разные решения. Берём первое и реальные failure cases второго, не всю инфраструктуру.
+[V1 Production Architecture](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md#L1-L155) полезно отделяет инструментальный Governor от модели и использует серверную БД. Но уже содержит redb Control WAL, leases, proof bookkeeping и продвижение policy/skills/retrieval. Малую топологию берём отдельно от церемонии.
 
-### 2.3 V2 сделала сложную запись универсальным путём
+### 2.3 V2 сделала сложную запись универсальной
 
-[I1.2](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md) разделяет Host, Kernel, daemon, Watchdog, storage bridge и SurrealDB. Blob capability допускается co-located: нельзя приписывать документу обязательный отдельный blob executable. Однако каждая настоящая граница требует launch, ownership, доставки, restart и обработки неизвестного результата.
+[I1.2](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md) разделяет Host, Kernel, daemon, Watchdog, storage bridge и SurrealDB; blob capability допускает co-location. [I5.6](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I05-06-admission-and-staging.md) задаёт 18 шагов scope/task/fence/provenance, digests, ORS staging, ordering, transaction, receipts и outbox с повторными проверками. Это цена выбранной топологии, не природа записи памяти.
 
-[I5.6](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I05-06-admission-and-staging.md) задаёт 18 шагов записи: scope/task/fence/provenance, digests, ORS staging, ordering, DB transaction, receipt reconciliation, outbox. Kernel и storage bridge снова проверяют то, что прошло предыдущий слой. Это цена выбранной топологии, а не естественное свойство записи памяти.
+**V3:** убрать ненужные границы, оставить доменный вызов, проверку настоящего входа, нужную транзакцию и identity повтора. Сохранить distributed pipeline и удалить случайные проверки — способ создать новые компенсации.
 
-**Корневое решение V3:** убрать ненужные межпроцессные границы и универсальные планы. Один typed domain call, проверка реального входа, stable retry identity и нужная транзакция заменяют старый distributed pipeline. Удалять случайные проверки, сохраняя pipeline, означало бы создавать следующую партию компенсаций.
+### 2.4 Петля роста
 
-### 2.4 Петля, которую нужно разорвать
-
-Понятие получает тип; тип — отдельного владельца и lifecycle; состояние копируется; shape-PASS заменяет полезного consumer; незавершённость лечится квитанцией; квитанция требует собственного восстановления. В итоге система доказывает, что подготовила форму, но не помогает следующему действию.
-
-Документы содержали и правильные запреты: [I17.11](../architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md) допускал D3a до всей необязательной широты D2. Следовательно, нельзя объяснить всё исключительно безупречным исполнением нормативов. Есть три разные причины: дорогая доктрина, ошибочное чтение и недостающая проводка. Аудит проверяет их по связанным функциям, а не только по размеру каталогов.
+Понятие получает тип → отдельного владельца/lifecycle → копии состояния → shape-PASS вместо consumer → квитанцию незавершённости → восстановление самой квитанции. При этом [I17.11](../architecture/I17-11-delivery-depth-d3-grounded-smart-understanding.md) уже допускал полезную глубину до всей необязательной широты. Причины надо разделять: дорогая доктрина, её неверное чтение, отсутствующая проводка и фиктивное поведение.
 
 ## 3. The 34 preserved requirements
 
-Основания: [Canonical Master](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Canonical_Master.md), [Production Architecture](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md), [Understanding Layer](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md). Это сохранение требований, не свидетельство выполненных тестов.
+Основания: [Canonical Master](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Canonical_Master.md), [Production Architecture](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md), [Understanding Layer](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md).
 
-| № | Требование | Компактный механизм и сохраняемый смысл |
+| № | Требование | Сохраняемый смысл и малый механизм |
 |---|---|---|
-| 1 | Независимость от модели, провайдера и host | Общая память и реальные адаптеры; совместимость интерфейса не обещает одинакового качества |
+| 1 | Независимость от модели, провайдера и host | Общая память и реальные адаптеры; совместимый интерфейс не одинаковое качество |
 | 2 | Внешняя когнитивная петля | Наблюдение → контекст → действие/исход → изменение следующей работы |
 | 3 | Автономность понимания | Автоматические карты и provisional методы без approval каждой записи |
-| 4 | Экономия токенов и операций | Exact/lexical, совместимые vectors, batching, раскрытие; без LLM перед каждым чтением |
-| 5 | Разные виды знания | Observation, claim, hypothesis, decision, procedure и unknown не сливаются в один score |
-| 6 | Актуальность относительно мира | Материальные live anchors; история не аннулируется сменой HEAD |
-| 7 | Точное происхождение | Source event/revision/span, доступный оригинал, сохранённые числа и исключения |
+| 4 | Экономия токенов и операций | Exact/lexical, совместимые vectors, batching и раскрытие; без LLM перед каждым чтением |
+| 5 | Разные виды знания | Observation, claim, hypothesis, decision, procedure и unknown различаются |
+| 6 | Актуальность относительно мира | Материальные live anchors; история не исчезает при смене HEAD |
+| 7 | Точное происхождение | Source event/revision/span, оригинал, числа и исключения |
 | 8 | Противоречие и пересмотр | Ревизии, альтернативы и контрдоказательство вместо last-write-wins |
-| 9 | Область до использования | Поиск и раскрытие в выбранном project/workspace, не чужой top-k |
-| 10 | Данные не создают полномочий | Goal/config/tool permissions отдельно от текста памяти |
+| 9 | Область до использования | Поиск и раскрытие в выбранном project/workspace |
+| 10 | Данные не полномочия | Goal/config/tool permissions отдельно от текста памяти |
 | 11 | Сохранение без лишней формы | Capture до классификации; неизвестный смысл допустим |
-| 12 | Связность и продолжение | Эпизоды, решения, попытки и адресные связи, не только отдельные chunks |
+| 12 | Связность и продолжение | Эпизоды, решения, попытки и адресные связи |
 | 13 | Отбор пригодного после поиска | Один compiler учитывает состояние и применимость; similarity не доказательство |
-| 14 | Постепенное раскрытие | Короткий packet и handles с источником и текущей областью |
+| 14 | Постепенное раскрытие | Короткий packet и source handles |
 | 15 | Контекст под решение | Цель, критерии, ограничения, unknowns и следующий шаг на реальной границе модели |
-| 16 | Понимание проекта | Карта назначения, подсистем и ресурсов, не только vector index |
-| 17 | Холодный старт и обновление | Доступные anchors и non-Git scope; без выдуманной ревизии |
+| 16 | Понимание проекта | Назначение, подсистемы, ресурсы и последствия, не только vector index |
+| 17 | Холодный старт/обновление | Доступные anchors и non-Git scope, без выдуманной ревизии |
 | 18 | Структура и поведение | Static dependency, co-change и causal hypothesis различаются |
-| 19 | Предсказание и калибровка | Ожидаемое наблюдение до действия, затем сопоставление с исходом |
-| 20 | Негативная память до действия | Своевременный совет; конкретное принуждение отдельно в host |
-| 21 | Связь действия с исходом | Версия метода, попытка, фактическое действие и критерий; cue overlap не использование |
-| 22 | Честное завершение | Реальные критерии и gaps; один exit 0 не закрывает всю задачу |
-| 23 | Dreamer предлагает преобразования | Реальное finite model job и обычное применение результата, не произвольный SQL |
-| 24 | Разные виды забывания | Exposure, withdrawal, revision, erasure отдельно; restore учитывает известные удаления |
-| 25 | Процедурное обучение | Preconditions, метод, примеры, исключения и следующий consumer |
-| 26 | Метаобучение и перенос | Тот же job/attempt путь; опыт улучшения помогает следующему улучшению |
-| 27 | Наблюдаемость | Связный trace и views; квитанция не заменяет действия |
-| 28 | Восстановление | Stable identity, минимальный spool, claim и external readback |
-| 29 | Власть человека | Явные goal/config/control; score не создаёт новых прав |
-| 30 | Малый интерфейс агента | Несколько операций; служебные сведения собирает adapter |
-| 31 | Проверка реальных отказов | Различающие сквозные ситуации, не сертификат по форме |
-| 32 | Лёгкий инструментальный Governor | Demand-start, один memory writer и нужное независимое наблюдение |
-| 33 | Заменяемость хранения | Private Store, native DB, export; не универсальный KV с компенсациями |
+| 19 | Предсказание и калибровка | Ожидание до действия и сопоставление с наблюдением |
+| 20 | Негативная память до действия | Своевременный совет; точное host enforcement отдельно |
+| 21 | Действие и исход | Версия метода, попытка, фактическое действие и критерий |
+| 22 | Честное завершение | Реальные критерии и gaps, не один exit 0 |
+| 23 | Dreamer преобразует память | Finite model job и обычное применение результата |
+| 24 | Разные виды забывания | Exposure, withdrawal, revision и erasure отдельно |
+| 25 | Процедурное обучение | Метод, условия, примеры, исключения и следующий consumer |
+| 26 | Метаобучение и перенос | Опыт улучшения помогает следующему улучшению через те же jobs/attempts |
+| 27 | Наблюдаемость | Реальные события и views, не квитанция вместо действия |
+| 28 | Восстановление | Stable identity, малый spool, claim и external readback |
+| 29 | Власть человека | Явные goal/config/control; score не создаёт прав |
+| 30 | Малый интерфейс | Несколько операций; служебную metadata собирает adapter |
+| 31 | Реальные отказы | Различающие сквозные ситуации, не сертификаты формы |
+| 32 | Лёгкий Governor | Demand-start, один memory writer и нужное независимое наблюдение |
+| 33 | Заменяемость хранения | Private Store, native DB и export, не универсальный KV |
 | 34 | Улучшение не удостоверяет себя | Provisional use отдельно от доказанного выигрыша на будущих случаях |
 
-Поздняя [UL Part C](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md#L1433-L1468) отменяет ручное approval детерминированных UL-артефактов. Полезная автономность не должна исчезать из-за требования полного эксперимента до каждой подсказки. При этом записанный кандидат не превращается автоматически в установленный факт или новое разрешение.
+Поздняя [UL Part C](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md#L1433-L1468) отменяла approval детерминированных UL-артефактов. Автономность не должна исчезнуть из-за эксперимента перед каждой подсказкой. Это не превращает гипотезу в факт или новое разрешение.
 
 ## 4. Что точно не переносить, что извлечь из V2
 
-### 4.1 Капсулы и поддерживаемость по наличию форм
+[I2.20](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md) не требует crate на каждую cell. Его реальный перегиб — обязательная триада ContractKit/ContextCapsule/TestCapsule, digest, proof ceiling и срок квалификации независимо от пользы кода. Берём понятную ответственность и consumer, не отдельный продукт для разрешения считать другой продукт поддерживаемым.
 
-[I2.20](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md) прямо допускает cell не как crate; обвинять его в обязательном crate на понятие неточно. Реальная избыточность — обязательные `ModuleContractKit + CrateContextCapsule + ModuleTestCapsule`, contract digest, proof ceiling, replacement boundary и срок квалификации независимо от полезности готового кода.
+[Notification admission](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliotd/src/notification_plan_admission.rs#L1-L380) повторно читает generated catalogue и вычисляет несколько digests ради локального state update. Clock/deadline меняют request identity; реальный repeat guard — БД и ключ проблемы. [Общий hash](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/storage/eliot-store-api/src/request_hash.rs#L1-L175) не подпись и не доказательство смысла. Убрать конверт вместе с ненужной межпроцессной границей.
 
-Берём ясную ответственность, интерфейс и реальный consumer. Не переносим отдельный продукт, удостоверяющий, что другой продукт разрешено считать поддерживаемым. `AUDIT-MAP` не является новой капсулой.
+[Новый cue normalizer](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/smart/eliot-cue-normalizer/src/normalize.rs#L1-L510) полезен сохранением исходной формы и единым сравнением capture/query. Policy/fence/input/result digest envelope вокруг pure helper не нужен. Unsupported absolute/UNC формы здесь сохраняют original value: это не доказательство потери raw capture. Реальный старый consumer использует другую normalization (§22).
 
-### 4.2 Уведомление с общей admission-церемонией
-
-В [notification_plan_admission.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliotd/src/notification_plan_admission.rs#L1-L380) ради NotificationState строится CanonicalWriteEnvelope, вычисляются plan/admission/request digests, повторно читается тот же generated catalogue, затем вновь проверяется hash. Комментарий уточняет: clock/deadline меняют identity, а настоящие repeat guards опираются на БД и ключ проблемы, не этот digest.
-
-[request_hash.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/storage/eliot-store-api/src/request_hash.rs#L1-L175) показывает общий конверт scope/task/manifests/security/proof/head. Это не криптографическая подпись и не независимая проверка смысла. V3 использует keyed problem state, условный update и фактическую доставку; подробные найденные control-разрывы — §22.
-
-### 4.3 Полезный normalizer внутри ненужной обвязки
-
-[Новый cue normalizer](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/smart/eliot-cue-normalizer/src/normalize.rs#L1-L510) даёт полезные правила: одна функция для capture/query, исходное написание отдельно от сравнения, case folding только по определённой семантике, неподдерживаемая форма не означает равенства. Не нужен NormalizationEnvelope с policy/fence/input/result digests вокруг обычной функции в процессе.
-
-Некоторые absolute/drive/UNC формы объявлены Unsupported в выбранном helper, но original value сохраняется. Нельзя из этого вывести потерю raw capture или запретить все реальные абсолютные host paths в V3. Adapter разрешает путь относительно настоящего base; поисковые aliases не становятся exact identity. Старый consumer продолжает пользоваться другим алгоритмом — §22.6.
-
-### 4.4 Донорские части по полезной обязанности
-
-| Семейство | Не импортировать | Что действительно извлечь |
+| Семейство | Не импортировать | Полезный остаток |
 |---|---|---|
-| Host/Kernel | Hot replacement, generations, registry/epoch choreography | Ownership процесса, planned exit, ограниченный restart |
-| ORS/redb | Вторую семантическую БД и общий recovery engine | Unknown acknowledgement, durable intake, external readback |
-| Storage bridge | Отдельный процесс и named-operation language | Parameterized queries, conditional writes, native DB |
-| Contract/capsule tooling | Certificates/read receipts/manifest matrices | Понятный контракт и конкретные edge cases |
-| Dreamer families | Сервис/пакет на каждую мыслительную операцию | Extract/reconcile, dissent, процедуры, source changes |
-| Notification | Универсальную digest/admission систему | Dedup проблемы, ack отдельно от resolution |
-| Cues | Криптографическое замыкание pure transformations | Lossless source и одинаковое сравнение при записи/чтении |
-| Agent fabric | Второй swarm/provider scheduler в памяти | Реальные host events и ссылки на task/attempt |
+| Host/Kernel | Hot generations, registry/epoch choreography | Ownership процесса, planned exit, ограниченный restart |
+| ORS/redb | Вторую смысловую БД и общий recovery engine | Durable intake, unknown acknowledgement/effect |
+| Storage bridge | Отдельный процесс и query language | Native parameterized queries/transactions |
+| Capsules/tooling | Certificates, manifests как критерий готовности | Короткий контракт и реальные edge cases |
+| Dreamer families | Crate/service на каждую мысль | Extraction, reconciliation, dissent, процедуры |
+| Notifications | Digest/admission церемонию | Problem dedup, ack отдельно от resolution |
+| Agent fabric | Второй swarm/provider scheduler | Host events и external task/attempt refs |
 
-Это решения для V3, не удаления V2 без проверки. У 79 ORS tables разные обязанности; нельзя объявить их эквивалентом одной очереди. Снятие ненужных владельцев делает ненужной часть таблиц, а не наоборот.
+У 79 ORS tables неодинаковые обязанности. Они не объявляются «одной очередью»: сначала снимается ненужная роль старой топологии. Это решения для нового продукта, не команда удалять непроверенный V2 runtime.
 
 ## 5. Исправления Claude и собственных ранних утверждений
 
-| Утверждение/схема | Корректная граница |
+| Прежнее утверждение | Коррекция |
 |---|---|
-| BM25 был только в V1 | В V2 есть вызываемый FTS path и `search::score`; live качество отдельно не измерялось |
-| Весь Dreamer всегда отказывает | Подтверждён normal resolver; curation имеет отдельный путь |
-| 15 бинарных пакетов = 15 постоянных процессов | Manifest count не измеряет поставку |
-| Таблица anchors закрыла функциональность | Проектное соответствие не working runtime |
-| `DEFINE EVENT` реализует всю надёжность очереди | Атомарное enqueue не заменяет retry/cancel/unknown handling |
-| `influence != none` достаточно | Quarantine/handle-only требуют реального правила выдачи |
-| Одинаковая размерность = совместимые vectors | Важны encoder, preprocessing и content revision |
-| Одна сохранившаяся ссылка оправдывает весь вывод | Не различены обязательные premises и альтернативные derivations |
-| После N шагов каскада остальные записи валидны | Непросмотренный остаток не становится проверенным |
-| Exit 0 означает всю задачу | Только реально покрытый критерий |
-| Запрет слов Receipt/Lease/Fence решает сложность | Избыточность определяется функцией и владельцем, не названием |
-| 50× сокращение доказано | Не измерено на сопоставимом продукте |
+| BM25 только в V1 | В V2 есть вызываемый FTS path; качество отдельно не измерялось |
+| Весь Dreamer всегда отказывает | Подтверждён normal resolver; curation — другой путь |
+| Manifest count = постоянные процессы | Не измеренная топология |
+| Таблица anchors означает готовность | Это проектное соответствие, не runtime |
+| DB event — вся надёжная очередь | Enqueue не заменяет retry/cancel/unknown |
+| Равная dimension — совместимые vectors | Важны encoder/preprocessing/content |
+| Одна оставшаяся citation оправдывает синтез | Нужны реальные premises/alternative derivations |
+| Ограниченный каскад проверил весь остаток | Непросмотренное не становится подтверждённым |
+| Exit 0 означает whole task | Только покрытый критерий |
+| Запрет слов Lease/Fence/Receipt решает сложность | Причина и consumer важнее имени |
+| 50× уже доказано | Не измерено на одинаковом продукте |
 
-Ранее подтверждённые первичные ссылки: [FTS caller](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/canonical_store.rs#L2513-L2555), [SQL](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/load_memory_search_fts_candidates.surql), [Dreamer resolver](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/controller.rs#L64-L84), [caller](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/lib.rs#L792-L806).
+Сохранённые source findings: [FTS caller](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/canonical_store.rs#L2513-L2555), [FTS SQL](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/load_memory_search_fts_candidates.surql), [normal Dreamer resolver](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-dreamer/src/controller.rs#L64-L84).
 
-Собственные ошибки ранней V3: universal freshness выключала исторический опыт; ModelJob одновременно требовал Task и запрещал fake Task; backup обещал неопределённый короткий snapshot; описание одного направления controller выдавалось за доказательство отсутствия другого; подготовленная редакция оставалась локально. Эти ошибки исправляются в действующих договорах. Старые обещания не становятся истинными от добавления ещё одного отчёта.
+Собственные ошибки: universal freshness выключала историю; ModelJob требовал Task и одновременно запрещал fake Task; backup обещал неопределённый snapshot; описание одного направления controller выдавалось за доказательство отсутствия другого; подготовленные документы оставались локально. Исправляются действующие договоры, не добавляются оправдательные квитанции.
 
 ## 6. Hy-Memory: что взять, где ограничить вывод
 
-Hy уже позволяет выбрать model/совместимый endpoint: [config](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/config.py#L132-L214), [provider](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/agent/llm_provider.py#L309-L440). Поэтому свобода выбора не является только преимуществом Eliot. Writer weights, приложение и training evaluation — разные артефакты. [Статья](https://arxiv.org/html/2610.22196v1) не гарантирует произвольной модели результат специализированного writer.
+Hy уже допускает model/endpoint selection: [config](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/config.py#L132-L214), [provider](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/agent/llm_provider.py#L309-L440). Writer weights, application и [training paper](https://arxiv.org/html/2610.22196v1) — разные артефакты. Любая модель с похожим prompt не наследует опубликованное качество.
 
-Берём раздельные эпизоды и переносимый опыт, extraction отдельно от reconciliation, ограниченных кандидатов, реальную историю edits и законный результат no-proposal. Не берём отдельный store/service на каждый уровень, вечного агента для каждой операции и обязательный урок из каждого пакета.
+Берём episodes отдельно от transferable experience, extraction отдельно от reconciliation, адресные кандидаты и no-proposal. Не переносим store/service на уровень и обязательный урок из каждой порции.
 
-[coding/writer.py](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/writer.py#L65-L205) пишет trace в `finally` после попытки extraction, а ошибку сохранения логирует. Chat raw-first не доказывает raw-first всех сценариев. Eliot сначала подтверждает capture, затем интерпретирует; prompt truncation не является политикой уничтожения оригинала.
+[Coding writer](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/writer.py#L65-L205) сохраняет trace в `finally` после extraction, а ошибку записи логирует. Chat raw-first не квалифицирует все coding paths. В Eliot первичное сохранение независимо от интерпретации.
 
-[_crosslink](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/writer.py#L236-L280) связывает каждый experience со всеми fact IDs партии. Это соседство, не доказанная premise каждой мысли. Достаточно episode/batch ID для соседства и адресных evidence/live links для обоснования. Ограничения раскрытия результата определяются фактически переданными модели данными, не её заявлением «этот приватный кусок не использован».
+[_crosslink](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/writer.py#L236-L280) связывает каждый experience со всеми facts партии. Это соседство, не premise каждой мысли. Episode/batch ID подходит для навигации, evidence адресуются отдельно. Разрешённое раскрытие зависит от фактически переданного модели материала, не только её citations.
 
-В прежних выбранных [chat parser](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/agent/reconciler.py#L1900-L1930) и [coding UPDATE](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/reconciler.py#L450-L474) форма ID не всегда сопровождалась фактической проверкой candidate membership. Это source-level риск, не сообщение о live атаке. V3 адресует свои сохранённые targets обычным lookup, а не доверяет произвольному ID из prose.
+Прежние parser/UPDATE findings касаются выбранных проверок target membership, не live атаки и не всех режимов. Обычный lookup существующих targets достаточен; универсальная платформа полномочий не нужна.
 
 ## 7. SurrealDB: использовать готовые возможности
 
-Одна primary БД обеспечивает текстовый и векторный поиск, связи и транзакции. Small scoped exact vector search — нормальная реализация векторов; ANN выбирается по реальной цене. Частный Store не требует универсального KV, AST или нового query language.
+Одна БД уже предоставляет полнотекст, векторы, связи и транзакции. Small scoped exact vector search допустим; ANN выбирается по цене. Private Store не требует собственного AST, neutral KV и компенсирующего query framework.
 
-Официальный [Rust query API](https://surrealdb.com/docs/reference/rust/methods/query) различает transport success и ошибки statements; несвязанный параметр становится `NONE`. Нужны обязательные bindings, проверка ошибок и ожидаемого количества изменённых строк возле конкретного запроса. Не нужна отдельная платформа доказательств SQL.
+[SDK query API](https://surrealdb.com/docs/reference/rust/methods/query): transport success не ошибки statements; нужны обязательные bindings и проверка реально изменённых строк рядом с запросом. Семантическая история — обычные revision records; export не восстанавливает перезаписанное прошлое автоматически. [Backup/import](https://surrealdb.com/docs/manage/self-hosted/backups-and-recovery) проверяются по фактическим данным, не предположению о повторе всех старых table events.
 
-Семантические ревизии — обычные records; logical export не сохраняет историю уже перезаписанного значения автоматически. Import проверяет фактическое содержимое и при необходимости достраивает derived indexes/jobs, не предполагая повтор всех исторических events. [Backup reference](https://surrealdb.com/docs/manage/self-hosted/backups-and-recovery).
+[Filtered vector search](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) исследуется на выбранном server/schema/query/EXPLAIN. Ограничение Python-донора не переносится в SurrealDB по аналогии. Правильный query plan также не обещает полной смысловой полноты.
 
-[Similarity search](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) и EXPLAIN описывают filtered plans и index-assisted prefiltering. Сначала проверяется выбранный запрос/сервер, затем добавляется fallback. Ограничение Python-донора не является автоматически ограничением SurrealDB. При этом даже правильная ANN-фильтрация не доказывает полноту знания.
+D41 Agent Memory/Spectron — отдельное приложение, не встроенное понимание БД. [Старый no-SDK ADR](../ADR/0001-phase-a-dependency-boundaries.md) — историческое решение, не veto V3. Первым выбран официальный network SDK; замена требует конкретной проблемы, не церемонии отмены донора.
 
-D41 SurrealDB Agent Memory/Spectron — отдельный application tier, не встроенный бесплатный интеллект БД. Старый [no-SDK ADR](../ADR/0001-phase-a-dependency-boundaries.md) описывал тогдашнюю зависимость/релизную проблему, не вечное вето V3. Первичный выбор — официальный сетевой SDK с нужными features; другой клиент требует конкретной причины, а не церемонии отмены донора.
+## 8. Controller и host: реальные границы
 
-## 8. Controller и host: реальные границы, а не одинаковые слова
+[Прежний integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/96a0d5a6632cfbd541e804d7969d3e76e716bf6a/docs/eliot-memory-os-integration.md) описывал controller→memory context, не готовый memory→controller inference API. Ограниченный поиск не доказывает глобального отсутствия метода. Реальные text/embedding routes выбираются при реализации.
 
-Прежний [integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/96a0d5a6632cfbd541e804d7969d3e76e716bf6a/docs/eliot-memory-os-integration.md) обсуждал запрос контекста **из controller в память**, не готовый reverse API для inference. Отрицательный поиск по нескольким ключам не доказывает отсутствия всех методов. Выбираются реальные доступные text/embedding routes; описанные здесь имена не объявляются существующими RPC.
+Memory владеет намерением преобразования и применением, controller — provider execution/retries. Local claim, external request и applied revision — разные сведения, не три сервиса. После падения worker сначала readback прежнего execution; acceptance не output, best-effort cancel не нулевая стоимость.
 
-Memory владеет преобразованием и применением; controller — внешним исполнением/provider retries. Local claim, external request и applied memory mutation реально различаются, но не требуют трёх lifecycle engines. После падения worker сначала читается прежнее execution reference, а не покупается повторный inference. Accepted input не равно output; best-effort cancel не доказывает остановку или нулевую стоимость.
+Maintenance не требует fake coding Goal. Настоящая synthesis Task допустима, когда нужна executor. [Claude hooks](https://code.claude.com/docs/en/hooks) различают hook и model-decision boundary. Совет в PreToolUse не обязательно меняет уже выбранный call. Negative memory advisory по умолчанию; конкретное host enforcement отдельно.
 
-Maintenance не требует фиктивной coding Goal. Настоящая ограниченная synthesis Task допустима при таком executor contract. Ни обязательный fake Task на embedding, ни словесный запрет всех Task не нужны.
-
-Официальные [Claude hooks](https://code.claude.com/docs/en/hooks#add-context-for-claude) отличают время hook от следующего model request. PreToolUse не означает, что совет прочитан до уже выбранного tool call. Advisory попадает на реальную границу решения; точное host enforcement отдельно, не искусственная блокировка каждого инструмента. Native hooks и SDK bridge с похожими fields не доказывают одинаковое поведение.
-
-Старый текст может остаться в transcript. Новая context incarnation и изменённый совет допускают обновлённую выдачу; локальное withdrawal не отзывает уже переданные remote bytes.
+Старый контекст может оставаться в transcript. Current incarnation и материально новый совет допускают новую выдачу; локальное withdrawal не удаляет раскрытые provider bytes. Letta compaction уточняет эту границу в §29.
 
 ## 9. Самообучение без самоудостоверения
 
-Урок — ordinary memory revision, попытка — outcome с нужными ссылками, aggregate — view. Полезный условный совет можно использовать автоматически. Применимость и эмпирическая эффективность — разные вопросы; эксперимент перед каждой подсказкой остановил бы обучение.
+Урок — revision, попытка — outcome, aggregate — view. Provisional use не ждёт доказательства универсального выигрыша. Delivery, action, adherence, criterion outcome и comparative benefit различаются. Replay, paraphrase и несколько steps одного эпизода не независимая поддержка. Correction заменяет вклад с историей.
 
-Доставка, наблюдаемое действие, adherence, outcome и comparative benefit различаются. Вклад одного method/attempt/criterion учитывается один раз; replay, steps одного эпизода и summary-paraphrases не независимые случаи. Исправленный outcome заменяет прежний вклад с историей. Induction evidence объясняет происхождение правила, но не пользу правила до его существования.
+В выбранном [MemOS L2](https://github.com/MemTensor/MemOS/blob/a7367d07e55db61099f7b4e2c1108bc5831a24f3/apps/memos-local-plugin/core/memory/l2/l2.ts#L371-L445) with-set включает induction associations. [Gain](https://github.com/MemTensor/MemOS/blob/a7367d07e55db61099f7b4e2c1108bc5831a24f3/apps/memos-local-plugin/core/memory/l2/gain.ts#L62-L133) при равных observed means 0,8, пяти without-cases и prior 0,5 веса пять даёт +0,15. Это арифметика, не causal lift и не live запуск. Heuristic ranking допустим, выдуманное сравнительное доказательство — нет.
 
-В выбранном [MemOS L2](https://github.com/MemTensor/MemOS/blob/a7367d07e55db61099f7b4e2c1108bc5831a24f3/apps/memos-local-plugin/core/memory/l2/l2.ts#L371-L445) with-set включает associations/induction evidence. [Gain formula](https://github.com/MemTensor/MemOS/blob/a7367d07e55db61099f7b4e2c1108bc5831a24f3/apps/memos-local-plugin/core/memory/l2/gain.ts#L62-L133) при одинаковых наблюдаемых means 0,8, пяти without-cases и prior 0,5 веса пять даёт baseline 0,65, gain +0,15. Это арифметический контрпример causal-интерпретации, не запуск MemOS. Prior может ранжировать гипотезы, но не создавать отсутствующее сравнение.
-
-Отсутствующая ошибка не pass, когда verifier не дошёл до target, смотрел другую ревизию или вернул неполный лог. Несвязанный network failure не опровергает каждый совет; успех одного критерия не скрывает остальные failures. Для широких утверждений нужны последующие сопоставимые случаи. Shadow фиксирует selection, не изменённое поведение. Недостаток статистики оставляет условное знание, а не запрещает чтение.
+Отсутствующий diagnostic не pass, если verifier не дошёл до consumer, видел другую revision или неполный вывод. Сетевой отказ не опровергает все предложенные методы. Shadow фиксирует выбор, не изменённое действие. Недостаток статистики оставляет полезную гипотезу, а не выключает память.
 
 ## 10. Надёжность без второй операционной системы
 
-Historical evidence, live applicability и disclosure различаются без отдельного truth/policy engine. Локальный профиль задаёт проекты, capture/retention и разрешённые routes. Unknown applicability допускает условный совет; известная приватность учитывается на фактической передаче данных. Полный рекурсивный corpus walk не требуется каждому recall.
+Historical evidence, live applicability и disclosure различаются обычными полями/связями. Local configuration задаёт проекты, capture/retention и routes; не нужен principal/grant graph. Stable IDs, транзакции, current claim и readback решают конкретные ошибки. Signed proposals и proof-of-reading не решают смысловую задачу.
 
-Stable ID, transaction, current claim и external readback устраняют конкретные ошибки. Signed learning proposals, per-helper policy digest, principal/grant graph и proof-of-reading — не нужны. Hash идентифицирует bytes/cache/backup, но не создаёт полномочий или понимания.
+Spool подтверждает сохранённый input, не semantic truth. Backup имеет quiesced export, blobs, конечный staged cutoff и новый batch для поступающих событий. Export-length pause честнее неизвестного «мгновенного snapshot»; нельзя ждать worker под его lock.
 
-Spool подтверждает доставку исходного события, не его semantic truth. Простой backup имеет quiesced export, blobs и конечный cutoff staged input; новое событие принадлежит новому batch. Export-length pause честнее неопределённого «мгновенного snapshot». Нельзя ждать worker, удерживая нужный ему lock.
+Owner-selected restore работает даже при утраченном фрагменте deletion history: применяются известные удаления, неизвестное обозначается, primary доступно до derived rebuild. Старые external jobs автоматически не replay. Нужное независимое наблюдение не означает два собственных supervisor; Job Objects помогают custody, не защищают от любого unrestricted процесса того же OS user.
 
-В 0.8 исправлен собственный избыточный запрет: выбранная владельцем копия может быть восстановлена при утрате части deletion history, с применением известных удалений и обозначением неизвестных. Primary data доступны до embeddings/maps. Отдельный selective-import продукт для обхода blanket запрета не нужен. Старые внешние jobs автоматически не запускаются: восстановление данных не равно повторению effects.
+## 11. Доноры и аудиты: карта, не обязательная программа переносов
 
-Один фактический supervisor наблюдает failure domain; при подходящем существующем host/controller второй не строится. Иначе малый demand-start режим того же бинаря владеет daemon+DB. Job Objects помогают custody, не изолируют от любого процесса того же OS user. Notification ack не resolution, heartbeat не progress, exit code не whole-task acceptance.
-
-## 11. Доноры и аудиты: карта, не программа обязательных переносов
-
-### 11.1 Что означает историческая инвентаризация
-
-Сохраняется прежний учёт: 43 D-поверхности, 27 P-работ и 187 S-записей — 257 строк, не 257 гарантированно независимых источников. Draft/completed в реестре не означает прочитанную работу или reproduced experiment. Старый archive incomplete не возобновляется как issue factory V3.
-
-Полный ZIP не перечитан в 0.10. Прежние сведения о нём опираются на соответствующие проходы и приложение Claude. Текущий реестр показывает направления переноса; свежие reads отмечаются в карте. Конкретная библиотека выбирается по consumer и цене, а не потому, что имя занесено в таблицу.
+Исторический реестр: 43 D-поверхности, 27 P-работ, 187 S-записей — 257 строк, не 257 независимых прочитанных источников. Добавленный D44 сохраняет старые IDs. Архив и все upstreams целиком не перечитаны. Конкретное копирование кода требует условий соответствующей версии; исследование механизма не импортирует продукт.
 
 ### 11.2 D01–D44
 
-Строка — кандидатный механизм, не квалификация всех версий/лицензий. При реальном копировании кода проверяются конкретные условия. Старая нумерация сохранена.
-
-| D | Донор | Полезный механизм и граница переноса |
+| D | Донор | Решение/механизм |
 |---|---|---|
-| 01 | MemMachine | Derivative → source episode → контекст ремонта (§26); в 0.13 дочитаны дешёвое разбиение, semantic ingestion, реальный progress/SQL caller. Не переносить oldest-50 update window и сообщения×категории как обязательный pipeline (§27) |
-| 02 | MemPalace | Event identity, одинаковые timestamps и повторные экспорты; не last duplicate wins |
-| 03 | Subcog | В 0.14 прочитаны real RRF/recall, summary-source links и lifecycle formula. Брать native facets/ранжирование; normalized max=1 не уверенность, retention-helper не готовая система забывания (§28) |
-| 04 | MemOS local plugin | Retrieval по ситуации; gain не объявлять causal proof |
-| 05 | Claude Code memory/tool search | Малый начальный индекс и раскрытие вместо вечного дампа |
-| 06 | ClawVM | Сохранение необходимых смысловых единиц при сжатии |
-| 07 | Pichay / demand paging | Цена повторного чтения; не строить paging OS заранее |
-| 08 | Graphiti | Свежая проверка 0.12: отдельные duplicate/contradiction candidates, обновление временных интервалов и источников; не перенос managed Zep/онтологического runtime; §26 |
-| 09 | Hindsight | Incremental facet update и saved questions (§26); в 0.13 дочитаны retain orchestration, update/answer fusion и реальное исключение injected memory перед retain. Delta зависит от пути/backend; plugin chat text не равен всем tool outcomes (§27) |
-| 10 | EverOS | Reconciliation пропущенных событий; replacement прежде retirement |
-| 11 | EverMemOS historical | Episode/atomic facts/foresight; различать historical/current stacks |
-| 12 | Cloudflare managed Agent Memory | Raw рядом с extracted; service не бесплатная library |
+| 01 | MemMachine | Derivative→episode→ремонт; дешёвое разбиение и реальные ingestion callers. Не oldest-prefix и не messages×categories (§§26–27) |
+| 02 | MemPalace | Event identity, равные timestamps, повторные exports; не last duplicate wins |
+| 03 | Subcog | Native arms/RRF, сохранённые summary sources. Score не confidence; lifecycle arithmetic отдельно (§28) |
+| 04 | MemOS local plugin | Retrieval по ситуации; gain не causal proof |
+| 05 | Claude Code memory/tool search | Малый индекс и раскрытие вместо постоянного дампа |
+| 06 | ClawVM | Сохранение значимых смысловых единиц при сокращении |
+| 07 | Pichay / demand paging | Цена повторного чтения; не paging OS заранее |
+| 08 | Graphiti | Duplicate/contradiction candidates и temporal intervals; не весь managed Zep (§26) |
+| 09 | Hindsight | Facet update, saved questions, retention без собственного echo; conditional delta (§§26–27) |
+| 10 | EverOS | Пропущенные события и replacement прежде retirement |
+| 11 | EverMemOS historical | Episodes/facts/foresight; различать версии |
+| 12 | Cloudflare managed Agent Memory | Raw рядом с derived; service не бесплатная library |
 | 13 | Cloudflare Agents SDK Sessions | Immutable turns, branch-local compaction |
-| 14 | SurrealFS | Source/indexer/content/profile revisions; не сама SurrealDB |
-| 15 | MentisDB | Versioned procedures и source-linked reveal; проверить lifecycle |
-| 16 | LangMem | Отдельный background submit/search, сохранение всех inputs при debounce, scoped prompt proposal и реальный no-change; §§23–24 |
-| 17 | Letta Code current | Candidate/cancel и защита от позднего результата |
-| 18 | Letta V1 archive | История по требованию и цена truncation; не current Code |
-| 19 | Nocturne Memory | В 0.14 прочитаны stable node/version/alias и настоящий read renderer: recall clues плюс раскрытие; без boot-ритуала, принудительной личности и обязательной URI-иерархии (§28) |
-| 20 | Mem0 OSS | Batch extraction/embeddings; отличать ошибку от пустого результата |
-| 21 | OpenMemory historical MCP | Membership/access ideas с оговоркой о historical продукте |
-| 22 | OpenMemory session CLI | Перенос сессий; roadmap не выполненный runtime |
-| 23 | Cavira LongMemory | Узкие decay/supersedes/checkpoint, не смешивать с mem0 OpenMemory |
-| 24 | ripgrep | Exact spans/offsets и простой первый source tool |
-| 25 | ast-grep | Синтаксические patterns/координаты, не runtime proof |
-| 26 | SCIP | Definitions/references с encoding и producer/source revision |
-| 27 | GitHub Copilot Memory | Перепроверка citation; описание не открытый runtime |
-| 28 | Docling | Parser реальной ingestion-задачи и page/element provenance |
-| 29 | Docling Core | Document hierarchy и chunk metadata выбранного parser |
-| 30 | DocETL | Raw/error/partial и retries, не новый general research engine |
-| 31 | Vector / VRL | Сохранить событие при transform error; DSL только при необходимости |
-| 32 | Kreuzberg v4 LTS | Native extraction/source mapping, точная версия и лицензия |
-| 33 | Kreuzberg current | Не наследовать свойства другой версии по имени |
-| 34 | Cedar | Policy backend только при оправданной сложности, не baseline V3 |
+| 14 | SurrealFS | Source/indexer/content identities; не сама SurrealDB |
+| 15 | MentisDB | Versioned procedures и source reveal; lifecycle ещё проверить |
+| 16 | LangMem | Submit/search отдельно, coalesce без потери inputs, no-change обработан (§§23–24) |
+| 17 | Letta Code current | Свежая 0.15: реальный local compaction caller и отдельная reflection-подготовка. Continuation не durable lesson; не второй host (§29) |
+| 18 | Letta V1 archive | История по требованию и truncation; в 0.15 не выдана за current Code |
+| 19 | Nocturne Memory | Stable node/revision/alias и короткие recall clues, не обязательный boot/persona (§28) |
+| 20 | Mem0 OSS | Batch extraction/embedding; ошибка не empty result |
+| 21 | OpenMemory historical MCP | Membership/access ideas historical продукта |
+| 22 | OpenMemory session CLI | Перенос сессий; roadmap не runtime |
+| 23 | Cavira LongMemory | Decay/supersedes/checkpoint; не смешивать с mem0 |
+| 24 | ripgrep | Exact source spans и простой source tool |
+| 25 | ast-grep | Синтаксические patterns, не runtime proof |
+| 26 | SCIP | Definitions/references и source/producer/encoding |
+| 27 | GitHub Copilot Memory | Citation recheck; описание не открытый runtime |
+| 28 | Docling | Нужная ingestion и page/element provenance |
+| 29 | Docling Core | Иерархия документа и chunk metadata |
+| 30 | DocETL | Raw/error/partial, не новый general research engine |
+| 31 | Vector / VRL | Сохранить событие при transform error; DSL по нужде |
+| 32 | Kreuzberg v4 LTS | Native extraction, конкретная версия/лицензия |
+| 33 | Kreuzberg current | Не наследовать свойства иной версии по имени |
+| 34 | Cedar | Только при реальной сложности policy, не baseline |
 | 35 | OPA | Undefined/error/result; не второй policy owner |
-| 36 | redb | Исторический durable spool; baseline V3 не требует второй БД |
-| 37 | duroxide | Idempotent activity identity, не целый workflow runtime |
-| 38 | Flawless | Unknown external outcome и retry/replay safety |
+| 36 | redb | Historical spool; baseline не требует второй БД |
+| 37 | duroxide | Activity identity как идея, не workflow runtime |
+| 38 | Flawless | Unknown effect и retry/replay |
 | 39 | FoundationDB testing | Будущие управляемые отказы, не тестовая платформа сейчас |
-| 40 | Wasmtime | Изоляция реального недоверенного расширения при оправданной цене |
-| 41 | SurrealDB Agent Memory / Spectron | Source-linked retrieval/scope; отдельный application tier |
-| 42 | MAGMA | Ограниченные typed graph walks с фактическими фильтрами |
-| 43 | A-MEM | В 0.14 сопоставлены статья и отдельная library: локальная эволюция поискового описания/связей, но фактические record IDs и отбор соседей до упаковки. Не считать library автоматически выполнением эксперимента статьи (§28) |
-| 44 | Google Research Harness2 | Два цикла улучшения и раскрываемые реальные материалы; §§19,25. Не импортировать benchmark engine или считать cache новым экспериментом |
+| 40 | Wasmtime | Изоляция реального недоверенного расширения при нужной цене |
+| 41 | SurrealDB Agent Memory / Spectron | Source-linked retrieval; отдельное приложение |
+| 42 | MAGMA | Свежая 0.15: отношения под вопрос, реальный query/traversal/packing; не полные scans и hardcoded dataset routing (§29) |
+| 43 | A-MEM | Evolution реально индексируемых описаний и связей; library/paper различаются (§28) |
+| 44 | Harness2 | Два improvement loops и реальные раскрываемые материалы; cache не новый опыт (§§19,25) |
 
-Hy-Memory отдельно углублён в §§6,16–18. Не нужно импортировать всех доноров, чтобы сохранить перечисленные свойства.
-
-### 11.3 Исследование должно завершаться решением о продукте
-
-MemGPT/HiAgent помогают понять подцели и раскрытие; LongMemEval/MemoryArena/Mem2Act — различить remembered/retrieved/action; LightMem/MemDelta — цену консолидации; ATMS — альтернативные опоры без обязательного комбинаторного движка; Meta-Harness/Harness2 — улучшение метода работы. Чужие benchmark scores не цели Eliot.
-
-Достаточно указать пробел, конкретный mechanism/source, полезный consumer, ограничения и решение взять/не брать. Нет обязательного отдельного файла с 13 разделами каждой идее. Mature library не должна проходить больше церемоний, чем написанный с нуля аналог худшего качества.
+Hy-Memory отдельно углублён в §§6,16–18. MemGPT/HiAgent, LongMemEval/MemoryArena/Mem2Act, LightMem/MemDelta, ATMS и Meta-Harness исследуются по пробелу продукта, не ради обязательных карточек. Достаточны source, механизм, consumer, цена и решение взять/не брать. Самописный аналог не должен проходить легче зрелой библиотеки только потому, что донору назначена лишняя церемония.
 
 ## 12. All 29 original scenarios
 
-Источник — [V2 A15](../architecture/A15-end-to-end-scenarios.md). Сохраняется смысл пользовательской ситуации, не физическая топология донора.
+Источник — [V2 A15](../architecture/A15-end-to-end-scenarios.md). Сохраняется пользовательский смысл, не старая топология.
 
 | A15 | Ситуация | Решение V3 |
 |---|---|---|
-| 1 | Новая область без Git | Реальные anchors и provisional scope, без выдуманного commit |
-| 2 | Агент не знает, что искать | Orientation, полезный advisory и handles на границе решения |
-| 3 | Плохо типизированное наблюдение | Сначала сохранить permitted raw |
-| 4 | Ложное слияние/процедура | История и dissent сохраняются; производное влияние пересматривается |
-| 5 | Изменение workspace без отчёта | Доступные независимые сигналы, gap и целевой resync |
-| 6 | Разные объяснения | Источники и различающий следующий шаг, не голосование |
-| 7 | Большой swarm audit | Уникальный охват/partial/gaps в памяти, рой в controller |
-| 8 | Повтор известного провала | Своевременный applicable совет; точный host gate отдельно |
+| 1 | Новая область без Git | Реальные anchors и provisional scope |
+| 2 | Агент не знает, что искать | Orientation, совет и handles на границе решения |
+| 3 | Неопределённый тип наблюдения | Сначала permitted raw |
+| 4 | Ложное слияние/процедура | История/dissent, пересмотр производного влияния |
+| 5 | Workspace изменён без отчёта | Доступные сигналы, gap и целевой resync |
+| 6 | Разные объяснения | Источники и различающий шаг, не голосование |
+| 7 | Большой swarm audit | Уникальный охват/gaps в памяти; рой у controller |
+| 8 | Повтор известного провала | Applicable advice; точный host gate отдельно |
 | 9 | Ложный guard | Challenge и сужение неверной части |
-| 10 | Позднее poisoning | Отзыв реальных зависимостей и обоснованная новая ревизия |
-| 11 | Injection из tool/model/document | Данные не полномочия; обычное применение по реальным targets |
-| 12 | Отказ optional модуля | Незатронутые пути продолжаются; изоляция по реальной цене отказа |
-| 13 | Governor падает | Без воспроизведения Kernel: внешний observer и pending/unknown recovery |
-| 14 | Давление очереди/диска | Явный staged/rejected, доступный control и ограниченная работа |
-| 15 | Repair не помогает | Остановить повтор того же ремонта и сохранить проблему |
-| 16 | Compaction/restart | Новая incarnation, цель, обязательства, ошибки; discarded plan не оживает |
-| 17 | Смена model/harness | Проверить нужные capabilities/applicability; история остаётся |
-| 18 | Verifier отсутствует | Непроверенный критерий unknown, не успех |
-| 19 | Пропущенное уведомление | Attention сохраняется; acknowledgement не resolution |
-| 20 | Найден executable | Metadata не разрешение запуска; использовать реальный host tool путь |
-| 21 | Privacy deletion | Withdrawal, purge controlled copies и внешние ограничения различаются |
-| 22 | Старый backup | Известные удаления применяются; owner может восстановить выбранное при обозначенном пробеле history |
-| 23 | Прерванная migration | Restart-based upgrade и явный результат, не весь live-generation stack |
-| 24 | Код против Architecture | Grounded discrepancy и явная правка нужной стороны |
-| 25 | Экспериментальный модуль | Подходящая ограниченная проверка, не arbitrary hot replacement |
-| 26 | Рой пишет модули | Один manager/worktree и writer/область; процесс разработки не Memory OS |
-| 27 | Локальный PASS, продукт FAIL | Не заявлять whole-product success; сохранить исход |
-| 28 | Не хватает окна | Progressive reveal/decomposition, не молчаливое удаление исключений |
-| 29 | Meta candidate пережил смену стека | Проверить применимость; старый score не новое доказательство |
+| 10 | Позднее poisoning | Пересмотр реальных зависимостей и новая обоснованная revision |
+| 11 | Injection из данных | Данные не полномочия; действительные targets |
+| 12 | Optional failure | Незатронутая польза продолжается |
+| 13 | Governor падает | Внешний observer, pending/unknown recovery без Kernel clone |
+| 14 | Давление диска/очереди | Явный staged/rejected и доступный control |
+| 15 | Неэффективный repair | Остановить тот же retry, сохранить проблему |
+| 16 | Compaction/restart | Цель/обязательства/ошибки, новая incarnation; discarded plan не оживает |
+| 17 | Смена модели/host | Проверить нужные capabilities; сохранить историю |
+| 18 | Нет verifier | Критерий unknown, не успех |
+| 19 | Пропущено уведомление | Attention сохраняется; ack не resolution |
+| 20 | Найден executable | Metadata не permission; реальный host путь |
+| 21 | Privacy deletion | Withdrawal/purge и внешние ограничения различаются |
+| 22 | Старый backup | Известные удаления, owner-selected restore с обозначенным gap |
+| 23 | Прерванная migration | Restart-based upgrade и явный результат |
+| 24 | Код против Architecture | Grounded discrepancy, правка нужной стороны |
+| 25 | Экспериментальный модуль | Ограниченное подходящее сравнение, не hot-replacement matrix |
+| 26 | Рой пишет модули | Один manager/worktree и writer/область вне Memory OS |
+| 27 | Локальный PASS, продукт FAIL | Не заявлять общий успех |
+| 28 | Мало окна | Reveal/decomposition, не молчаливое удаление exceptions |
+| 29 | Meta candidate после смены стека | Применимость заново, старый score не новое evidence |
 
-Implementation S1–S32 и прежние 36 Cognition walkthroughs остаются в своих документах. Они не являются заявлением о выполненных продуктовых тестах.
+Implementation S1–S32 и 36 прежних cognitive walkthroughs остаются в своих документах. Это проектные ситуации, не выполненные тесты.
 
-## 13. Разработка и публикация без параллельной системы истины
+## 13. Разработка и публикация
 
-Единица работы завершает полезный переход либо устраняет названный отказ. Не сначала все DTO, потом все handlers, затем proof registry и когда-нибудь реальный consumer. Один manager — один изменяемый worktree; read-only review не требует размножать рабочие копии.
+Единица работы заканчивает полезный переход, а не семейство DTO и будущих заглушек. Один manager — один изменяемый worktree. Публикация — настоящий GitHub commit/ref, не локальный ZIP. Исторический разрыв 0.5 устранён; работающий GitHub API не объявляется read-only из-за локальной сети.
 
-Публикация означает GitHub commit/ref и фактическое чтение результата. Локальный ZIP не равен коммиту. Старый разрыв поставки 0.5 устранён в 0.6; нельзя сохранять его как нынешний blocker. Отсутствие локальных Git credentials не отменяет работающий GitHub API.
-
-Исторические CI-дефекты: фиксированный каталог 11 V2 issues применялся к #5324; в одном Windows run reading receipt зависел от LF/CRLF. [Каталог](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/.github/work-unit-cohort.toml), [gate](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/scripts/work_unit_gate/doc_read_evidence.py#L1592-L1659), [run](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/39176892004). Это не универсальный диагноз каждого нового CI failure.
-
-Не подставлять чужую issue, не выдумывать независимого reviewer, не повторять старый PASS для новых bytes. Изменения CI требуют отдельного явного решения; этот проход их не меняет. Branch commit не равен main merge. Подготовка документации не закрывает все старые active programmes и не мигрирует `workstreams/ACTIVE.toml`.
+Старые CI-находки относились к конкретным runs: fixed cohort из 11 issues и LF/CRLF-зависимость reading receipt. [Cohort](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/.github/work-unit-cohort.toml), [gate](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/scripts/work_unit_gate/doc_read_evidence.py#L1592-L1659). Они не объясняют автоматически каждый новый failure. Не подставлять чужую issue, не выдумывать независимого reviewer, не переиспользовать старый PASS. Этот проход CI и ACTIVE registry не меняет.
 
 ## 14. Минимальная рабочая конструкция
 
-`capture` сохраняет observation и нужное намерение обработки; `store` использует native DB; `context` находит и отбирает полезный материал; Dreamer интерпретирует подходящий эпизод; `learning` связывает методы с последующими исходами; controller выполняет внешние действия. Наблюдение — реальный progress/result, не наличие сертификата.
-
-Один app writer не устраняет concurrency: поздний worker и потерянный ответ всё ещё возможны. Но matching claim, ожидаемая revision и stable request ID не требуют Authority Epoch/PreparedTransition framework. Advisory не обязан быть уже доказанным универсальным методом, а читать память не значит исполнять записанную команду.
-
-Когнитивная глубина — реконструкция, различение, условия, аналогия и пересмотр. Число процессов, рёбер, классов и повторных reflection не её мера.
+Capture сохраняет observation и необходимую работу; Store использует native DB; context находит полезное; Dreamer интерпретирует; learning связывает метод с будущим outcome; controller исполняет внешнее. Matching claim/revision устраняет позднюю запись без Authority Epoch framework. Advisory не обязан быть универсально доказан; чтение метода не его исполнение. Число рёбер, сервисов и reflection не мера понимания.
 
 ## 15. Что пока не доказано
 
-Нет полного построчного аудита миллионов строк, нового прочтения всего release ZIP/187 papers/всех donors, выполненного V3, Windows custody/restore, SurrealDB query/benchmark, controller inference или сравнительного LOC/RAM/latency. Каждый source finding имеет свою область; прежние synthetic probes — не новая live qualification.
-
-O1–O6 в Implementation — точный host, controller routes, filesystem durability, Store schema/client, criterion и observer. Это не шесть платформ и не разрешение блокировать все полезные функции, пока не доказана каждая. Карта фиксирует оставшиеся связанные чтения, без фиктивного общего процента готовности.
+Нет полного построчного аудита V2, повторного чтения всего ZIP/всех papers/donors, работающего V3 или сравнительного LOC/RAM/latency. O1–O6 в Implementation — конкретные host/controller/Store/platform choices, не разрешения заблокировать другие функции. Карта показывает точный остаток без фиктивного процента готовности.
 
 ## 16. Cognitive audit 0.3
 
-Исторический результат: 0.2 подробнее описывала recovery, чем само понимание. Cognition определила вычисления внутри прежних modules: scoped current-value resolution, intended/observed/proposed, групповой lookup альтернатив вне top-k, карты с membership, finite refresh, three-valued applicability и criterion-specific outcomes.
+0.2 подробнее описывала recovery, чем вычисления понимания. Добавлены scoped current resolution, intended/observed/proposed, lookup альтернатив вне top-k, membership views, finite refresh, three-valued applicability и criterion-specific outcomes внутри существующих modules. [V1 §4.12](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Canonical_Master.md#412-deterministic-current-value-resolution) и [UL mission](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md#L14-L120) дают смысл, не обязательные старые DTO.
 
-[V1 §4.12](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Canonical_Master.md#412-deterministic-current-value-resolution) даёт смысл resolver, [UL mission](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/b5c84d4e53292dbc8996917c63448d5ee96c4bc7/docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md#L14-L120) — cues/реконструкцию/dirty tracking. Их старые DTO и тезис injection=usage не импортируются вместе с идеей.
+Новый consumer делает карту неполной без изменения старых cited files: нужны scope/membership, не полный rebuild. В optional/default-off [Hy helper](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/system2_agent.py#L72-L346) прежняя изолированная проба принимала цитату `I use glasses` за состояние пользователя. Не весь Hy deployment: user-role не исключает quoted/example content.
 
-Контрпример maps: три cited consumers неизменны, но появился четвёртый. Положительные ссылки не доказывают полный набор. View сохраняет examined scope/selection basis, а изменение membership делает dirty именно его. Не нужен query AST или полный rebuild после любого edit.
-
-У необязательного Hy [canonical-state helper](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/system2_agent.py#L72-L346), выключенного по умолчанию, изолированный перенос принимал чужую цитату и пример `I use glasses` за личное использование. Это не production failure всего Hy. Вывод: роль user не исключает цитаты; general understanding не строится расширяющимся каталогом бытовых regex.
-
-[DCPM](https://arxiv.org/html/2606.09483v1) полезна revision trajectories и offline abstraction, но её квадратичный межобластный sweep и chat benchmark не гарантируют engineering transfer. Два предшествующих chunks в [Hy §5.3](https://arxiv.org/html/2610.22196v1) относятся к reward annotation, не каждому production writer. [LongMemEval](https://arxiv.org/html/2410.10813v2) различает update/temporal/abstention; это failure categories, не обязательная онтология продукта.
+[DCPM](https://arxiv.org/html/2606.09483v1) полезна trajectories/offline abstraction, не квадратичным sweep как обязательной нормой. Два preceding chunks [Hy §5.3](https://arxiv.org/html/2610.22196v1) относятся к reward annotation, не каждому production writer. [LongMemEval](https://arxiv.org/html/2410.10813v2) различает update/temporal/abstention, не задаёт универсальную онтологию Eliot.
 
 ## 17. Memory transition audit 0.4
 
-Источники — Hy [fact_reconciler.py](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/fact_reconciler.py) и [store.py](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/store.py). Подробные координаты и исходные пробы сохранены в [историческом §17](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c28359fc2716f3b498ea512ca24a57801d18014c/docs/v3/AUDIT.md#17-memory-transition-audit-04).
+Источник — Hy [fact reconciler](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/fact_reconciler.py) и [store](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/coding/store.py).
 
-| Находка | Малое решение |
+| Проверенный механизм | Решение |
 |---|---|
-| `_execute` снимает predecessor до history/model work и нового insert; отдельный autocommit | Подготовить вне transaction, затем атомарно revision+links+retirement+result |
-| WorkingFact — whole trace/session, не atomic claim | Продолжение задачи обновляет progress, а не отменяет все прежние exceptions |
-| Subject gate optional/default false | Не считать prompt безусловной runtime-гарантией всех режимов |
-| После A→B удаление B может ошибочно вернуть A | Retired value не воскресает без нового основания или явного исправления replacement |
-| Допустимо несколько родителей, ancestor query выбирает `LIMIT 1` | Frontier/visited и явная неполнота, не превращать graph в chain сортировкой |
-| Lexical rerank только внутри dense pool | Independent exact/lexical candidates; векторный сбой не пустая память |
-| Exact details хранятся вне searchable fields выбранного пути | Source-derived cues и адресный поиск/раскрытие |
-| Нет diagnostic, потому что verifier не дошёл | Coverage/completeness критерия, не автоматический pass |
+| Retirement прежде model/history/new insert, отдельный autocommit | Подготовить снаружи, атомарно publish revision/links/retirement/result |
+| Session progress вместо atomic claim | Продолжение не отменяет все старые исключения |
+| Optional subject gate | Prompt не безусловная гарантия каждого режима |
+| После A→B удалён B | A не воскресает без основания |
+| Несколько родителей, ancestor LIMIT 1 | Frontier/visited и явная неполнота |
+| Lexical rerank после dense threshold | Независимые exact/lexical кандидаты |
+| Exact details не searchable | Source-derived cues и адресное раскрытие |
+| Verifier не дошёл до consumer | Missing diagnostic не pass |
 
-Прежняя SQLite-проба retirement-before-insert оставляла старую superseded и отсутствующую новую запись. Проба A/B→C→D возвращала A,C без B и без исчерпания depth. Это воспроизведение выбранных SQL-переходов в изоляции, не запуск Hy/SurrealDB или измерение recall. Простой finite traversal сохраняет нужную историю без provenance engine.
+Прежняя SQL-проба оставляла retired predecessor без successor; другая A/B→C→D пропускала B без исчерпания depth. Это изолированные переходы, не полный runtime или recall benchmark. Подробности сохранены в исторических редакциях.
 
 ## 18. Cross-domain learning audit 0.5
 
-Исторически подготовленный материал 0.5 опубликован в 0.6. Полный первоначальный отчёт с isolated controls — [§18 редакции 0.9](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#18-cross-domain-learning-audit-05). Ни одна из этих проб не перезапускалась в 0.10.
+[Hy sweeper](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/cross_domain_sweeper.py) и [optional compaction](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/system2_tools.py#L84-L209):
 
-Основные sources: [cross_domain_sweeper.py](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/cross_domain_sweeper.py) и [optional compaction](https://github.com/Tencent-Hunyuan/Hy-Memory/blob/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a/hy_memory/pipelines/system2_tools.py#L84-L209).
+- Existing-core branch выбирает первый set element и добавляет связи без нового semantic matching. Сортировка исправляет порядок, не смысл. Alternatives сохраняются; association не evidence.
+- Union-find создаёт компоненту из попарной близости, которая не транзитивна. Прежние synthetic углы 0/40/80 градусов это показывали. Компонента — кандидаты, не доказанный общий принцип; clique-proof также не нужен.
+- Начальные 500 узлов не ограничивают повторное перечисление всех behavioral nodes. В prompt для отсутствующего source может попасть лишь ID. Две условные float32 матрицы 10000×10000 требуют 800000000bytes без прочих расходов; это арифметика, не measured OOM.
+- Null branch не переиспользует no-change локально; `_has_beh` не означает текущий abstractor/encoder. Existing job input/method identity решает reuse без новой negative-result БД.
+- Default-off compaction использует shared sources+cosine для снятия второй формулировки без проверки исключения. Прежняя synthetic пара read-only retry/unknown side effect показывала недостаточность условия, не качество настоящего encoder.
 
-**Existing core:** `_process_cluster` берёт первый ID множества старых targets, добавляет связи новым members без нового semantic matching/evidence read и пересмотра core text. Сортировка IDs делает выбор воспроизводимым, не осмысленным. Изолированная fake-graph проба A/core-A, B/core-B добавляла B→core-A без модели. V3 оставляет alternatives; сходство допускает navigation analogy, не подтверждённую premise.
-
-**Нетранзитивность:** union-find объединяет подходящие пары. Synthetic angles 0°,40°,80° дают cosine соседей ≈0,766, крайних ≈0,174; порог0,70 всё равно создаёт одну компоненту. Кластер — конечный набор для рассмотрения, не доказанное общее правило. Можно использовать подмножество или вернуть no-change; полный clique-proof не нужен.
-
-**Ложный предел:** `sweep` начинает с500 nodes, а `_fetch_basics_with_beh` перечитывает все подходящие без первоначальной membership. Для отсутствующего в первом `basic_map` источника prompt получает ID вместо текста. Две условные float32 матрицы10000×10000 требуют800000000bytes только под их entries; это арифметика, не измеренный OOM. V3 удерживает один finite input набор на job, ограничивает реально рассматриваемые пары и продолжает следующий участок без бесконечной обработки первого окна.
-
-**No-change и feature:** null branch сам не сохраняет reuse решения; повторный прямой вызов в пробе снова вызвал модель. `_has_beh` не удостоверяет текущий abstractor/encoder. V3 применяет уже существующие job input/method identities и completed no-change; меняется derived representation, не обязательно все original embeddings. Отдельное behavioral space — опция по полезным пропускам, не обязательная цена каждого observation.
-
-**Compaction:** shared evidence/raw-source и высокий cosine могут снять второй текст без сохранения особых условий. Опция default false. Synthetic identical vectors для правил retry read-only и не повторять unknown side effect разрешили merge в выбранной функции. Это контрпример достаточности условия, не поведение реального encoder. Общий источник содержит разные правила/контрпримеры; сохраняются условия, не только IDs источников.
-
-Все исправления используют ordinary revisions, finite jobs, indexed candidate retrieval, адресные source links и existing transaction. Нет ConceptualStore, merge daemon или отдельного планировщика «самоэволюции».
+V3 удерживает finite inputs, нужные пары и продолжение; обновляет derived representation по назначению; сохраняет конкретные условия и independent cases. Дополнительное behavioral пространство опционально по реальным пропускам. Нет ConceptualStore/merge daemon/самостоятельного планировщика самоэволюции.
 
 ## 19. Harness2: рекурсия для Eliot, не новый агентный runtime
 
-D44 прочитан на `1cfe254e...`; механизмы и исходный source map остаются в [историческом §19](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#19-harness2-рекурсия-для-eliot-не-новый-агентный-runtime). Дополнительная проверка прохода 0.10 — §25.6.
+[recursion.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/recursion.py), [selection](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/selection.py), [library](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/library.py), [ledger](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/ledger.py), [schedule caller](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/schedule.py#L390-L560) и [experiment guide](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/docs/EXPERIMENTS.md) проверялись отдельно от опубликованных scores.
 
-### 19.1 Два объекта обучения
+Task-local Propose–Probe–Compose меняет способ конкретной работы. Cross-task lesson улучшает способ будущей диагностики/улучшения. Recipe стабилен внутри сравнения; следующий task не наследует весь прежний специфический harness. Веса моделей не меняются.
 
-Task-local **Propose–Probe–Compose** меняет способ выполнения конкретной задачи по execution contrasts. Cross-task reflection сохраняет, как диагностировать и улучшать метод, для следующего improvement cycle. Это не просто библиотека финальных ответов. Improvement recipe фиксирован внутри сравнения; следующий task не наследует весь прошлый специфический harness. Веса моделей не меняются.
+Final pool исключает reference outputs; Compose всё же может оставить input tree. Eliot явно сохраняет baseline/no-change. Sequential latest composition не обязательно better. R=4k/P=3k — экспериментальная структура, не число всех API calls: selection/reflection/retries/cache отдельно. Не назначать её каждому событию памяти.
 
-### 19.2 Где механизм реализован
-
-| Source | Роль |
-|---|---|
-| [recursion.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/recursion.py) | General/domain proposals, execution probes, compose, parallel/sequential |
-| [selection.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/selection.py) | Выбор deliverable и отдельная reflection cue/lesson/evidence |
-| [library.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/library.py) | Выбранный harness, EXPERIENCE.md и индекс для будущего обращения |
-| [ledger.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/ledger.py) | Rollout/improvement labels и attempts/cached, не один recursion=один call |
-| [schedule.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/schedule.py#L390-L560) | Реальный caller библиотеки, recursion, selection и reflection |
-| [EXPERIMENTS.md](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/docs/EXPERIMENTS.md) | Экспериментальные режимы, пределы воспроизведения и отдельное judging |
-
-Parallel k — ширина, не бесконечная рекурсивная глубина. Sequential получает composed tree следующей итерации, который не обязательно объективно лучше. Shape validation изменений не semantic proof.
-
-### 19.3 Что нельзя механически переносить
-
-Final selection pool исключает reference outputs; k=1 выбирает единственный final без нового model judge. Compose может сохранить input tree — поэтому это не обязательная мутация. Однако V3 должен явно иметь baseline/no-change среди допустимых adoption результатов, не считать любой final улучшением.
-
-R=4k включает kbase+2kprobes+kfinals; P=3k — два типа proposal и compose. Selection/reflection и attempts считаются отдельно, cache меняет новую фактическую стоимость. Один rollout может содержать много API/tool calls. Такой benchmark workload не назначается каждому эпизоду памяти.
-
-Reflection field presence не доказывает grounding/causal benefit. Нового полезного experience может не быть. Network/public grading information в benchmark setup ограничивает интерпретацию результатов; руководство сообщает о validation rollout, скачавшем rubric. Это не доказательство загрязнения всех результатов. Eliot не копирует unrestricted benchmark executor ради обычного extraction.
-
-### 19.4 Применение в V3
-
-Обычная method revision, ограниченный job и controller исполняют task-local proposal/probe/compose. Ordinary lesson хранит cue, attempted change, observed contrast, conditions и когда полезно повторить способ улучшения. Будущий Dreamer извлекает подходящий урок. Не требуется ReflectionStore, отдельная library DB, рекурсивный swarm или новый runtime.
-
-Cheap repeatable сравнение полезно; повтор irreversible effects ради эксперимента не становится допустимым автоматически. При недостатке данных можно оставить conditional suggestion/no-change. Подробная реализация — [Cognition §6.7](COGNITION.md#67-two-recursive-loops-from-harness2).
+Reflection fields не causal proof. Guide сообщает о validation rollout, скачавшем публичный rubric; это ограничение setup, не доказательство загрязнения всех результатов. Existing memory/attempt/jobs/controller реализуют два цикла без ReflectionStore, другого executor и рекурсивного роя. Необратимые действия не повторяются ради проверки без подходящего разрешённого сценария.
 
 ## 20. Где проектировщик сам вернул бюрократию и что изменено
 
-| Собственный перегиб | Исправление |
+| Мой перегиб | Исправление |
 |---|---|
-| Old no-SDK ADR стал обязательным veto | Official network SDK сначала; проверяется конкретная новая проблема |
-| Wider reuse требовал независимого эксперимента каждый раз | Automatic provisional transfer отдельно от широкого effectiveness claim |
-| Operation family грозила стать вторым generic ledger | Mutation readback рядом с owning record/job; отдельная запись только при реальной нужде |
-| Свой supervisor независимо от существующего покрытия | Один настоящий owner; reuse или небольшой standalone observer |
-| Enterprise owner/principal vocabulary | Local projects/routes/retention, не grant graph |
-| Provenance превращалась во whole-corpus walk | Проверка релевантных выбранных зависимостей и affected views |
-| Fingerprint language провоцировал per-helper hashing | Hash только для настоящих bytes/cache/backup |
-| «Сначала qualify всё» блокировало независимую пользу | Проверять фактическую capability перед заявлением её готовности |
-| Restore ждал недоступной полной deletion history | Owner-selected recovery с известными ограничениями, отдельно от replay effects |
-| Наблюдаемость требовала разрешения показать результат | Основная польза отдельно от optional logging и diagnostic writes |
+| Old SDK veto | Сначала официальный сетевой SDK; конкретная проблема меняет решение |
+| Эксперимент перед каждым transfer | Automatic provisional advice отдельно от benefit claim |
+| Второй generic operation ledger | Readback у настоящего owning record/job |
+| Свой supervisor всегда | Один реально покрывающий failure domain owner |
+| Enterprise principal/grant vocabulary | Local projects/routes/retention |
+| Whole-corpus provenance walk | Релевантные выбранные источники и affected views |
+| Per-helper digests | Hash для actual bytes/cache/backup, не понимания |
+| Сначала qualify всё | Реальная capability, не veto остальных |
+| Restore требует потерянный журнал | Owner-selected recovery с честным gap |
+| Optional telemetry разрешает выдачу | Полезный результат отдельно от его измерения |
 
-Не заменяем один аппарат другим: запрет терминов, approval helpers, 13 разделов каждой идеи и произвольный LOC ceiling заставят лишь переименовать старые формы. Проверяем назначение, state owner, реальную ошибку, consumer и наличие готовой библиотеки. История audits остаётся в Git; повтор каждого старого статуса в новом документе не делает решение качественнее.
+Запрет слов, approval каждой функции и произвольный LOC ceiling создадут лишь переименование старых конструкций. Проверяем назначение, state owner, consumer и готовый native механизм. Нужная транзакция не бюрократия; слои вокруг неё могут ею быть.
 
 ## 21. Порядок следующей работы
 
-Карта A01–A14 хранит прочитанные места и следующий связанный путь, не signatures/permissions/workflow. Главный критерий: если запись полезна, кто её создаёт, кто действительно читает и что меняется в следующем действии? Дополнительная проверка не должна сама становиться предпосылкой существования данных.
-
-После source-level выводов о notification/cue/context основной фокус перемещён на experience producer, нормальный packet consumer, skill paths и поведение донора Harness2 на реальных inputs. Не нужно каждый проход начинать с уже разобранного определения normalizer или увеличивать число diagnostic crates.
+Карта A01–A14 — навигация прочитанного, не runtime registry. Главный вопрос: кто действительно создаёт полезные данные, кто читает и что меняется в следующем действии? Source-level findings не заменяют связанный путь. Следующее чтение должно закрывать такой пробел, не повторять уже разобранный normalizer ради счётчика.
 
 ## 22. Connected control and context audit 0.7
 
-Полный прежний отчёт с диапазонами и counterchecks: [§22 редакции0.9](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#22-connected-control-and-context-audit-07).
+[Полная историческая запись](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#22-connected-control-and-context-audit-07).
 
-### 22.1 Безусловный отказ control
+**Control.** Названные broker acknowledge/cancel/reconcile ветви заканчиваются общим `HumanApprovalActionDigestUnverifiable`, не имея success path. [Gate](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-user-broker/src/lib.rs#L2380-L2520). Ниже [ack launcher](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-user-broker/src/lib.rs#L1835-L1915) создаёт/выбрасывает строку и сообщает, что запись принадлежит daemon. Удаление первого gate не соединяет второй разрыв. Нужен прямой operation-specific call, не proof producer.
 
-Названные broker acknowledge/cancel/reconcile dispatch-ветви вызывают общий gate, который после actor/session checks неизбежно возвращает `HumanApprovalActionDigestUnverifiable`; у него нет требуемого digest. [broker lib](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-user-broker/src/lib.rs#L2380-L2520). Это не «все API всего продукта отключены», а проверенный no-success path.
+**Notification recurrence.** Existing matching key/fence подавляет emission, включая resolved; upsert отдельно отказывает resolved/different draft. Нельзя просто убрать exists-check: будет IdentityConflict. Problem/episode/seen revision различаются. Ack старого не гасит новое. [Persistence](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/storage/eliot-store-surreal-adapter/src/apply/surreal_notification.rs#L1-L610) проигрывает всю историю перед update и переписывает массив. N=1000 принятых legs — 499500 прежних replay и 500500 serialized entries; не latency measurement. SQL CAS присутствует. Current row+append history в одной транзакции устраняет повторную работу.
 
-Ниже [launch_notify_acknowledge](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/bins/eliot-user-broker/src/lib.rs#L1835-L1915) строит строку, выбрасывает её и возвращает non-completion, потому что canonical owner — daemon. Снятие одного gate не чинит missing intake stitch. V3 даёт прямое operation-specific управление собственной записью, не зависимое от toast/model/Critical-approval producer. Request cancel не объявляется наблюдаемой остановкой external effect.
+**Optional enrichment.** Некоторые обычные MCP branches после primary success отдают generic error из-за последующего enrichment `?`; исключения для части packets/telemetry уже есть. Сбой украшения не должен означать отсутствие произошедшего эффекта. [InjectionPlanner](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L190-L590) пишет delivered до вставки в ответ и восстанавливает suppression из receipts. Receipt failure подавляет пользу, crash-before-send может оставить ложную доставку. Это source-order вывод, не transport fault injection. Нужны наблюдённый handoff и малый presentation cache.
 
-### 22.2 Повтор проблемы и цена истории
-
-Notification emitter подавляет existing matching key/fence, включая resolved. `NotificationStore::upsert` отдельно отказывает resolved и materially different draft. Простое удаление exists-check даст IdentityConflict вместо update. Нужны problem key, episode, source event и seen revision, не новые grants. Старый ack не гасит новую проблему; dismissal не техническое recovery.
-
-[surreal_notification.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/storage/eliot-store-surreal-adapter/src/apply/surreal_notification.rs#L1-L610) проигрывает всю прежнюю историю перед каждым принятым lifecycle leg и пишет растущий массив обратно. Для N=1000 одношаговых принятых updates это499500 прежних legs и500500 serialized entries, не измерение времени. Revision CAS в SQL есть — lost update не заявлялся. V3 current-row+append history в одной транзакции; replay — recovery, не ordinary update.
-
-### 22.3 Optional enrichment и ложное delivered
-
-Retained MCP сначала получает primary success, затем некоторые обычные branches могут отдать общую ошибку из-за enrichment `?`. Есть исключения для admitted packets и отдельных telemetry writes. V3 не переписывает известный исход эффекта из-за optional decoration.
-
-[InjectionPlanner](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs#L190-L590) пишет `delivered` до insertion в ответ и восстанавливает suppression из receipts. Receipt failure пропускает полезный item; crash после receipt до send может надолго подавить неполученное. Это source-order inference, не transport fault injection. Достаточно фактически наблюдённого handoff и малого presentation cache; новой delivery-proof системы не надо.
-
-### 22.4 Старый реальный matcher и широкий loader
-
-Цепочка dispatcher→InjectionPlanner→CueIndexService пользуется прежней lossy normalization, хотя отдельная новая A-11 семья существует. ASCII-перенос показал слияние `Parser::read`/`parser::read`, `Type.method`/`Type::method`, UNC/relative и rooted/relative forms. Это string-key collisions, не утверждение о любой OS/language pair. Exact resource identity отделяется от advisory aliases.
-
-После максимум8 совпадений planner загружает до10000 project records с payload. SQL имеет caps и `truncated`, поэтому «полностью безграничный запрос» было бы неточно. Правильное решение — hydrate выбранных IDs/необходимых альтернатив, не cache поверх лишнего whole-project read.
-
-Counterchecks сохранены: валидный DirPath уже требует Prefix, path segment boundary полезна, notification CAS есть, и не каждый telemetry failure ломает каждый ответ. Не надо исправлять несуществующий дефект, прочитав только нижнюю функцию.
+**Cue path.** Реальный retained caller использует старую lossy normalization, несмотря на новый crate. Прежние ASCII-пробы сливают case-distinct symbols, `Type.method`/`Type::method`, UNC/relative и rooted/relative keys. Это string collisions, не универсальное равенство во всех OS/languages. После ≤8 matches loader выбирает до10000 project payloads. Hydrate нужных IDs/alternatives вместо cache поверх лишнего whole-project read. Counterchecks: DirPath contract уже требует Prefix, segment boundary полезна, не каждый telemetry failure ломает всё.
 
 ## 23. Working memory without global gates 0.8
 
-Полный исходный отчёт: [§23 редакции0.9](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#23-working-memory-without-global-gates-08).
+[Полная запись](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#23-working-memory-without-global-gates-08).
 
-### 23.1 Лимит страницы стал запретом пользоваться памятью
+[Store loaders](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/canonical_store.rs#L2385-L2500) при truncated возвращают PolicyViolation сверх10000, не continuation. Рост несвязанных данных может выключить малый lookup. Увеличение потолка не решение: primary indexed queries и pages.
 
-[Store loaders](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/canonical_store.rs#L2385-L2500) при `truncated=true` возвращают PolicyViolation для cue rows, sources и session receipts сверх10000. Это не continuation. При whole-project hydration unrelated corpus growth может отключить small relevant lookup. Увеличивать потолок или чистить квитанции ради поиска — симптоматический обход. Primary queries/ID lookup и paged broad scans устраняют причину.
+[ActivationEngine](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/activation.rs#L1-L300) ставит graph readiness/запись observability перед expansion; порог500 касается graph branch, не всего поиска. Direct matches должны возвращаться без этих зависимостей. [Projection queue](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/claim_cognitive_projection_project.surql) блокирует поздние jobs любой ранней non-applied строкой проекта независимо от target. Сохранять порядок только настоящих зависимостей.
 
-### 23.2 Граф и общий порядок не должны стоять перед прямой пользой
+Missing/stale cue cache и permanent `boot_sent` не определяют существование primary памяти. Неудачная первая orientation не должна скрывать новую карту всю сессию. Scope выводов ограничен прочитанными callers; иные resets не объявлены отсутствующими глобально.
 
-[ActivationEngine](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/activation.rs#L1-L300) читает readiness, загружает graph и пишет observability до возврата expansion. Порог500 касается graph branch, не всех видов поиска. Однако готовые direct matches не должны зависеть от достаточного общего числа edges и успешной записи trace.
+LangMem [reflection executor](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/reflection.py): separate submit/Future и search полезны; guide с `await` не становится неблокирующим от названия. Delayed payload заменяется, а не объединяется. Coalesce сигналы, сохранять observations и обрабатывать actual unprocessed episode.
 
-[Projection claim SQL](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/claim_cognitive_projection_project.surql) блокирует более позднюю запись проекта любой более ранней non-applied, независимо от family/target. Blocked/retry head мешает независимой работе того же проекта; другие проекты могут продолжаться. V3 сохраняет порядок настоящих зависимостей, не всего project lifecycle.
-
-### 23.3 Cache не определяет существование памяти
-
-Stale/missing CueShard честно отмечается, но не возвращает сохранённые primary сведения. `boot_sent` Boolean и hydration из receipts в рассмотренном пути могут фиксировать даже not_onboarded orientation и не дать новой карте обновить ту же сессию. Иные reset callers не объявлены отсутствующими по всему repo. V3 primary reads независимы; cache отражает показанные revisions, не вечное разрешение больше не ориентировать.
-
-### 23.4 D16 LangMem: фон отдельно, observations не выбрасывать
-
-На `48e3c11f` [reflection.py](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/reflection.py) показывает submit/Future, отдельный worker и search без ожидания reflection. Это полезная развязка. Но basic background guide использует `await` перед возвратом; название не делает execution неблокирующим.
-
-Delayed guide передаёт текущую пару сообщений, а новый PendingTask заменяет прежний payload без слияния. Полный контекст должен прийти от caller/сохранённой истории. V3 coalesces сигналы, не observations, и читает действительно необработанный эпизод. Нет второй ReflectionStore/очереди и бесконечного откладывания на непрерывном потоке.
-
-### 23.5 Собственная поправка recovery
-
-В0.7 я требовал isolation восстановленной копии до current deletion history либо нового selective import, а serving — после derived reconciliation. Это превращало утрату auxiliary metadata в запрет владельцу использовать целые данные. Исправлено: explicit owner restore, известные удаления, ясный пробел history, доступный primary read и background rebuild. Старые effects не replay автоматически; memory access и повтор действий — разные вопросы.
+В0.8 удалён мой blanket restore quarantine до полной current deletion history/derived readiness. Владелец может восстановить выбранные данные с известными удалениями/неизвестным gap; старые внешние эффекты отдельно от доступа к памяти.
 
 ## 24. From an episode to useful learned behavior — 0.9
 
-Подробный прошлый source/probe report: [§24 редакции0.9](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#24-from-an-episode-to-useful-learned-behavior--09). Он касается выбранного retained experience пути, не всех V2 producers и skills.
+[Полная запись](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#24-from-an-episode-to-useful-learned-behavior--09).
 
-### 24.1 DTO не заменяет интерпретацию
+[Formation](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/semantic_memory.rs#L1-L250) получает заполненный VerifiedEpisodeProjection; MCP передаёт input.episode. Это настоящий приёмник, не автоматическое понимание raw событий. Missing cause/cue может дать NothingToLearn, хотя последовательность полезна. Maturity ladder дорога, но IncludeCaseCandidates уже разрешает reconstructed cases — универсальный запрет не заявляется.
 
-[semantic_memory.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/semantic_memory.rs#L1-L250) получает заполненный VerifiedEpisodeProjection, проверяет cause/outcome/verifier/conditions и строит Case. MCP действительно передаёт `input.episode`. Это приёмник структурированного материала, не автоматический raw-event interpreter. Отсутствие cause/cue может дать NothingToLearn, хотя полезная последовательность событий ещё остаётся.
+Applicability по75% token overlap путает отрицание/упоминание проверки/короткие версии. Прежние пробы: committed/not committed, просьба run cargo check и APIv1/v2 совпали. Branch order делает AnalogyOnly/PartiallyApplicable недостижимыми. Заполненные семь TaskMeaning fields+evidence могут вывести MemoryNeed=None; explicit requested_need переопределяет. Unknowns иногда дают RequireProbe. Нужны наблюдения и условный совет, не prover естественного языка.
 
-[I12.21](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I12-21-memory-ecology-residual-experience-and-transfer.md) и [I12.24](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/docs/architecture/I12-24-meta-learning-and-improvement-delivery.md) дают нужный смысл переноса, но задают дорогие campaign/overlay/activation/closure формы. Reconstructed cases доступны в IncludeCaseCandidates — неверно утверждать универсальную недоступность любого опыта до ActiveProcedure. Для V3 один эпизод/коррекция может создать provisional note без лестницы регистрации.
+[Semantic loader](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/semantic_records_by_kind.surql) читает oldest512 без continuation. Recall обрезает до3 до applicability. Late corrections и подходящий четвёртый теряются в этом path. Candidate scan не final packet budget.
 
-### 24.2 Условие и заполненная форма не доказывают понимания
+Case projection по project+job и pattern по normalized core скрывают разные условия; duplicate case_refs, наоборот, повышают cases.len support. Нужны lesson identity/revision и independent source ID, не identity framework.
 
-`condition_matches` использует75% token overlap, а applicability corpus включает текст unknowns и requested checks. ASCII-пробы дали true для `database transaction committed` против `database transaction not committed`, `run cargo check` против просьбы её запустить и APIv2 против APIv1 из-за short-token filter. Это isolated rule behavior, не запуск Rust. `AnalogyOnly` и `PartiallyApplicable` в прочитанном branch order недостижимы; earlier returns разбирают случаи.
-
-`decision_sufficient` по непустым семи категориям+evidence способен вызвать inferred MemoryNeed=None и пустой recall. Explicit requested_need переопределяет это; unknowns отдельно могут дать RequireProbe. Counterchecks не отменяют основной вывод: field presence не полнота знания, запрос проверки не её результат, similarity не истинность. Unknown допустимо показать как условие, а не скрыть полезный метод.
-
-### 24.3 Поздний опыт исчезает из выбранного reader
-
-[semantic_records_by_kind.surql](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-store/src/surql/semantic_records_by_kind.surql) выбирает oldest512 physical records по revision/sequence, без continuation. Поздние уроки/коррекции могут храниться, но не попадать в этот path. Recall затем truncate≤3 до applicability; подходящий четвёртый уже не рассматривается. V3 separates candidate examination/final packet budget и читает current searchable records, не oldest prefix.
-
-### 24.4 Несовпадающая идентичность уроков и поддержки
-
-Projection key cases по project+job, patterns по normalized invariant core может скрыть разные outputs/conditions. Физические записи не удаляются, но used logical projection теряет различие. В обратную сторону repeated case_refs клонируются abstraction handler, а cases.len становится support. Нужны lesson identity/revision и source event identity, не новый identity framework. Общий batch и одинаковая фраза не доказывают одного смысла; replay не независимый case.
-
-### 24.5 LangMem: обработать реальный no-change
-
-В D16 [stateless.py](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/prompts/stateless.py) trajectory/optional feedback/current prompt приводят к компактному model proposal. [Prompt contract](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/prompts/prompt.py) разрешает update_prompt=false и пустой new_prompt, но показанные invoke/ainvoke возвращают new_prompt без проверки flag. Дальнейшая потеря текста зависит от caller; полный donor/model не запускался. V3 `keep` сохраняет метод, меняется named instruction, а не весь system prompt.
-
-### 24.6 Рабочая петля
-
-[Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt): реальные события или прямое исправление → нужная интерпретация → searchable provisional lesson → ordinary next context → наблюдаемый исход. Missing cause/verifier остаётся unknown, не повод сочинять поля или выбросить эпизод. No-change не создаёт обязательного reflection текста.
+LangMem [stateless](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/prompts/stateless.py) получает proposal из trajectory/feedback/current prompt. [Contract](https://github.com/langchain-ai/langmem/blob/48e3c11f5bb527282c7d5339c6a87a0b35abccfc/src/langmem/prompts/prompt.py) разрешает false+empty no-change, а выбранные invoke возвращают new_prompt без флага. Последующее уничтожение зависит от caller. Eliot keep сохраняет текст; одна полезная интерпретация даёт обычный searchable lesson.
 
 ## 25. Real experience input and normal context 0.10
 
-**Проход 0.10, 20 октября2026.** Прочитаны связанные V2 `context.rs`, фактический compile handler, skill registry/filter/proof functions и их MCP dispatch; capture `eliot.observe`; Harness2 `context.py`1–260 и весь `proposer.py`. Дальнейшие conclusions ниже — source-level, не продуктовый запуск.
+[Полная запись](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/841c807659727cd7fb5730331190ee27cd50f47d/docs/v3/AUDIT.md#25-real-experience-input-and-normal-context-010).
 
-### 25.1 Обычный consumer существует, но связан с посторонней готовностью
+Обычный consumer **существует**: [compile handler](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/task_handlers.rs#L195-L460) передаёт cases в context compiler/experience_priors. Но читает их лишь при успешной map enrichment; unavailable map подставляет empty cases. Чтение урока должно быть независимо от карты.
 
-Вопрос0.9 «как опыт попадает в обычный packet» уточнён по реальному caller. [dispatch_compile_packet_l3](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/task_handlers.rs#L195-L460) передаёт `PacketExperienceSource::Cases` в `ContextCompiler::compile_plan`; [attach_packet_plan_sources](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/context.rs#L680-L730) вызывает ExperienceRetrievalService и записывает `packet.experience_priors`. Поэтому утверждение «consumer есть только у ручного experience_recall» было бы неверно.
+Formation создаёт ReconstructedCase, default MatureExperienceOnly исключает его; IncludeCaseCandidates связан с CertificationTreatment. Этот режим всё же может дать active packet. Исправление — нормальный provisional use, не новый обход через эксперимент.
 
-Проблема в ветвлении handler: **cases читаются лишь после успешного `revision_bound_packet_enrichment` карты проекта**. При `PacketEnrichmentUnavailable` сборщик подставляет `Cases(Vec::new())`, не прочитав сохранённый опыт. Другие ошибки могут прервать compile. Это конкретная ненужная зависимость: ошибка карты превращается в отсутствие опыта независимо от его реального наличия.
+[MCP skill](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/skill.rs) list/inspect строит template cards вместо чтения stored methods. Execution-proof handler конструирует новый ProjectId, `inspect-scope`, `MCP skill proof output`, `just verify`, Succeeded без исполнения и передаёт writer. Lower Store может отказать; live загрязнение не воспроизводилось. Ошибка — сама фабрикация успешного результата на callable path. Реальные события/report source заменяют её без нового ProofVerifier.
 
-**Решение V3:** lesson lookup выполняется независимо. Карта добавляет ориентацию, но не выдаёт право читать случаи. Не нужна дополнительная fallback-платформа или новый readiness state; достаточно вынести независимый read из условной ветви. В Cognition §5.2 это задано как обычная компоновка источников.
+[Procedural packet](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/skill.rs#L640-L735) содержит IDs/activation/verifier/warnings, не шаги метода. Отсутствующий execution verifier не должен запрещать прочитать условный совет. Useful instruction+exception и actual open достаточны; existence refs не фактическая проверка.
 
-### 25.2 Новый опыт скрыт штатным режимом
+Harness2 [context](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/context.py#L1-L260) даёт короткую mission и раскрываемые реальные материалы. Observation truncation и names-only не означают full bytes. [Proposer](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/proposer.py) использует temporary workspace; его cache key не включает model/effort/channel и reader не сравнивает model metadata. Новый run directory, рекомендованный донором, смягчает риск. Reuse допустим как старый proposal, не новый запуск иной модели/независимый исход.
 
-[Formation](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/semantic_memory.rs#L45-L140) создаёт `ReconstructedCase`. Default `MemoryExposureMode` — `MatureExperienceOnly`; [exposure_allows](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/semantic_memory.rs#L1008-L1025) допускает в этом режиме только TransferValidated/ProcedureCandidate/ActiveProcedure. Именно source-compatibility нового producer со стандартным reader должна проверяться, не только наличие обоих типов.
-
-Handler сопоставляет IncludeCaseCandidates с CertificationTreatment и готовит measurement. Этот режим **может** получить активный packet: [admission](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/context.rs#L1047-L1082) делает counterfactual только ShadowEvaluation при соответствующем gate. Поэтому нет оснований говорить, что любой candidate всегда заблокирован. Подтверждено другое: обычное использование свежего урока связано с maturity/exposure режимом, а его обход — с экспериментальной ветвью.
-
-**V3:** useful provisional advice — нормальный продуктовый путь, не certification exception. Эксперимент может отдельно выключать memory для сравнения, но не определяет ordinary access. Проверка эффективности остаётся отдельной задачей, не prerequisite чтения.
-
-### 25.3 Публичный навык иногда является демонстрацией вместо сохранённого метода
-
-Прочитан [mcp_stdio/skill.rs](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/skill.rs). `dispatch_skill_list` создаёт active card с новым SkillId и candidate с названием `MCP skill candidate`; он не читает stored cards. `dispatch_skill_inspect` принимает ID, но строит `mcp_active_skill(id, Active)`, а не загружает этот record. Estimate/filter используют ту же шаблонную конструкцию.
-
-Это не вывод по комментарию или имени: такое поведение прямо находится в handler functions. Dispatcher содержит named маршруты к этим handlers. Scope вывода — retained MCP skill surface на указанном V2, не все потенциальные skill API или deployments.
-
-**Для V3:** list/open обслуживают настоящие memory records. Неизвестный ID даёт отсутствие записи, а не правдоподобную карточку. Демо может быть примером вне продуктового read path. Для этого не нужен RegistryVerifier: надо заменить фабрикацию обычным чтением.
-
-### 25.4 «Execution proof» создаётся с заранее выбранным успехом
-
-В том же файле `dispatch_skill_execution_proof` разбирает label input и вызывает constructor с **новым ProjectId**, постоянным шагом `inspect-scope`, выходом `MCP skill proof output`, verifier строкой `just verify` и `SkillExecutionOutcome::Succeeded`. Затем передаёт объект в `write_skill_execution_proof_to_memory`, пишет локальный report и возвращает его. В этом handler нет исполнения навыка или verifier.
-
-[Engine proof constructor/write](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/skill.rs#L680-L735) переносит полученные значения в record и подаёт observation writer. Найденный wrapper вызывает этот writer, не реальный tool runner. Named dispatcher также ведёт к handler. Поэтому проблема — не просто «высокий confidence»: **демонстрационный успешный исход формируется на callable product path и направляется в слой записи**.
-
-**Граница доказательства:** приложение/БД не запускались. Возможный нижний refusal, actual credentials или иной caller могут не дать сохранить record. Не заявляется воспроизведённое загрязнение deployed памяти. Но сам успешный результат не основан на наблюдавшемся выполнении в рассмотренной функции, независимо от того, примет ли его Store.
-
-**V3:** host передаёт фактический tool/check result и известную task/session/call связь. Явный отчёт агента или пользователя тоже полезен, но остаётся отчётом названного источника, не превращается в независимо выполненный verifier. Нет причины генерировать другой project или фиктивные completed steps ради заполнения DTO. Отсутствие наблюдения допускает сохранение partial/unknown; оно не останавливает полезный recall. Это обычные исходные данные, не новый proof protocol.
-
-### 25.5 Выбранный skill ID ещё не доставленная процедура
-
-[SkillDistractorFilterService::procedural_packet](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/skill.rs#L640-L685) возвращает included/excluded IDs, activation decisions, required verifier names и warnings. Самих ordered_steps/purpose в этом view нет. [compile_with_skills](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/context.rs#L515-L551) присоединяет этот view, но рассмотренный основной MCP handler вызывает compile_plan с cases. Отсутствие других возможных expanders по всему репозиторию не утверждается.
-
-Есть и ненужное сцепление чтения с исполнением: `SkillActivationGate` не включает метод при отсутствующих execution inputs/verifier; `missing_verifier` требует непустого required plan. Это может быть условием автоматического исполнения, но не обязательным условием показать человеку/агенту способ работы. `activate` устанавливает last_verified_at после проверок наличия refs, не после выполнения verifier внутри этой функции.
-
-**V3:** packet содержит полезную инструкцию и материальное условие/исключение, плюс handle подробностей. Full action recipe можно раскрыть по требованию через existing open. Execution prerequisites не блокируют чтение conditional advice. Оценивать следует actual rendered text, не весь административный SkillCardV2 перед выдачей нескольких IDs. Отдельный skill-delivery runtime не требуется.
-
-### 25.6 Harness2: настоящие материалы по требованию и предел cache
-
-[context.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/context.py#L1-L260) строит task/source/rollouts/deliverables/harness/library tree; короткая mission указывает, где читать. Layout отражает существующие категории. Это практический механизм для Dreamer: начать с нужного вопроса и ограниченного набора ссылок, раскрывать реальные материалы, а не нагружать каждый prompt всем архивом.
-
-«Full trajectory» в этом source означает последовательность, а отдельные observations получают `obs_trunc`, переданный adapter. Names-only deliverables тоже явно отличаются от contents. Нельзя превратить красивый index в обещание, что модель увидела все bytes. Полная копия library tree в каждом context уместна как donor implementation choice, но не обязательна для большой памяти Eliot; existing open/controller workspace adapter достаточно.
-
-[proposer.py](https://github.com/google-research/harness2/blob/1cfe254e8d25b15f37048c3730134686abe60335/harness2/core/proposer.py) создаёт отдельную temporary workspace на попытку, копирует inputs, извлекает выбранный edited subtree до cleanup. Это уменьшает случайное наследование local residue между попытками. Сам tool/provider executor остаётся у нашего controller; отдельный subprocess manager в Memory OS ради копирования донора не нужен.
-
-В `_call_fingerprint` включены label, mission, system, context path и contents, но **не ChannelSpec.model/effort/channel**. `_cached` читает response/workspace, не проверяя model metadata, хотя `_write_audit` её сохраняет. При повторном использовании того же audit directory и тех же inputs с изменённой конфигурацией модели можно вернуть старый ответ. Это следует из caller+key+reader, не воспроизведение оплаченного вызова. Документация донора рекомендует новый runs directory при смене модели; такой способ разделения уменьшает риск. Нельзя на этой находке объявлять все опубликованные эксперименты смешанными.
-
-**Малое решение:** execution cache сравнивает actual request settings либо разделяется run namespace. Старый proposal может быть сознательно переиспользован как старое знание, но не маркируется новым запуском другой модели и не даёт ещё одно независимое подтверждение. Хешировать всё ещё сильнее, строить certificate service или инвалидировать всю память при смене Dreamer не нужно.
-
-### 25.7 Что найдено на стороне capture и чего пока не найдено
-
-Дополнительно прочитан [dispatch_observe, verification.rs1–245](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/verification.rs#L1-L245). Реальный capture-first handler сохраняет переданные observations без обязательного task и не отбрасывает capture только из-за отсутствия cue. Это полезный контрпример утверждению, что весь V2 input обязательно проходит готовый VerifiedEpisodeProjection.
-
-При этом handler требует bound project; taskless или cue-less материал помечается cold, и cue_bindings не добавляются в индексируемое поле. Он возвращает candidate commitment, не вызывает в прочитанном теле ExperienceFormation. Из этого нельзя вывести отсутствие всех downstream workers; найден только конкретный предел пути. Поиски типов/сервисов дали declarations, MCP inputs, tests и consumer, но не достаточное основание для глобального «автоматического извлечения нет нигде».
-
-**Для реализации V3:** adapter сохраняет события с доступной ассоциацией; ordinary job обрабатывает нужную непроработанную часть episode. Не нужно требовать полного task contract или самостоятельного заполнения causal fields агентом. Missing correlation оставляет запись в известной сессии, а не привязывает её к последней задаче наугад. Real result, scoped lesson, actual next-context text — достаточная связная конструкция без дополнительного gate.
-
-### 25.8 Изменения и проверка
-
-Cognition §§5.2,6.7,6.8 теперь описывают independent lesson read, содержательную выдачу метода, реальные inputs вместо synthetic proof и reuse execution cache без подмены происхождения. Architecture и Implementation не переписываются: эти уточнения реализуют уже выбранный путь и не создают новых owners.
-
-Аудит сводит прежние находки, сохраняя их подробные immutable версии, и добавляет этот раздел. Карта отмечает actual packet/skill/capture reads и оставшиеся code paths. Не добавлены новая таблица критериев, permission service, тестовая фабрика или модельный вызов перед каждым tool.
-
-**Фактически выполнено:** чтение названных исходников, проверка связей через dispatcher/writer и review изменённых документов; runtime/model/DB/Windows не запускались. Новых isolated probes в этом проходе не было. Нет независимого субагентного review, полной повторной проверки архива, всего skill subsystem или всех Harness2 adapters. Конкретные результаты публикации и проверки diff сообщаются в PR, а не выводятся из написанного текста.
+Реальный [eliot.observe](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-app/src/mcp_stdio/verification.rs#L1-L245) сохраняет taskless/cueless input в bound project. Это контрпример глобальному «capture нет». В его теле не найден вызов ExperienceFormation; все downstream workers этим не исключены. Actual capture→interpretation scheduling остаётся в карте.
 
 ## 26. Donor mechanisms for useful memory 0.12
 
-**20 октября 2026.** Фокус этого прохода — полезные операции D09 Hindsight, D01 MemMachine и D08 Graphiti, а не новые условия допуска. Ревизии в §1 обозначают прочитанные исходники; они не требуют закрепить эти продукты как зависимости Eliot. Ни один из трёх runtime целиком не предлагается переносить в наш Rust/SurrealDB stack.
+[Полный source map и прежние решения](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/841c807659727cd7fb5730331190ee27cd50f47d/docs/v3/AUDIT.md#26-donor-mechanisms-for-useful-memory-012).
 
-### 26.1 Что выбрано для переноса
+**Hindsight.** [Prompts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/consolidation/prompts.py) и [consolidator](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py) обновляют один аспект по existing candidates и пакетируют совместимый материал/embeddings. Optional triage/dedup добавляют вызовы; не весь pipeline «один call». Update target selection не обязательно answer reranking. Донорская observation — синтез, не raw. Запрет вычислений в particular fact prompt не переносится как запрет Dreamer рассуждать.
 
-| Донор | Проверенный механизм | Место в Eliot | Что он заменяет |
-|---|---|---|---|
-| Hindsight | Сопоставление новых фактов с существующими по отдельному аспекту, пакетное преобразование | Текущая интерпретация Dreamer и ordinary memory revisions | Создание новой несвязанной заметки на каждую перефразировку и переписывание всего проекта |
-| Hindsight | Сохранённый ответ на постоянный вопрос с целевым обновлением | Уже описанная project/area view и existing job | Новый полный отчёт на каждый запрос и обязательная пирамида карточек |
-| MemMachine | Поиск по короткому представлению с возвратом исходного эпизода и соседства | `context` и `open` над теми же observations | Потеря ремонта/исключения после извлечения одного удачно совпавшего chunk |
-| Graphiti | Отдельные кандидаты на дубликат и на противоречие; временные интервалы | Existing claim grouping, source links и current-state resolution | Last-write-wins по времени загрузки и полная пересборка графа |
+[Saved mental-model query](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-docs/docs/developer/api/mental-models.mdx) даёт question-shaped project view. В доноре ручная курация/optional auto-refresh; Eliot не наследует approval. Документированная write-time stale detection пропускает deletion, а некоторые tagged views читают untagged без invalidation. Использовать existing source changes; last useful view/direct reads не блокируются.
 
-Это выбранные проектные решения на основании названных источников, не результаты сравнительного benchmark Eliot. Стоимость и качество конкретной реализации ещё не измерялись.
+**MemMachine.** [Declarative retrieval](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/declarative_memory/declarative_memory.py) идёт derivative→source episode→предшествующие/последующие события; facade callers проверены. Это один backend. Берём восстановление ремонта/результата и source dedup, не всю topology и не embedding-before-write как primary capture guarantee.
 
-### 26.2 Hindsight: обновлять аспект знания, а не всю тему
-
-В Hindsight термин `observation` означает **производное обобщение**, а не исходное событие Eliot. [Consolidation prompts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/consolidation/prompts.py) различают один аспект сущности, новое знание и изменение существующего. Общее название темы не повод сливать разные свойства; обновление должно сохранить не затронутую новой информацией часть. Учитывается время высказывания, а не просто очередность поступления.
-
-**Применение:** новая причина timeout в одном endpoint не переписывает всю запись о сервисе и не отменяет исключение для другого endpoint. Existing subject/aspect lookup и небольшая модельная интерпретация дают новую ревизию нужного вывода. Отдельный ObservationConsolidationService и ещё один store не требуются. Исходные occurrences сохраняются, даже когда их обобщение объединено.
-
-Локальное правило этого prompt запрещает вычислять числа/делать логические выводы при консолидации заявленных фактов. Его **не переносим как запрет Dreamer думать**: Eliot должен строить объяснения и переносить опыт. Нужно различать сообщённое и выведенное, а не отключать вывод. Количество источников у обобщения также не становится вероятностью истины или числом независимых успешных применений метода.
-
-### 26.3 Hindsight: разные цели поиска и меньше повторных обращений
-
-В [consolidator.py](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py) `_process_memory_batch` объединяет найденные observations по ID и передаёт пакет новых фактов с общими кандидатами в основной вызов консолидации. Query embeddings и embeddings новых текстов создаются пакетно. Optional triage и semantic-dedup могут добавлять обращения: весь путь не объявляется всегда одним модельным запросом.
-
-`_find_related_observations` использует interleave вместо answer-oriented reranking: для UPDATE важно не потерять ближайший старый аналог. Это конкретная реализация, а комментарий о превосходстве данного отбора — опыт авторов, не наш benchmark. Для Eliot достаточно existing key lookup плюс релевантные кандидаты; цель обновления не обязана использовать тот же финальный ranking, что ответ пользователю. Не нужны два поисковых движка.
-
-**Малое решение:** интерпретировать совместимый новый материал вместе с адресованными существующими записями; повторяющиеся inputs и тексты не отправлять отдельно без нужды. Это сокращает обращения внутри уже имеющегося job/controller пути. Не добавлять обязательную вторую консолидацию после каждого удачно сохранённого урока.
-
-### 26.4 Hindsight: «ментальная модель» как ответ на полезный вопрос
-
-Официальная [Mental Models API](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-docs/docs/developer/api/mental-models.mdx) определяет mental model как сохранённый результат reflect для `source_query`. В доноре такие сводки курируются пользователем; автоматическое обновление отдельно настраивается. Код `_trigger_mental_model_refreshes` выбирает затронутые устаревшие модели и не ставит повторное in-flight обновление. Это не обещание, что любой вызов reflect мгновенный или не использует модель.
-
-**Eliot:** area card может быть ответом «как устроен этот модуль», «почему выбрали этот API» или «что здесь уже не сработало». В одной существующей записи достаточно вопроса, области, ответа и источников. Изменилось релевантное — обновить её существующим job; не изменилось — использовать сохранённое. Пользовательский запрос или повторяющаяся полезная задача могут создать такую view автоматически; донорская ручная курация не становится новым обязательным approval.
-
-**Граница переноса:** документация Hindsight прямо предупреждает, что её write-time staleness не видит удалений. Некоторые tagged-модели также читают untagged memories, но untagged writes не делают их stale. В Eliot обновление views должно учитывать фактические исправления/удаления и использованные источники через уже существующие изменения памяти. Не нужен ещё один freshness registry. Старый полезный ответ и исходники остаются доступны с оговоркой, пока идёт пересмотр.
-
-### 26.5 MemMachine: вернуть не обрывок, а эпизод с продолжением
-
-Проверен [declarative_memory.py](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/declarative_memory/declarative_memory.py): `search_scored` ищет derivatives, переходит по source links к episodes, объединяет повторные попадания, достраивает предшествующие/следующие события и ранжирует получившийся контекст. `_contextualize_episode` применяет тот же фильтр и порядок timestamp/ID. Проверены реальные вызывающие [LongTermMemory](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/long_term_memory/long_term_memory.py) и [EpisodicMemory](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/episodic_memory.py). У продукта есть и event backend; его качество не выводится из прочитанного declarative path.
-
-**Eliot:** короткая запись помогает найти место, но при сложном случае можно раскрыть исходные попытку, ремонт и проверку, а не передавать один error chunk. Связь с эпизодом и его порядок уже есть в данных; отдельная episodic БД не нужна. Перекрывающиеся окна объединяются по IDs. Соседство берётся из соответствующего эпизода/сессии, не из случайно близкого времени другой работы. Не обязательно всегда копировать donor ratio прошлого/будущего или требовать reranker для обычного раскрытия.
-
-Ограничение выбранного helper: `add_episodes` сначала получает embeddings, потом записывает nodes. Это не готовая гарантия raw-first; общий сервис может сохранять исходники другим путём. Поэтому переносим **механизм чтения**, а не этот порядок ingestion. Primary capture Eliot остаётся независимым от embedding/model availability.
-
-### 26.6 Graphiti: история меняющегося состояния без глобальной пересборки
-
-В [EntityEdge](https://github.com/getzep/graphiti/blob/3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f/graphiti_core/edges.py) различаются `valid_at`, `invalid_at` и `expired_at`. Первые описывают действие факта, последний — когда система отметила его прекращение. [Edge resolution](https://github.com/getzep/graphiti/blob/3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f/graphiti_core/utils/maintenance/edge_operations.py) отдельно ищет duplicates между выбранными endpoints и более широкие contradiction candidates. После смыслового сопоставления temporal helpers работают с интервалами: поздно поступившее старое событие не должно стать новым текущим только из-за загрузки сегодня.
-
-**Применение:** переход проекта с backend A на B затрагивает тот же аспект, но другой target. Поиск противоречия только среди точных A–A/B–B пар пропустит изменение. Existing subject/aspect group и источники дают нужные кандидаты; исправляется соответствующая история, не весь граф. Semantic judgment у Graphiti использует модель — это не бесплатный детерминированный решатель любых противоречий.
-
-**Ограниченный риск переноса:** exact-text/endpoints fast path в `_dedupe_extracted_edge` возвращает старое ребро без проверки интервала в этой ветви. Если на вход попадёт историческая версия при реальном A→B→A, одинаковых слов недостаточно для дедупликации. Это условный вывод из helper, не воспроизведённый end-to-end дефект Graphiti: полнота его upstream временных фильтров здесь не проверялась. В Eliot сохраняется различие повтора доставки и нового реального события. Neo4j, universal ontology и весь Graphiti runtime не требуются; managed Zep — другой продукт, его показатели не наследуются.
-
-### 26.7 Как эти механизмы работают вместе
-
-Проектный пример: агент находит запись об ошибке API. Обычный поиск даёт короткий урок; при необходимости `open` раскрывает исходную правку, ошибку, ремонт consumer и последующую проверку. Новая работа добавляет ограничение применимости — Dreamer обновляет именно этот аспект метода, не создаёт копию всего рассказа. Вопрос «что учитывать при изменении этого API» может иметь сохранённый ответ, обновляемый по затронутым данным. Изменение версии API закрывает старую применимость, не стирая исторический опыт.
-
-Это иллюстрация решения для V3, а не наблюдавшийся результат трёх доноров. Конкретные добавления находятся в Cognition §3 (время/повтор состояния), §§4.1–4.2 (вопрос и изменения views), §5.3 (source episode) и §6.8 (incremental update/batching). Используются прежние `memory`, `context`, `jobs`, controller и native Store. Нет новой системы допусков, mandatory multi-pass pipeline, агента на каждый факт или дополнительного хранилища.
-
-### 26.8 Граница выполненного чтения и следующий выбор
-
-Свежепрочитаны Hindsight README, авторское описание consolidation, prompts, выбранные batch/recall/embedding/refresh функции и Mental Models API; MemMachine declarative add/search/contextualization и соответствующие facade; Graphiti README, EntityEdge fields и extraction/resolution/temporal helpers. Навигационные searches не считаются полным чтением файлов. Статьи/цифры качества и deployment этих проектов не воспроизводились; прежние V2/Hy/Harness2 findings не объявляются заново проверенными.
-
-В реестре уточнены прежние D01/D08/D09, новые номера не созданы. Архивные остальные donors остаются отдельно отмеченными в карте. Следующий предметный выбор — автоматическая сегментация эпизода и отбор полезного материала у event/semantic ветвей MemMachine, затем различия generic/dedicated retrieval у Hindsight. Брать нужно лишь механизм, который улучшает найденный пробел Eliot, а не достраивать вокруг него весь donor product.
-
-Проверка текущего прохода — чтение источников и согласование документации. Не выполнялись новые продуктовые или синтетические тесты, запуск моделей, БД либо независимый субагентный review. Публикация и diff проверяются по GitHub; результат не объявляется реализованным V3.
+**Graphiti.** [EntityEdge](https://github.com/getzep/graphiti/blob/3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f/graphiti_core/edges.py) различает valid/invalid/expired; [resolution](https://github.com/getzep/graphiti/blob/3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f/graphiti_core/utils/maintenance/edge_operations.py) выбирает duplicates и broader contradictions отдельно. Смена A→B затрагивает один аспект при разных endpoints. Exact-text fast path не сравнивает interval в этой ветви: при историческом кандидате A→B→A возможна ошибка identity. Upstream filters не полностью проверены, поэтому это условная helper-находка, не reproduced end-to-end defect. Native records/intervals, не universal ontology runtime.
 
 ## 27. Episodes, incremental learning and memory feedback 0.13
 
-**20 октября 2026; продолжение документации `6f4ea708`.** Дочитаны выбранные event/semantic пути MemMachine и retain/integration функции Hindsight на тех же версиях, что в §26. Главный результат — не новое состояние допуска, а разделение операций: сохранить реальное событие, дёшево подготовить поиск, интерпретировать полезный новый эпизод и не выдавать собственный прошлый ответ за новый опыт.
+[Полный отчёт](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/841c807659727cd7fb5730331190ee27cd50f47d/docs/v3/AUDIT.md#27-episodes-incremental-learning-and-memory-feedback-013).
 
-### 27.1 Сегментация текста не означает понимание эпизода
+MemMachine TextSegmenter/TextDeriver выполняют обычное разбиение/форматирование, не generative episode reasoning. Source event, search chunk и working episode различаются. Default500codepoints не закон V3; session/task/call links помогают без модели на каждом разрезе.
 
-[MemMachine TextSegmenter](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/event_memory/segmenter/text_segmenter.py) использует обычный RecursiveCharacterTextSplitter: в рассмотренном default 500 codepoints, без перекрытия, с последовательностью разделителей. Он разбивает блоки одного Event, сохраняя event UUID, block index, ordinal offset, context и timestamp. Это физическая подготовка представления, а не поиск границы законченной задачи среди сообщений.
+Реальный SemanticMemory background worker вызывает [ingestion](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_ingestion.py#L130-L300) для каждого message×category. [LLM helper](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_llm.py) превращает missing parsed response в empty commands; context overflow и успех другой category могут пометить UID ingested. SQL marker относится к set+history, не category. Это не доказательство удаления raw. Сохранённая новая связная часть и relevant current lessons дают обычный finite job; failed parse не no-change.
 
-[WholeTextDeriver и SentenceTextDeriver](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/event_memory/deriver/text_deriver.py) тоже не вызывают генеративную модель: форматируют весь фрагмент либо предложения с контекстом производителя и при необходимости временем. Embedding вызывается позже в [EventMemory._encode_events](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/event_memory/event_memory.py#L190-L310). Там embeddings предшествуют записи segments; это не гарантия порядка первичного сохранения EpisodeStorage во всём продукте.
+[PostgreSQL update context](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/storage/sqlalchemy_pgvector_semantic.py#L330-L395) без vector options выбирает oldest first page default50. Увеличение лимита не находит поздний нужный факт. Dedup удаляет старые features до embedding/replacement отдельными commits: использовать уже выбранную атомарную замену, не новый recovery manager.
 
-**Берём:** дешёвую подготовку поисковых единиц отдельно от смысловой работы. **Не берём:** default размер как архитектурный закон и отдельный framework segmenter/deriver/store ради того же результата. Для Eliot исходное событие, поисковый фрагмент и рабочий эпизод различаются. Доступные session/task/tool-call связи и границы turns уже помогают собрать попытку с результатом; смысловое уточнение требуется лишь там, где оно действительно полезно. Большой лог можно дробить обычной библиотекой, не спрашивая модель о каждом разрезе. [Cognition §1](COGNITION.md#1-one-useful-path-and-its-owners).
+Hindsight [content.ts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/content.ts) исключает известные injected memory blocks перед retain и recall query; [реальный hook](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/hooks.ts#L130-L235) это вызывает. Новые corrections/tools сохраняются, собственная вставка не fresh evidence. Plugin читает user/assistant text, не все tool results; whole plugin не coding capture.
 
-### 27.2 Найден настоящий фоновый producer, но его цена определяется вложенными циклами
-
-[SemanticMemory.add_messages/add_message_to_sets](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_memory.py#L230-L310) регистрируют идентификаторы сохранённых эпизодов. [Фоновая задача](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_memory.py#L800-L870) запрашивает dirty sets с параметрами количества/возраста необработанных сообщений и вызывает реальный IngestionService. Это автоматический consumer, не только декларация типа. Полное поведение критериев выбора dirty sets и HTTP capture в этом проходе не квалифицировано.
-
-[IngestionService._process_single_set](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_ingestion.py#L130-L300) берёт до пяти pending IDs, загружает сообщения, затем для **каждой категории и каждого сообщения** читает старые features и вызывает модель. [llm_feature_update](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_llm.py) передаёт OLD_PROFILE и отдельное message.content. При M доступных сообщениях и C настроенных категориях это M×C вызовов helper в рассмотренном нормальном проходе, до дополнительных embeddings/consolidation. Это свойство циклов, не измерение времени, цены или качества.
-
-**Eliot:** новая связная часть эпизода и относящиеся к ней прежние уроки могут обрабатываться одним обычным заданием, выдающим несколько полезных аспектов. Категории организуют результат, но не требуют C независимых интерпретаций каждого входного сообщения. Существующий job хранит действительно обработанный диапазон; не вводится новый SemanticIngestionManager поверх прежнего планировщика. [Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt).
-
-### 27.3 Неполная интерпретация не должна выглядеть завершённой
-
-В просмотренном `llm_feature_update` отсутствие parsed response (`None`) возвращается как пустой список команд. Caller после применения такого списка добавляет message UID в общий `mark_messages`. Отдельно context-length exception прямо добавляет этот UID в тот же список, хотя извлечение пропущено. Успех одной категории также может добавить сообщение в общий список, пока другая категория закончилась обработанной исключительной ветвью. [Helper](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_llm.py), [caller](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_ingestion.py#L210-L300).
-
-Это проверено до конкретного [PostgreSQL storage](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/storage/sqlalchemy_pgvector_semantic.py#L485-L525): `ingested=True` относится к set+history_id, не к каждой категории. Не заявляется уничтожение исходного сообщения, обязательная потеря во всех режимах или запуск приложения. Подтверждён путь, где исходный материал остаётся, но его нужная semantic обработка может считаться выполненной без соответствующего результата.
-
-**Решение без нового слоя:** успешный no-change — ответ модели, который действительно получен и разобран. Отсутствие ответа или превышение контекста — состояние существующего задания; уменьшить вход либо оставить неудавшуюся часть для последующей обработки. Если разные цели намеренно обрабатываются отдельно, прогресс относится к конкретной выполненной работе. Не требовать завершения всех дополнительных обработок до чтения уже полезного результата. [Cognition §6.6](COGNITION.md#66-reuse-no-change-and-version-derived-features).
-
-### 27.4 Ограничить контекст — не значит всегда брать старейшие записи
-
-Ingestion передаёт `max_features_per_update` как page_size (default 50), без query relevance и номера следующей страницы. В [реальном PostgreSQL get_feature_set](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/storage/sqlalchemy_pgvector_semantic.py#L330-L395) при отсутствии vector options используется порядок created_at ASC/id ASC и LIMIT с начальной страницей. Это действительно bounded первый префикс, а не автоматически проходящий все страницы iterator.
-
-**Следствие, ограниченное этим backend/path:** подходящий более поздний факт может не попасть в OLD_PROFILE для изменения. Увеличение 50 до произвольного большого числа лишь передвинет границу. Для Eliot надо выбрать текущие записи о затронутом аспекте через уже существующий поиск/ключи. Широкий листинг может иметь пагинацию; update context не обязан быть первой страницей всей категории.
-
-Дополнительный no-copy вывод: `_deduplicate_features` сначала удаляет старые features, затем получает embeddings и вставляет replacements; выбранный SQL backend коммитит эти вызовы отдельно. Это повтор уже разобранного retirement-before-replacement, не повод создавать ещё один recovery manager. Применить подготовленное изменение одной обычной транзакцией — уже выбранное решение Eliot. Весь multi-backend storage донора переносить ради нескольких операций не требуется.
-
-### 27.5 Hindsight: не извлекать собственную подсказку как новый факт
-
-В [OpenCode content.ts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/content.ts) `stripMemoryTags` удаляет известные блоки `<hindsight_memories>` и `<relevant_memories>`. Эта функция реально вызывается при подготовке retention transcript и при построении recall query из прежних turns. [hooks.ts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/hooks.ts#L130-L235) вызывает подготовку transcript перед retain на session idle и compaction. Поэтому это действующий путь исключения механического echo, не неиспользуемый helper.
-
-**Для Eliot:** adapter уже знает, какие блоки он вставил. Повторную копию этого контекста не надо превращать в новую входную порцию Dreamer. Достаточно известного происхождения/ссылки на delivery; новые действия, результаты и коррекции сохраняются отдельно. При импорте общего transcript помогают source roles и собственные явные markers, а не модель-антифильтр, угадывающая, какие похожие мысли запрещено помнить. Новая цитата пользователя остаётся сообщением пользователя; она не становится независимым подтверждением только от повторения старого совета.
-
-Так устраняется конкретная петля разрастания: память → вставленный совет → повторное извлечение совета → новые версии того же совета. Это не защита от любых смысловых ошибок и не обещание распознать каждую модельную перефразировку. [Cognition §6.3](COGNITION.md#63-stopping-self-reinforcement-and-wasted-work).
-
-**Важная граница донора:** `getSessionMessages` в этом plugin берёт только роли user/assistant и text parts. Tool-result parts здесь не сохраняются. Следовательно, перенос whole plugin не обеспечит наблюдение фактической работы coding-агента. Eliot использует свои уже предусмотренные host tool-result events; текст отчёта остаётся текстом отчёта, а не доказательством исполнения.
-
-### 27.6 Инкрементальность начинается с правильной формы входа
-
-В Hindsight [retain orchestration](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py#L1830-L2110) различаются append и замена документа. Append читает прежнее тело, добавляет хвост и может переиспользовать неизменившиеся chunks через условный delta путь. Для структурированной беседы [общий join](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py#L205-L320) сохраняет единый JSON-массив ролей, не склеивает два несовместимых массива обычной строкой. `force_reextract` позволяет явно обработать те же bytes новым методом вместо вечного пропуска по отсутствию текстовых изменений.
-
-Delta зависит от backend, первого sub-batch и параметров; код не обещает этот путь любой записи. Малые и большие документы направляются в один streaming pipeline, а не две независимо поддерживаемые реализации. Дорогие read-heavy resolution операции отдельно вынесены из короткой write transaction. Полный верхний HTTP/queue/worker путь и все commit/retry ветви не прочитаны; async retain не объявляется автоматически raw-first API Eliot.
-
-**Упрощение для нашего native input:** не восстанавливать один растущий документ всей сессии на каждый tool. Host уже предоставляет отдельные события и IDs: сохранить новое, взять необработанный диапазон с нужным прежним контекстом. Импорт полного source snapshot — отдельный очевидный случай; хвост не должен притворяться новым полным состоянием. Reuse неизменившейся обработки экономит calls, а смена метода может обосновать переработку. Не нужны универсальные digest-планы, второй журнал синхронизации и перенос backend-specific repair machinery Hindsight. [Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt).
-
-### 27.7 Запрос «продолжай» использует существующий контекст, не нового посредника
-
-В том же [content.ts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/content.ts) query собирается из последней просьбы и ограниченного числа user turns; shortening удаляет старый контекст раньше новой просьбы. Собственные memory blocks исключаются. Реальные callers в system-transform/compaction используют эти функции. Это полезная небольшая альтернатива обязательному LLM query-rewriter.
-
-Для Eliot краткое продолжение связывается с доступной целью, выбранными ресурсами и ближайшими исходными turns. Нельзя автоматически приписать ему последнюю из нескольких параллельных задач; неизвестная привязка остаётся известным ограничением. Не надо каждый раз посылать всю историю, строить полный TaskMeaningFrame или отказывать в памяти из-за отсутствующего поля.
-
-Дочитан и [fusion.py](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/search/fusion.py): RRF и round-robin interleave — обычные функции над результатами поиска, не отдельные движки. Это подтверждает предыдущий выбор §26: отбор для ответа и для нахождения обновляемой записи может различаться без дублирования базы/планировщика. Donor default «recall once per session» не переносится как запрет обновлять контекст при новой задаче.
-
-### 27.8 Что меняется в Eliot и предел проверки
-
-| Задача | Нативное решение в существующем коде V3 | Не строить |
-|---|---|---|
-| Подготовить большой исходник к поиску | Обычное source-aware разбиение с ссылкой на оригинал | LLM-классификатор каждого разреза |
-| Понять новую попытку | Сохранённые связанные события, полезный новый диапазон и релевантные уроки | Обязательную обработку каждого сообщения всеми категориями |
-| Не раздувать память собственным выводом | Отличать injected context от новых host events на входе | Проверяющий сервис над бесконечно повторно извлекаемыми заметками |
-| Обновить подходящий факт | Выборка затронутого аспекта, обычная новая ревизия | Whole-category oldest-prefix и ещё один cache поверх него |
-| Пережить неудачную интерпретацию | Обычный статус существующего job, доступные primary данные | Ложный processed flag или остановку всей памяти |
-| Продолжить текущую работу | Цель/ресурсы/ближайшие исходные turns в existing context | Посредника, заново формулирующего каждый короткий запрос |
-
-Это проектные решения для V3, не результат запуска приложения. Изменены конкретные абзацы Cognition §§1,5.2,6.3,6.6,6.8; Architecture, Implementation, продуктовый код, схема и CI не меняются. Новые номера доноров или checklist family не добавлены.
-
-**Чтение:** MemMachine TextSegmenter/TextDeriver, EventMemory encode path, semantic ingestion/LLM helpers, выбранный PostgreSQL storage и реальные registration/background callers; Hindsight content/hooks, retain orchestrator selected ranges, fact schema header и fusion functions. Недоступный большой memory_engine source не считается прочитанным; fetch с пустым content — ограничение доступа к bytes, не доказательство пустой реализации. Иные backend semantics, full capture orchestration, temporal Graphiti callers и все registry donors не объявляются закрытыми.
-
-Новых runtime, модельных, синтетических или продуктовых тестов не выполнялось. Количество вызововов выведено из циклов, не измерено в deployment; потеря raw-событий глобально не заявляется. Независимого субагентного review нет. Следующие точные чтения и фактический статус публикации отражаются в карте и PR.
+[Retain orchestration](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py#L1830-L2110) различает append/snapshot, условный delta, force_reextract и общий streaming pipeline. Не все backends дают одинаковый delta, полный HTTP/worker commit path не прочитан. Eliot native events просто добавляются и интерпретируются диапазонами; хвост не заменяет весь документ. Краткое «продолжай» использует goal/resources/исходные turns, не обязательного query-rewriter. Fusion/interleave — обычные функции, не новые движки.
 
 ## 28. Associations and useful forgetting 0.14
 
-**20 октября 2026; база `f82b7ff8`.** В этом проходе выбраны другие доноры: D43 A-MEM, D19 Nocturne Memory и D03 Subcog. Исследуются не их общие рейтинги, а связность между созданным знанием, поиском и фактически выдаваемым контекстом. Версии в §1 идентифицируют прочитанные исходники, не новые обязательные зависимости Eliot.
+[Полная запись с диапазонами](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/841c807659727cd7fb5730331190ee27cd50f47d/docs/v3/AUDIT.md#28-associations-and-useful-forgetting-014).
 
-### 28.1 Что полезно перенести
+**A-MEM.** [Статья v11](https://arxiv.org/html/2502.12110v11) использует enriched representation и evolution descriptions/links. [Библиотека](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py) отдельно от experiment repo: add_note не вызывает analyze_content, indexed document — original content, context/tags metadata. Изменение неиспользуемой metadata само не улучшает retrieval.
 
-| Механизм | Основание в доноре | Применение в Eliot |
-|---|---|---|
-| Новое событие улучшает способ найти прежнее знание | A-MEM: evolution contextual description, tags и links | В той же интерпретации изменить полезные cues/связь названного урока и реальное поисковое представление |
-| Один материал имеет несколько входов | Nocturne: stable node, version и aliases | Ресурс, тема и area view ссылаются на один lesson ID, не на копии текста |
-| Короткая ориентация помогает выбрать подробность | Nocturne: выбранный текст и child `When to recall` | Полезный ответ плюс несколько объяснённых handles; обычный `open`, не обязательная навигация по всему дереву |
-| Независимый поиск и простое объединение | Subcog: text/vector arms, RRF и фактический recall caller | Native Store queries и небольшая функция ranking; значение score не подменяет условия применимости |
-| Меньше лишнего в текущем контексте | Subcog tiering как идея, Nocturne progressive recall | Снижать обычную выдачу ненужных подробностей, сохраняя доступ к источнику и редким применимым случаям |
+find_related_memories возвращает result positions, process_memory применяет их к порядку общего словаря: адресуются не обязательно прочитанные моделью заметки. search_agentic добавляет neighbors после k direct hits, затем возвращает первые k. Neighbor metadata меняется в памяти без немедленного Chroma update; поздняя consolidation не полностью проверена. В Eliot реальные IDs, реально индексируемое описание и related candidates до packing, не дополнительная система доказательств.
 
-Последняя колонка — наши проектные решения. Они не измерены на работающем Eliot и не требуют переноса всех слоёв этих продуктов.
+**Nocturne.** [Models](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/db/models.py) различают stable node, content version и path. [Renderer](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/system_views.py) даёт useful selected content и child When-to-recall handles; MCP caller проверен. `disclosure` — подсказка когда вспомнить, не ACL. Несколько входов к одному lesson без копий. Не переносить [prompt doctrine](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/docs/system_prompt_en.md): mandatory boot, first-person-only, zero-conflict и fixed node count. Graph transactions не прочитаны целиком.
 
-### 28.2 A-MEM: эволюция поискового представления, а не только накопление заметок
+**Subcog.** [Recall](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/recall.rs) действительно объединяет native arms, MCP caller есть. Max-normalized1 — relative, не confidence. [Lifecycle service](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/consolidation.rs) фиксирует importance=.5; [score](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/models/consolidation.rs) имеет floor.25, Archive<.2 недостижим. Это алгебра, не live запуск. LRU access не долговременная история; namespace-size heuristic не обнаруженные смысловые contradictions.
 
-В [статье 2502.12110v11, §§3.1–3.4](https://arxiv.org/html/2502.12110v11) заметка сочетает исходное содержание, ключевые слова, tags, contextual description и links. Новая заметка помогает пересмотреть описания/связи соседних; embedding в формуле 3 использует не один исходный текст, а обогащённое представление. Полезная идея: новый опыт меняет не только количество записей, но и то, по каким ситуациям находится старое знание.
+Lifecycle consolidate и actual LLM consolidate_memories различаются; последняя имеет callers/source writes. Не вся консолидация фиктивна. No-op link_memories документирован, другие edge writes есть. Fallback all-pairs mesh создаёт n(n−1) направленных связей; summary/source или несколько полезных relations дешевле. Low usage не falsehood/erase: меньше proactive detail, history доступна. Новый опыт может добавить к тому же Nginx-уроку вход SPA/config path без переписывания первоначального события.
 
-При этом [README библиотеки](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/README.md) отдельно направляет к experiment repository. Рассмотренная библиотека `agiresearch/A-mem` и результаты статьи не объявляются одним и тем же исполненным артефактом. Здесь не воспроизводились их эксперименты и не используются заявленные scores как гарантия V3.
+## 29. MAGMA and Letta: relations and continuation 0.15
 
-В фактическом [memory_system.py](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L230-L320) `add_note` создаёт MemoryNote, вызывает `process_memory` и индексирует `note.content`; `analyze_content` не вызывается этим обычным путём. Default keywords пусты, context — General, если caller не передал другие значения. [ChromaRetriever.add_document](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/retrievers.py#L45-L110) передаёт content как document, а context/tags — metadata. Следовательно, нельзя обещать, что описанное в статье обогащение embedding уже получается от этой library entrypoint само.
+**Новый проход.** Изучены другие роли памяти: почему обход связи добавляет ответу недостающее основание и что нужно сохранять при вытеснении старой переписки из окна. Ни четыре графа MAGMA, ни полный agent runtime Letta не предлагаются как новые компоненты Eliot.
 
-**Для Eliot:** сохранить оригинал, а полезное поисковое описание держать как производное. Когда новая работа уточняет, при каком запросе старый урок пригодится, обновлять соответствующие lexical fields и при необходимости embedding input, которые reader действительно использует. Метаданные, которые никто не читает при выборе, сами по себе не реализуют адаптацию памяти. Это обычное изменение нескольких records и derived vectors через прежние jobs, без нового EvolutionService.
+### 29.1 MAGMA: полезная идея — идти по отношению, нужному вопросу
 
-### 28.3 A-MEM: два разрыва между отношениями и их использованием
+[README](https://github.com/FredJiang0324/MAGMA/blob/467cb70b67ac337b22fdb42194d37c04ad701b62/README.md) и [статья v1](https://arxiv.org/html/2601.03236v1) рассматривают semantic, temporal, causal и entity relations. В прочитанном [query_engine.py](https://github.com/FredJiang0324/MAGMA/blob/467cb70b67ac337b22fdb42194d37c04ad701b62/memory/query_engine.py#L260-L470) тип вопроса определяет предпочтительные links и глубину. Это содержательная идея: «что было после» требует порядка событий, «какой consumer затронут» — структурной связи, «почему изменили» — основания решения.
 
-В [find_related_memories](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L290-L350) есть настоящий `doc_id`, но функция возвращает позиции результатов `i`. Далее [process_memory](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L585-L750) применяет эти позиции к `list(self.memories.values())`, то есть к порядку общего словаря. Порядок сходства не обязан совпадать с порядком добавления. В update_neighbor это адресует не обязательно те заметки, которые модель только что прочитала. Вывод следует из producer/consumer индексов, без запуска модели или synthetic test.
+**Решение Eliot:** обычные typed links в той же SurrealDB, запрос от найденного source/resource к конкретному недостающему соседу. Прямого ответа достаточно — expansion не нужен. Обязательный LLM-router перед каждым recall, четыре БД, universal ontology и второй graph server не требуются. Модельная гипотеза причинности остаётся гипотезой, даже когда хранится как causal link.
 
-Второй разрыв — [search_agentic](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L508-L585): сначала добавляются до k direct hits, после них — связанные заметки, затем возвращается `memories[:k]`. Когда прямые результаты заняли все k мест, добавленные соседи в ответ не попадут. Это не утверждение об отсутствии любого graph retrieval во всех методах; исследована конкретная заявленная agentic entrypoint.
+### 29.2 Читать надо вызываемый алгоритм, не соседнюю реализацию из статьи
 
-Изменение neighbor tags/context также записывается в in-memory object без немедленного обновления его Chroma metadata в этой ветви. Reader выбирает часть содержания из metadata, поэтому наличие нового описания в одном объекте не гарантирует его использование следующим поиском. Полное поведение поздней re-add consolidation и версий Chroma здесь не квалифицировано.
+Фактический [QueryEngine.query](https://github.com/FredJiang0324/MAGMA/blob/467cb70b67ac337b22fdb42194d37c04ad701b62/memory/query_engine.py#L700-L875) получает vector, keyword и scan candidates, объединяет RRF, затем при включённом expanded retrieval вызывает `_adaptive_graph_traversal`. В том же файле есть `_probabilistic_beam_search` с intent weights, но данный caller вызывает **не его**. Наличие метода с названием Algorithm1 само не доказывает, что рассматриваемый endpoint исполняет именно его. Другие callers по всему проекту этим не исключены.
 
-**Устраняем причины, а не добавляем проверяющий слой:** передавать реальные target IDs из поиска до изменения; direct и полезные related candidates объединять до окончательной упаковки; обновлять то представление, по которому реально читаем. Не нужно проверять все заметки мира, добавлять подпись на соседство или всегда выделять фиксированную долю контекста каждому типу результата. Смысловая связь должна иметь полезный consumer, а не просто увеличивать число рёбер.
+Есть конкретная ошибка в [_get_neighbors](https://github.com/FredJiang0324/MAGMA/blob/467cb70b67ac337b22fdb42194d37c04ad701b62/memory/query_engine.py#L1190-L1280). При непустом наборе предпочтений сначала проверяется наличие TEMPORAL, затем через `elif` SEMANTIC и CAUSAL. `multi_hop` передаёт все три; первая ветвь поэтому фильтрует как temporal, а не объединяет разрешённые типы. Особые CONTEXT_NEIGHBOR проходят отдельно — нельзя назвать это полным отсутствием любой поперечной связи.
 
-### 28.4 Nocturne: recall clue — не правило доступа
+**Не нужен repair-router поверх router.** В Eliot тип/подтип и направление отношения — обычные параметры запроса. Несколько нужных типов объединяются явным условием выбора, а не взаимоисключающими ветвями классификатора. Код для одного реального вида связи предпочтительнее универсальной схемы с неверной композицией.
 
-[Tool reference](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/docs/TOOLS.md) использует `disclosure` для короткого описания **когда вспомнить** запись. Это не ACL, не privacy label и не требование доказать предусловие перед чтением. В [реальном renderer](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/system_views.py#L20-L180) выбранная память выдаётся полностью, а дочерние — как URI, priority и `When to recall`; при отсутствии описания используется snippet. Glossary добавляет поперечные ссылки. В этом renderer нет генеративной классификации на каждый переход.
+### 29.3 Промежуточный узел не обязан повторять слова вопроса
 
-Проверен [MCP read_memory caller](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/mcp_server.py#L280-L400), а не только helper. Обычный read действительно вызывает этот formatter; boot отдельно собирает настроенные core URI. В boot renderer неудача одного источника перечисляется, а успешно загруженные материалы остаются в ответе.
+В [_adaptive_graph_traversal](https://github.com/FredJiang0324/MAGMA/blob/467cb70b67ac337b22fdb42194d37c04ad701b62/memory/query_engine.py#L1100-L1280) сосед попадает в очередь только после `_lightweight_keyword_filter`, совпадения query vocabulary и ограничений similarity/drop. Значимый промежуточный объект с иной формулировкой может быть отрезан прежде, чем алгоритм увидит дальнейший ответ. Это вывод о данном условии, не измерение качества MAGMA в целом.
 
-**Eliot:** готовая ориентация может показывать несколько подходящих входов: «при изменении возвращаемого типа открыть историю совместимости», «при похожем timeout открыть прежний repair». Основной полезный совет уже присутствует; подробности доступны существующим `open`. Automatic context остаётся у Eliot, не перекладывается целиком на обязанность модели самостоятельно догадаться о каждой записи. Пустое recall description не мешает capture и прямому поиску. Полный векторный поиск Eliot не отменяется тем, что этот донор использует keyword search.
+Проектный пример Eliot: «почему экспорт зависает» → обработчик команды → удерживаемая транзакция → ожидание worker. Два средних узла могут не содержать слова «экспорт». Они полезны из-за конкретной связи, не из-за повторения исходной фразы. Разрешить нужный адресный переход не означает обходить весь граф: scope, выбранный relation и конечная порция уже ограничивают работу.
 
-### 28.5 Nocturne: несколько путей без нескольких копий знания
+**Наше решение:** искать anchors обычным retrieval; раскрывать структурно обоснованную связь, когда она помогает конкретному вопросу; ранжировать полезный результат и объясняющую цепочку вместе. Не требовать monotonic cosine или lexical match на каждом промежуточном шаге. Поиск соседей не становится самостоятельным автономным агентом.
 
-В [models.py](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/db/models.py#L1-L220) Node UUID сохраняется между версиями Memory; Edge ссылается на Node, а Path является адресом. Поэтому новая версия текста не требует перепривязать все смысловые отношения. [add_alias tool](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/mcp_server.py#L775-L905) вызывает `graph.add_path` и сообщает о другом входе к тому же материалу. Полный DB transaction этого graph helper не изучен, поэтому декларация tool и модель данных не выдаются за exhaustive storage review.
+### 29.4 Ограничение выдачи не ограничивает фактическую работу
 
-Берём **различие identity/representation/entrance**: один метод может находиться через тему, конкретный ресурс и связанную ошибку без трёх расходящихся копий. Удаление одного пути не равно физическому удалению знания; наши существующие операции forgetting уже различают эти задачи. Не нужен импорт всего materialized URI tree и его каскадной синхронизации, если ID+cue/link решают задачу.
+Название `_scan_all_nodes` — «fallback», но `query()` вызывает его независимо от того, нашлись ли vector/keyword hits. Сам helper проходит все узлы. `_get_neighbors` при каждом раскрытии перебирает всю коллекцию links. `_adaptive_graph_traversal` заново кодирует anchor/neighbor content через encoder, хотя другие части файла умеют обращаться к сохранённому embedding. Ветвь имеет пределы глубины, соседей и до400 encodings; она **не бесконечна**. Это счётчик обращений к encoder, не доказанные400 платных API calls: способ исполнения encoder отдельно не квалифицирован.
 
-Не переносим [personality system prompt](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/docs/system_prompt_en.md) как архитектуру Eliot: там предписаны mandatory boot до любой работы, first-person-only записи, устранение всех противоречий и стабильное число nodes как признак зрелости. Это авторская настройка данного агента, не свойство memory engine и не наши исходные требования. Eliot сохраняет цитаты, наблюдения, намерения и гипотезы различимыми; конфликт нельзя удалить лишь потому, что наличие двух версий неудобно. Полезный способ навигации не требует обязательного ритуала чтения или новой человеческой приёмки каждой записи.
+Перенос whole implementation заставил бы ускорять полный scan кэшем и потом чинить кэш. Eliot уже имеет indexed lexical/vector lookup, сохранённые совместимые embeddings и адресные relations. Использовать их напрямую дешевле по числу повторных операций; конкретная latency/RAM не измерялась. Source text не меняется — его сохранённое совместимое представление можно использовать повторно. Нет нужды создавать вторую копию графа ради обхода.
 
-### 28.6 Subcog: рабочий простой поиск и неверное прочтение его шкалы
+### 29.5 Раскрытая причина должна дойти до ответа
 
-В [RecallService](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/recall.rs#L790-L1240) hybrid_search действительно вызывает text/vector arms отдельно, объединяет их RRF и сохраняет raw scores. [MCP execute_recall](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/mcp/tools/handlers/core.rs#L120-L230) вызывает этот поиск с построенным фильтром; это не одна функция без потребителя. При недоступной векторной части предусмотрено продолжение с текстом. Для Eliot полезны native filtered queries и малая rank-fusion функция, не ещё один сервис поисковой координации.
+После отбора top nodes `query()` вызывает `_expand_qa_context`, который добавляет ANSWERED_BY/RESPONSE_TO и соответствующий следующий turn. Затем снова выполняется `top_nodes[:top_k]`. Если первоначальные результаты заполнили k, добавленные ответы могут оказаться за срезом. Это конкретный порядок, аналогичный разобранному A-MEM, не отсутствие любых полезных session summaries: они передаются formatter отдельно.
 
-Но `normalize_scores` делит результаты на максимальное значение текущего набора. Любой положительный top hit получает 1,0, даже когда абсолютная связь с запросом слабая. Это удобное относительное представление, **не вероятность правильности и не универсальный порог применимости 0,7**. Зафиксирован вывод о шкале, не обвинение всех downstream consumers донора в неверном поведении. В Eliot порядок выдачи и основания совета остаются разными сведениями.
+Eliot формирует semantic units **до** финального packing: вопрос+нужный ответ, failed action+repair, утверждение+существенное исключение. Можно кратко передать вывод и source handles, но не считать раскрытие реализованным лишь потому, что сосед был вычислен и затем выброшен. Предел задаётся реальным размером контекста; не требуется фиксированная квота каждому типу узлов.
 
-### 28.7 Subcog: забывание нельзя получать из красивой формулы по названию
+В `_identify_target_sessions` также виден literal dictionary вроде month→session numbers и тематических слов→фиксированных sessions. Его влияние на все текущие callers здесь не установлено. Это не универсальный temporal resolver и не код для копирования в продукт. Eliot использует время и источники собственного материала. Benchmark-oriented constants не становятся законами памяти.
 
-Связаны две реальные реализации: [ConsolidationService.calculate_retention_score/consolidate](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/consolidation.rs#L465-L650) и [RetentionScore](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/models/consolidation.rs#L155-L235). В service importance постоянно 0,5. Формула — 0,2×frequency + 0,3×recency + 0,5×importance, а Archive выбирается ниже 0,2. Для неотрицательных frequency/recency минимум равен **0,25**; следовательно, архивная ветвь этой функции недостижима при её нормальных входах. Это прямой алгебраический вывод из кода, не выполненный runtime-тест.
+### 29.6 Letta Code: сжать рабочее окно — не обучить долговременную память
 
-Access counts/last_access здесь лежат в локальных LRU, новый service начинает с пустых значений, отсутствующий last_access превращается в 0. Такой cache не является достоверной многолетней историей использования. Кроме того, helper `detect_contradictions` считает количество элементов namespace сверх порога, а не анализирует противоречащие утверждения. Его счётчик может обозначать участок для рассмотрения, но не обнаруженные содержательные конфликты.
+Изучен современный `letta-ai/letta-code`, не прежний D18 server. В [local-backend.ts](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/backend/local/local-backend.ts#L680-L950) реальный caller получает план, вызывает summarizer и затем меняет conversation store. Sliding mode сохраняет часть недавних сообщений, заменяя предыдущую часть summary; при конкретной невозможности sliding planning/достаточного сокращения предусмотрен all path. Нельзя выводить готовность всего донорского host из одного helper, но здесь planner действительно вызывается.
 
-**Существенная граница:** lifecycle `consolidate()` и LLM/grouping `consolidate_memories()` — разные функции. В навигации найдены настоящие CLI/MCP callers второй; end-to-end caller первой в этом проходе не установлен. Поэтому не заявляется, что обычная команда Subcog всегда теряет/архивирует данные или что вся его консолидация фиктивна. [create_summary_node](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/consolidation.rs#L1250-L1450) действительно сохраняет сводку и исходные IDs; это полезный механизм. Отдельный `link_memories` — явно документированная no-op заготовка, но другие edge writes существуют.
+[Compaction code](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/backend/local/compaction.ts) хранит разные prompts для all/sliding. Они просят сохранить goal, существенные детали, ошибки и lookup hints. Перед summarizer длинные tool returns и иногда общий transcript сокращаются с маркировкой. Поэтому summary — **производное представление выбранной части**, а не полная первичная история и не новое независимое evidence. Ошибка генерации не изображается выполненной смысловой работой. Все replay/storage ветви не проверены; гарантия вечного сохранения всего исходного host transcript здесь не заявляется.
 
-В частности, fallback `create_related_edges` строит двунаправленные связи каждой пары группы. Это n(n−1) направленных записей, не обязательная цена полезной ассоциации. В Eliot источник+сводка или несколько содержательных relations дают навигацию без полного mesh. Full scan, все пары, HOT/WARM/COLD storage tiers и очередной lifecycle service не импортируются вместе с идеей меньшего шума.
+**Для Eliot:** continuation card отвечает «что мы делаем, что реально произошло, что ещё открыто, что нужно следующим». Долговременный метод отвечает «что пригодится в другой подходящей попытке». Это разные purpose одной memory/view, не два сервиса. Compaction не должно само создавать permanent lesson или увеличивать его support. Сохранённые Eliot source events остаются адресуемыми; host может получить краткое продолжение и раскрывать детали по мере нужды.
 
-### 28.8 Практическое забывание и связный пример для V3
+Хост/controller владеет собственным token window и сжатием переписки. Eliot не начинает второе независимое удаление/repacking того же transcript и не требует разрешения на продолжение после summary. Он подаёт доступные цели, решения, текущие ограничения и handles на поддерживаемой host boundary.
 
-Уменьшать текущий контекст и уничтожать историю — разные действия. Сначала обычный compiler перестаёт повторять ненужные подробности, показывает компактный действующий метод и оставляет доступ к источнику. Доступные usage/recency сведения могут помочь этой выдаче; отсутствие статистики не означает, что запись забыта с Unix epoch. Чтение тоже не подтверждает истинность или успешное применение. Давно не встречавшаяся ошибка немедленно полезна, когда адресован тот самый ресурс.
+### 29.7 Letta reflection: брать фактический материал, не второй цикл управления агентами
 
-Проектный пример: прежний эпизод описан как сбой Nginx. Новая попытка показывает, что полезный урок относится к SPA fallback. Dreamer уточняет recall clues и связь с конфигурацией маршрутизации у **того же** метода; исходный эпизод не переписывается как будто изначально имел это объяснение. Его можно найти по Nginx, SPA и конкретному config path. Краткая карточка показывает действие и исключение, `open` — историю исправления. Повседневный prompt не таскает все логи, а редкий точный запрос их по-прежнему находит.
+[Reflection prompt](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/agent/subagents/builtin/reflection-v2.md) направлен на reusable workflows, ошибки поведения и долговременные сведения, а не копию текущего task status. [Reflection transcript helper](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/cli/helpers/reflection-transcript.ts#L1-L250) описывает source message IDs, tool call/result fields, unreflected и replay slices, отдельный selector prompt. Это содержимое реального исходника, **не доказательство завершённого автоматического scheduling**: полный соответствующий caller в этом проходе не прочитан.
 
-Это иллюстрация нашего дизайна, не наблюдавшийся benchmark. В Cognition изменены §2 (несколько входов), §5.2 (соседи до упаковки и смысл score), §5.4 (короткие recall clues), §6.8 (реальное indexed представление) и §7 (exposure отдельно от truth/erase). Механизмы используют прежние records, native queries, context и Dreamer jobs. Новая модель доверия, глобальная оценка важности и отдельная служба забывания не создаются.
+[reflection-runs.ts](https://github.com/letta-ai/letta-code/blob/e8073d4e475ab7f56e76f9aaeea81a7618a92575/src/agent/reflection-runs.ts) реально различает Code-managed localMemfs path и server cutover; явная команда может enqueue cloud reflection без нового model turn. Поэтому одна надпись «cloud required» у низкого API не доказывает, что никакой локальной reflection вообще нет. Серверное исполнение по этой квитанции не проверено.
 
-### 28.9 Охват и незакрытые вопросы
+Eliot берёт подходящие already-saved episode slices и relevant methods через собственный existing job. Старый материал можно намеренно переосмыслить для аналогии/противоречия, но replay не новый observed success. Если работа и новый диапазон уже известны, отдельный модельный селектор всех бесед не обязателен. Provider execution остаётся у controller; ещё один subagent scheduler, memory filesystem и cloud ownership protocol внутри памяти не создаются.
 
-A-MEM: статья v11 и library README; `memory_system.py` от MemoryNote до process_memory; retriever add/search/metadata и объявление альтернативного persistent backend. Экспериментальный `WujiangXu/AgenticMemory` здесь не проверен. Nocturne: tool/system-prompt docs, models1–230, system_views1–270 и MCP read/alias/delete paths; полная реализация graph transactions не проверена. Subcog: README и историческая consolidation specification сопоставлены с выбранными service/model/recall functions и реальным recall handler; не весь startup, hooks или lifecycle wiring.
+Не переносим prompt-пожелание всегда разрешать противоречие в пользу latest evidence как универсальный last-write-wins. Новый input может быть старым импортом, цитатой или другим scope. Сохраняются уже заданные distinctions времени/перспективы/источника. Одна редкая серьёзная ошибка тоже может дать полезный совет; повторяемость не admission gate.
 
-Новые выводы — чтение исходников, сравнение contract/consumer и алгебра формулы. Приложения, модели, synthetic tests и product tests не запускались; заявленные авторами метрики не воспроизводились. Независимого субагентного review нет. D03/D19/D43 уточнены в прежнем реестре, остальные открытые пути сохранены в карте. Следующий полезный контраст — MAGMA и Letta: когда обход связей или активное раскрытие действительно добавляют сведения, а когда только умножают запросы. Не переносить их topology по названию, пока не прочитан конкретный consumer.
+### 29.8 Связный механизм без новых слоёв
+
+Пример — проектное решение, не runtime результат. При вопросе о зависшем backup обычный поиск находит прежний эпизод. Нужная связь раскрывает, что worker ждал lock, удерживаемый вызывающей стороной. Compiler сохраняет это основание рядом с советом, а подробный trace оставляет в `open`. После смены окна continuation view помнит незавершённую правку и фактический результат последнего запуска. Долговременный урок о порядке ожидания хранится отдельно по назначению и обновляется новым реальным исходом, не повтором summary.
+
+Реализация укладывается в `context` (indexed retrieval, relation expansion, semantic packing), `memory` (source-linked views) и уже существующие `jobs`/controller для нужной интерпретации. Удаляется обязанность полных scans, повторного encoding и второго управления transcript, а не добавляется контролёр, разрешающий эти операции.
+
+### 29.9 Охват, ограничения и следующий шаг
+
+Свежепрочитаны MAGMA README, paper methods и query_engine selected ranges с фактическим query→adaptive→neighbor→packing путём; Letta compaction planner/summarizer, actual local backend caller, выбранные local-store ranges, reflection prompt, transcript helper и command ownership/enqueue. Отдельный probabilistic search не назван исполнителем прочитанного query. Полный server-side reflection, application всех local-store replay events и archived Letta D18 не квалифицированы.
+
+Несколько попыток получить предполагаемые reflection paths оказались неудачными; после проверки имён через code search прочитаны реально существующие helper/command files. Неуспешные fetches не засчитаны как чтение и не использованы как доказательство отсутствия функции. Точно так же локальная сеть не дала загрузить рабочую копию: публикация идёт доступным GitHub API, без выдуманного локального diff-check.
+
+Новых runtime, model, database, synthetic или продуктовых тестов не запускалось; нет независимого субагентного review. Следующий конкретный источник — полезная автоматическая адресация/предвосхищение из D10/D11 EverOS/EverMemOS либо ещё не завершённый Eliot capture→interpretation trigger. Выбор определяется пробелом продукта, а не обязанностью импортировать очередного донора.
