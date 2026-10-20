@@ -1,8 +1,10 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.12 · 20 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.13 · 20 октября 2026 · документация до переписывания продукта.**
 
-**Новый результат — [§26](#26-donor-mechanisms-for-useful-memory-012):** предметно изучены D09 Hindsight, D01 MemMachine и D08 Graphiti. Отобраны обновление отдельного аспекта знания, восстановление исходного эпизода, сохранённые ответы на повторяющиеся вопросы и временное разрешение изменений. Разобраны реальные функции, ограничения переноса и место каждого механизма в существующих модулях Eliot. Это не предложение установить три дополнительных memory runtime.
+**Новый результат — [§27](#27-episodes-incremental-learning-and-memory-feedback-013):** продолжено чтение D01 MemMachine и D09 Hindsight до конкретных обработчиков входа, фоновой интерпретации и интеграции с хостом. Разделены технические фрагменты поиска и рабочие эпизоды; отобраны обработка нового материала и исключение собственной вставленной памяти из повторного извлечения. Найдены случаи, где неполная интерпретация считается завершённой, а ограниченный набор старых фактов мешает обновить подходящий новый. Решения уточняют существующие операции Eliot, не добавляя ещё один runtime.
+
+**Результат 0.12 — [§26](#26-donor-mechanisms-for-useful-memory-012):** предметно изучены D09 Hindsight, D01 MemMachine и D08 Graphiti. Отобраны обновление отдельного аспекта знания, восстановление исходного эпизода, сохранённые ответы на повторяющиеся вопросы и временное разрешение изменений. Разобраны реальные функции, ограничения переноса и место каждого механизма в существующих модулях Eliot. Это не предложение установить три дополнительных memory runtime.
 
 **Результат 0.10 — [§25](#25-real-experience-input-and-normal-context-010):** обычный сборщик контекста действительно вызывает поиск опыта, но чтение случаев связано с готовностью карты проекта; стандартный режим отсекает только что сформированный опыт. В retained MCP обнаружены карточки навыков, создаваемые из шаблона вместо чтения хранилища, и обработчик, конструирующий успешное «доказательство исполнения» без исполнения. У Harness2 дочитаны доступ к материалам и модельный executor/cache. Решения внесены в [Cognition](COGNITION.md), не в новую платформу проверок.
 
@@ -16,7 +18,7 @@
 |---|---|
 | V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: Canonical Master, Production Architecture, Understanding Layer; исходные требования и донор |
 | V2 | `5aac094834fb5635921b550c821cb933a1196105`: старые нормативы, исходники и незавершённые программы |
-| База текущего изменения V3 | `5c5e23dfe8470c26e036d2f5ec6b90c671c0dc43`: опубликованный Implementation 0.11 и аудит 0.10 в PR #5325 |
+| База текущего изменения V3 | `6f4ea70830d5964dc58be549657b0770d828d468`: опубликованная документация 0.12 в PR #5325 |
 | Аудит Claude | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения, измерения и сообщённые решения; не безошибочная спецификация |
 | Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы анализа и доноров, не обязательный backlog V3 |
 | Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer, reconciliation, store, System 2 и transfer пути прежних проходов |
@@ -24,8 +26,8 @@
 | Eliot Swarm Controller | `96a0d5a6632cfbd541e804d7969d3e76e716bf6a`: прежняя ограниченная проверка integration document; другие старые findings сохраняют собственные ссылки |
 | Harness2, D44 | `1cfe254e8d25b15f37048c3730134686abe60335`, commit 14.10.2026; [статья 2610.14224v1](https://arxiv.org/html/2610.14224v1), 09.10.2026 |
 | LangMem, D16 | `48e3c11f5bb527282c7d5339c6a87a0b35abccfc`: background/reflection и prompt optimization, рассмотренные в 0.8–0.9 |
-| Hindsight, D09 | `c5f585f8f8568ed0677eb2e70fe830c4c483e2a2`: новая проверка consolidation и mental-model mechanisms, §26 |
-| MemMachine, D01 | `d5a39a8e774e977fb1e6c22efb03555c4e51e05e`: declarative retrieval и его действующие вызывающие facade, §26 |
+| Hindsight, D09 | `c5f585f8f8568ed0677eb2e70fe830c4c483e2a2`: consolidation и mental-model mechanisms в §26; дополнительные retain/integration paths в §27 |
+| MemMachine, D01 | `d5a39a8e774e977fb1e6c22efb03555c4e51e05e`: declarative retrieval и вызывающие facade в §26; event/semantic ingestion и реальный storage в §27 |
 | Graphiti, D08 | `3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f`: извлечение/сопоставление связей и temporal invalidation, §26 |
 
 Прямое поручение владельца: V1/V2 становятся донорами, V3 пишется с нуля после документации; сохраняются самообучение, когниция, модульность, гибкость и лёгкость; Dreamer заменяем по модели. Приложение Claude сообщает дополнительные решения: Rust, demand-start, SurrealDB child, модели и embeddings через controller, векторы в полном продукте, отсутствие собственного роя. Точные будущие версии SDK, API и численные параметры не объявляются уже согласованными или работающими.
@@ -242,7 +244,7 @@ Spool подтверждает доставку исходного событи�
 
 | D | Донор | Полезный механизм и граница переноса |
 |---|---|---|
-| 01 | MemMachine | Свежая проверка 0.12: поиск derivative → source episode → ограниченный контекст с результатом/ремонтом; declarative backend и реальные callers, не весь multi-backend runtime; §26 |
+| 01 | MemMachine | Derivative → source episode → контекст ремонта (§26); в 0.13 дочитаны дешёвое разбиение, semantic ingestion, реальный progress/SQL caller. Не переносить oldest-50 update window и сообщения×категории как обязательный pipeline (§27) |
 | 02 | MemPalace | Event identity, одинаковые timestamps и повторные экспорты; не last duplicate wins |
 | 03 | Subcog | Facets/RRF без read-side semantic mutation |
 | 04 | MemOS local plugin | Retrieval по ситуации; gain не объявлять causal proof |
@@ -250,7 +252,7 @@ Spool подтверждает доставку исходного событи�
 | 06 | ClawVM | Сохранение необходимых смысловых единиц при сжатии |
 | 07 | Pichay / demand paging | Цена повторного чтения; не строить paging OS заранее |
 | 08 | Graphiti | Свежая проверка 0.12: отдельные duplicate/contradiction candidates, обновление временных интервалов и источников; не перенос managed Zep/онтологического runtime; §26 |
-| 09 | Hindsight | Свежая проверка 0.12: инкрементальное объединение одного аспекта, пакетные обращения и сохранённый ответ на вопрос; не proof-count как эффективность и не весь layer stack; §26 |
+| 09 | Hindsight | Incremental facet update и saved questions (§26); в 0.13 дочитаны retain orchestration, update/answer fusion и реальное исключение injected memory перед retain. Delta зависит от пути/backend; plugin chat text не равен всем tool outcomes (§27) |
 | 10 | EverOS | Reconciliation пропущенных событий; replacement прежде retirement |
 | 11 | EverMemOS historical | Episode/atomic facts/foresight; различать historical/current stacks |
 | 12 | Cloudflare managed Agent Memory | Raw рядом с extracted; service не бесплатная library |
@@ -694,3 +696,82 @@ Cognition §§5.2,6.7,6.8 теперь описывают independent lesson rea
 В реестре уточнены прежние D01/D08/D09, новые номера не созданы. Архивные остальные donors остаются отдельно отмеченными в карте. Следующий предметный выбор — автоматическая сегментация эпизода и отбор полезного материала у event/semantic ветвей MemMachine, затем различия generic/dedicated retrieval у Hindsight. Брать нужно лишь механизм, который улучшает найденный пробел Eliot, а не достраивать вокруг него весь donor product.
 
 Проверка текущего прохода — чтение источников и согласование документации. Не выполнялись новые продуктовые или синтетические тесты, запуск моделей, БД либо независимый субагентный review. Публикация и diff проверяются по GitHub; результат не объявляется реализованным V3.
+
+## 27. Episodes, incremental learning and memory feedback 0.13
+
+**20 октября 2026; продолжение документации `6f4ea708`.** Дочитаны выбранные event/semantic пути MemMachine и retain/integration функции Hindsight на тех же версиях, что в §26. Главный результат — не новое состояние допуска, а разделение операций: сохранить реальное событие, дёшево подготовить поиск, интерпретировать полезный новый эпизод и не выдавать собственный прошлый ответ за новый опыт.
+
+### 27.1 Сегментация текста не означает понимание эпизода
+
+[MemMachine TextSegmenter](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/event_memory/segmenter/text_segmenter.py) использует обычный RecursiveCharacterTextSplitter: в рассмотренном default 500 codepoints, без перекрытия, с последовательностью разделителей. Он разбивает блоки одного Event, сохраняя event UUID, block index, ordinal offset, context и timestamp. Это физическая подготовка представления, а не поиск границы законченной задачи среди сообщений.
+
+[WholeTextDeriver и SentenceTextDeriver](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/event_memory/deriver/text_deriver.py) тоже не вызывают генеративную модель: форматируют весь фрагмент либо предложения с контекстом производителя и при необходимости временем. Embedding вызывается позже в [EventMemory._encode_events](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/episodic_memory/event_memory/event_memory.py#L190-L310). Там embeddings предшествуют записи segments; это не гарантия порядка первичного сохранения EpisodeStorage во всём продукте.
+
+**Берём:** дешёвую подготовку поисковых единиц отдельно от смысловой работы. **Не берём:** default размер как архитектурный закон и отдельный framework segmenter/deriver/store ради того же результата. Для Eliot исходное событие, поисковый фрагмент и рабочий эпизод различаются. Доступные session/task/tool-call связи и границы turns уже помогают собрать попытку с результатом; смысловое уточнение требуется лишь там, где оно действительно полезно. Большой лог можно дробить обычной библиотекой, не спрашивая модель о каждом разрезе. [Cognition §1](COGNITION.md#1-one-useful-path-and-its-owners).
+
+### 27.2 Найден настоящий фоновый producer, но его цена определяется вложенными циклами
+
+[SemanticMemory.add_messages/add_message_to_sets](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_memory.py#L230-L310) регистрируют идентификаторы сохранённых эпизодов. [Фоновая задача](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_memory.py#L800-L870) запрашивает dirty sets с параметрами количества/возраста необработанных сообщений и вызывает реальный IngestionService. Это автоматический consumer, не только декларация типа. Полное поведение критериев выбора dirty sets и HTTP capture в этом проходе не квалифицировано.
+
+[IngestionService._process_single_set](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_ingestion.py#L130-L300) берёт до пяти pending IDs, загружает сообщения, затем для **каждой категории и каждого сообщения** читает старые features и вызывает модель. [llm_feature_update](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_llm.py) передаёт OLD_PROFILE и отдельное message.content. При M доступных сообщениях и C настроенных категориях это M×C вызовов helper в рассмотренном нормальном проходе, до дополнительных embeddings/consolidation. Это свойство циклов, не измерение времени, цены или качества.
+
+**Eliot:** новая связная часть эпизода и относящиеся к ней прежние уроки могут обрабатываться одним обычным заданием, выдающим несколько полезных аспектов. Категории организуют результат, но не требуют C независимых интерпретаций каждого входного сообщения. Существующий job хранит действительно обработанный диапазон; не вводится новый SemanticIngestionManager поверх прежнего планировщика. [Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt).
+
+### 27.3 Неполная интерпретация не должна выглядеть завершённой
+
+В просмотренном `llm_feature_update` отсутствие parsed response (`None`) возвращается как пустой список команд. Caller после применения такого списка добавляет message UID в общий `mark_messages`. Отдельно context-length exception прямо добавляет этот UID в тот же список, хотя извлечение пропущено. Успех одной категории также может добавить сообщение в общий список, пока другая категория закончилась обработанной исключительной ветвью. [Helper](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_llm.py), [caller](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/semantic_ingestion.py#L210-L300).
+
+Это проверено до конкретного [PostgreSQL storage](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/storage/sqlalchemy_pgvector_semantic.py#L485-L525): `ingested=True` относится к set+history_id, не к каждой категории. Не заявляется уничтожение исходного сообщения, обязательная потеря во всех режимах или запуск приложения. Подтверждён путь, где исходный материал остаётся, но его нужная semantic обработка может считаться выполненной без соответствующего результата.
+
+**Решение без нового слоя:** успешный no-change — ответ модели, который действительно получен и разобран. Отсутствие ответа или превышение контекста — состояние существующего задания; уменьшить вход либо оставить неудавшуюся часть для последующей обработки. Если разные цели намеренно обрабатываются отдельно, прогресс относится к конкретной выполненной работе. Не требовать завершения всех дополнительных обработок до чтения уже полезного результата. [Cognition §6.6](COGNITION.md#66-reuse-no-change-and-version-derived-features).
+
+### 27.4 Ограничить контекст — не значит всегда брать старейшие записи
+
+Ingestion передаёт `max_features_per_update` как page_size (default 50), без query relevance и номера следующей страницы. В [реальном PostgreSQL get_feature_set](https://github.com/MemMachine/MemMachine/blob/d5a39a8e774e977fb1e6c22efb03555c4e51e05e/packages/server/src/memmachine_server/semantic_memory/storage/sqlalchemy_pgvector_semantic.py#L330-L395) при отсутствии vector options используется порядок created_at ASC/id ASC и LIMIT с начальной страницей. Это действительно bounded первый префикс, а не автоматически проходящий все страницы iterator.
+
+**Следствие, ограниченное этим backend/path:** подходящий более поздний факт может не попасть в OLD_PROFILE для изменения. Увеличение 50 до произвольного большого числа лишь передвинет границу. Для Eliot надо выбрать текущие записи о затронутом аспекте через уже существующий поиск/ключи. Широкий листинг может иметь пагинацию; update context не обязан быть первой страницей всей категории.
+
+Дополнительный no-copy вывод: `_deduplicate_features` сначала удаляет старые features, затем получает embeddings и вставляет replacements; выбранный SQL backend коммитит эти вызовы отдельно. Это повтор уже разобранного retirement-before-replacement, не повод создавать ещё один recovery manager. Применить подготовленное изменение одной обычной транзакцией — уже выбранное решение Eliot. Весь multi-backend storage донора переносить ради нескольких операций не требуется.
+
+### 27.5 Hindsight: не извлекать собственную подсказку как новый факт
+
+В [OpenCode content.ts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/content.ts) `stripMemoryTags` удаляет известные блоки `<hindsight_memories>` и `<relevant_memories>`. Эта функция реально вызывается при подготовке retention transcript и при построении recall query из прежних turns. [hooks.ts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/hooks.ts#L130-L235) вызывает подготовку transcript перед retain на session idle и compaction. Поэтому это действующий путь исключения механического echo, не неиспользуемый helper.
+
+**Для Eliot:** adapter уже знает, какие блоки он вставил. Повторную копию этого контекста не надо превращать в новую входную порцию Dreamer. Достаточно известного происхождения/ссылки на delivery; новые действия, результаты и коррекции сохраняются отдельно. При импорте общего transcript помогают source roles и собственные явные markers, а не модель-антифильтр, угадывающая, какие похожие мысли запрещено помнить. Новая цитата пользователя остаётся сообщением пользователя; она не становится независимым подтверждением только от повторения старого совета.
+
+Так устраняется конкретная петля разрастания: память → вставленный совет → повторное извлечение совета → новые версии того же совета. Это не защита от любых смысловых ошибок и не обещание распознать каждую модельную перефразировку. [Cognition §6.3](COGNITION.md#63-stopping-self-reinforcement-and-wasted-work).
+
+**Важная граница донора:** `getSessionMessages` в этом plugin берёт только роли user/assistant и text parts. Tool-result parts здесь не сохраняются. Следовательно, перенос whole plugin не обеспечит наблюдение фактической работы coding-агента. Eliot использует свои уже предусмотренные host tool-result events; текст отчёта остаётся текстом отчёта, а не доказательством исполнения.
+
+### 27.6 Инкрементальность начинается с правильной формы входа
+
+В Hindsight [retain orchestration](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py#L1830-L2110) различаются append и замена документа. Append читает прежнее тело, добавляет хвост и может переиспользовать неизменившиеся chunks через условный delta путь. Для структурированной беседы [общий join](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py#L205-L320) сохраняет единый JSON-массив ролей, не склеивает два несовместимых массива обычной строкой. `force_reextract` позволяет явно обработать те же bytes новым методом вместо вечного пропуска по отсутствию текстовых изменений.
+
+Delta зависит от backend, первого sub-batch и параметров; код не обещает этот путь любой записи. Малые и большие документы направляются в один streaming pipeline, а не две независимо поддерживаемые реализации. Дорогие read-heavy resolution операции отдельно вынесены из короткой write transaction. Полный верхний HTTP/queue/worker путь и все commit/retry ветви не прочитаны; async retain не объявляется автоматически raw-first API Eliot.
+
+**Упрощение для нашего native input:** не восстанавливать один растущий документ всей сессии на каждый tool. Host уже предоставляет отдельные события и IDs: сохранить новое, взять необработанный диапазон с нужным прежним контекстом. Импорт полного source snapshot — отдельный очевидный случай; хвост не должен притворяться новым полным состоянием. Reuse неизменившейся обработки экономит calls, а смена метода может обосновать переработку. Не нужны универсальные digest-планы, второй журнал синхронизации и перенос backend-specific repair machinery Hindsight. [Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt).
+
+### 27.7 Запрос «продолжай» использует существующий контекст, не нового посредника
+
+В том же [content.ts](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-integrations/opencode/src/content.ts) query собирается из последней просьбы и ограниченного числа user turns; shortening удаляет старый контекст раньше новой просьбы. Собственные memory blocks исключаются. Реальные callers в system-transform/compaction используют эти функции. Это полезная небольшая альтернатива обязательному LLM query-rewriter.
+
+Для Eliot краткое продолжение связывается с доступной целью, выбранными ресурсами и ближайшими исходными turns. Нельзя автоматически приписать ему последнюю из нескольких параллельных задач; неизвестная привязка остаётся известным ограничением. Не надо каждый раз посылать всю историю, строить полный TaskMeaningFrame или отказывать в памяти из-за отсутствующего поля.
+
+Дочитан и [fusion.py](https://github.com/vectorize-io/hindsight/blob/c5f585f8f8568ed0677eb2e70fe830c4c483e2a2/hindsight-api-slim/hindsight_api/engine/search/fusion.py): RRF и round-robin interleave — обычные функции над результатами поиска, не отдельные движки. Это подтверждает предыдущий выбор §26: отбор для ответа и для нахождения обновляемой записи может различаться без дублирования базы/планировщика. Donor default «recall once per session» не переносится как запрет обновлять контекст при новой задаче.
+
+### 27.8 Что меняется в Eliot и предел проверки
+
+| Задача | Нативное решение в существующем коде V3 | Не строить |
+|---|---|---|
+| Подготовить большой исходник к поиску | Обычное source-aware разбиение с ссылкой на оригинал | LLM-классификатор каждого разреза |
+| Понять новую попытку | Сохранённые связанные события, полезный новый диапазон и релевантные уроки | Обязательную обработку каждого сообщения всеми категориями |
+| Не раздувать память собственным выводом | Отличать injected context от новых host events на входе | Проверяющий сервис над бесконечно повторно извлекаемыми заметками |
+| Обновить подходящий факт | Выборка затронутого аспекта, обычная новая ревизия | Whole-category oldest-prefix и ещё один cache поверх него |
+| Пережить неудачную интерпретацию | Обычный статус существующего job, доступные primary данные | Ложный processed flag или остановку всей памяти |
+| Продолжить текущую работу | Цель/ресурсы/ближайшие исходные turns в existing context | Посредника, заново формулирующего каждый короткий запрос |
+
+Это проектные решения для V3, не результат запуска приложения. Изменены конкретные абзацы Cognition §§1,5.2,6.3,6.6,6.8; Architecture, Implementation, продуктовый код, схема и CI не меняются. Новые номера доноров или checklist family не добавлены.
+
+**Чтение:** MemMachine TextSegmenter/TextDeriver, EventMemory encode path, semantic ingestion/LLM helpers, выбранный PostgreSQL storage и реальные registration/background callers; Hindsight content/hooks, retain orchestrator selected ranges, fact schema header и fusion functions. Недоступный большой memory_engine source не считается прочитанным; fetch с пустым content — ограничение доступа к bytes, не доказательство пустой реализации. Иные backend semantics, full capture orchestration, temporal Graphiti callers и все registry donors не объявляются закрытыми.
+
+Новых runtime, модельных, синтетических или продуктовых тестов не выполнялось. Количество вызовов выведено из циклов, не измерено в deployment; потеря raw-событий глобально не заявляется. Независимого субагентного review нет. Следующие точные чтения и фактический статус публикации отражаются в карте и PR.

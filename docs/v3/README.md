@@ -1,39 +1,33 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.12 · 2026-10-20.** Documentation before the greenfield rewrite. V1/V2 remain donors; the product has not been implemented by these documents.
+**Revision 0.13 · 2026-10-20.** Documentation before the greenfield rewrite. V1/V2 remain donors; these documents do not implement the product.
 
 | Document | Purpose |
 |---|---|
-| [Architecture](ARCHITECTURE.md) | Product purpose, cognition, automatic learning and module boundaries; remains 0.6 |
-| [Implementation](IMPLEMENTATION.md) | Direct native Store/host/controller paths, background work and practical recovery; remains 0.11 |
-| [Cognition](COGNITION.md) | Algorithms inside the same modules; 0.12 adds selected donor mechanisms |
-| [Consolidated audit](AUDIT.md) | Source findings, 34 original requirements, 29 A15 cases and donors D01–D44 |
-| [Audit map](AUDIT-MAP.md) | Exact fresh/prior reading, limits and the next useful source paths |
+| [Architecture](ARCHITECTURE.md) | Product purpose, cognition, automatic learning and boundaries; remains 0.6 |
+| [Implementation](IMPLEMENTATION.md) | Native Store/host/controller paths and connected product work; remains 0.11 |
+| [Cognition](COGNITION.md) | Algorithms inside those modules; 0.13 refines episode intake and incremental learning |
+| [Consolidated audit](AUDIT.md) | Source findings, 34 requirements, 29 A15 cases and D01–D44 |
+| [Audit map](AUDIT-MAP.md) | Actual source coverage, limits and next connected reading |
 
-## Current donor work
+## Current donor result
 
-[Audit §26](AUDIT.md#26-donor-mechanisms-for-useful-memory-012) studies D09 Hindsight, D01 MemMachine and D08 Graphiti at named source revisions. It distinguishes their actual code/documentation from the proposed Eliot implementation:
+[Audit §27](AUDIT.md#27-episodes-incremental-learning-and-memory-feedback-013) continues MemMachine and Hindsight beyond their architectural descriptions. It follows actual segment/derive code, semantic-ingestion callers and storage, and Hindsight's retention hooks and selected retain orchestration.
 
-- Hindsight: update a particular aspect using existing related records, batch compatible interpretation/embedding work, and save an answer to a recurring question instead of regenerating an entire project report.
-- MemMachine: a short search hit can lead to its original episode and relevant neighboring events, including a later repair and result. The inspected declarative backend is not all MemMachine behavior.
-- Graphiti: separate when a fact applied from when it was learned; search for changed facts more broadly than exact duplicate endpoints. Preserve historical occurrences without a whole-graph rebuild.
+The resulting Eliot choices are small: ordinary text splitting prepares search inputs but does not define a working episode; related host events form useful interpretation input; only new material and relevant prior context need processing. The adapter excludes its own injected memory from fresh learning input instead of generating successive copies of the same advice. Actual tool outcomes remain separate from a chat report.
 
-These refine ordinary `memory`, `context` and `jobs`, not three new runtime dependencies. The donor's terminology and limits are recorded: Hindsight observations are synthesized knowledge; its documented staleness check does not see deletions. MemMachine's selected low-level writer is not a raw-first guarantee. Graphiti's temporal helper concern is a conditional source finding, not a reproduced deployment failure.
+A successful no-change is not a missing parsed result or an oversized failed request. Progress belongs to the work actually completed, without blocking access to preserved data. Existing facts are selected for relevance to an update, not always from the oldest fixed-size page. A short follow-up uses the active goal/resources and nearby original turns, without a mandatory model-mediated query rewrite.
 
-Cognition §3 clarifies temporal occurrences; §§4.1–4.2 make useful question-shaped views concrete; [§5.3](COGNITION.md#53-recover-the-episode-not-just-the-matching-fragment) describes source-episode expansion; §6.8 specifies incremental same-aspect updates and compatible batching. There is no new promotion gate, separate episodic database, ontology service or compulsory extra interpretation pass. Existing useful primary reads remain available.
+These changes belong to Cognition §§1,5.2,6.3,6.6,6.8. No new service, store, approval stage, parser framework or checklist family is added. Hindsight's delta behavior is conditional on its retain path/backend; MemMachine findings concern the inspected ingestion and PostgreSQL storage, not every deployment.
 
-## Earlier work retained
+## Earlier mechanisms retained
 
-[Audit §25](AUDIT.md#25-real-experience-input-and-normal-context-010) distinguishes a real experience consumer from its map/maturity dependencies, generated skill cards from stored methods, and fabricated execution proof from host observations. [Cognition §6.8](COGNITION.md#68-one-episode-to-a-useful-next-attempt) connects a captured episode or explicit correction to useful advice in a subsequent context.
+[Audit §26](AUDIT.md#26-donor-mechanisms-for-useful-memory-012) records Hindsight's same-aspect updates and saved questions, MemMachine's source-episode expansion, and Graphiti's temporal resolution. [§25](AUDIT.md#25-real-experience-input-and-normal-context-010) distinguishes genuine Eliot inputs/consumers from generated skill cards and success-shaped proof records.
 
-The 0.11 Implementation specifies native host events, actual stored records, native database operations and connected product work rather than success-shaped scaffolding. Ordinary advice does not wait for global graph readiness, optional diagnostics or a universal effectiveness certificate.
+Architecture and Implementation are unchanged. All existing requirement/scenario/donor families and thirty-six cognitive walkthroughs remain. They are design expectations, not executed product tests. Historical full documentation is available in [Git history](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/6f4ea70830d5964dc58be549657b0770d828d468/docs/v3).
 
-The existing requirement/scenario/donor identities and thirty-six cognitive walkthroughs remain. They are design expectations, not executed product tests. No new checklist family is added.
+## Remaining reading and publication
 
-## Continuing work and publication
+The [map](AUDIT-MAP.md) retains the unresolved Eliot tool-outcome-to-interpretation edge, Graphiti temporal caller, Hindsight top-level queued/inline retain boundary, Harness2 reset/executor and ORS ownership. Unavailable large-file content is not evidence that its implementation is absent; navigation searches are not complete reads.
 
-The [map](AUDIT-MAP.md) now prioritizes MemMachine event/semantic segmentation, Hindsight retain/retrieval callers and Graphiti temporal search filters. The actual Eliot episode-scheduling edge, remaining Harness2 executor/reset work and ORS ownership are still explicit open reads. A donor name in the registry does not mean its whole code or experiments were reviewed.
-
-V2 source: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. Earlier documentation is retained in [Git history](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5c5e23dfe8470c26e036d2f5ec6b90c671c0dc43/docs/v3); archived research remains in the [incomplete audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete).
-
-Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Record actual publication/diff/CI there. This pass is source reading, not a live donor/model/database experiment or independent subagent review. Runtime, schemas, dependencies, CI, the old ACTIVE registry and user data are unchanged. Product implementation follows the documentation stage and the owner's product-code/minimum-Clippy/tests-later order.
+Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Report actual commit/ref/diff/CI there. This pass is source reading and design review, not a donor/model/database run or independent subagent review. Runtime, schema, dependencies, CI, old ACTIVE registry and user data are unchanged. Product implementation follows the documentation stage and the owner's product-code/minimum-Clippy/tests-later order.
