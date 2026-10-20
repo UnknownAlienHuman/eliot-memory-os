@@ -1,8 +1,10 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.13 · 20 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.14 · 20 октября 2026 · документация до переписывания продукта.**
 
-**Новый результат — [§27](#27-episodes-incremental-learning-and-memory-feedback-013):** продолжено чтение D01 MemMachine и D09 Hindsight до конкретных обработчиков входа, фоновой интерпретации и интеграции с хостом. Разделены технические фрагменты поиска и рабочие эпизоды; отобраны обработка нового материала и исключение собственной вставленной памяти из повторного извлечения. Найдены случаи, где неполная интерпретация считается завершённой, а ограниченный набор старых фактов мешает обновить подходящий новый. Решения уточняют существующие операции Eliot, не добавляя ещё один runtime.
+**Новый результат — [§28](#28-associations-and-useful-forgetting-014):** изучены другие доноры — D43 A-MEM, D19 Nocturne Memory и D03 Subcog. Отобраны эволюция поискового представления старого знания, несколько входов к одной записи, раскрытие подробностей и уменьшение лишней выдачи без потери истории. Проверены реальные функции: обнаружены несовпадение search rank с identity, отсечение добавленных соседей, относительный score вместо уверенности и недостижимая ветвь архивирования. Проектные решения помещены в существующие операции Cognition, не в новые службы.
+
+**Результат 0.13 — [§27](#27-episodes-incremental-learning-and-memory-feedback-013):** продолжено чтение D01 MemMachine и D09 Hindsight до конкретных обработчиков входа, фоновой интерпретации и интеграции с хостом. Разделены технические фрагменты поиска и рабочие эпизоды; отобраны обработка нового материала и исключение собственной вставленной памяти из повторного извлечения. Найдены случаи, где неполная интерпретация считается завершённой, а ограниченный набор старых фактов мешает обновить подходящий новый. Решения уточняют существующие операции Eliot, не добавляя ещё один runtime.
 
 **Результат 0.12 — [§26](#26-donor-mechanisms-for-useful-memory-012):** предметно изучены D09 Hindsight, D01 MemMachine и D08 Graphiti. Отобраны обновление отдельного аспекта знания, восстановление исходного эпизода, сохранённые ответы на повторяющиеся вопросы и временное разрешение изменений. Разобраны реальные функции, ограничения переноса и место каждого механизма в существующих модулях Eliot. Это не предложение установить три дополнительных memory runtime.
 
@@ -18,7 +20,7 @@
 |---|---|
 | V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: Canonical Master, Production Architecture, Understanding Layer; исходные требования и донор |
 | V2 | `5aac094834fb5635921b550c821cb933a1196105`: старые нормативы, исходники и незавершённые программы |
-| База текущего изменения V3 | `6f4ea70830d5964dc58be549657b0770d828d468`: опубликованная документация 0.12 в PR #5325 |
+| База текущего изменения V3 | `f82b7ff884c57412becb747e4fb673495c2df271`: опубликованная документация 0.13 в PR #5325 |
 | Аудит Claude | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения, измерения и сообщённые решения; не безошибочная спецификация |
 | Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы анализа и доноров, не обязательный backlog V3 |
 | Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer, reconciliation, store, System 2 и transfer пути прежних проходов |
@@ -29,6 +31,9 @@
 | Hindsight, D09 | `c5f585f8f8568ed0677eb2e70fe830c4c483e2a2`: consolidation и mental-model mechanisms в §26; дополнительные retain/integration paths в §27 |
 | MemMachine, D01 | `d5a39a8e774e977fb1e6c22efb03555c4e51e05e`: declarative retrieval и вызывающие facade в §26; event/semantic ingestion и реальный storage в §27 |
 | Graphiti, D08 | `3cc723cd292eb5c2ac5ea2c5539270b8e1b6389f`: извлечение/сопоставление связей и temporal invalidation, §26 |
+| A-MEM, D43 | `ceffb860f0712bbae97b184d440df62bc910ca8d`: библиотека `agiresearch/A-mem`; отдельно [статья 2502.12110v11](https://arxiv.org/html/2502.12110v11), §28 |
+| Nocturne Memory, D19 | `1858957bf797722a9b731fb197bd9530f7ae67e4`: tool docs, model identity, actual renderer/MCP read and alias paths, §28 |
+| Subcog, D03 | `0cd2d4f0cff04938c9f865353fbfefa1b4e3f754`: native recall/fusion, selected consolidation/lifecycle functions and score model, §28 |
 
 Прямое поручение владельца: V1/V2 становятся донорами, V3 пишется с нуля после документации; сохраняются самообучение, когниция, модульность, гибкость и лёгкость; Dreamer заменяем по модели. Приложение Claude сообщает дополнительные решения: Rust, demand-start, SurrealDB child, модели и embeddings через controller, векторы в полном продукте, отсутствие собственного роя. Точные будущие версии SDK, API и численные параметры не объявляются уже согласованными или работающими.
 
@@ -246,7 +251,7 @@ Spool подтверждает доставку исходного событи�
 |---|---|---|
 | 01 | MemMachine | Derivative → source episode → контекст ремонта (§26); в 0.13 дочитаны дешёвое разбиение, semantic ingestion, реальный progress/SQL caller. Не переносить oldest-50 update window и сообщения×категории как обязательный pipeline (§27) |
 | 02 | MemPalace | Event identity, одинаковые timestamps и повторные экспорты; не last duplicate wins |
-| 03 | Subcog | Facets/RRF без read-side semantic mutation |
+| 03 | Subcog | В 0.14 прочитаны real RRF/recall, summary-source links и lifecycle formula. Брать native facets/ранжирование; normalized max=1 не уверенность, retention-helper не готовая система забывания (§28) |
 | 04 | MemOS local plugin | Retrieval по ситуации; gain не объявлять causal proof |
 | 05 | Claude Code memory/tool search | Малый начальный индекс и раскрытие вместо вечного дампа |
 | 06 | ClawVM | Сохранение необходимых смысловых единиц при сжатии |
@@ -262,7 +267,7 @@ Spool подтверждает доставку исходного событи�
 | 16 | LangMem | Отдельный background submit/search, сохранение всех inputs при debounce, scoped prompt proposal и реальный no-change; §§23–24 |
 | 17 | Letta Code current | Candidate/cancel и защита от позднего результата |
 | 18 | Letta V1 archive | История по требованию и цена truncation; не current Code |
-| 19 | Nocturne Memory | Stable node, revision, alias; review до разрушения источника |
+| 19 | Nocturne Memory | В 0.14 прочитаны stable node/version/alias и настоящий read renderer: recall clues плюс раскрытие; без boot-ритуала, принудительной личности и обязательной URI-иерархии (§28) |
 | 20 | Mem0 OSS | Batch extraction/embeddings; отличать ошибку от пустого результата |
 | 21 | OpenMemory historical MCP | Membership/access ideas с оговоркой о historical продукте |
 | 22 | OpenMemory session CLI | Перенос сессий; roadmap не выполненный runtime |
@@ -286,7 +291,7 @@ Spool подтверждает доставку исходного событи�
 | 40 | Wasmtime | Изоляция реального недоверенного расширения при оправданной цене |
 | 41 | SurrealDB Agent Memory / Spectron | Source-linked retrieval/scope; отдельный application tier |
 | 42 | MAGMA | Ограниченные typed graph walks с фактическими фильтрами |
-| 43 | A-MEM | Предложения evolution заметок, не model-authorized overwrite |
+| 43 | A-MEM | В 0.14 сопоставлены статья и отдельная library: локальная эволюция поискового описания/связей, но фактические record IDs и отбор соседей до упаковки. Не считать library автоматически выполнением эксперимента статьи (§28) |
 | 44 | Google Research Harness2 | Два цикла улучшения и раскрываемые реальные материалы; §§19,25. Не импортировать benchmark engine или считать cache новым экспериментом |
 
 Hy-Memory отдельно углублён в §§6,16–18. Не нужно импортировать всех доноров, чтобы сохранить перечисленные свойства.
@@ -408,7 +413,7 @@ O1–O6 в Implementation — точный host, controller routes, filesystem d
 
 ## 19. Harness2: рекурсия для Eliot, не новый агентный runtime
 
-D44 прочитан на `1cfe254e...`; механизмы и исходный source map остаются в [историческом §19](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#19-harness2-рекурсия-для-eliot-не-новый-агентный-runtime). Текущая дополнительная проверка — §25.6.
+D44 прочитан на `1cfe254e...`; механизмы и исходный source map остаются в [историческом §19](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0a71fd7d1b784486ef38f66b11cdd15cc8f8f81e/docs/v3/AUDIT.md#19-harness2-рекурсия-для-eliot-не-новый-агентный-runtime). Дополнительная проверка прохода 0.10 — §25.6.
 
 ### 19.1 Два объекта обучения
 
@@ -774,4 +779,86 @@ Delta зависит от backend, первого sub-batch и параметр�
 
 **Чтение:** MemMachine TextSegmenter/TextDeriver, EventMemory encode path, semantic ingestion/LLM helpers, выбранный PostgreSQL storage и реальные registration/background callers; Hindsight content/hooks, retain orchestrator selected ranges, fact schema header и fusion functions. Недоступный большой memory_engine source не считается прочитанным; fetch с пустым content — ограничение доступа к bytes, не доказательство пустой реализации. Иные backend semantics, full capture orchestration, temporal Graphiti callers и все registry donors не объявляются закрытыми.
 
-Новых runtime, модельных, синтетических или продуктовых тестов не выполнялось. Количество вызовов выведено из циклов, не измерено в deployment; потеря raw-событий глобально не заявляется. Независимого субагентного review нет. Следующие точные чтения и фактический статус публикации отражаются в карте и PR.
+Новых runtime, модельных, синтетических или продуктовых тестов не выполнялось. Количество вызововов выведено из циклов, не измерено в deployment; потеря raw-событий глобально не заявляется. Независимого субагентного review нет. Следующие точные чтения и фактический статус публикации отражаются в карте и PR.
+
+## 28. Associations and useful forgetting 0.14
+
+**20 октября 2026; база `f82b7ff8`.** В этом проходе выбраны другие доноры: D43 A-MEM, D19 Nocturne Memory и D03 Subcog. Исследуются не их общие рейтинги, а связность между созданным знанием, поиском и фактически выдаваемым контекстом. Версии в §1 идентифицируют прочитанные исходники, не новые обязательные зависимости Eliot.
+
+### 28.1 Что полезно перенести
+
+| Механизм | Основание в доноре | Применение в Eliot |
+|---|---|---|
+| Новое событие улучшает способ найти прежнее знание | A-MEM: evolution contextual description, tags и links | В той же интерпретации изменить полезные cues/связь названного урока и реальное поисковое представление |
+| Один материал имеет несколько входов | Nocturne: stable node, version и aliases | Ресурс, тема и area view ссылаются на один lesson ID, не на копии текста |
+| Короткая ориентация помогает выбрать подробность | Nocturne: выбранный текст и child `When to recall` | Полезный ответ плюс несколько объяснённых handles; обычный `open`, не обязательная навигация по всему дереву |
+| Независимый поиск и простое объединение | Subcog: text/vector arms, RRF и фактический recall caller | Native Store queries и небольшая функция ranking; значение score не подменяет условия применимости |
+| Меньше лишнего в текущем контексте | Subcog tiering как идея, Nocturne progressive recall | Снижать обычную выдачу ненужных подробностей, сохраняя доступ к источнику и редким применимым случаям |
+
+Последняя колонка — наши проектные решения. Они не измерены на работающем Eliot и не требуют переноса всех слоёв этих продуктов.
+
+### 28.2 A-MEM: эволюция поискового представления, а не только накопление заметок
+
+В [статье 2502.12110v11, §§3.1–3.4](https://arxiv.org/html/2502.12110v11) заметка сочетает исходное содержание, ключевые слова, tags, contextual description и links. Новая заметка помогает пересмотреть описания/связи соседних; embedding в формуле 3 использует не один исходный текст, а обогащённое представление. Полезная идея: новый опыт меняет не только количество записей, но и то, по каким ситуациям находится старое знание.
+
+При этом [README библиотеки](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/README.md) отдельно направляет к experiment repository. Рассмотренная библиотека `agiresearch/A-mem` и результаты статьи не объявляются одним и тем же исполненным артефактом. Здесь не воспроизводились их эксперименты и не используются заявленные scores как гарантия V3.
+
+В фактическом [memory_system.py](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L230-L320) `add_note` создаёт MemoryNote, вызывает `process_memory` и индексирует `note.content`; `analyze_content` не вызывается этим обычным путём. Default keywords пусты, context — General, если caller не передал другие значения. [ChromaRetriever.add_document](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/retrievers.py#L45-L110) передаёт content как document, а context/tags — metadata. Следовательно, нельзя обещать, что описанное в статье обогащение embedding уже получается от этой library entrypoint само.
+
+**Для Eliot:** сохранить оригинал, а полезное поисковое описание держать как производное. Когда новая работа уточняет, при каком запросе старый урок пригодится, обновлять соответствующие lexical fields и при необходимости embedding input, которые reader действительно использует. Метаданные, которые никто не читает при выборе, сами по себе не реализуют адаптацию памяти. Это обычное изменение нескольких records и derived vectors через прежние jobs, без нового EvolutionService.
+
+### 28.3 A-MEM: два разрыва между отношениями и их использованием
+
+В [find_related_memories](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L290-L350) есть настоящий `doc_id`, но функция возвращает позиции результатов `i`. Далее [process_memory](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L585-L750) применяет эти позиции к `list(self.memories.values())`, то есть к порядку общего словаря. Порядок сходства не обязан совпадать с порядком добавления. В update_neighbor это адресует не обязательно те заметки, которые модель только что прочитала. Вывод следует из producer/consumer индексов, без запуска модели или synthetic test.
+
+Второй разрыв — [search_agentic](https://github.com/agiresearch/A-mem/blob/ceffb860f0712bbae97b184d440df62bc910ca8d/agentic_memory/memory_system.py#L508-L585): сначала добавляются до k direct hits, после них — связанные заметки, затем возвращается `memories[:k]`. Когда прямые результаты заняли все k мест, добавленные соседи в ответ не попадут. Это не утверждение об отсутствии любого graph retrieval во всех методах; исследована конкретная заявленная agentic entrypoint.
+
+Изменение neighbor tags/context также записывается в in-memory object без немедленного обновления его Chroma metadata в этой ветви. Reader выбирает часть содержания из metadata, поэтому наличие нового описания в одном объекте не гарантирует его использование следующим поиском. Полное поведение поздней re-add consolidation и версий Chroma здесь не квалифицировано.
+
+**Устраняем причины, а не добавляем проверяющий слой:** передавать реальные target IDs из поиска до изменения; direct и полезные related candidates объединять до окончательной упаковки; обновлять то представление, по которому реально читаем. Не нужно проверять все заметки мира, добавлять подпись на соседство или всегда выделять фиксированную долю контекста каждому типу результата. Смысловая связь должна иметь полезный consumer, а не просто увеличивать число рёбер.
+
+### 28.4 Nocturne: recall clue — не правило доступа
+
+[Tool reference](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/docs/TOOLS.md) использует `disclosure` для короткого описания **когда вспомнить** запись. Это не ACL, не privacy label и не требование доказать предусловие перед чтением. В [реальном renderer](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/system_views.py#L20-L180) выбранная память выдаётся полностью, а дочерние — как URI, priority и `When to recall`; при отсутствии описания используется snippet. Glossary добавляет поперечные ссылки. В этом renderer нет генеративной классификации на каждый переход.
+
+Проверен [MCP read_memory caller](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/mcp_server.py#L280-L400), а не только helper. Обычный read действительно вызывает этот formatter; boot отдельно собирает настроенные core URI. В boot renderer неудача одного источника перечисляется, а успешно загруженные материалы остаются в ответе.
+
+**Eliot:** готовая ориентация может показывать несколько подходящих входов: «при изменении возвращаемого типа открыть историю совместимости», «при похожем timeout открыть прежний repair». Основной полезный совет уже присутствует; подробности доступны существующим `open`. Automatic context остаётся у Eliot, не перекладывается целиком на обязанность модели самостоятельно догадаться о каждой записи. Пустое recall description не мешает capture и прямому поиску. Полный векторный поиск Eliot не отменяется тем, что этот донор использует keyword search.
+
+### 28.5 Nocturne: несколько путей без нескольких копий знания
+
+В [models.py](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/db/models.py#L1-L220) Node UUID сохраняется между версиями Memory; Edge ссылается на Node, а Path является адресом. Поэтому новая версия текста не требует перепривязать все смысловые отношения. [add_alias tool](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/backend/mcp_server.py#L775-L905) вызывает `graph.add_path` и сообщает о другом входе к тому же материалу. Полный DB transaction этого graph helper не изучен, поэтому декларация tool и модель данных не выдаются за exhaustive storage review.
+
+Берём **различие identity/representation/entrance**: один метод может находиться через тему, конкретный ресурс и связанную ошибку без трёх расходящихся копий. Удаление одного пути не равно физическому удалению знания; наши существующие операции forgetting уже различают эти задачи. Не нужен импорт всего materialized URI tree и его каскадной синхронизации, если ID+cue/link решают задачу.
+
+Не переносим [personality system prompt](https://github.com/Dataojitori/nocturne_memory/blob/1858957bf797722a9b731fb197bd9530f7ae67e4/docs/system_prompt_en.md) как архитектуру Eliot: там предписаны mandatory boot до любой работы, first-person-only записи, устранение всех противоречий и стабильное число nodes как признак зрелости. Это авторская настройка данного агента, не свойство memory engine и не наши исходные требования. Eliot сохраняет цитаты, наблюдения, намерения и гипотезы различимыми; конфликт нельзя удалить лишь потому, что наличие двух версий неудобно. Полезный способ навигации не требует обязательного ритуала чтения или новой человеческой приёмки каждой записи.
+
+### 28.6 Subcog: рабочий простой поиск и неверное прочтение его шкалы
+
+В [RecallService](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/recall.rs#L790-L1240) hybrid_search действительно вызывает text/vector arms отдельно, объединяет их RRF и сохраняет raw scores. [MCP execute_recall](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/mcp/tools/handlers/core.rs#L120-L230) вызывает этот поиск с построенным фильтром; это не одна функция без потребителя. При недоступной векторной части предусмотрено продолжение с текстом. Для Eliot полезны native filtered queries и малая rank-fusion функция, не ещё один сервис поисковой координации.
+
+Но `normalize_scores` делит результаты на максимальное значение текущего набора. Любой положительный top hit получает 1,0, даже когда абсолютная связь с запросом слабая. Это удобное относительное представление, **не вероятность правильности и не универсальный порог применимости 0,7**. Зафиксирован вывод о шкале, не обвинение всех downstream consumers донора в неверном поведении. В Eliot порядок выдачи и основания совета остаются разными сведениями.
+
+### 28.7 Subcog: забывание нельзя получать из красивой формулы по названию
+
+Связаны две реальные реализации: [ConsolidationService.calculate_retention_score/consolidate](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/consolidation.rs#L465-L650) и [RetentionScore](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/models/consolidation.rs#L155-L235). В service importance постоянно 0,5. Формула — 0,2×frequency + 0,3×recency + 0,5×importance, а Archive выбирается ниже 0,2. Для неотрицательных frequency/recency минимум равен **0,25**; следовательно, архивная ветвь этой функции недостижима при её нормальных входах. Это прямой алгебраический вывод из кода, не выполненный runtime-тест.
+
+Access counts/last_access здесь лежат в локальных LRU, новый service начинает с пустых значений, отсутствующий last_access превращается в 0. Такой cache не является достоверной многолетней историей использования. Кроме того, helper `detect_contradictions` считает количество элементов namespace сверх порога, а не анализирует противоречащие утверждения. Его счётчик может обозначать участок для рассмотрения, но не обнаруженные содержательные конфликты.
+
+**Существенная граница:** lifecycle `consolidate()` и LLM/grouping `consolidate_memories()` — разные функции. В навигации найдены настоящие CLI/MCP callers второй; end-to-end caller первой в этом проходе не установлен. Поэтому не заявляется, что обычная команда Subcog всегда теряет/архивирует данные или что вся его консолидация фиктивна. [create_summary_node](https://github.com/zircote/subcog/blob/0cd2d4f0cff04938c9f865353fbfefa1b4e3f754/src/services/consolidation.rs#L1250-L1450) действительно сохраняет сводку и исходные IDs; это полезный механизм. Отдельный `link_memories` — явно документированная no-op заготовка, но другие edge writes существуют.
+
+В частности, fallback `create_related_edges` строит двунаправленные связи каждой пары группы. Это n(n−1) направленных записей, не обязательная цена полезной ассоциации. В Eliot источник+сводка или несколько содержательных relations дают навигацию без полного mesh. Full scan, все пары, HOT/WARM/COLD storage tiers и очередной lifecycle service не импортируются вместе с идеей меньшего шума.
+
+### 28.8 Практическое забывание и связный пример для V3
+
+Уменьшать текущий контекст и уничтожать историю — разные действия. Сначала обычный compiler перестаёт повторять ненужные подробности, показывает компактный действующий метод и оставляет доступ к источнику. Доступные usage/recency сведения могут помочь этой выдаче; отсутствие статистики не означает, что запись забыта с Unix epoch. Чтение тоже не подтверждает истинность или успешное применение. Давно не встречавшаяся ошибка немедленно полезна, когда адресован тот самый ресурс.
+
+Проектный пример: прежний эпизод описан как сбой Nginx. Новая попытка показывает, что полезный урок относится к SPA fallback. Dreamer уточняет recall clues и связь с конфигурацией маршрутизации у **того же** метода; исходный эпизод не переписывается как будто изначально имел это объяснение. Его можно найти по Nginx, SPA и конкретному config path. Краткая карточка показывает действие и исключение, `open` — историю исправления. Повседневный prompt не таскает все логи, а редкий точный запрос их по-прежнему находит.
+
+Это иллюстрация нашего дизайна, не наблюдавшийся benchmark. В Cognition изменены §2 (несколько входов), §5.2 (соседи до упаковки и смысл score), §5.4 (короткие recall clues), §6.8 (реальное indexed представление) и §7 (exposure отдельно от truth/erase). Механизмы используют прежние records, native queries, context и Dreamer jobs. Новая модель доверия, глобальная оценка важности и отдельная служба забывания не создаются.
+
+### 28.9 Охват и незакрытые вопросы
+
+A-MEM: статья v11 и library README; `memory_system.py` от MemoryNote до process_memory; retriever add/search/metadata и объявление альтернативного persistent backend. Экспериментальный `WujiangXu/AgenticMemory` здесь не проверен. Nocturne: tool/system-prompt docs, models1–230, system_views1–270 и MCP read/alias/delete paths; полная реализация graph transactions не проверена. Subcog: README и историческая consolidation specification сопоставлены с выбранными service/model/recall functions и реальным recall handler; не весь startup, hooks или lifecycle wiring.
+
+Новые выводы — чтение исходников, сравнение contract/consumer и алгебра формулы. Приложения, модели, synthetic tests и product tests не запускались; заявленные авторами метрики не воспроизводились. Независимого субагентного review нет. D03/D19/D43 уточнены в прежнем реестре, остальные открытые пути сохранены в карте. Следующий полезный контраст — MAGMA и Letta: когда обход связей или активное раскрытие действительно добавляют сведения, а когда только умножают запросы. Не переносить их topology по названию, пока не прочитан конкретный consumer.
