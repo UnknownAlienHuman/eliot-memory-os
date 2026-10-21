@@ -1,8 +1,10 @@
 # Eliot Memory OS V3 — сводный аудит документации и архитектуры
 
-**Редакция 0.19 · 20 октября 2026 · документация до переписывания продукта.**
+**Редакция 0.20 · 21 октября 2026 · документация до переписывания продукта.**
 
-**Новый результат — [§32](#32-host-capture-and-non-destructive-continuation-019):** прочитаны ранее пропущенные claude-mem и OpenHands Software Agent SDK. Проверены реальные hook handlers, захват до фоновой обработки, выдача контекста и границы сжатия по связям вызовов/результатов. В реестр добавлены D45–D46; исходные D01–D44 не перенумерованы. Субагенты в этой сессии не запущены: доступного вызова их исполнения не оказалось. Это самостоятельное чтение, не независимая проверка четырьмя агентами.
+**Новый результат — [§33](#33-controller-execution-and-embedding-boundary-020):** проверены действующие controller methods, создание/запуск Task, настоящий вызов Claude SDK и чтение результата. Подготовка исполнителя и принятие input не равны inference; поддержка `agent.send` не гарантирует чтения его ответа выбранным reader. Для текста задан конкретный путь через настоящую задачу интерпретации без выдуманного coding verification. Отдельный embedding RPC в проверенном реестре не найден; минимальная недостающая операция описана в существующем controller, не заменена вторым исполнителем в памяти. [Implementation §6](IMPLEMENTATION.md#6-dreamer-through-controller) изменён непосредственно.
+
+**Результат 0.19 — [§32](#32-host-capture-and-non-destructive-continuation-019):** прочитаны ранее пропущенные claude-mem и OpenHands Software Agent SDK. Проверены реальные hook handlers, захват до фоновой обработки, выдача контекста и границы сжатия по связям вызовов/результатов. В реестр добавлены D45–D46; исходные D01–D44 не перенумерованы. Субагенты в этой сессии не запущены: доступного вызова их исполнения не оказалось. Это самостоятельное чтение, не независимая проверка четырьмя агентами.
 
 **Результат 0.17 — [§31](#31-real-interpretation-not-validation-shaped-learning-017):** прослежены сохранение наблюдения и следующий projection worker V2, фактический вход Dreamer и его локальная «модельная» стадия. Обновление индексов не оказалось интерпретацией, а проверка пустого draft — вызовом модели. Для сравнения прочитан реальный extraction-путь D20 Mem0. Решение V3 — соединённая работа с исходным эпизодом, настоящим controller response и обычной памятью, без добавления нового слоя удостоверений.
 
@@ -20,12 +22,12 @@
 |---|---|
 | V1 | `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`: исходные требования и донор |
 | V2 | `5aac094834fb5635921b550c821cb933a1196105`: замороженные нормативы и код |
-| База текущей документации | `815f51e5a6839263ce6e310a42392c7810eb8218`, PR #5325 |
+| База текущей документации | `350832a981f642e475d1b92899f976e8ea80cb33`, PR #5325 |
 | Claude audit | Приложенный `eliot-documentation-audit(1)(1).md`, редакция 4: предложения и исторические измерения, не безошибочный норматив |
 | Архив | [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete): материалы исследования, не обязательный backlog V3 |
 | Hy-Memory | `7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a`: выбранные writer/reconciliation/store/System 2 пути |
 | MemOS local plugin | `a7367d07e55db61099f7b4e2c1108bc5831a24f3`: выбранные L2/gain функции |
-| Eliot Swarm Controller | `96a0d5a6632cfbd541e804d7969d3e76e716bf6a`: прежняя ограниченная проверка integration document |
+| Eliot Swarm Controller | `912df90f86320ff556c1dba23badc2c69e518e34`: текущие registry/Task/dispatch/Claude result paths (§33); прежние findings сохраняют свои ссылки |
 | Harness2 D44 | `1cfe254e8d25b15f37048c3730134686abe60335`; [статья 2610.14224v1](https://arxiv.org/html/2610.14224v1) |
 | LangMem D16 | `48e3c11f5bb527282c7d5339c6a87a0b35abccfc`: reflection/extraction и prompt optimization |
 | Hindsight D09 | `c5f585f8f8568ed0677eb2e70fe830c4c483e2a2`: consolidation, views, выбранные retain и host paths |
@@ -212,11 +214,9 @@ Owner-selected restore работает даже при утраченном ф�
 
 ## 11. Доноры и аудиты: карта, не обязательная программа переносов
 
-Исторический реестр: 43 D-поверхности, 27 P-работ, 187 S-записей — 257 строк, не 257 независимых прочитанных источников. Добавленные D44–D46 сохраняют старые IDs. Архив и все upstreams целиком не перечитаны. Конкретное копирование кода требует условий соответствующей версии; исследование механизма не импортирует продукт. Сверка охвата в [AUDIT-MAP](AUDIT-MAP.md) остаётся отдельной от решения использовать механизм.
+Исторический реестр: 43 D-поверхности, 27 P-работ, 187 S-записей — 257 строк, не 257 независимых прочитанных источников. Добавленный D44 сохраняет старые IDs. Архив и все upstreams целиком не перечитаны. Конкретное копирование кода требует условий соответствующей версии; исследование механизма не импортирует продукт.
 
 ### 11.2 D01–D44
-
-Заголовок сохраняет исторический anchor; D45–D46 добавлены ниже без перенумерации прежних строк.
 
 | D | Донор | Решение/механизм |
 |---|---|---|
@@ -575,7 +575,7 @@ Eliot берёт подходящие already-saved episode slices и relevant m
 
 Проверена не только эта декларация. [HTTP route](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/entrypoints/api/routes/search.py) вызывает [service.search](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/service/search.py), который создаёт [SearchManager](https://github.com/EverMind-AI/EverOS/blob/c4a20a280a4c8c4bd3a91174c57dd92ac6cfba18/src/everos/memory/search/manager.py). User path формирует episodes/profile/unprocessed, agent path — cases/skills/unprocessed. Foresight recaller и поле его выдачи в этом построении отсутствуют. Это конкретный стандартный consumer, не исчерпывающий поиск каждого возможного custom reader или доказательство невозможности прочитать сохранённый Markdown.
 
-**Для Eliot:** существующая интерпретация эпизода может сохранить условную будущую потребность или риск рядом с основанием, а обычный `context` показывает его при релевантном решении. Уже явный план не требует ещё одного предсказательного вызова. Формат «при этих условиях полезно проверить X, поскольку в эпизоде Y произошло Z» даёт действие и ограничение; отдельная ForesightDatabase или бесконечный predictor на каждом сообщении не нужны. Без пути до контекста генератор не считается законченной когнитивной функцией.
+**Для Eliot:** существующая интерпретация эпизода может сохранить условную будущую потребность или риск рядом соснованием, а обычный `context` показывает его при релевантном решении. Уже явный план не требует ещё одного предсказательного вызова. Формат «при этих условиях полезно проверить X, поскольку в эпизоде Y произошло Z» даёт действие и ограничение; отдельная ForesightDatabase или бесконечный predictor на каждом сообщении не нужны. Без пути до контекста генератор не считается законченной когнитивной функцией.
 
 ### 30.3 Срок прогноза не превращается в факт исполнения
 
@@ -765,3 +765,73 @@ OpenHands: condenser README, token helpers, LLMSummarizingCondenser, Condensatio
 Попытки получить архив/локальную копию не дали проверенного полного корпуса; missing work-system report от14.10 тоже не найден поиском по имени. Найденный соседний отчёт о донорах controller не подставлен вместо него. Полная исходная автономность, controller request/result и все старые аудиты остаются открытыми по карте. Из46 нумерованных поверхностей15 теперь имеют конкретные source findings,3 — doc/paper treatment,28 — прежний неподтверждённый comparable review; это не процент завершённости и не полный объединённый список источников владельца.
 
 Независимых субагентных заключений нет. Запись результатов в GitHub подтверждает публикацию, не запуск V3 или автоматическое слияние PR. Работа с кодом продукта по-прежнему следует после документации.
+
+## 33. Controller execution and embedding boundary 0.20
+
+**21 октября 2026; документация Memory OS на `350832a9`, controller на `912df90f86320ff556c1dba23badc2c69e518e34`.** Этот проход закрывает часть предметного пробела O2: вместо слов «вызвать controller» показаны реальные отправка, состояние и получение текста. Установка пользователя, модель и транспорт не запускались; source-connected путь не объявляется готовой интеграцией. Отдельная потребность в векторах остаётся конкретной недостающей capability, а не скрывается за успешным text call.
+
+### 33.1 Два направления связи не один готовый интерфейс
+
+Текущий [integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/docs/eliot-memory-os-integration.md) по-прежнему помечает runtime integration как requested/not implemented. Его `eliot_compile_packet_l3` — будущий запрос **controller→memory**, не реализованная модельная обработка **memory→controller**. Положительный [реестр методов](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-contracts/src/method_policy.rs) перечисляет настоящие Task/agent/result/artifact операции. Отдельного метода получения vector embeddings в нём не найдено; это сильнее отрицательного keyword search, но не утверждение об отсутствии любого такого кода или частного endpoint во всех соседних продуктах.
+
+[IPC](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/ipc.rs#L1-L190) уже принимает аутентифицированные запросы и передаёт их Store. Это готовая граница для клиента памяти. Переносить второй provider runtime, новую сеть прокси или controller SQLite в Memory OS не требуется. Здесь не предлагается обходить существующее право клиента; отсутствие будущей memory integration не превращает неизвестный метод в разрешённый RPC.
+
+### 33.2 Открыть исполнителя не означает отправить задачу
+
+В [operations::open/reserve_open](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/store/operations.rs#L2600-L3050) прямой `agent.open` принимает `lane_id` и `route`, создаёт binding и возвращает queued/not_observed. Он не требует Task в своём входе. Отдельный `open_for_launch_for_actor` действительно связан с Task, Attempt и lease. Поэтому прежняя обобщённая фраза «любое открытие требует coding Task/worktree» была бы неверной.
+
+Реальный [Claude startNative](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/modules/claude/bridge-v6.mjs#L400-L495) вызывает SDK startup через `prepareQuery`. Это подготовка процесса без prompt и без native session identity. В `sendNative` первый запрос допускается через `task.dispatch`, затем выполняется **`prepared.query(gatedInput)`** и читается SDK stream. Здесь есть настоящий вызов модели в коде, в отличие от локальной проверки пустого draft в V2 Memory OS (§31).
+
+Контрпроверка важна: rootless `agent.send` в этом bridge отказывает с `INITIAL_TASK_DISPATCH_REQUIRED`. Обойти Task, просто переименовав вызов в send после open, нельзя. Но это свойство конкретного выбранного route, не доказательство устройства каждого другого адаптера.
+
+### 33.3 Настоящая задача интерпретации не обязана имитировать разработку кода
+
+[TaskSpec](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/model.rs#L420-L545) и [task admission](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/store/tasks.rs#L80-L245) позволяют отсутствие acceptance policy. Тогда нельзя подкладывать verification fields, которые не будут иметь смысла. Следовательно, требовать fake verifier/commit/test report ради любого полезного ответа неправильно даже относительно этого controller.
+
+**Начальное проектное отображение V3:** одна выбранная связная порция эпизода становится настоящей конечной synthesis Task: что требуется понять и какой полезный ответ нужен. Existing `task.create`/`task.claim` связывают её с выбранным binding; `task.dispatch` передаёт материал. Это не Task на каждый source event и не перенос всего coding workflow в память. `acceptance` отсутствует, когда работа не требует формальной политики приёмки; модельный ответ всё равно не объявляется доказательством правильности вывода.
+
+[Dispatch](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/store/operations.rs#L3260-L3465) действительно требует текущий Attempt и ready binding. [TaskPrompt builder](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/store/task_prompt.rs#L175-L270) добавляет к source text Task identity и brief. Нельзя называть этот путь byte-identical raw completion API. Memory adapter передаёт настоящие данные/доступные handles и ожидаемый ответ, а служебную идентичность оставляет её текущему владельцу.
+
+Это выбранный путь реализации первого текстового обмена, не обещание сегодняшнего live запуска и не вечный запрет более прямого backend. Если иной существующий route принимает малый запрос и возвращает соответствующий результат напрямую, достаточно тонкого adapter к нему; не нужен универсальный inference framework ради поддержки обоих.
+
+### 33.4 Принятый input, завершение модели и bytes ответа — разные факты
+
+Claude `settleSends` после native echo записывает `outcome: applied`, но одновременно явно указывает `completion_condition: native_input_admitted` и **`execution_complete: false`**. Это корректно описанный факт принятия input. Ошибка возникла бы в Memory OS, если она превратила такой applied в «Dreamer закончил, можно продвинуть обработанный диапазон».
+
+[Результаты controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/README.md) читаются без повторного inference: `agent.result` сохраняет page artifact, следующие диапазоны получают по той же identity, `artifact.read`/assembly работают с уже полученными bytes. [Claude result-pages](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/modules/claude/result-pages.mjs) принимает completed **или failed** terminal result. Непустой diagnostic текст failed ответа не является извлечённым уроком и не равен успешному keep.
+
+**Применение:** в существующем memory job хранится ссылка на external execution и полученный output. После перезапуска читается тот же результат, где это поддержано, а не отправляется «повтори ответ». Обрабатывается завершённый нужный response, не latest reply соседнего turn. Одна страница и полный результат различаются. Дополнительный StatusService, генератор подтверждений и копия controller Operations внутри памяти не нужны.
+
+### 33.5 Возможность отправить следующий turn не гарантирует его получение этим reader
+
+В прочитанном bridge `agent.send(next_turn)` реально поддержан. Но `resultOrigin` в том же [result-pages.mjs](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/modules/claude/result-pages.mjs#L20-L90) требует **`origin.target_method === 'task.dispatch'`**. Селектор `claude_assistant_result` привязан к соответствующему input_operation_id, session и native input. Поэтому нельзя спроектировать постоянный Dreamer как произвольную цепь `agent.send` и заявить, что данный reader возвращает результат любого её шага.
+
+Это установленное ограничение выбранной пары input/result, не доказательство отсутствия других способов прочитать native transcript. Не нужно компенсировать его в памяти новой системой scraping или просьбой к агенту прислать текст ещё раз. Для нужной пары используется существующий поддержанный путь либо адресно дорабатывается **тот же controller adapter**. Право повторного использования native session не подменяет соответствие конкретного ответа конкретному запросу.
+
+Есть ещё два практических предела. Source body у этого reader ограничен **512000 bytes**, страница — **65536 bytes**; общий больший artifact envelope не увеличивает первый предел. Тело до копирования в controller хранится в текущем bridge; capability `recover/resume` отсутствует. Реконнект живого bridge и восстановление после его потери — разные операции. Не обещать бесконечный размер или durable readback по одному наличию operation ID. Это не новые предлагаемые лимиты Eliot, а свойства источника, которые adapter обязан отражать.
+
+[Текущий Codex README](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/modules/codex/README.md) описывает другой Rust executor и иные размеры/восстановление. В этом проходе его полная реализация результата не прослежена, поэтому Claude-вывод не распространяется на Codex. Старый Python bridge нельзя объявить текущим исполнителем только потому, что он лежит в том же репозитории.
+
+### 33.6 Векторы нельзя получить переименованием текстового вызова
+
+В просмотренном положительном реестре есть agent/task/results, но нет проверенного callable batch-embedding API. Поиск `embedding` сам по себе дал и термин «встраивание host», который к vector representation не относится. Отсутствие метода сформулировано в границе **этого реестра и ревизии**, а не как глобальное отрицание всех encoder implementations.
+
+**Минимальная нужная операция — проектное предложение, ещё не реализованный API:** выбранный encoder route, request key и список `(item_id, content_revision, text)` передаются существующему controller provider boundary; обратно приходят соответствующие vectors либо item errors и фактический encoder/profile. Query/document preprocessing сохраняется, если выбранная модель его различает. Где native response позиционный, исходный порядок фиксируется у отправленного batch, не угадывается по порядку постороннего ответа.
+
+Не нужны coding Task на каждый вектор, агент, печатающий список чисел, отдельная очередь провайдера в памяти или новая vector database. Existing controller transport/execution и ordinary Store достаточно; конкретное публичное имя будущего метода не выдаётся за существующее. Text и embeddings конфигурируются независимо. Недоступная векторизация не блокирует raw/lexical путь, но полный продукт с требуемыми векторами пока не объявляется реализованным.
+
+### 33.7 Не создавать рекурсивную зависимость до первого полезного результата
+
+Это **вывод для конструкции V3**, не воспроизведённый deadlock действующего controller. Controller запрашивает memory context для обычной работы; память просит controller интерпретировать сохранённое. Если запуск этой интерпретации обязательно ждёт её же будущую карту/урок, первый полезный результат никогда не появится.
+
+Исправление — порядок обычных вызовов. Finite job уже имеет выбранный source slice и может начать с ним. Optional lookup читает доступное, не ждёт завершения собственного producer. Controller исполняет один запрос, память сохраняет полезный результат; индексы и зависимые views обновляются после этого. Не нужен readiness graph или обходной token. Не добавлять controller Goal, бесконечно возобновляющий уже выполненный semantic job.
+
+### 33.8 Изменения, доказанный охват и остающееся
+
+В Implementation §6 теперь есть таблица настоящих операций первого текстового пути, фактические ограничения Claude input/result и минимальная отдельная vector capability. O2 перестал означать абстрактное «что-нибудь через controller»: нужны wiring выбранной пары и небольшой недостающий encoder operation в его владельце. Native execution code, права, workflows и оба runtime репозитория **не изменялись**.
+
+Свежие reads: controller README, agent-operations implementation1–210, Memory integration, canonical MCP surfaces1–200, Claude/Codex README; method_policy registry; IPC1–190; model TaskSpec/current admission и request fields; tasks1–260; operations open/reserve/dispatch примерно2600–3465; task_prompt1–290; Claude bridge1–245 и320–600; result-pages1–240. Дополнительно для навигации прочитаны выбранные Store/runtime/results ranges и явно Store-only taskless ScriptRun fixture. Этот fixture не доказывает taskless модельного вызова; ни его, ни другие тесты не запускали. Не прочитаны все controller validators, все adapters и полная обработка каждого terminal event.
+
+Перечисленные sources проверены по GitHub; попытки локально загрузить text snapshot не удались из-за сети/DNS, поэтому full checkout или local diff-check не заявляются. Публикация проверяется фактическим diff/ref. Нет оплаченного inference, БД-прогона, benchmarks, новых product/synthetic tests, Clippy или независимого субагентного review.
+
+Остались реальная интеграция выбранного route, encoder implementation и конкретная схема/операции primary Store. Следующий проектный шаг — минимальные записи и native queries от capture до поиска и поправки урока, вместе с оставшейся сверкой исходной автономности. Это не новые разрешения на работу и не повод считать ещё28 непересверенных доноров прочитанными.

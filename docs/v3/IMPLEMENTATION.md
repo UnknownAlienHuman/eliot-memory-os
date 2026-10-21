@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 0.11 · 2026-10-20 · design for the greenfield implementation.**
+**Revision 0.20 · 2026-10-21 · design for the greenfield implementation.**
 
-[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §§23–25](AUDIT.md#25-real-experience-input-and-normal-context-010) explains the blocking machinery and fabricated skill surfaces being replaced. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. This revision makes the native implementation choices and connected work sequence explicit. It is documentation, not a claim that V3 is implemented.
+[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) traces actual controller input and result paths and distinguishes the missing embedding interface. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. This revision specifies the first text integration and the separate vector requirement inside existing owners. It is documentation, not a claim that V3 is implemented.
 
 ## 1. Initial delivery
 
@@ -192,23 +192,56 @@ Reserve useful service for capture/control/outcomes during bulk work. Import/reb
 
 ### 6.1 Actual integration boundary
 
-The previously examined [controller integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/96a0d5a6632cfbd541e804d7969d3e76e716bf6a/docs/eliot-memory-os-integration.md) describes controller-to-memory context, not a completed reverse inference API. Select actual text and embedding routes separately using existing controller infrastructure. Method names and installed capabilities remain implementation choices.
+The controller was read at `912df90f86320ff556c1dba23badc2c69e518e34` on 2026-10-21. Its [Memory OS integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/docs/eliot-memory-os-integration.md) still describes a future controller-to-memory context request, not the reverse inference connection. The positive [method registry](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-contracts/src/method_policy.rs) exposes agent execution and result reads; no dedicated vector-embedding method was found there. Do not label both capabilities implemented merely because a controller connection exists.
+
+Use the controller's existing authenticated client/IPC and selected execution route. Memory OS does not copy its Store, native adapters, provider loop or admission envelopes. The concrete initial text mapping below uses a genuine finite synthesis Task. This is a design choice over inspected source capabilities, not a completed integration or a requirement that every future executor expose Task objects.
 
 ### 6.2 Request and result
 
-A request carries finite input, method/output expectation, route and relevant cost/disclosure settings. A memory job reference suffices for maintenance unless the real executor requires a legitimate synthesis Task. Do not manufacture a coding Goal solely for transport.
+The memory-side request contains a stable request key, configured route, finite saved input, method/output expectation and relevant cost/disclosure settings. The job retains the returned external references and later reads that same execution. It does not maintain a parallel copy of every controller state. Input contains real event text or handles the executor can actually open, not source IDs presented as contents.
 
-Results carry the execution reference, output/partial/failure, observed model/profile and known or unknown usage. Accepted input is not generated output. Text-only maintenance need not receive workspace-modification tools. Credentials stay outside model context.
+| Step | Existing controller operation | Memory-side meaning |
+|---|---|---|
+| Prepare execution | `agent.open` with lane and route | Obtain the binding; this prepares an executor, not a model answer |
+| Describe the work | `task.create` and `task.claim` for the selected binding | One real episode-interpretation task with a useful objective/output; group related input, not one task per captured event |
+| Start that work | `task.dispatch` with the actual Attempt and text | Save its Operation reference; queued or native input admitted is not completed inference |
+| Observe the outcome | Existing state/event reads and the route's result selector | Distinguish completed, failed, still running and unknown; do not ask the model to repeat its answer |
+| Read the output | `agent.result`, then retained `artifact.read`/pages; assemble when needed | Obtain the actual response bytes for this input, not a status description or the latest unrelated reply |
+| Apply useful content | Existing memory revision/job transaction | Save create/amend/keep and the processed source range; controller Task acceptance is not proof of semantic truth |
+
+A synthesis Task's objective is interpretation of the supplied episode, not fictitious code modification. The inspected [TaskSpec and admission](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/model.rs#L420-L545) permit absence of an acceptance policy; do not add fake verifier, Git commit or test-result fields to get an advisory back. Actual controller authorization and route setup still apply. Direct `agent.open` is not the workspace-leasing `swarm.launch` path; an executor's configured working directory does not require a new worktree for every memory job.
+
+The controller [TaskPrompt builder](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/crates/swarm-kernel-host/src/store/task_prompt.rs#L175-L270) appends the real Task identity and brief. This route is not an unwrapped text-completion API. Describe the interpretation once, keep the supplied sources distinguishable from its instruction, and do not require the model to manufacture controller metadata.
+
+**Concrete route limit.** In the inspected [Claude bridge](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/modules/claude/bridge-v6.mjs#L400-L580), the first model query requires `task.dispatch`; later `agent.send` is a real next turn. However, its [result-page reader](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/modules/claude/result-pages.mjs) accepts a `claude_assistant_result` origin whose target method is `task.dispatch`. Do not implement recurring Dreamer work as arbitrary sends on this route while assuming the same result reader covers them. Reuse a route only for a request/result pairing it actually supports; extend the existing controller adapter when a needed pairing is missing, rather than ask the agent to restate an answer or build a second transcript scraper in Memory OS.
+
+A result page is not the complete response. Follow its continuation for the same input and preserve result identity across pages. The selected Claude reader caps pages at 65,536 bytes and the source body at 512,000 bytes; these are inspected adapter limits, not universal Eliot limits. Its not-yet-copied body is boot-local and resume/recover is unavailable. Read and retain useful output before releasing that executor; a worker loss cannot be repaired by calling a nonexistent durable result API. Other routes have their own behavior. A permitted replacement inference is a new charged attempt, not recovery of the old answer.
 
 ### 6.3 Apply useful proposals
 
 Accept model-proposed memory revisions, relations and procedures through a small application check: parseable result, addressed inputs/targets and relevant concurrent revisions. Models do not need a certificate of semantic understanding before a provisional note becomes usable. App-generated record IDs avoid confusing a proposed new item with an unrelated existing one.
 
-Commit genuinely dependent changes together. Independent valid proposals may survive an explicitly partial batch. An empty successful result is allowed. Invalid output is diagnosed without losing the original observation or stopping unrelated jobs. Physical erasure, execution permissions and the user's goal are not inferred from prose.
+Commit genuinely dependent changes together. Independent valid proposals may survive an explicitly partial batch. An explicit successful keep is allowed. A failed execution with diagnostic text, missing pages or an unparseable response is not keep and does not mark the episode interpreted. The original observations and unrelated work remain usable. Physical erasure, execution permissions and the user's goal are not inferred from prose.
 
 ### 6.4 Cost and observed support
 
-Use the actual executor's configured limits and count all attempts. Unknown usage is not zero. Fallback follows the configured route/disclosure choice. Demonstrate a capability's real request/result, error and cancellation/readback behavior before claiming that capability works; there is no requirement to qualify all providers before using one working route.
+Retain requested route/model separately from what the executor actually reports. Use known usage with its basis: a cumulative session snapshot is not another independent per-job charge, and a request's budget is not measured consumption. Unknown usage is not zero. Count actual retries and late results even when a stale proposal is no longer applied.
+
+Text-only interpretation does not need code-editing tools merely because the selected executor is a coding harness. Use a route with the appropriate actual tool configuration; do not add a separate permission platform inside memory. Credentials stay outside model context. Demonstrate the chosen route's actual request, terminal response and readback behavior during implementation before calling it integrated; there is no requirement to qualify all providers before using one working route.
+
+### 6.5 Embeddings are a separate batch operation
+
+**Still missing as a verified callable interface:** the inspected controller public registry does not provide a dedicated vector-embedding method. The minimum required extension belongs to the existing controller's model/provider boundary, not to a new service inside Memory OS. Its public method name and selected native encoder are not asserted to exist in this revision.
+
+The required data operation is small: a stable request key, encoder route and a batch of item IDs, content revisions and text in; corresponding vectors or item errors and the actual encoder/profile out. Where the encoder distinguishes query/document input, preserve that setting. A native positional response can be matched to the retained submitted order; never associate by an unrelated response order. Existing §4.2 checks finite values, dimensions and content/profile correspondence. A partial valid batch can be applied without discarding primary content.
+
+Do not ask a generative agent to print plausible numbers, wrap each embedding in a coding Task, or select a second memory database to hide this missing capability. Reuse the controller's transport, provider configuration and actual request execution; a thin typed operation is sufficient. Text synthesis and vector generation use independent configured routes, so changing Dreamer does not re-embed the corpus. Exact/lexical capture and recall continue while this route is unavailable; the full vector-enabled product is not declared finished until it is connected.
+
+### 6.6 Avoid a circular dependency between execution and memory
+
+Controller-to-memory context and memory-to-controller synthesis are separate calls. A job already holding its saved episode can start interpretation without first waiting for the finished project view or lesson it is itself producing. Optional retrieval during that work reads available primary memory; it does not demand completion of its own job. This is ordinary call placement, not a new readiness graph or bypass token.
+
+Eliot's `jobs` owns when a semantic transformation is useful; controller owns native execution. Do not add an autonomous controller Goal that repeatedly asks for the same memory job after it has completed. One final response supplies material to the existing memory transaction; indices and additional views can follow without a recursive controller-to-memory-to-controller startup loop.
 
 ## 7. Learning that reaches a subsequent attempt
 
@@ -373,7 +406,7 @@ All [29 original A15 scenarios](AUDIT.md#12-all-29-original-scenarios) and S1–
 | ID | Direction | Remaining implementation choice |
 |---|---|---|
 | O1 | Native Claude hooks + MCP | Installed event/ID and continuation/result behavior |
-| O2 | Existing controller, independent text and embeddings | Actual methods/routes and their execution/readback limits |
+| O2 | Existing controller; concrete synthesis Task/result mapping in §6 | Connect one selected route end to end; implement the missing dedicated batch-vector capability in the controller owner, with actual model and readback behavior |
 | O3 | Small spool and ordinary backup/restore | Windows file primitives and concrete recovery behavior |
 | O4 | Official network SDK and primary native indexes | Compatible versions/features and actual queries |
 | O5 | Automatic provisional learning and transfer | Useful task criteria and evidence for broader benefit claims |
