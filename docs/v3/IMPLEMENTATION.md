@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 0.21 · 2026-10-21 · design for the greenfield implementation.**
+**Revision 0.22 · 2026-10-21 · design for the greenfield implementation.**
 
-[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §34](AUDIT.md#34-native-store-operations-without-mirrored-state-021) explains the native persistence choices below; [§33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) traces the external execution boundary. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. This revision specifies primary records, finite input ranges and concrete Store operations. It is documentation, not an installed schema or implemented V3.
+[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §35](AUDIT.md#35-autonomous-understanding-without-a-compulsory-pyramid-022) reconciles the original Understanding Layer with the concrete source-to-view path in §8. [§34](AUDIT.md#34-native-store-operations-without-mirrored-state-021) explains native persistence; [§33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) traces external execution. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. These are design choices, not an installed schema or implemented V3.
 
 ## 1. Initial delivery
 
@@ -264,7 +264,7 @@ Jobs retain purpose, actual inputs/method, progress, current worker and any exte
 
 Claim a due job, compute outside the transaction, then conditionally publish its result and finish it. Check the actual current claim and affected input/target revisions when changing existing state. An expired worker cannot overwrite newer work; cancellation and completion meet on that job. These are local concurrency checks, not global authority epochs.
 
-Do not place all project work behind its oldest unapplied row. A failed map refresh must not block an unrelated procedure, capture or search. Preserve ordering only for transformations that actually depend on earlier outputs. Independent target jobs use the same queue and can proceed. No new task-graph engine is needed.
+Do not place all project work behind its oldest unapplied row. A failed map refresh must not block an unrelated procedure, capture or search. Preserve ordering only for transformations that actually depend on earlier outputs. Independent targets can run concurrently. No new task-graph engine is needed.
 
 Coalesce wakeups, not observations. Capture each event, then process the relevant unprocessed episode range; replacing a pending trigger with the latest message must not discard earlier unprocessed turns. Advance progress for inputs actually processed and committed. A running finite batch can finish; new input goes into its successor. Debouncing must not postpone every useful consolidation indefinitely during continuous activity.
 
@@ -351,7 +351,7 @@ The working interpretation is a normal controller request over saved episode mat
 
 Cognition distinguishes applicable, inapplicable and unknown. Missing preconditions are not filled by similarity. Unknown can still yield a conditional analogy or a useful check instead of total refusal.
 
-Provisional reuse in another configured context is automatic when appropriate; no approval or experiment per record. Claiming broad effectiveness is a stronger question requiring subsequent comparable evidence. Conditional usefulness does not depend on already proving a universal causal benefit.
+Provisional reuse in another configured situation is automatic when appropriate; no approval or experiment per record. Claiming broad effectiveness is a stronger question requiring subsequent comparable evidence. Conditional usefulness does not depend on already proving a universal causal benefit.
 
 For the API example, a missing diagnostic counts as success only when a suitable complete check covered the target revision. Distinguish a supported pass/failure from an inconclusive or unobserved check. Keep other real failures and costs visible; do not blame every offered procedure for an unrelated network problem.
 
@@ -369,11 +369,47 @@ Keep baseline/no-change eligible. A composed output is not automatically better;
 
 ## 8. Project understanding, causality and research
 
-Cognition owns purpose/map/area views, exact source structure, inferred meaning, membership tracking and targeted refresh. Initial exact capture/read starts before whole-repository onboarding. When a map is old or incomplete, expose useful remembered structure with that qualification and refresh the affected area; do not block orientation until every source is revalidated.
+### 8.1 First useful orientation, not compulsory whole-project onboarding
 
-Use available host tools, ripgrep or one suitable structural/LSP/SCIP adapter rather than competing code graphs. Preserve observable intermediate edits; a final diff cannot reconstruct reverted attempts.
+Within configured memory/background settings, the first attachment makes a finite orientation job due automatically. Foreground capture and context return existing knowledge and available source facts immediately. The agent need not call an onboarding ritual, propose every concept or approve every view. The owner can correct the result afterward through ordinary memory edits.
 
-Distinguish static dependency, co-change, analogy and causal explanation. A prediction precedes the action and names its observable criterion. Research retains sources, examined scope and gaps. These mechanisms can describe Eliot itself without rewriting its requirements merely to label a failure successful.
+Begin with actual project documentation/manifests and the area relevant to the task. Grow a compact purpose/map/area view as useful material becomes available. A directory grouping can help navigation without defining the real conceptual architecture. A file may serve several cross-cutting concerns; there is no required minimum number of concepts, unique file-to-concept partition or complete pyramid before the first helpful response. Non-code projects use their documents, sections, observations and sources through the same path.
+
+### 8.2 One selected structural source, not an embedded code-intelligence platform
+
+Use a configured **codebase-memory-mcp** connection as the initial structural adapter when available through the host/controller tool route. Source reviewed on 2026-10-21: [DeusData/codebase-memory-mcp at 3457b21b](https://github.com/DeusData/codebase-memory-mcp/tree/3457b21b0a3d75960c07ed3ec666a9e684985ef9), donor D47. Its [actual get_architecture handler](https://github.com/DeusData/codebase-memory-mcp/blob/3457b21b0a3d75960c07ed3ec666a9e684985ef9/src/mcp/mcp.c#L8059-L8290) provides compact languages/packages/entry-points by default and scoped requested aspects. Request structured output for adapter use rather than scrape display prose.
+
+Use its documented `get_file_outline`, `search_graph`, `trace_path`, `get_code_snippet` and `check_index_coverage` for the particular question and source span. The inspected trace evidence distinguishes language-server resolution, language rules, heuristics and unresolved relationships. Retain the relevant origin/limits in the source observation; a static call is not an observed execution. The complete parser, every language and every tool path have not been qualified by this source review.
+
+Reuse the existing tool's owner and index. Do not embed its C parser, copy its whole SQLite graph into SurrealDB, install its UI, reproduce its coordination daemon or rewrite the user's agent setup from a memory job. Its index is an external derived source; Eliot stores selected source observations, decisions, lessons and project views as its own memory. The first adapter is a narrow caller, not a universal code-graph abstraction.
+
+If the configured graph is absent, unavailable or incomplete for a language, use existing scoped source reads and textual search plus manifests. State that these do not establish a complete call graph. Do not make raw capture, lesson recall or all project orientation wait for the index. Connecting the selected tool in the actual host remains implementation work, not an assertion that this session invoked it on Eliot.
+
+### 8.3 Structure supplies evidence; Dreamer explains its meaning
+
+A compact structural inventory selects where to read. Supply the relevant declaration/body, documentation and recorded decisions, or handles the executor can actually open, before asking for purpose, boundaries, material invariants and likely consequences. Counts, filenames and symbols alone do not establish why a subsystem exists. Exact structure, documented intent and inferred explanation remain distinguishable.
+
+Save a useful explanation as an ordinary versioned view with its examined source scope and links. There is no rigid four-kilobyte input rule or fixed purpose-length limit for every project: size the request for its useful evidence, use progressive reading and render a compact answer. Missing rationale stays missing. If interpretation fails, retain the available structural facts and previous useful explanation; do not publish a generated `purpose="(pending)"` as completed semantic understanding. Valid source references and a complete heading skeleton are not proof that the explanation is correct.
+
+Several perspectives can cover the same resource. A package map, an API-flow explanation and a deployment view need not share one forced tree. Use existing memory links for the selected relationships; do not mirror every source symbol just to draw a map. Git co-change may suggest another relevant file, but it is not a static dependency or a causal effect. Read available Git history selectively for a concrete question; mandatory full-history mining is not an onboarding prerequisite.
+
+### 8.4 Refresh the affected view from actual source changes
+
+Reuse actual host file events and the configured structural tool's status. For a Git workspace, native `git status --porcelain=v1 -z --untracked-files=all` distinguishes staged/unstaged, deleted, renamed and new paths; the [Git status contract](https://git-scm.com/docs/git-status) is the source for parsing, not human display text. Read relevant changed content or diffs when needed. HEAD alone does not describe a dirty worktree. Non-Git sources use the available event/listing and content information instead.
+
+A changed cited file can dirty its views. A new consumer, changed manifest/configuration, rename, deletion or source-selection change can also affect a set-valued view without modifying its old citations. Apply the existing reverse source links and examined selection scope from Cognition §4; coalesce one pending refresh for that view. If the observation stream has a gap, reconcile the relevant area on reattachment or demand. Do not rescan the entire project before each read or build another general watcher/lineage service.
+
+Provider coverage is useful but not a completeness certificate. The inspected CBM coverage output explicitly describes best-effort results, exclusions and truncation; `metadata_match` compares recorded file metadata, not full content equality or semantic truth. Read the relevant source when a consequential negative assertion needs more support. Unknown coverage does not make stored history unusable. Refresh a parent only after a material child result changes, not merely because a refresh timestamp changed.
+
+### 8.5 Automatic work must have a useful output and consumer
+
+Use the existing target-keyed jobs for initial orientation, a material source change, an explicit correction, a useful unresolved question or an observed episode needing interpretation. Prioritize changes relevant to active work and corrections; use otherwise available background capacity for useful incomplete areas. No model call is required for every filesystem event, every concept or every access. Unchanged input/no-change is reused; a model outage leaves work pending and does not stop reading. Work runs while the demand-start profile is active or on its next start, not through an unrequested permanent nightly service.
+
+At the next supported planning boundary, `context` combines the relevant available view with actual constraints, applicable experience, dissent and the useful next check. An automatic refresh does not require the agent to discover and query its new ID. Avoid resending unchanged orientation; a material correction can be offered as a small update. Delivery remains different from use or improved outcome. The host/controller still owns the task and its execution.
+
+Record a prediction only when it names a useful expected observation before an action; compare with the subsequent actual result when available. Static edges or a graph-derived answer key can check structural recall, not certify real-world causal understanding. Do not import a compulsory weekly exam or an automatic advice cutoff based on `injected_tokens - observed_exploration_tokens`: more observed exploration is a cost, not measured savings. Later comparisons can assess total work and outcomes without blocking current useful memory.
+
+Research uses the same source-linked views and finite work. Keep examined scope, evidence, alternative explanations and open questions; a generated explanation does not silently rewrite the owner's goal or erase an inconvenient source. This preserves autonomous understanding and learning without a new concept server, permission stage or self-certification loop.
 
 ## 9. Control, supervision and completion
 
@@ -502,7 +538,7 @@ All [29 original A15 scenarios](AUDIT.md#12-all-29-original-scenarios) and S1–
 | O1 | Native Claude hooks + MCP | Installed event/ID and continuation/result behavior |
 | O2 | Existing controller; concrete synthesis Task/result mapping in §6 | Connect one selected route end to end; implement the missing dedicated batch-vector capability in the controller owner, with actual model and readback behavior |
 | O3 | Small spool and ordinary backup/restore | Windows file primitives and concrete recovery behavior |
-| O4 | Network SDK/server 3.3.4 reference; primary layout and operations in §§2.6–2.9 | Write the concrete DDL/parameterized operations against that selected build; confirm statement results and query plans during implementation, not by a new qualification platform |
+| O4 | Official network SDK and primary native indexes; initial layout/operations in §§2.6–2.9 | Implement actual DDL, typed bindings and parameterized mutations for the selected profile; inspect plans and observe behavior on that build |
 | O5 | Automatic provisional learning and transfer | Useful task criteria and evidence for broader benefit claims |
 | O6 | Reused or small independent supervisor | Actual process custody/progress and notification coverage |
 
