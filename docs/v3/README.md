@@ -1,35 +1,37 @@
 # Eliot Memory OS V3 — documentation
 
-**Revision 0.22 · 2026-10-21.** Documentation before the greenfield rewrite. V1/V2 remain donors. This revision connects autonomous project understanding to an existing structural source and removes compulsory onboarding machinery; it does not implement V3.
+**Revision 0.23 · 2026-10-21.** Documentation before the greenfield rewrite. V1/V2 remain donors. This revision prepares and applies source-grounded Architecture/Implementation changes for disagreement, external research and self-correction; it is not implemented V3.
 
 | Document | Purpose |
 |---|---|
-| [Architecture](ARCHITECTURE.md) | Product purpose and ownership; remains 0.6 |
-| [Implementation](IMPLEMENTATION.md) | Native Store/host/controller paths; 0.22 makes §8's source-to-view-to-next-context path concrete |
-| [Cognition](COGNITION.md) | Cognitive algorithms in the same owners; remains 0.16 |
-| [Consolidated audit](AUDIT.md) | Findings, 34 requirements, 29 original A15 cases and D01–D47; adds §35 |
-| [Audit map](AUDIT-MAP.md) | Actual reading, unfinished audits/donors and remaining implementation decisions |
+| [Architecture](ARCHITECTURE.md) | Product purpose and boundaries; 0.23 preserves Concilium, autonomous research and targeted self-improvement without new owners |
+| [Implementation](IMPLEMENTATION.md) | Concrete operations, interfaces and work sequence; 0.23 adds §§7.5,8.6–8.7 |
+| [Cognition](COGNITION.md) | Cognitive algorithms within those modules; remains 0.16 |
+| [Consolidated audit](AUDIT.md) | Sources, findings and rejected alternatives; new §36 |
+| [Audit map](AUDIT-MAP.md) | Actual coverage, unreviewed sources and the next implementation choices |
 
-## Current result
+## Current material for the rewrite
 
-[Audit §35](AUDIT.md#35-autonomous-understanding-without-a-compulsory-pyramid-022) revisits the original Understanding Layer mission and its later Parts C/D/E. Autonomous orientation and useful proactive recall remain. The old implementation prescriptions do not become V3 requirements: first-grep-match integration, no-new-dependency doctrine, forced unique file-to-concept assignment, fixed minimum concepts and a published `(pending)` purpose are not substitutes for understanding.
+[Audit §36](AUDIT.md#36-disagreement-research-and-self-revision-023) compares original Concilium/research/self-quality requirements with selected V2 functions and the current separate Research plan. The original Concilium already rejects voting and permits one agent; the new design keeps that purpose rather than inventing a mandatory council.
 
-The old token formula subtracts actual observed exploration from injected context; it therefore cannot by itself measure saved work. A structural exam based on the same graph may check recall of that graph, not certify real consequences. The source's later correction of seed-adjacent decay is acknowledged rather than reported again as an unresolved defect.
+[Implementation §7.5](IMPLEMENTATION.md#75-diagnose-the-failing-step-and-revise-the-useful-method) distinguishes missing input, failed retrieval, failed delivery, non-use and a genuinely harmful method. Correct the affected step through ordinary observations, jobs and revisions. A previous failed repair does not prohibit all further diagnosis under the same configuration. Incomplete general monitoring does not conceal a known local problem.
 
-[Implementation §8](IMPLEMENTATION.md#8-project-understanding-causality-and-research) selects a configured **DeusData/codebase-memory-mcp** connection as the first structural adapter, donor D47. Its compact architecture output and addressed source/trace/coverage information help choose actual material to read. Dreamer explains purpose and boundaries from that material; a symbol list alone does not establish meaning. The external tool owns its derived index and process. Eliot does not embed its parser, clone its graph database or auto-install its agent profiles.
+[§8.6](IMPLEMENTATION.md#86-resolve-the-question-not-a-compulsory-panel) resolves a useful question using actual grounds, contrary evidence and a discriminating observation. Additional agents are optional through the host/controller. Qualified alternatives and dissent remain readable; unrelated work does not wait for universal agreement.
 
-First attach makes useful orientation work due under the configured profile, without blocking foreground capture/recall. Source changes and corrections refresh affected views through existing jobs; native worktree status is not replaced by HEAD alone. The next planning context receives relevant available explanations and experience without a per-view approval or compulsory acknowledgement. An unavailable model or source index leaves useful original facts and prior qualified views accessible. Non-code sources use the same source-linked view mechanism.
+[§8.7](IMPLEMENTATION.md#87-acquire-the-missing-evidence-through-an-actual-research-route) starts with available local memory and sources, then uses configured external acquisition for a remaining useful gap. The separate Research project owns its corpus and execution; Eliot stores the useful compact evidence and lessons. Its exact request/result integration is still unverified, not replaced with a fabricated RPC or the old federation framework.
 
-No new service, semantic store, maturity ladder, mandatory exam or test programme is added. Architecture, Cognition, current Store/controller choices and the existing scenarios are unchanged. This is a concrete design based on selected source reading, not an installed CBM integration or a verified runtime.
+Architecture states why these functions matter. Implementation assigns concrete inputs, work, outputs and consumers to the existing modules. No self-quality database, ConflictRegistry, compulsory panel, research engine inside memory or new promotion gate is added.
 
-## Coverage remains partial
+## Earlier decisions retained
 
-D01–D47 now include sixteen source-excerpt entries, three docs/paper entries and twenty-eight unreconciled entries. These are reading categories, not complete product audits or a percentage of understanding. The newly read UL ranges do not complete the Canonical Master, all original requirements or all historical audit findings.
+The first structural source is configured codebase-memory-mcp, not an embedded parser/graph clone. Project views come from real source/documents and are refreshed by relevant changes. Primary Store reads do not await mirrored search publication. Controller input admission is not model completion; the dedicated vector operation remains explicit implementation work. Capture preserves real observations before optional interpretation; useful provisional lessons reach ordinary context.
 
-[Map §5](AUDIT-MAP.md#5-what-remains-for-an-implementable-v3-model) retains the unfinished original-purpose comparison, real host/controller/vector wiring, actual Store implementation and practical lifecycle. The next reading focuses on disagreement, autonomous research/self-revision and first-use/process ownership rather than another generic layer around source lookup.
+The 34 requirement groups, 29 original A15 cases, D01–D47, Implementation S1–S32 and 36 cognitive walkthroughs remain. They are not executed product tests. Sixteen numbered donors have concrete source-excerpt findings, three docs/paper treatment and twenty-eight remain unreconciled; none of those counts means whole-product qualification. Full archive and original-requirement reconciliation are still open.
 
-Previous detailed work remains in [§34](AUDIT.md#34-native-store-operations-without-mirrored-state-021), [§33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) and earlier audit sections. The 34 requirements, 29 A15 cases, S1–S32 and 36 cognitive walkthroughs are design expectations, not executed tests. [The incomplete release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete) remains research input, not an active V2 programme.
+## Continuing work and publication
 
-## Publication
+The [map](AUDIT-MAP.md) next prioritizes first-use configuration/process ownership and actual remaining routes, followed by unfinished original/audit reconciliation. There is no need for a new installation or permission platform merely to connect one useful path.
 
-Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Actual changed-file/readback and workflow status are recorded there. No independent subagent review, model/DB/donor execution, synthetic test, benchmark or Clippy run occurred. Runtime, deployed schema, dependencies, permissions, CI, validators, ACTIVE registry, main and user data are unchanged. Product implementation follows documentation and the owner's code/minimum-Clippy/tests-later sequence.
+V2 source: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. Prior documentation remains in [Git history](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/d7a9de88b87020585a02194c4b51189063f97d96/docs/v3); research material remains in the [incomplete audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete).
+
+Work belongs to [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325). Actual changed-file/readback and workflow status are recorded there. No independent subagent review, model/DB/runtime execution, synthetic test, benchmark or Clippy run occurred. Runtime, schema, dependencies, permissions, CI, validators, ACTIVE registry, main and user data are unchanged. Product implementation follows documentation and the owner's code/minimum-Clippy/tests-later sequence.

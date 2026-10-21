@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 0.22 · 2026-10-21 · design for the greenfield implementation.**
+**Revision 0.23 · 2026-10-21 · design for the greenfield implementation.**
 
-[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §35](AUDIT.md#35-autonomous-understanding-without-a-compulsory-pyramid-022) reconciles the original Understanding Layer with the concrete source-to-view path in §8. [§34](AUDIT.md#34-native-store-operations-without-mirrored-state-021) explains native persistence; [§33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) traces external execution. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. These are design choices, not an installed schema or implemented V3.
+[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §36](AUDIT.md#36-disagreement-research-and-self-revision-023) grounds the self-diagnosis, disagreement and research paths added in §§7.5,8.6–8.7. [§35](AUDIT.md#35-autonomous-understanding-without-a-compulsory-pyramid-022) covers project understanding; [§34](AUDIT.md#34-native-store-operations-without-mirrored-state-021) native persistence; [§33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) external execution. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. These are design choices, not an installed schema or implemented V3.
 
 ## 1. Initial delivery
 
@@ -367,6 +367,26 @@ Use [Cognition §6.7](COGNITION.md#67-two-recursive-loops-from-harness2): within
 
 Keep baseline/no-change eligible. A composed output is not automatically better; previous task-specific instructions are not blindly inherited. Existing revisions, attempts, jobs and controller execute the loop. No separate recursion server, reflection database, per-level swarm or compulsory benchmark workload is required. Compare repeatable work/copies or permitted executions, not unrequested repetitions of irreversible effects.
 
+### 7.5 Diagnose the failing step and revise the useful method
+
+Capture a user correction, wrong-scope complaint, repeated failure or observed costly repetition as an ordinary observation. Associate the affected memory/context/attempt when that relationship is known; otherwise retain the report without inventing an attribution. Use the actual sources and available execution records to distinguish what failed. Do not require a complete system-wide measurement packet before examining one concrete problem.
+
+| Observed problem | First useful inspection or change |
+|---|---|
+| Needed experience was never retained | Inspect capture/episode input; preserve missing material when available |
+| The lesson exists but was not found | Inspect the actual query, cues and selected candidates; fix retrieval, not the lesson's factual support |
+| It was found but did not reach the agent | Inspect packing, suppression and the real host boundary; correct delivery rather than re-extract every episode |
+| It reached the agent but was not applied | Inspect wording, applicability and the known action; do not infer causality from delivery alone |
+| It was applied and the relevant outcome worsened | Reconsider the method, conditions and criterion; amend or stop recommending the affected revision |
+
+These are diagnostic distinctions, not five mandatory passes or a requirement for telemetry before every read. If a needed observation is unavailable, name that gap and still act on the independent facts that are available. A partial view must not declare the whole product healthy; it also must not hide a known failure because another dimension is unmeasured. A success and a failure in the same broad category are not a contradiction unless they concern incompatible claims under matching conditions.
+
+A previous failed repair narrows the usefulness of that repair under its actual conditions. It does not disable diagnosis for the whole configuration. Do not issue the same unsupported intervention again merely to appear active. New observations, a different mechanism or a changed relevant input can justify further work without inventing a new configuration identity.
+
+`learning` can propose a targeted memory or context-method revision using the existing Dreamer job. Direct corrections need no model; a missing retrieval connection may need ordinary code work rather than another generated lesson. Save the chosen revision, its reason and source observations through `apply`; use it provisionally where appropriate and inspect subsequent relevant outcomes. Preserve or restore a useful earlier method when a new one proves harmful, without erasing the failed attempt. Changing executable code, deployment, tool access or the owner's objective is not an implicit side effect of a memory proposal: route actual development/configuration work to the existing owner.
+
+The loop finishes with a useful correction, an identified implementation defect, no worthwhile change or a specific unresolved question. It resumes on relevant new material or an explicit request, not every time its own diagnostic note is read. No separate self-quality database, global intelligence score, proof factory or mandatory replay campaign is introduced. [Audit §36](AUDIT.md#36-disagreement-research-and-self-revision-023) distinguishes these V3 choices from the inspected V2 decision tree.
+
 ## 8. Project understanding, causality and research
 
 ### 8.1 First useful orientation, not compulsory whole-project onboarding
@@ -410,6 +430,28 @@ At the next supported planning boundary, `context` combines the relevant availab
 Record a prediction only when it names a useful expected observation before an action; compare with the subsequent actual result when available. Static edges or a graph-derived answer key can check structural recall, not certify real-world causal understanding. Do not import a compulsory weekly exam or an automatic advice cutoff based on `injected_tokens - observed_exploration_tokens`: more observed exploration is a cost, not measured savings. Later comparisons can assess total work and outcomes without blocking current useful memory.
 
 Research uses the same source-linked views and finite work. Keep examined scope, evidence, alternative explanations and open questions; a generated explanation does not silently rewrite the owner's goal or erase an inconvenient source. This preserves autonomous understanding and learning without a new concept server, permission stage or self-certification loop.
+
+### 8.6 Resolve the question, not a compulsory panel
+
+Represent a material disagreement with the existing claims/hypotheses and links, plus an ordinary question or decision item when it needs continuing attention. First compare subject, scope, time and perspective: a historical statement and a current correction, or a requirement and observed code, are not automatically two competing descriptions of the same thing. No separate ConflictRegistry or TheoryPortfolio store is required.
+
+Read the strongest available grounds for each relevant explanation, including shared sources and counterevidence. Find the smallest useful discriminating observation: an exact source read, a known result, a targeted lookup or a suitable experiment through the actual executor. When a direct source already answers the question, do not convene models to restate it. Semantic comparison can use one finite Dreamer request; additional independent work is optional through the host/controller when it contributes different evidence or a genuinely useful challenge. Multiple answers from one model or copies of one source do not become independent observations by changing agent names.
+
+The output contains the supported conclusion or qualified alternatives, the grounds that mattered and the remaining question when relevant. It need not fill a fixed number of rival slots. Save a provisional decision with its rationale and a material reconsideration condition; retain substantive dissent instead of rewriting all positions into agreement. Normal context delivers the conclusion and its exception together. A provisional external action remains the host's or user's decision, not a new authority issued by memory.
+
+If the question remains unresolved, the independent part of the task and useful existing memory stay available. The related recommendation is conditional, or the missing check is shown; the whole project is not blocked. Stop the finite investigation when it has a supported answer, no informative next step, exhausted permitted work or unavailable required material. Relevant new evidence can make another job useful. Unchanged opinions alone do not start another automatic debate.
+
+### 8.7 Acquire the missing evidence through an actual research route
+
+The trigger is a useful question left unresolved by existing memory and selected local sources, not every empty field. Identify what observation would change the answer and first use the available source/tool that can supply it. A routine source lookup does not require deep research or a critic panel. More extensive acquisition belongs to the configured external Research system, not an embedded web crawler, corpus index or research workflow inside Memory OS.
+
+The separate [Eliot Research project](https://github.com/UnknownAlienHuman/eliot-research/tree/7c034569b908d3b03a8b821b7c537477a24b10f7) is itself being simplified. Its [current implementation plan](https://github.com/UnknownAlienHuman/eliot-research/blob/7c034569b908d3b03a8b821b7c537477a24b10f7/docs/implementation/backend-entrypoints.md) distinguishes an ordinary answer from explicit deep research and replaces old report-admission machinery. This pass read that plan, not the complete live federation endpoint. The exact callable request/result adapter therefore remains an implementation choice; no new RPC name or completed integration is asserted here. Do not recreate V2's generation/digest/freeze protocol merely because old contracts in both repositories mention it.
+
+Use the existing memory job and the configured route. Supply the concrete question, scope/time/version when relevant, chosen source classes and only material intended for that external route. Retain the actual external request reference and the returned source/report references. Question, source observations and synthesis remain distinguishable. An answer with citations is not automatically a verified procedure; a failed acquisition is not a negative research finding. If only a report or snippet was read, record that coverage instead of claiming inspection of the full underlying source.
+
+Keep compact useful source excerpts, decisions, hypotheses and lessons in ordinary Eliot records. Large external corpora and their parsing/indexing remain with the research owner and are opened by source handle when needed; do not replicate both databases or give Research a direct writer into memory. Existing local observations remain primary input, not disposable merely because an external copy was requested. Useful partial material can enter context with its limits while another source is unavailable.
+
+Apply the returned knowledge using the same memory/history/link transaction, then surface it through normal context or the continuing inquiry. Retain an unresolved point when the material is insufficient. A provider failure may be retried through its existing execution path; completed but uninformative research instead needs new evidence, a changed useful question or an explicit re-evaluation—not automatic repetition of the same request. Ordinary saved observations and last useful answers remain readable throughout.
 
 ## 9. Control, supervision and completion
 
@@ -539,7 +581,7 @@ All [29 original A15 scenarios](AUDIT.md#12-all-29-original-scenarios) and S1–
 | O2 | Existing controller; concrete synthesis Task/result mapping in §6 | Connect one selected route end to end; implement the missing dedicated batch-vector capability in the controller owner, with actual model and readback behavior |
 | O3 | Small spool and ordinary backup/restore | Windows file primitives and concrete recovery behavior |
 | O4 | Official network SDK and primary native indexes; initial layout/operations in §§2.6–2.9 | Implement actual DDL, typed bindings and parameterized mutations for the selected profile; inspect plans and observe behavior on that build |
-| O5 | Automatic provisional learning and transfer | Useful task criteria and evidence for broader benefit claims |
+| O5 | Automatic provisional learning and transfer | Useful task criteria and evidence for broader benefit claims; targeted self-revision follows §7.5 |
 | O6 | Reused or small independent supervisor | Actual process custody/progress and notification coverage |
 
-These are implementation choices, not admission gates for unrelated functions. Use the working path, isolate an unavailable extension, and report the actual limitation.
+The external Research adapter in §8.7 also needs a concrete callable request/result mapping during implementation; reading its refactoring plan is not that integration. These are implementation choices, not admission gates for unrelated functions. Use the working path, isolate an unavailable extension, and report the actual limitation.

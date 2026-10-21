@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 0.6 · 2026-10-19 · documentation-stage design, not a working product.**
+**Revision 0.23 · 2026-10-21 · documentation-stage design, not a working product.**
 
-V1 and V2 are donors. V3 is a new implementation, not a compatibility migration. This manifesto defines purpose and boundaries; [Implementation](IMPLEMENTATION.md) and [Cognition](COGNITION.md) define mechanisms. The [consolidated audit](AUDIT.md) holds sources and rejected alternatives; the [audit map](AUDIT-MAP.md) tracks unfinished reading, not runtime permissions.
+V1 and V2 are donors. V3 is a new implementation, not a compatibility migration. This manifesto defines purpose and boundaries; [Implementation](IMPLEMENTATION.md) and [Cognition](COGNITION.md) define mechanisms. The [consolidated audit](AUDIT.md) holds sources and rejected alternatives; the [audit map](AUDIT-MAP.md) tracks unfinished reading, not runtime permissions. [Audit §36](AUDIT.md#36-disagreement-research-and-self-revision-023) supplies the source basis for the revised disagreement, research and self-improvement boundaries.
 
 The design inputs remain local-first Rust, demand-start operation, a SurrealDB server child, full vector capability, model and embedding routes through `eliot-swarm-controller`, and no second swarm inside memory. Old donor ADRs and release ceremonies do not acquire authority over V3 merely by remaining in Git.
 
@@ -95,7 +95,9 @@ Update affected views, not the whole world after every edit. A list of cited fil
 
 A prediction names the expected observation before the action, its conditions and how it can be checked. Static dependency, co-change and causal explanation are different relationships. An unavailable comparison proves neither success nor failure.
 
-Preserve successful methods as well as negative experience. A false warning is itself feedback. When explanations conflict, retain their evidence and differences and identify a discriminating observation; this preserves Concilium's cognitive purpose without a voting platform.
+Preserve successful methods as well as negative experience. A false warning is itself feedback. Concilium's purpose is to expose errors in the shared picture: retain rival explanations and their actual grounds, then seek an observation that distinguishes them. One agent or a direct source lookup may suffice. More agents are optional tools supplied by the host/controller, not a compulsory panel, voting platform or proof of independent evidence.
+
+A disagreement belongs to a question, scope and time. Different outcomes in different situations need not contradict one another. Show the useful alternatives and what remains uncertain; unrelated work continues. A provisional choice retains its reason and the observation that would cause reconsideration. Do not require total agreement before using the uncontested part of memory.
 
 An unresolved commitment or contradiction is state, not a notification. Delivery and acknowledgement do not resolve it.
 
@@ -113,13 +115,17 @@ Two recursive loops use these same records. Within a task, propose a concrete ch
 
 An improvement can be rejected or add no knowledge. The user goal, permissions and acceptance criteria are not editable variables of the same comparison. A chosen output is not automatically better, and the latest task-specific harness is not blindly inherited by the next task.
 
+Eliot also learns from its own failures: a lesson may be missing, hard to find, poorly delivered, unsuitable or genuinely wrong. Diagnose the affected step using actual observations rather than one global intelligence score. A failed repair stops that unsupported repetition, not further diagnosis. Incomplete overall monitoring does not hide a known local defect. Correct useful memory and its delivery through the same revision path; changes to executable code or deployment remain work for the existing developer/controller, not a second self-modifying runtime.
+
 ## 8. Dreamer and research
 
 Dreamer performs interpretation, consolidation, contradiction analysis, project orientation, procedure extraction and improvement through the existing job and storage paths. It is not an always-on second authority or one service per cognitive operation.
 
 Models propose content and relationships. Application code checks a small concrete contract: valid result shape, actual input/target membership, relevant source/target revisions and current job. It does not issue semantic-comprehension certificates. Physical erasure, goal changes and new execution permissions are not implied by a model response.
 
-Research can use external Search/Research providers. Record the examined scope, sources, contrary evidence and gaps. Exploration may revise its question openly. An empty sample or top-k result is not universal absence.
+Research answers a useful open question. Start with available memory and exact local sources; acquire external material when it can resolve the remaining gap. Configured autonomous work does not require approval of every question, but does need a concrete question and a reason to continue. Return useful partial knowledge when sources or capacity are missing. New relevant evidence can reopen the question; repeatedly restating the same uncertainty cannot justify an endless research loop.
+
+External Search/Research systems own their acquisition tools, corpora and research execution. Eliot keeps the compact sources, conclusions, alternatives and experience needed by its agents, with addresses for deeper reading. It does not clone an external research engine or share its database. Distinguish the returned report from the underlying evidence and its actual coverage. A changed question is recorded openly; an empty sample or top-k result is not universal absence.
 
 [Hy-Memory](https://github.com/Tencent-Hunyuan/Hy-Memory/tree/7b7fd217a8084fe0d5f9c196d9e4cb88dbba570a) supplies useful memory mechanisms; its writer weights, application paths and training evaluation are distinct artifacts. Borrowing one does not qualify the others.
 
