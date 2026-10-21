@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 0.20 · 2026-10-21 · design for the greenfield implementation.**
+**Revision 0.21 · 2026-10-21 · design for the greenfield implementation.**
 
-[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) traces actual controller input and result paths and distinguishes the missing embedding interface. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. This revision specifies the first text integration and the separate vector requirement inside existing owners. It is documentation, not a claim that V3 is implemented.
+[Architecture](ARCHITECTURE.md) defines the product; [Cognition](COGNITION.md) defines its cognitive algorithms. [Audit §34](AUDIT.md#34-native-store-operations-without-mirrored-state-021) explains the native persistence choices below; [§33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) traces the external execution boundary. [Audit map](AUDIT-MAP.md) records actual reading and remaining work. This revision specifies primary records, finite input ranges and concrete Store operations. It is documentation, not an installed schema or implemented V3.
 
 ## 1. Initial delivery
 
@@ -34,7 +34,9 @@ Idle shutdown stops new external dispatch, settles short mutations, retains pend
 
 ### 1.3 One database client
 
-Use the official network-capable Rust SDK, private to Store, with one compatible SDK/server pair and the necessary network/TLS features. Actual versions and features are selected when implementation starts. Do not compile embedded engines without a need.
+Use the official network-capable Rust SDK, private to Store, with one compatible SDK/server pair and the necessary network/TLS features. The documentation reference profile is server **3.3.4** and Rust SDK **3.3.4**, checked on 2026-10-21: [server release](https://github.com/surrealdb/surrealdb/releases/tag/v3.3.4), [SDK reference](https://surrealdb.com/docs/reference/rust). The latter specifies Rust 1.95 or newer. This selects the API/syntax being designed against; no dependency lock, Windows build or installation is claimed.
+
+Start with one reusable remote WebSocket connection and the documented `protocol-ws` feature; do not enable embedded `kv-*` engines for this server-child profile. [Transport reference](https://surrealdb.com/docs/reference/rust/methods/connect). Select the actual TLS features with the implementation rather than imply a measured dependency-size reduction from this document. A second HTTP/gRPC abstraction is unnecessary for the initial paged operations.
 
 The old [Phase A ADR](../ADR/0001-phase-a-dependency-boundaries.md) is donor history, not a V3 veto. A concrete unresolved dependency or platform problem may justify an ordinary JSON-RPC client instead; choose one client, not a compatibility framework around both.
 
@@ -81,6 +83,98 @@ Keep normal OS/file permissions, database credentials and the host's configured 
 Interpret a path using the adapter's actual source syntax and base. Retain unresolved distinctions between relative, rooted, drive-relative, drive-absolute and UNC forms. Missing path context does not reject raw capture. Use native/library path handling, not a new cross-platform path language.
 
 Symbols follow their source language. Case-insensitive and punctuation aliases can find candidates but are not exact entity equality. Preserve original forms and use the same comparison behavior on capture and query. A command-family cue retrieves a lesson; it is not enough to prohibit an action. A normalization change rebuilds derived lookup data, not the original observation.
+
+### 2.6 Initial physical layout
+
+The following is the selected starting layout for the capture-to-lesson path, not an arbitrary table-count ceiling for the entire OS. Each row has one meaning and one Store writer. Declare types for fields used in identity, filtering and ordering; retain source-specific input in an ordinary payload instead of inventing a schema family for every tool.
+
+| Table | Actual data | Required lookup |
+|---|---|---|
+| `stream` | Configured source/session identity, project scope and last local ingestion sequence | Stable stream ID; no project-wide truth revision |
+| `observation` | Original event key, stream, ingestion sequence, available occurrence time, body/blob and actual call/parent/task references | Unique `(project, stream, event_key)`; ordered `(project, stream, ingest_seq)`; native text index over captured searchable text |
+| `memory` | Stable item ID, current editorial revision, kind, content/search text/cues, subject/aspect/perspective, applicability/time and exposure | Direct ID; scoped comparison group; native full-text index; compatible optional vector |
+| `memory_history` | A previous semantic revision of that item, archived once when replaced | Unique `(item, revision)`; paged item history |
+| `link` | Native relation endpoints, purpose and the addressed memory revision at each versioned endpoint | Endpoint/kind/revision lookup in either useful direction |
+| `job` | Transformation purpose/target, method, finite input, state, current claim, external references and applied result references | Due work; pending/running work for the same purpose/target; direct job readback |
+
+`memory` is the primary working record, not a cache requiring a second publisher. `memory_history` stores previous revisions; it is not another mutable current copy. Archive the replaced semantic fields, not a second set of derived vectors. A version handle is `(item_id, revision)`: `open` reads the current row if that revision matches, otherwise the exact historical row. A missing or withdrawn current row does not authorize selecting the newest historical row as current.
+
+Editorial revision is not world-state authority. Several incompatible claims can remain separate items in the same comparison group. Revising one procedure does not supersede all claims about its resource. Observed validity, receipt time and the reasons for replacement retain their existing meanings from Cognition §3.
+
+Links to a memory item carry the material source revision when their meaning depends on it. Reading an old lesson must not silently cite the new text of its edited premise. Keep historical links associated with their originating revision; publish the links for a new revision with that revision. A relation supplies navigation, evidence or a live requirement according to its kind, not all three automatically. Do not maintain a separate source-ID array and independently mutable edge registry as competing authorities.
+
+An actual execution result remains an `observation`. An interpreted method/attempt/criterion assessment can be an ordinary versioned `memory` item with that tuple as its lookup key and links to the result. Repeated delivery updates neither the independent case count nor a second execution ledger. Aggregate effectiveness and status remain queries/views. No `SkillRegistry`, `TruthStore` or separate outcome database is needed.
+
+For a large external payload, preserve its blob and exact source handle. A bounded searchable excerpt is not a claim that all bytes were indexed. Add source-linked derived chunks only when that ingestion path needs them; do not copy the complete body into every lesson or confuse a chunk with a new observed event. Physical erasure includes the relevant current/history rows, links and controlled blobs under §10.
+
+### 2.7 Five concrete Store operations
+
+These are ordinary methods and parameterized query files inside `store`, not a public named-operation registry, generic query builder or another process. The single application mutation owner serializes short write transactions. Source reading, model execution, embeddings and large file preparation happen outside those transactions; reads need not wait for a model.
+
+| Operation | Work committed together | What is not required |
+|---|---|---|
+| `capture(event)` | Preserve the new source event, assign its local stream position and insert/extend necessary pending work | Semantic classification, vector generation, a project map or a write-plan certificate |
+| `claim_due()` | Freeze the chosen finite input and assign this job to the current worker; retain any unclaimed remainder | A project-wide queue barrier or a new task-graph engine |
+| `apply(job, proposal)` | Publish addressed memory/history/links and the actual result/processed input of that job | Re-running inference just because the DB acknowledgement was lost |
+| `find(request)` | Read independent candidates, relevant alternatives and selected relations | A write receipt, full history replay or global search-publication state |
+| `open(handle)` | Read the addressed current/historical item or source segment under its actual scope | Regenerating a plausible substitute for missing content |
+
+**Capture and replay.** The adapter supplies the upstream event identity, or allocates one before its first delivery/spool write. A stream distinguishes actual source/session/agent streams; an event key includes a source revision when that source's IDs are mutable. Within the capture transaction, an existing key with the same source input returns the existing observation and does not enqueue the work again. Different input under that key is a concrete conflict or explicit correction, not an overwrite. Content equality alone does not merge independent occurrences.
+
+For a new event, advance the stream's local ingestion sequence, save the observation, and create or extend appropriate pending work before commit. This position is for delivery/progress only: a late imported old event receives a new ingestion position while retaining its old occurrence time. Do not use `occurred_at` as the processed watermark. A sparse sequence is acceptable; there is no need to prove that every integer exists. Return the actual primary/staged/unknown result; a wakeup only accelerates the worker.
+
+**Finite work under continuing input.** Keep one running job and at most one coalesced pending successor for the same purpose/target. Capture can extend the pending successor, never the input of the running job. Claim a bounded prefix using saved event identity/order and useful call/result boundaries; leave any remainder pending. The existing single mutation owner makes this a short read/update, not a distributed admission protocol. Independent targets can run concurrently.
+
+A job retains the actual source IDs or bounded stream ranges and the named existing item revisions supplied for interpretation. If only positions 1–12 were supplied, it cannot mark 1–20 interpreted. If events 21–24 arrive while work on 1–20 runs, completing that job leaves 21–24 pending. This example describes the design, not an executed test. The same originals remain available for a later distinct purpose or deliberate reinterpretation; there is no universal `processed=true` on an observation.
+
+**Amendment and completion.** Prepare the model result before opening the transaction. On application, check the addressed current item revision and the current job claim; archive the predecessor, update the existing item, add the new source/replacement links and finish the job for exactly its supplied input together. A direct user correction uses the same memory-write functions with its captured event as the repeat identity; it does not need a fabricated model job. Genuinely independent proposal subsets may be applied explicitly as partial under §6.3.
+
+Use an explicit `BEGIN TRANSACTION` / `COMMIT TRANSACTION` around dependent statements. [SurrealDB transactions](https://surrealdb.com/docs/learn/querying/concepts-and-guides/transactions) are not implied by putting several top-level statements in one SDK request. An in-transaction `UPDATE ... WHERE revision = $expected RETURN AFTER` must change the intended row; otherwise throw inside that transaction so preceding dependent writes do not remain. `UPDATE` can succeed with zero rows. Do not replace this with `UPSERT`, which may create an absent record. [UPDATE](https://surrealdb.com/docs/reference/query-language/statements/update) · [UPSERT](https://surrealdb.com/docs/reference/query-language/statements/upsert).
+
+Snapshot isolation is not a promise that every previously read predicate is protected from another writer. Keep the chosen single mutation owner and relevant row checks; do not infer global serializability from the word transaction. Native write/unique-index conflicts are handled at this short operation. A conflict means reread the affected input/target and decide whether the prepared proposal still applies, not blindly replay a paid external call or force stale text into the new revision.
+
+After a lost commit acknowledgement, read the same event key or job/result reference. If application committed, return those saved references rather than create a second lesson. A successful explicit keep completes that job without inventing a memory revision. Missing pages, invalid output and provider failure do not advance its interpreted range. Persist the useful external result before releasing an executor whose body is otherwise temporary; §6 defines that external boundary.
+
+### 2.8 Direct reads and native indexes
+
+The query shapes below are design sketches for the stated 3.3.4 profile, not executed migrations or a verified query plan. Bind IDs as typed record values and text as parameters. Page by the actual ordering key with a fixed upper bound for that read, not a fixed oldest prefix or a growing offset into unrelated records.
+
+```surql
+-- An exact address does not depend on the search index's state.
+SELECT * FROM $item WHERE project = $project;
+
+-- One finite original-input range; later arrivals remain for a later range.
+SELECT id, event_key, ingest_seq, occurred_at, body, blob_ref
+FROM observation
+WHERE project = $project AND stream = $stream
+  AND ingest_seq > $after AND ingest_seq <= $through
+ORDER BY ingest_seq ASC
+LIMIT $page_size;
+
+-- Current editorial records, not a replay of every past snapshot.
+SELECT id, revision, text, search::score(0) AS score
+FROM memory
+WHERE project = $project AND exposure = 'normal'
+  AND search_text @0@ $query
+ORDER BY score DESC, id ASC
+LIMIT $candidate_limit;
+```
+
+The last query illustrates one configured lexical policy, not a universal rule that every word must match. Exact cues, lexical candidates and compatible vectors are independent inputs to the existing context compiler. A valid full-text match may have a BM25 score of zero, especially in a small or repetitive corpus; do not turn `score > 0` into a requirement for being remembered. Use a deterministic tie order. This is a native-search consideration, not a newly demonstrated zero-score defect in the old Eliot query.
+
+Define separate indexes for source-key uniqueness, ordered stream reads, scoped claim-group lookup, full-text fields and actual relation lookups. In SurrealDB 3.x the documented full-text clause is `FULLTEXT ANALYZER`, not the old `SEARCH ANALYZER`. Array cue lookup must use the actual supported element-index shape, not assume an arbitrary index on an array serves every predicate. [Native index reference](https://surrealdb.com/docs/reference/query-language/statements/define/indexes).
+
+Use native maintained indexes on the actual primary fields. Initial concurrent index construction and normal transactional index maintenance are different: a building index may be unavailable, but it is not a reason to deny direct ID/source reads. Do not re-create `memory_search_projection`, project-wide matching revision rows and a publication queue merely to expose text that is already committed. Inspect `EXPLAIN` for the selected queries during implementation; native syntax alone is not measured performance.
+
+Retrieve the relevant claim group's alternatives and the required source/relationship neighbors before final packing. Fetch payloads only for those records. An exact historical handle opens its exact version; normal recall prefers the working records and intentionally selected history, not whichever first 512 physical rows happen to load. Whole-history enumeration has continuation. The scoped current-state resolver in Cognition, not a newest-timestamp shortcut, decides applicability.
+
+### 2.9 Derived vectors do not become a second publication authority
+
+Start with one configured active encoder profile for a given vector field/index. The current vector carries the content revision and encoder/preprocessing profile from which it was produced. The corresponding query vector uses that same profile. The native index dimension is chosen from the actual encoder, not inferred from the Dreamer model name.
+
+When searchable content changes, commit the new text and clear the obsolete vector reference in the same memory mutation; schedule the existing embedding work. The new lesson is already available through direct and lexical reads. Apply returned vectors only to their still-current content revision/profile. A late vector for an old revision is not silently attached to the new text. Storing a vector is a derived-data update, not a new semantic lesson, independent confirmation or trigger for another reflection.
+
+For the initial implementation, changing encoder can temporarily disable that vector arm while rebuilding the derived values/index for the new profile. Exact/lexical access continues. This is a deliberate simpler choice, not a promise of uninterrupted ANN service or a requirement for permanent dual encoders. Do not mix incompatible vectors to make the route appear ready, and do not wait for a whole-corpus embedding certificate before returning independent useful results.
 
 ## 3. Host interface and experience intake
 
@@ -408,7 +502,7 @@ All [29 original A15 scenarios](AUDIT.md#12-all-29-original-scenarios) and S1–
 | O1 | Native Claude hooks + MCP | Installed event/ID and continuation/result behavior |
 | O2 | Existing controller; concrete synthesis Task/result mapping in §6 | Connect one selected route end to end; implement the missing dedicated batch-vector capability in the controller owner, with actual model and readback behavior |
 | O3 | Small spool and ordinary backup/restore | Windows file primitives and concrete recovery behavior |
-| O4 | Official network SDK and primary native indexes | Compatible versions/features and actual queries |
+| O4 | Network SDK/server 3.3.4 reference; primary layout and operations in §§2.6–2.9 | Write the concrete DDL/parameterized operations against that selected build; confirm statement results and query plans during implementation, not by a new qualification platform |
 | O5 | Automatic provisional learning and transfer | Useful task criteria and evidence for broader benefit claims |
 | O6 | Reused or small independent supervisor | Actual process custody/progress and notification coverage |
 

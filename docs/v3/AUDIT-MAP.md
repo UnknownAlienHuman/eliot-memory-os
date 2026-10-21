@@ -1,16 +1,16 @@
 # V3 audit map — coverage and remaining design work
 
-**Revision 0.20 · 2026-10-21.** Reading coverage, not runtime state or an approval gate. [AUDIT.md](AUDIT.md) holds findings; [Architecture](ARCHITECTURE.md), [Implementation](IMPLEMENTATION.md) and [Cognition](COGNITION.md) hold the product design. This pass traces the real controller text-execution path and specifies the separate missing embedding operation. It does not declare the whole design or research complete.
+**Revision 0.21 · 2026-10-21.** Reading coverage, not runtime state or an approval gate. [AUDIT.md](AUDIT.md) holds findings; [Architecture](ARCHITECTURE.md), [Implementation](IMPLEMENTATION.md) and [Cognition](COGNITION.md) hold the product design. This pass selects the initial primary layout and concrete Store operations against current SurrealDB documentation. It does not declare the whole design or research complete.
 
-Base: `350832a981f642e475d1b92899f976e8ea80cb33`, PR #5325. V2: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. The [0.18 census](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/815f51e5a6839263ce6e310a42392c7810eb8218/docs/v3/AUDIT-MAP.md) and [0.19 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/350832a981f642e475d1b92899f976e8ea80cb33/docs/v3/AUDIT-MAP.md) retain previous exact reading and limits. New material is in [Audit §33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) and [Implementation §6](IMPLEMENTATION.md#6-dreamer-through-controller).
+Base: `0f4013f053c9e9dfdf6ee4210b6e057229062f82`, PR #5325. V2: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. The [0.18 census](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/815f51e5a6839263ce6e310a42392c7810eb8218/docs/v3/AUDIT-MAP.md) and [0.20 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0f4013f053c9e9dfdf6ee4210b6e057229062f82/docs/v3/AUDIT-MAP.md) retain earlier reading and limits. New material is in [Audit §34](AUDIT.md#34-native-store-operations-without-mirrored-state-021) and [Implementation §§2.6–2.9](IMPLEMENTATION.md#26-initial-physical-layout).
 
 ## 1. What can honestly be claimed
 
 **No independent subagent review.** The earlier tool/plugin/local-executor discovery did not expose a usable GPT Luna/Codex/subagent invocation. The present source work is also solo, not independent reports by several reviewers.
 
-**All donors studied: no.** The numbered table has fifteen source-excerpt entries, three docs/paper entries and twenty-eight unreconciled entries. D45 claude-mem and D46 OpenHands were added in 0.19; no external donor number is added in 0.20. These are reading categories, not percentages of product understanding or whole-repository audit claims.
+**All donors studied: no.** The numbered table has fifteen source-excerpt entries, three docs/paper entries and twenty-eight unreconciled entries. D45 claude-mem and D46 OpenHands were added in 0.19; no external donor number is added in 0.21. These are reading categories, not percentages of product understanding or whole-repository audit claims.
 
-**All audits checked: no.** The supplied Claude report and earlier owner reports informed the design, but there is no complete finding-by-finding reconciliation of the full archive. This pass makes the initial text-request/result mapping concrete and identifies the vector-interface gap. Actual integration, the remaining original requirements and physical Store design are not completed by reading controller code.
+**All audits checked: no.** There is no complete finding-by-finding reconciliation of the full archive. The current change gives the previously logical Store families a concrete initial layout, native read shapes and transactional write sequence. It does not apply DDL, exercise the SDK, finish all original requirements or establish working host/controller integration.
 
 The 34 requirement groups, 29 A15 cases and Claude's 63 anchors/eight hard boundaries are different denominators. Preserving them is not proof that all source requirements have been independently reconciled or implemented.
 
@@ -101,48 +101,53 @@ These are the owner's source filenames, not new repository reports. Multiple rev
 | Release `audit-2026-10-16-incomplete` | Metadata/assets named; full ZIP not successfully transferred/read in that pass | Audit findings, source-transfer decisions and research entries need actual reconciliation; manifest/ledger is not that work |
 | `audit-2026-09-14.md` | Its opening establishes adjacent Research/Cloudflare/D1 scope | Not a completed Memory OS audit or evidence about SurrealDB |
 
-The archive's named MANIFEST, execution/intake coverage, blockers, publication and research-join assets establish available names, not complete/correct contents. Failed transfer is not absence of an asset. No new archive-wide count or semantic completeness percentage is claimed. This controller pass does not reclassify those audit families as reviewed.
+The archive's named MANIFEST, execution/intake coverage, blockers, publication and research-join assets establish available names, not complete/correct contents. Failed transfer is not absence of an asset. No new archive-wide count or semantic completeness percentage is claimed. This Store pass does not reclassify those audit families as reviewed.
 
 ## 5. What remains for an implementable V3 model
 
-Six connected subjects remain, with the controller boundary now more specific. These are not six new subsystems or permission gates.
+Six connected subjects remain, with the initial Store choice now concrete. These are not six new subsystems or permission gates.
 
 | Work | Chosen direction | Remaining concrete result |
 |---|---|---|
 | Original-purpose reconciliation | Local-first greenfield memory, history/cognition/transfer and original scenarios retained | Complete source comparison for autonomous understanding, non-code sources, disagreement and self-improvement; name genuine departures |
-| Actual host/controller boundary | Native events; concrete finite synthesis Task→dispatch→result mapping in Implementation §6 | Connect the selected route with real terminal output, preserve its exact input/result pairing and implement the missing batch-vector capability in the controller owner. No fake code task, second transcript scraper or new provider runtime |
-| Concrete storage/read operations | One SurrealDB, native indexes/relations/transactions | Minimal physical layout and capture/work/retrieve/revise/open queries with a compatible SDK/server choice |
-| Autonomous useful work | Finite episode interpretation, provisional advice, no-change and subsequent outcomes | What makes work due, which actual source range it consumes, what it changes and how normal next context uses it. No worker per cognitive noun |
-| Grounded project understanding | Small purpose/area views linked to real source | Choose an existing structural source and connect actual changed resources/consumers to affected views |
-| Practical lifecycle and consistency | Demand start, degraded useful reads, one observer, simple recovery/control | Concrete process/file/DB choices and first-use setup; reconcile all three design documents without invented intermediary layers |
+| Actual host/controller boundary | Native events; finite synthesis Task→dispatch→result mapping in Implementation §6 | Connect the selected route with real terminal output and implement the missing controller batch-vector capability; do not duplicate its execution state |
+| Concrete storage/read operations | Six initial primary tables; current/history separation; capture/claim/apply/find/open in §§2.6–2.9; SDK/server 3.3.4 reference | Implement actual DDL and parameterized mutations, bind types, inspect plans and observe their behavior on the selected build. The query sketches are not executed code |
+| Autonomous useful work | Stable stream arrival positions, finite running input, pending successor, no-change and ordinary next-context use | Finish the remaining original-autonomy decisions: useful triggers and prioritization beyond the already specified episode path; no universal processed flag or worker per noun |
+| Grounded project understanding | Small purpose/area views linked to real source | Select an actual structural source and connect changed resources/consumers to affected views |
+| Practical lifecycle and consistency | Demand start, degraded useful reads, one observer, simple recovery/control | Concrete process/file/DB choices and first-use setup; reconcile the remaining design boundaries without invented intermediary layers |
 
-No blanket completion of all research is required for a decided independent component after the documentation stage. Conversely, source findings cannot replace these product decisions. Quality/performance and a promised fifty-fold reduction require implementation, not a new test campaign compensating for missing code.
+No blanket completion of all research is required for a decided independent component after the documentation stage. Conversely, source findings cannot replace product decisions. Quality/performance and a promised fifty-fold reduction require implementation, not a new test campaign compensating for missing code.
 
-### Current controller boundary rechecked
+### Controller boundary retained from 0.20
 
-Controller `912df90f86320ff556c1dba23badc2c69e518e34`, read 2026-10-21: the [integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/docs/eliot-memory-os-integration.md) still describes the future controller→memory direction. Actual reverse text execution is now traced through public methods, Task admission, dispatch and the Claude SDK bridge; see [Audit §33](AUDIT.md#33-controller-execution-and-embedding-boundary-020).
+Controller `912df90f86320ff556c1dba23badc2c69e518e34`: the [integration document](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/912df90f86320ff556c1dba23badc2c69e518e34/docs/eliot-memory-os-integration.md) describes the future controller→memory direction. Reverse text execution was traced through public methods, Task admission, dispatch and Claude SDK; [Audit §33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) records the exact reading. It was not re-audited in this Store pass.
 
-Direct `agent.open` prepares a binding without a Task parameter. The selected Claude first query nevertheless requires `task.dispatch`; a genuine synthesis Task may omit acceptance policy and does not need fabricated code-verification results. Native input admission explicitly has `execution_complete=false`. Later `agent.send` is supported, but the inspected Claude result reader accepts a `task.dispatch` origin. Body/page limits and boot-local retention are real route constraints, not universal Eliot rules. The current Codex README describes a different Rust adapter; its complete source path was not audited here.
+Direct open is preparation; the selected first Claude query requires task.dispatch. Input admission is not completed inference. Later send and the selected dispatch-only result reader do not automatically form a complete pair. The missing dedicated vector operation remains controller work. No claim of a working installed route is added here.
 
-A dedicated vector-embedding method is absent from the inspected positive public registry. This is a scoped interface finding, not proof that no encoder exists in any private or adjacent system. Implementation §6.5 defines the small required batch-vector operation at the existing controller provider boundary without pretending its public name already exists. Text and vectors are separate routes. Primary capture and lexical lookup remain usable while vectors are unavailable.
+### Concrete Store decision in 0.21
+
+Use `stream`/`observation` for source delivery and originals, `memory`/`memory_history` for working and prior semantic revisions, `link` for addressed relationships and `job` for finite transformations. Six tables describe this starting path, not the full-product table budget. Current editorial revision is not unique current truth; conflicting items and historical validity retain Cognition's meaning.
+
+Capture and necessary pending work commit together. The running input stays fixed while later input extends its successor. Apply publishes memory/history/links and the corresponding job result together. Native indexed primary reads do not wait for mirrored search publication. A stale vector is detached from changed text and only an appropriately matched result is applied. These are design decisions; no schema was deployed.
 
 ## 6. Fresh source reads and useful next action
 
-| Source | Read in 0.20 | Remaining boundary |
+| Source | Read in 0.21 | Remaining boundary |
 |---|---|---|
-| Controller documentation at `912df90f` | README; agent-operations implementation1–210; Memory OS integration; MCP surfaces1–200; current Claude and Codex README | Installation-specific routes/credentials; docs alone do not establish execution |
-| Controller interface and ownership | method_policy registry; IPC1–190; model TaskSpec/current admission and request fields; tasks1–260; selected Store mod/routing/results ranges | Not all authorization/acceptance validators or every RPC implementation |
-| Actual text path | operations open/reserve/dispatch approximately2600–3465; task_prompt1–290; Claude bridge1–245 and320–600; result-pages1–240 | Full claim/release/teardown loop, all terminal-event handling and live request/result; no whole-controller audit |
-| Other navigation | Selected runtime ranges for dispatch/result handoff and a clearly Store-only taskless ScriptRun fixture | The fixture was not run and does not establish a taskless model API |
+| Current Memory OS documents at `0f4013f0` | AGENTS, relevant current Architecture/Implementation/Cognition and maintained Audit/map/navigation; full Audit and Implementation blob contents for preservation | Not a new full comparison of every V1/UL requirement or archived audit |
+| V2 `5aac0948` | Entire `load_memory_search_fts_candidates.surql` and `semantic_records_by_kind.surql` | Specific readers, not all Store entrypoints; no DB execution |
+| SurrealDB official release/API, accessed 2026-10-21 | Stable server 3.3.4 release (published 2026-10-19); SDK 3.3.4/Rust requirement; query/connect, transactions, UPDATE/UPSERT, native indexes and record IDs/ranges | Actual build/features, DDL, execution plans, Windows behavior and performance unobserved |
 
-Previous D45/D46 detailed reads remain in the [0.19 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/350832a981f642e475d1b92899f976e8ea80cb33/docs/v3/AUDIT-MAP.md#6-fresh-source-reads-and-useful-next-action); they were not re-audited here. The new findings are request preparation versus actual execution, optional Task acceptance, concrete input/result limits, vector capability and avoiding a circular startup dependency. Source facts and design decisions are separated in Audit §33.
+The old exact-handle SQL is gated by project-wide projection state; the semantic reader still reads oldest512. New-native considerations include explicit multi-statement atomicity, zero-row UPDATE, typed bindings, valid zero-score lexical matches and content-versioned derived vectors. V2's inspected query does not filter on `score > 0`; that defect is not falsely attributed to it.
 
-**Next:** specify the minimal primary records and actual native Store operations for capture with pending work, current/history retrieval, one lesson amendment and source expansion. Reconcile remaining original-purpose/autonomy requirements and select the first structural source for project understanding. The controller integration still needs actual wiring and an encoder operation; extending another donor list does not silently finish those tasks.
+Prior controller reads remain in the [0.20 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/0f4013f053c9e9dfdf6ee4210b6e057229062f82/docs/v3/AUDIT-MAP.md#6-fresh-source-reads-and-useful-next-action), and D45/D46 in the [0.19 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/350832a981f642e475d1b92899f976e8ea80cb33/docs/v3/AUDIT-MAP.md#6-fresh-source-reads-and-useful-next-action).
+
+**Next:** reconcile original Understanding Layer autonomy and the concrete structural source for project views. Follow a real changed-resource→affected-consumer/view→next-agent path, rather than create more abstract view types. Continue archive/audit reconciliation where it can reveal an omitted original requirement. The documented Store layout still needs later implementation, as do the actual host/controller wiring and encoder operation; these are not hidden completions.
 
 The A01–A14 subjects still cover requirements, control, process ownership, storage/recovery, retrieval, producers/consumers, development overhead, own design, Hy coding/transfer, Harness2, donor/archive, interfaces and publication. Graphiti temporal input, Hindsight complete commits, Letta automatic reflection, historical EverMemOS and ORS ownership remain partial.
 
 ## 7. Verification and publication boundary
 
-No product/donor/model/database execution, synthetic test, Rust/Clippy or performance measurement took place. No independent subagent review is claimed. The current file-transfer attempts did not yield a local checkout; publication checks use actual GitHub object/diff/ref/readback rather than a claimed local full-repository scan.
+No product/donor/model/database execution, synthetic test, Rust/Clippy or performance measurement took place. No independent subagent review is claimed. Local network/transfer attempts did not yield a current checkout; complete document content was read through GitHub blobs, and publication checks use actual GitHub diffs/ref/readback, not a claimed local full-repository scan.
 
-This pass changes the consolidated Audit, Implementation §6/O2, this map and navigation. Architecture 0.6 and Cognition 0.16 retain their existing owners. The 34 original requirements, 29 A15 scenarios, Implementation S1–S32 and 36 cognitive examples remain. Runtime, schema, dependencies, CI, validators, ACTIVE registry, main and user data are unchanged. Product implementation remains after documentation, following the owner's product-code/minimum-Clippy/tests-later sequence.
+This pass changes the consolidated Audit, Implementation §1.3/§§2.6–2.9/O4, this map and navigation. Architecture 0.6 and Cognition 0.16 retain their existing owners. The 34 original requirements, 29 A15 scenarios, Implementation S1–S32 and 36 cognitive examples remain. Runtime, deployed schema, dependencies, CI, validators, ACTIVE registry, main and user data are unchanged. Product implementation remains after documentation, following the owner's product-code/minimum-Clippy/tests-later sequence.
