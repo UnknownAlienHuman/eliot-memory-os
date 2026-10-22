@@ -9,10 +9,13 @@ V1 and V2 are donors. V3 is a greenfield implementation.
 1. [Architecture](ARCHITECTURE.md) — purpose, ownership, invariants and explicit non-goals.
 2. [Implementation](IMPLEMENTATION.md) — process family, data model, Store operations, integrations and vertical build sequence.
 3. [Cognition](COGNITION.md) — current-work reconstruction, revisable knowledge, retrieval, learning and self-improvement algorithms.
-4. [Audit conclusion](AUDIT.md) — evidence, root causes, rejected mechanisms and source limits.
-5. [Requirements/source map](AUDIT-MAP.md) — dispositions for original requirements, historical audits and donors.
+4. [Active analysis registry](ANALYSIS-REGISTRY.md) — what is checked, what remains open, exact gaps and the next work queue.
+5. [Audit conclusion](AUDIT.md) — evidence, root causes, rejected mechanisms and source limits.
+6. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for original requirements, historical audits and donors.
 
-Architecture, Implementation and Cognition are now one coherent design baseline. They are **not implemented product code**.
+Architecture, Implementation and Cognition are one coherent design baseline. They are **not implemented product code**.
+
+`ANALYSIS-REGISTRY.md` is the only active work ledger. `AUDIT-MAP.md` remains the stable source/decision matrix; new analysis should update the registry instead of starting another chronological report.
 
 ## Selected baseline
 
