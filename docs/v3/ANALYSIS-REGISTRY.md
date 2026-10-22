@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-22 · baseline `7408e946` · активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-22 · baseline `abec7502` · активный рабочий реестр, не runtime gate.**
 
 Этот файл отвечает только на четыре вопроса:
 
@@ -39,17 +39,17 @@
 |---|---|---|---|---|---|
 | R-001 | Граница продукта и владельцы | Architecture §§1–3; Implementation §§1–3; Cognition §14 | `CHECKED` | Host/controller владеет задачами и эффектами; Eliot — памятью и интерпретацией; второго task owner нет. | Не менять без нового реального consumer/failure. |
 | R-002 | Локальная process family | Architecture §3; Implementation §1 | `DECIDED` | Один supervisor владеет daemon+SurrealDB; relay временный; daemon не наблюдает собственный hang. | Проверить Windows launch mutex, Job Object, readiness и idle shutdown при Slice 1. |
-| R-003 | Точный адрес continuation | Architecture §5; Implementation §§4.3,7.2; Cognition §2 | `GAP` | Алгоритм требует direct task/session/branch lookup, но `memory` не содержит явного continuation key/index. `subject/aspect` недостаточно конкретны для interleaved work. | Добавить exact continuation address и lookup в Implementation/Cognition без новой таблицы. |
-| R-004 | Identity context packet и атрибуция метода | Architecture §7; Implementation §§6.3,10.5; Cognition §§6.5,8.3 | `GAP` | Документы различают prepared/handed-off/used и требуют exact method revision, но не задают устойчивый `packet_id` и links packet→method revisions→later action/outcome. | Описать packet identity как application event/observation; failure его учёта не должен блокировать advice. |
-| R-005 | Прямая структурированная поправка | Implementation §§6.1,10.2; Cognition §7 | `GAP` | Поправка может обойти Dreamer, но Store описывает только `apply_job_result`; общий mutation path без фиктивного job не назван. | Определить внутренний `publish_revision` для job result и direct correction; не новый public service. |
-| R-006 | Шесть таблиц и пять Store operations | Implementation §§4–5 | `CHECKED` | Схема и ownership согласованы; нет зеркальной search DB или отдельного skill/outcome store. | Спроектировать SurrealDB migration/query files и проверить планы на выбранной версии. |
-| R-007 | Revision/history/current-state | Architecture §4; Implementation §§4.3–4.5,5.3; Cognition §3 | `CHECKED` | Current row, history, replacement и withdrawal разделены; старый predecessor не воскресает автоматически. | Реализовать CAS/update/history transaction; проверить zero-row behavior. |
+| R-003 | Точный адрес continuation | Architecture §5; Implementation §§3,4.3,5.5,6.1,7; Cognition §2 | `DECIDED` | `attach` возвращает exact continuation key; `memory` имеет `address_kind/address_key` и exact index; interleaved task/branch IDs не сливаются в session fallback. | Реализовать typed key construction и exact query в Slice 2. |
+| R-004 | Identity context packet и атрибуция метода | Architecture §7; Implementation §§3,4.2,4.5,5.5,6.3,10.5; Cognition §§6.5,8.3 | `DECIDED` | `context` возвращает stable packet ID; prepared/handoff — application observations; packet links exact item/method revisions; later action/outcome carries ID only when host can correlate. | Реализовать packet event/link writes и host feedback; tracking failure must not suppress advice. |
+| R-005 | Прямая структурированная поправка | Implementation §§5.3–5.4,6.1,10.2; Cognition §7 | `DECIDED` | Один internal `publish_revision` используется job result и captured direct correction; fake job/service не нужен. | Реализовать CAS/history/link transaction and direct-correction caller. |
+| R-006 | Шесть таблиц и Store operations | Implementation §§4–5 | `CHECKED` | Схема и ownership согласованы; context packets остаются observations/links, нет mirrored search DB или отдельного skill/outcome store. | Спроектировать SurrealDB migration/query files и проверить планы на выбранной версии. |
+| R-007 | Revision/history/current-state | Architecture §4; Implementation §§4.3–4.5,5.3–5.4; Cognition §3 | `CHECKED` | Current row, history, replacement и withdrawal разделены; старый predecessor не воскресает автоматически. | Реализовать CAS/update/history transaction; проверить zero-row behavior. |
 | R-008 | Compound grounds | Architecture §4.5; Implementation §4.5; Cognition §3.3 | `CHECKED` | Одна non-null group = AND; разные groups = OR; ungrouped evidence supportive. Это не theorem prover. | Определить query/recompute для затронутых items; проверить неизвестную композицию. |
-| R-009 | Retrieval arms и packing | Architecture §5; Implementation §§5.4,7–8; Cognition §6 | `CHECKED` | Exact/FTS/vector/relations независимы; union до applicability; display limit не candidate limit. | Проверить SQL/index/query plans и реальные budget limits в Slice 2/5. |
+| R-009 | Retrieval arms и packing | Architecture §5; Implementation §§5.5,7–8; Cognition §6 | `CHECKED` | Exact/FTS/vector/relations независимы; union до applicability; display limit не candidate limit. | Проверить SQL/index/query plans и реальные budget limits в Slice 2/5. |
 | R-010 | Реальный consumer method revision | Implementation §§5.2,9.2,10.3; Cognition §8.2 | `CHECKED` | Job фиксирует method ID/revision; request builder открывает exact body; новая версия влияет на последующие jobs. | Проверить controller adapter и фактический request body в Slice 3. |
 | R-011 | Cross-project reuse | Architecture §§3,4.4; Implementation §§4.3,10.4; Cognition §8.4 | `CHECKED` | Origin не меняется; reuse scope фильтруется до top-k; counterexamples сохраняются. | Спроектировать typed reuse scope/index/query и disclosure filtering. |
 | R-012 | Host capture | Implementation §6; audit donor/source findings | `PARTIAL` | Используются actual host results, child/parent streams и injected-text exclusion. Installed host event/version не проверены. | Квалифицировать конкретную Claude Code версию и event payloads перед Slice 2. |
-| R-013 | Delivery semantics | Implementation §6.3; Cognition §§6.5,8.3 | `PARTIAL` | Prepared, handoff, use и outcome различены. До закрытия R-004 нет надёжной адресной атрибуции packet/method. | Закрыть R-004, затем определить adapter feedback и unknown attribution. |
+| R-013 | Delivery semantics | Implementation §6.3; Cognition §§6.5,8.3 | `DECIDED` | Prepared, handoff, use и outcome различены; packet ID связывает exact delivered revisions; отсутствие correlation оставляет adherence unknown. | Квалифицировать adapter handoff feedback и implement best-effort tracking. |
 | R-014 | Controller text execution | Implementation §9.1; audit §33 | `PARTIAL` | Реальный task-dispatch/model path найден; input admitted не completion. Later-send/result pairing ограничен. | Выбрать поддержанную request/result pair и durable result readback. |
 | R-015 | Batch embeddings | Implementation §9.3 | `OPEN` | Нужен controller API `profile + [(id, revision, text)] → vector/error`; текущий public route не подтверждён. | Реализовать/квалифицировать controller boundary; не агент и не отдельный scheduler Eliot. |
 | R-016 | Research adapter | Architecture §8; Implementation §§9.4,11.3 | `OPEN` | Контракт результата определён; существующий callable Memory↔Research endpoint не подтверждён. | Проверить текущий Eliot Research surface и реализовать один adapter. |
@@ -60,7 +60,7 @@
 | R-021 | Recursive improvement/self-diagnosis | Architecture §7; Implementation §§10.6–10.7; Cognition §9 | `CHECKED` | Existing methods/jobs/outcomes; baseline/no-change; diagnosis corrects first supported failed step. | Реализация после connected method/outcome path; не отдельный runtime. |
 | R-022 | Disagreement/anticipation | Architecture §8; Implementation §11; Cognition §§10–11 | `CHECKED` | Alternatives/grounds/discriminating observation; no voting; expiry does not fabricate outcome. | Реализовать ordinary memory representations after core claims/methods. |
 | R-023 | Direct control/status | Architecture §9; Implementation §13 | `DECIDED` | Owner can inspect/pause/cancel/correct/erase/backup/restore through actual state; notification optional. | Define CLI/MCP requests after Slice 1 Store/lifecycle. |
-| R-024 | Normative-document consistency | Architecture 1.0, Implementation 1.0, Cognition 1.0, README | `PARTIAL` | Ownership and major paths align. R-003–R-005 are concrete remaining normative gaps. | Fix those gaps, then repeat cross-document scan and update this row. |
+| R-024 | Normative-document consistency | Architecture 1.0, Implementation 1.0-draft.1, Cognition 1.0, README | `CHECKED` | Ownership and major paths align; R-003–R-005 closed without new tables/services. Runtime remains unimplemented. | Repeat after schema/API details materially change. |
 
 ## 3. Источники и внешняя доказательная база
 
@@ -99,7 +99,6 @@
 
 | Priority | Работа | Закрывает |
 |---|---|---|
-| P0 | Исправить normative gaps exact continuation address, packet identity/outcome attribution и shared direct-correction mutation | R-003, R-004, R-005, R-013, R-024 |
 | P1 | Спроектировать Slice 1 migrations/query files и Windows lifecycle primitives | R-002, R-006, R-007, R-019, R-023 |
 | P1 | Квалифицировать installed Claude hooks и controller request/result readback | R-012, R-014 |
 | P1 | Проверить packet→method→action/outcome linkage на одном реальном host path | R-004, R-013, R-010 |
@@ -114,3 +113,4 @@
 | Дата / baseline | Изменение |
 |---|---|
 | 2026-10-22 / `7408e946` | Создан active registry после согласованного rewrite. Перекрёстная проверка выявила R-003 exact continuation address, R-004 packet identity и R-005 direct correction mutation. |
+| 2026-10-22 / `abec7502` | R-003–R-005 закрыты в Implementation 1.0-draft.1: exact continuation key/index, stable packet identity with revision-aware attribution, shared `publish_revision`. R-013 и R-024 обновлены. |
