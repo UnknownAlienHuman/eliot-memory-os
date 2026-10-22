@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.3 · 2026-10-22 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.4 · 2026-10-22 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -242,7 +242,8 @@ Key fields:
 - selected method ID/revision;
 - current claim and expiry;
 - due time/attempt;
-- controller execution reference;
+- saved controller connection/caller, request method/ID and immutable parameters or their blob reference;
+- controller execution and result-artifact references;
 - result refs and processed input;
 - error or no-change result.
 
@@ -551,25 +552,33 @@ Spreadsheets, images and transcripts use their concrete locators. Unsupported de
 
 ### 9.1 Text execution
 
-Dreamer is a job purpose, not a separate service.
+Dreamer is a job purpose, not a separate service. The adapter uses controller's existing command and artifact operations. Source review at `70b99db3d8732d10a69d03d1dbe83afdd39a7229` confirms the replay and byte-read mechanisms below, but also a public-result projection gap. The complete Memory OS integration is not implemented; R-014 and R-027 in the [registry](ANALYSIS-REGISTRY.md) separate the useful existing paths from the required repair.
 
-Initial controller mapping uses the supported text-execution path:
+**Submit and recover the same request.** Prepare finite input and open the exact method revision. Before each state-changing controller request, save its configured connection, caller identity, `client_request_id`, method and submitted parameters on the existing job or referenced blob. Do not regenerate the request from newer memory or a new timestamp when reconnecting.
 
-1. prepare the finite request from saved inputs and the exact method revision;
-2. retain the controller request identity before submission when its actual API supports client identity/readback;
-3. prepare/open and dispatch through the supported request/result pair;
-4. save the returned execution reference and read the actual completed output and usage;
-5. preserve that output under the job before applying memory changes or releasing temporary executor state.
+The inspected Store deduplicates by `(caller_id, client_request_id)` and compares method and canonical parameters. An exact replay returns the saved admission receipt before reapplying the command; changed parameters under that ID are rejected. Therefore, if the acceptance reply was lost, resend that saved request to the same controller as the same authorized caller. If no admission occurred, it can be admitted; if it did, the original receipt is returned. This is controller request recovery, not permission to replay a native prompt. Save the returned Operation ID and read current progress with `operation.get`: the admission receipt deliberately remains unchanged after completion. A new caller or another controller is not the same deduplication scope.
 
-When a route supplies an ID only after acceptance, a lost acceptance response is an explicit unresolved dispatch, not proof that nothing ran. Use the controller's real lookup/idempotency capability when available. If it has none, do not promise exactly-once execution; a configured retry of pure inference is a potentially charged new attempt. Database retry never automatically makes that decision.
+**Obtain the actual result.** The adapter follows this path once the projection gap below is repaired:
 
-Input admission is not completed inference. A completed result-read operation may have stored only one page; its EOF flag does not prove that previous pages were collected. The adapter reads retained bytes through controller artifact operations, rather than parsing an Operation receipt as model prose.
+| Step | Existing operation and consumed result |
+|---|---|
+| Submit finite interpretation | Supported `task.dispatch` request; save its exact Operation/Attempt/session association, not just the newest session output |
+| Obtain a result page | `agent.result` for that source Operation and byte range; save the result-read Operation ID and obtain its persisted artifact handle and next range through public readback |
+| Assemble when needed | `artifact.assemble` over the collected page handles; save its admission Operation ID, then read its completion and output handle rather than treating the admission receipt as completed bytes |
+| Read the body | `artifact.read` for that handle, with `offset_bytes`/`length_bytes`; the inspected reader allows 1–65536 bytes per request, so continue until the retained body is collected |
+| Apply knowledge | Preserve the body and its limits on the memory job, parse it, then use §5.4 without another inference merely to recover delivery |
 
-For a selected route with paged output, retain page artifact references and offsets on the same job, fetch missing pages through the supported `agent.result` path, and use controller's existing `artifact.assemble` when a complete body is needed. Read the resulting artifact through `artifact.read` and preserve the input needed by Eliot before releasing executor-side state. This is an adapter flow to implement, not a claim that every route/successor already supports it. It does not require a second assembler or provider-result journal inside Memory OS.
+Use the configured controller client authorized for the relevant task and artifact. The native adapter's Module credential is not that client: the inspected public byte reader rejects Module-role calls and separately resolves artifact byte access. A reference identifies a result; it does not grant access. Reuse that existing boundary instead of exposing controller files or constructing a permission system in Memory OS.
 
-Keep three outcomes distinct: model execution status; complete coverage of the retained bytes; and usefulness/validity of the parsed proposal. The inspected assembler can cover a retained command-output prefix completely while still reporting `capture_truncated` or `capture_read_error`. Preserve those limits. An empty, truncated, failed or unavailable model output is not a successful no-change. A partial output may support an explicitly partial result only when that part is independently usable; it cannot mark the whole input processed.
+**Required controller repair — publish the usable handle.** In the inspected code, page registration and assembly finish store `details.artifact_ref` and completion/range information. Public `operation.get` passes results through `project_result_receipt`, which copies a method-specific list of top-level scalar fields but not those nested details. Its assembly list includes `artifact_id`, which the successful assembly producer does not write there. The proposed consumer therefore cannot obtain the stored output handle from this response even though the internal result says applied.
 
-Selected controller registration and assembly paths were read at `c3e331a37ef58b3b98f7859bfb9e40935501e106`; exact scope and remaining gaps are in R-014 of the registry. Runtime qualification still must cover the chosen public read path, credentials, request-ID recovery, adapter restart and retention. The controller's A2 durable-delivery design is not evidence that those missing pieces already run. Do not rely on a later-message API unless its result reader supports that origin; fix a gap in that adapter, not by scraping logs or repeating the model call in Memory OS.
+Repair the existing method-specific public projection to expose the actual artifact reference, completion condition and, for a page, its offset/length/total/EOF/next range. Preserve error codes and the existing object-read checks. These are required response data, not a new endpoint, proof package or broad export of private JSON. Do not compensate in Memory OS by deriving internal artifact filenames, opening controller's database, scraping logs or requesting the answer again. Other result-discovery paths have not been ruled out; this finding concerns the specified `operation.get` consumer.
+
+**Continuation and retained output.** The inspected normalized `agent.result` admission requires a source `task.dispatch`. The prepared-Claude-specific helper also requires that dispatch, not an arbitrary `agent.send`. Do not advertise a reusable conversation route merely because its send method exists. Extend the actual controller source-Operation/result mapping when continuation is selected, retaining the real input/Attempt association; never relabel a continuation as the first dispatch or create another attempt solely to retrieve its old answer. A steer may affect an existing turn rather than produce its own terminal response.
+
+Input admission, native completion, complete retained bytes and a usable parsed proposal remain distinct. EOF on one page does not establish earlier coverage; a complete assembly of a captured prefix can still be truncated. Preserve those flags and unknown usage. Empty, failed or malformed output is not successful no-change. A separately usable partial proposal may be retained as partial without marking the entire input processed.
+
+Reconnecting for a saved receipt does not recover native bytes lost before durable capture. Existing registered artifacts are read through controller; uncollected source-body retention, adapter restart and successor recovery remain open route-specific work, not a promise supplied by A2 documentation. Retain collected output before releasing its source. A failure of this route leaves raw capture and other working memory functions available, without a new model executor or result journal in Memory OS.
 
 ### 9.2 Request content
 
@@ -787,7 +796,8 @@ Build vertical slices in this order.
 
 ### Slice 3 — Dreamer and lessons
 
-- actual controller text execution;
+- actual controller text execution and same-request admission recovery;
+- public result handle through authorized artifact bytes, including the controller projection repair in §9.1;
 - finite episode job;
 - shared `publish_revision` for job output and direct correction;
 - create/update/keep;
