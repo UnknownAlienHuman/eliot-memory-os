@@ -1,159 +1,229 @@
-# V3 audit map — coverage and remaining design work
+# Eliot V3 — решения по исходным требованиям и границы охвата
 
-**Revision 0.23 · 2026-10-21.** Reading coverage, not runtime state or an approval gate. [AUDIT.md](AUDIT.md) holds findings; [Architecture](ARCHITECTURE.md), [Implementation](IMPLEMENTATION.md) and [Cognition](COGNITION.md) hold the product design. This pass prepares source-grounded disagreement, research and self-revision material for Architecture and Implementation. It does not complete the whole requirements or archive audit.
+**22 октября 2026. Приложение к [итоговому аудиту](AUDIT.md), не runtime registry и не перечень разрешений.**
 
-Base: `d7a9de88b87020585a02194c4b51189063f97d96`, PR #5325. V2: `5aac094834fb5635921b550c821cb933a1196105`; V1: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. The [0.18 census](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/815f51e5a6839263ce6e310a42392c7810eb8218/docs/v3/AUDIT-MAP.md) and [0.22 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/d7a9de88b87020585a02194c4b51189063f97d96/docs/v3/AUDIT-MAP.md) retain earlier reading limits. New findings are in [Audit §36](AUDIT.md#36-disagreement-research-and-self-revision-023); implementation changes are §§7.5,8.6–8.7.
+Эта карта заканчивает сверку доступных предложений для переписывания. Она не выдаёт решение «не переносить» за чтение исходников и не объявляет все источники проверенными. Старые подробные reading ranges остаются в [карте 0.23](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/41c2291f3b968ddbb2690b2f4be79e1677730de7/docs/v3/AUDIT-MAP.md).
 
-## 1. What can honestly be claimed
+## 1. Корпус и предел проверки
 
-**No independent subagent review.** Earlier discovery did not expose a usable GPT Luna/Codex/subagent invocation; this pass is also solo. Source reading and a second self-review are not several independent reviewers.
+| Материал | Фактически доступно и использовано | Что не утверждается |
+|---|---|---|
+| V1 Canonical Master | Полный текст до §40 прочитан в подготовке 0.24; цели и старая governance doctrine разделены | Это не полное чтение всего V1 или повтор всех его experiments |
+| Understanding Layer v1.4 и V2 нормы | Ранее разобранные Parts A/C/D/E и конкретные normative sections; immutable ссылки в прежнем аудите | Все нормы V2 и все ~2.6 млн физических строк не перепроверены |
+| Claude revision 4, `eliot-documentation-audit(1)(1).md` | Полный текст доступен; каталог, 63 якоря, восемь границ, предложения реализации/переноса и заключительные отступления сопоставлены | Его оценки LOC/скорости/полноты не новые измерения и не решения владельца |
+| `ELIOT_AUDIT_2026-10-08_v9(1).md` | Получен полный текст, включая T32–T37; T01–T37 получили переносимое решение ниже | Все первичные code paths не запускались и не перечитывались на текущем main |
+| `ELIOT-Swarm-AUDIT-2026-10-06(2).md` | Получен полный текст; логика controller/практики, сокращение, потеря локальных материалов и рекомендации сопоставлены | Исторические provider особенности и цифры не current deployment facts |
+| Аудит относительно `/docs/architecture`, 31.08.2026 | Полный текст; конкретные gaps отделены от похвалы строгой proof architecture | Его нормативный выбор не принят автоматически для V3 |
+| `ELIOT-LLM-PROBLEMS-2026-10-07.md` | Полный текст; failure classes сопоставлены с путями продукта и процессом разработки | Пересказ прежнего инцидента не заново воспроизведённый дефект |
+| Локальный пакет 0.24 | Прочитан и содержательно включён: continuation, method consumer, transfer, MemP/MentisDB | Его patch не объявляется применённым к старым нормативным файлам |
+| Релиз `audit-2026-10-16-incomplete` | Metadata и перечень assets подтверждены | ZIP и 968 entries не прочитаны; manifest не semantic review |
+| `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` | Только ссылки на него в Claude; прямые поиски не дали полного текста | Другой отчёт не подставляется под его имя |
 
-**All donors studied: no.** The numbered table has sixteen source-excerpt entries, three docs/paper entries and twenty-eight unreconciled entries. No new external donor number is added in 0.23. The separate Eliot Research repository is an integration source, not another independently audited donor. These categories do not measure whole-product understanding or imply complete repository audits.
+Недоступные последние два источника остаются **исключением из основания заключения**. Для исчерпывающего утверждения о всём архивном корпусе они нужны; для выбранного connected rewrite нельзя бесконечно выдавать их отсутствие за запрет разработки. Остальная работа разделена на конкретную реализацию и возможное уточнение источников, не смешана в один «процент готовности».
 
-**All audits checked: no.** The supplied Claude report and other historical audits have not been fully reconciled finding by finding. This pass reads selected original cognitive requirements, their V2 implementation and the current Research refactoring plan. It is not the entire Canonical Master, UL document or archive.
+## 2. Поимённая сверка 63 якорей Claude
 
-The 34 requirement groups, 29 A15 cases and Claude's 63 anchors/eight hard boundaries are different denominators. Preservation is not proof that every original statement has been independently checked or implemented. The small connected implementation is still a design, not deployed V3.
+Источник названий/кратких требований — §6.1 приложенного Claude revision 4. Правая колонка — решение данного аудита. Это проверка смысла и осознанных расхождений, а не заявление о выполнении старой нормы буквально или о готовом коде.
 
-## 2. D01–D44: conservative coverage census
+| Якорь | Требование в перечне Claude | Итоговое решение V3 |
+|---|---|---|
+| INTENT-01 | намерение выше буквы | Сохранить назначение выше ритуала; конфликт нормы и цели явно исправлять, не маскировать. |
+| CONCIL-01 | несогласие важнее голосов | Альтернативы, основания и различающее наблюдение; один участник допустим, голосование не доказательство. |
+| DEV-01 | сначала работающий срез | Поставлять связанное поведение. Это не запрет параллельных независимых работ. |
+| CORE-00 | работа накапливается | Наблюдения работы остаются в памяти. Обязательный урок или объяснение отсутствия урока на каждом finish убрать. |
+| CORE-01 | непрерывность понимания | Адресная continuation текущей задачи/ветки плюс новые события; host compaction не второй task manager. |
+| CORE-02 | четыре плоскости, один цикл | Сохранить роли цикла; плоскости не являются обязательными процессами. |
+| HELP-01 | снижать нагрузку | Штатный захват и малый доменный интерфейс; произвольный потолок восемь инструментов не критерий пользы. |
+| ROLE-01 | наблюдение, толкование, полномочия и проверка разделены | Наблюдение, интерпретация, permission и acceptance различаются. Приёмка внешней задачи у host/controller. |
+| ROLE-02 | ответственность по компетенции | Данные, исполнения и решения имеют своих фактических владельцев, не дублирующие власти. |
+| AUTH-01 | полномочия явны | Конфигурация владельца и реальные host permissions; не отдельная grant/approval платформа на каждую запись. |
+| MOD-01 | маленькое живое ядро | Малый связанный service. Rust task не изоляция process abort; независимый supervisor вне daemon. |
+| MOD-02 | глубина добавляется модулями | Добавлять нужную функцию в модуль; actor/job/hook не обязательная классификация любого helper. |
+| MOD-03 | у состояния один владелец | Один Store writer; views читают его данные. Не отдельный guard registry ради этого правила. |
+| PORT-01 | органы заменяемы | Настоящие adapters, network SDK и export; не универсальный backend framework. |
+| SCOPE-01 | область прежде повторного использования | Источник отдельно от reuse scope; проекты и общие методы фильтруются до top-k. |
+| MEM-01 | захват прежде организации | Сохранить permitted raw до модели, точность/полноту захвата обозначить. |
+| MEM-02 | ошибки памяти исправимы | Редакция конкретного item и история; current row не вечная append-only проекция. |
+| MEM-03 | производное хранит источники | Реальные адресуемые источники и версия; модель не создаёт source contents одним ID. |
+| MEM-04 | извлечение не подкрепляет | Retrieval не support. Rank допускает relevance/recency, но не выдаёт популярность за истинность. |
+| LIFE-01 | нет телепортации статусов | Причина и автор изменения в owning record/history, без общего автомата всех видов памяти. |
+| EPI-01 | позиции опровержимы | Разрешать адресную группу по времени/условиям/перспективе; latest или голова цепочки не универсальная истина. |
+| EPI-02 | вес по исходам | Наблюдаемые результаты уточняют полезность; источники/коррекции уточняют факты, не только verifier. |
+| EPI-03 | разведка не подтверждает себя | Исключить самоудостоверение. Два источника не обязательный допуск единственного полезного эпизода. |
+| EPI-04 | покрытие требует знаменателя | Называть examined scope и gaps; пустой top-k не универсальное отсутствие. |
+| UND-01 | понимание выражено публично | Хранить объяснение и отвергнутые варианты, а не скрытый reasoning transcript или сертификат понимания. |
+| UND-02 | причинность проверяется предсказанием | Ожидание до действия и последующее наблюдение; dependency graph не causal experiment. |
+| GROUND-01 | опора на артефакты | Конкретные source spans, ресурсы и реальные изменения; aliases не exact identity. |
+| SELF-01 | ELIOT знает себя | Eliot читает собственные документы/данные теми же средствами; status отражает реальные jobs/results. |
+| CTX-01 | достаточность прежде размера | Основание и существенное исключение упаковываются вместе; handles раскрывают детали. |
+| CTX-02 | проактивность от наблюдаемого | Триггеры от реальных доступных host/source events, не модель перед каждым событием. |
+| CTX-03 | доставка рядом с решением | Доставка на фактической границе решения; PreToolUse advice не отменяет уже выбранное действие. |
+| CTX-04 | поиск предлагает, сборщик допускает | Candidate selection и смысловая применимость; не обязательный permission score или запись лога до ответа. |
+| ATTN-01 | обязательство — состояние | Обязательство — ordinary memory state; показ/ack не resolution и не сообщение на каждом входе. |
+| SKL-01 | Skills короткие | Полезный компактный метод + раскрытие; сорок строк не универсальный предел. |
+| WDG-01 | независимый надзор | Один реальный независимый observer в active interval. Hook relay сам не видит hung daemon. |
+| WDG-02 | надзор за исходом, а не за церемонией | Различать heartbeat, progress и outcome; не читать prose как достоверный процессный сигнал. |
+| DRM-01 | Dreamer — не владелец | Модель предлагает; приложение применяет обычные revisions. Provisional advice не ждёт promotion bureaucracy. |
+| DRM-02 | Dreamer расширяет гипотезы | Объяснения, alternatives, gaps и следующий полезный вопрос остаются предметом интерпретации. |
+| DRM-03 | вычисления Dreamer под человеком | Configured finite work/cost/routes; manual/idle/due режимы не отдельные scheduler engines. |
+| DRM-04 | добыча ≠ толкование | Acquisition отдельно от interpretation; Research входит в полный scope, не удаляется решением аудитора. |
+| ACT-01 | эффект определяет полномочия | Host/controller исполняет и проверяет actual permissions. Память советует; regex команд не второй execution governor. |
+| SWM-01 | рой — ограниченный конвейер | Рой остаётся controller/host; память не владеет повторно task acceptance. |
+| SWM-02 | координация переживает агентов | Долговечная работа Eliot сохраняется в job; вся peer-координация не импортируется. |
+| LONG-01 | долгая работа живёт в БД | События, continuation и jobs переживают сессию; current task определяется адресно. |
+| FIN-01 | готово только с доказательством | Не выдавать частичный исход за готовность. Второй finish owner и выдуманный proof из памяти убрать. |
+| HUM-01 | человек управляет | Прямые status/inbox/configure/correct/erase/backup/restore; approval не обязателен для обычного read. |
+| SEC-01 | предполагать взлом | Отделить данные от инструкций, сохранять provenance и capture exclusions; не quarantine всей полезной памяти. |
+| SEC-02 | один путь записи | Один application write path и стандартные OS/DB границы; это не sandbox против unrestricted same-user process. |
+| SEC-03 | влияние привязано к источнику | Адресный пересмотр реальных зависимостей; AND/OR не угадываются по числу citations. |
+| SEC-04 | вывод модели — кандидат | Разбирать реальный model output; schema check не proof истины и не причина запрещать условную подсказку. |
+| PRIV-01 | стирание не воскресает | Known deletion replay и controlled purge; неизвестная история обозначается при явном owner restore. |
+| RES-01 | падать локально | Локальный отказ нужной операции; отдельные runtime-процессы только по реальной failure boundary. |
+| RES-02 | самоисправление ограничено | Не повторять бесполезный конкретный repair; не блокировать всю диагностику конфигурации. |
+| RES-03 | восстановление не воскрешает | Известные удаления применяются; старые external jobs не replay автоматически. |
+| ORD-01 | параллельно где независимо | Порядок зависимых изменений и параллельность независимых; нет project-wide oldest-head барьера. |
+| OBS-01 | журналы ≠ метрики ≠ аудит | Логи, метрики и primary history различаются; optional telemetry не меняет известный effect result. |
+| RES-04 | деградация видима | Сообщить конкретную недоступность, сохранив остальную пользу; не общий availability certificate. |
+| RES-05 | восстановление даёт знание | Сбой может дать полезный случай для будущего; каждый restart не обязан создавать новый урок. |
+| LEARN-01 | обучение через внешнее наследие | Изменённый урок/метод действительно читается следующим consumer; не лестница влияния ради формы. |
+| LEARN-02 | локально быстро, глобально — с доказательством | Automatic provisional transfer с условиями. Широкая эффективность не следует из shared flag или двух повторов. |
+| META-01 | самоулучшение — совет | Исправить исходную формулировку: не только советы человеку. Подключённые методы/параметры могут обновляться автоматически; code changes через developer. |
+| ECON-01 | стоимость — полномочие | Учитывать actual/unknown usage и настраиваемую работу; budget не подставляется как measured consumption. |
+| DEV-02 | глубина — проверяемыми слоями | Полезные законченные пути и явный full scope; текущий owner code/minimal-Clippy/tests-later без новой тестовой платформы. |
 
-The existing heading/link is retained; later donors are appended without renumbering. **Source excerpts** means named functions/callers read, not the entire product. **Unreconciled** means comparable review is not established in the maintained record, not that nobody ever read it. A mature tool does not require a whole-code audit simply to use its existing interface.
+### Восемь Hard Boundaries
 
-| D | Donor surface | Recorded level | Useful next question / retained limit |
-|---|---|---|---|
-| 01 | MemMachine | Source excerpts, §§26–27 | Actual configured backend and remaining segmenter/ingestion details |
-| 02 | MemPalace | Unreconciled | Source identities and repeated export handling |
-| 03 | Subcog | Source excerpts, §28 | Selected fusion/lifecycle functions, not full runtime quality |
-| 04 | MemOS local plugin | Source excerpts, §9 | L2/gain attribution, not complete learning pipeline |
-| 05 | Claude Code memory/tool search | Docs/paper | Installed timing and actual integration, not host source audit |
-| 06 | ClawVM | Unreconciled | What compression preserves and what the reader receives |
-| 07 | Pichay / demand paging | Unreconciled | Repeated expansion cost and reconstruction behavior |
-| 08 | Graphiti | Source excerpts, §26 | Temporal filters and add_episode caller before broadening helper findings |
-| 09 | Hindsight | Source excerpts, §§26–27 | Remaining retain/consolidation commits and broader retrieval |
-| 10 | Current EverOS | Source excerpts, §30 | Imported everalgo internals and unreviewed intake/recovery |
-| 11 | Historical EverMemOS | Docs/paper, §30 | Historical implementation matching the paper not established |
-| 12 | Cloudflare managed Agent Memory | Unreconciled | Actual service boundary and useful update mechanism |
-| 13 | Cloudflare Agents SDK Sessions | Unreconciled | Session/branch/compaction semantics for source intake |
-| 14 | SurrealFS | Unreconciled | Source/indexer identity and incremental indexing |
-| 15 | MentisDB | Unreconciled | Versioned procedure lookup/update and actual consumers |
-| 16 | LangMem | Source excerpts, §§23–24 | Selected executor/prompt path, not every backend |
-| 17 | Current Letta Code | Source excerpts, §29 | Full automatic/server reflection and replay remain partial |
-| 18 | Archived Letta V1 | Unreconciled | Historical source distinct from D17 |
-| 19 | Nocturne Memory | Source excerpts, §28 | Read/alias/version mechanisms, not persona/boot doctrine |
-| 20 | Mem0 OSS | Source excerpts, §31 | Synchronous extraction/formatter; async and hosted platform not qualified |
-| 21 | Historical OpenMemory MCP | Unreconciled | Exact historical product and consumer |
-| 22 | OpenMemory session CLI | Unreconciled | Real session/import/export rather than roadmap |
-| 23 | Cavira LongMemory | Unreconciled | Supersession/decay/checkpoint and product identity |
-| 24 | ripgrep | Unreconciled | Concrete source-span use; whole-tool audit unnecessary |
-| 25 | ast-grep | Unreconciled | Specific structural queries and coordinates; incidental reference lookup is not a comparable donor review |
-| 26 | SCIP | Unreconciled | Actual producer/version/encoding and definition-reference use |
-| 27 | GitHub Copilot Memory | Unreconciled | Publicly supportable citation/reuse behavior |
-| 28 | Docling | Unreconciled | Relevant document ingestion before parser selection |
-| 29 | Docling Core | Unreconciled | Hierarchy/provenance for that document path |
-| 30 | DocETL | Unreconciled | Useful transform/error handling, not its whole runtime |
-| 31 | Vector / VRL | Unreconciled | Concrete preservation mechanism; no DSL by default |
-| 32 | Kreuzberg v4 LTS | Unreconciled | Exact branch and needed native extraction |
-| 33 | Current Kreuzberg | Unreconciled | Do not inherit D32 properties by name |
-| 34 | Cedar | Unreconciled | No baseline policy-engine need; omission is not review |
-| 35 | OPA | Unreconciled | No second policy owner merely to use a donor |
-| 36 | redb | Unreconciled | Historical recovery ideas; one semantic DB choice unchanged |
-| 37 | duroxide | Unreconciled | Activity identity may help; workflow runtime not selected |
-| 38 | Flawless | Unreconciled | Unknown external outcome/retry distinctions |
-| 39 | FoundationDB testing | Unreconciled | Not an implementation prerequisite or new test platform |
-| 40 | Wasmtime | Unreconciled | Only a real extension/isolation need justifies it |
-| 41 | SurrealDB Agent Memory / Spectron | Docs/paper | Application-tier descriptions, not code/runtime qualification |
-| 42 | MAGMA | Source excerpts, §29 | Actual query path; broader ingestion remains partial |
-| 43 | A-MEM | Source excerpts, §28 | Library, research code and paper remain distinct |
-| 44 | Harness2 | Source excerpts, §§19,25 | Pool/mission/benchmark adapters still partial; no reproduced experiment |
-| 45 | claude-mem | Source excerpts, §32 | Hook/spool/generator/context, not all providers, low-level durability and source-to-derived persistence |
-| 46 | OpenHands Software Agent SDK | Source excerpts, §32 | Condenser/view/tool-call boundaries, not every agent/provider/storage path |
-| 47 | DeusData/codebase-memory-mcp | Source excerpts, §35, new in 0.22 | Compact architecture, coverage/trace evidence and actual dispatcher; not every parser, indexer, language, daemon or deployment |
+Исходные названия — Claude §5.8 со ссылкой на A0.3. Сохраняется запрет указанной ошибки; механизм меняется по выбранным владельцам, без восьми новых сервисов.
 
-Hy-Memory and V1/V2 remain outside this external numbering and were not read completely. The inherited 43 D + 27 P + 187 S inventory describes 257 historical rows, not 257 software projects or verified experiments. New entries do not establish the complete deduplicated union of the owner's sources.
-
-## 3. Additional named sources
-
-The supplied Claude revision 4 §10.2 names sources outside the old D table. Three omissions now appear as D45–D47 rather than being silently counted under a similar product.
-
-| Additional material | Status / relevance |
+| Исходная граница | Решение V3 и предел |
 |---|---|
-| claude-mem | D45, specific paths at `9e4f313a89236f7fb593a639a77ee02e21e94469`; old fixed hook/cost claims do not replace that scope |
-| OpenHands / software-agent-sdk | D46, selected SDK paths at `0996c33916c2a977ea9fe38deee660ff0e1389f2`; not qualification of every older version cited by Claude |
-| codebase-memory-mcp | D47, `DeusData` source `3457b21b0a3d75960c07ed3ec666a9e684985ef9`; selected as the first configured structural tool, not embedded parser/runtime |
-| mcp-memory-service | Natural memory triggers proposed by the supplied audit; actual current producer/consumer still unreconciled |
-| basic-memory | Contrasting Markdown-source design; not selected as Eliot storage; code review remains open |
-| Codex hooks and OpenCode plugins | Distinct host surfaces; Claude event names do not qualify them |
-| Surrealist | Existing inspection UI candidate, not a reason to build another operator application |
-| Cloudflare OS, Switchyard, Unsloth, cognee, Perplexity Portable Computer | Identity/relevance remain unresolved in the supplied audit; not accepted dependencies |
+| Скрытое создание или расширение полномочий | Model text не меняет user/config/tool permissions; реальный эффект остаётся у host/controller |
+| Скрытая подмена цели пользователя | Сохранить исходную цель и явные поправки; summary и method proposal не заменяют её молча |
+| Неотслеживаемый необратимый или внешний эффект | Сохранить actual execution reference/result; unknown отдельно, без слепого replay |
+| Ложный VERIFIED_COMPLETE | Память не фабрикует success и не принимает внешнюю задачу вместо её владельца |
+| Скрытое переписывание происхождения или истории | Реальные originals и редакции, адресуемый historical open; hash не доказательство смысла |
+| Возврат отозванного влияния после восстановления | Применить известные withdrawals/deletions; неизвестную историю обозначить при explicit owner restore, не обещать невозможное |
+| Второй неуправляемый владелец или путь записи | Один application Store writer; native DB/OS boundary, без второй semantic database |
+| Секреты за границей приватности | Configured capture exclusions и allowed routes на реальной передаче; не объявлять фильтр секретов безошибочным |
 
-Research families additionally include MemGPT/HiAgent, Retrieve then Solve, LightMem/MemDelta, STALE/ATMS, Memp/ACON, GraphRAG/CodexGraph/RepoGraph/HippoRAG 2, MemLineage/Selection Integrity/TOKI/MemTX and Meta-Harness. Some overlap P/S rows. The complete union and each result are not established by a bibliography.
+Это осознанное сопоставление, не буквальное сохранение предложенных Claude finish/approval/effect-log механизмов. Правильная полезная операция не должна ждать сертификата, который сам не создаёт нужной гарантии.
 
-## 4. Audit-of-audits: status retained
+## 3. Все T01–T37 из v9: что относится к переписыванию
 
-These are the owner's source filenames, not new repository reports. Copies and revisions are not independent corroboration. Status remains from earlier passes except the expressly listed fresh reading.
+Левая часть — историческая находка v9, не новый результат запуска. Правая часть — что делать в V3. «Не переносить механизм» не означает, что старый дефект исправлен в V2.
 
-| Audit family | Examined / status | Remaining reconciliation |
+| ID | Исторический предмет | Решение для нового продукта |
 |---|---|---|
-| Claude documentation audit, revision 4, 2026-10-18 | Used throughout; 0.18 reread donor §10.2 and implementation/original-purpose §§15–17; 0.23 retrieved relevant function-preservation/Concilium/Research proposals | Remaining recommendations and actual code; 63-anchor closure, fixed counts, line budgets and deferred functions remain proposals, not accepted owner requirements |
-| `ELIOT_AUDIT_2026-10-08_v9(1).md`, v8 also located | Historical `04eec326...`; scope, issue changes, corrections and block-map interpretation read | T01–T31 and later fixes not fully reconciled. Retractions of “tests are the established cause” and new registries must not be revived |
-| `ELIOT-Swarm-AUDIT-2026-10-06(2).md` | Historical controller `40591a2`; introduction and G1/initial G2 read | Separate controller/swarm responsibilities and historical defects from current interfaces |
-| `Аудит репозитория eliot-memory-os относительно /docs/architecture` | `15d6b40d...`, 2026-08-31; scope/findings/recommendations reread | Reconsider its praise of proof/routing machinery rather than importing it automatically |
-| `Eliot Memory OS: почему проект остаётся незавершённым` | Summary retrieved, not complete source reconciliation | Undated main/manual-CI claims must not become current facts |
-| `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` | Referenced by Claude; exact-title searches have not obtained its full text | Retrieve the actual report, not a different controller donor report |
-| Release `audit-2026-10-16-incomplete` | Metadata/assets named; full ZIP not successfully transferred/read | Findings, transfers and research entries still need reconciliation; manifest/ledger is not that work |
-| `audit-2026-09-14.md` | Opening establishes adjacent Research/Cloudflare/D1 scope | Not a completed Memory OS audit or evidence about SurrealDB |
+| T01 | Неверный разбор rust-toolchain.toml | Использовать parser формата у реальной build-интеграции, не новую конфигурационную эвристику |
+| T02 | Ошибка чтения override превращена в default | Отличать missing optional config от ошибки чтения выбранного значения |
+| T03 | Blob helper подтверждает не сохранённые bytes | Сначала реальная запись, затем адресный readback; receipt не содержимое |
+| T04 | Reservation подменяется worker claim | Не импортировать оба старых аппарата; обычный finite job хранит своего исполнителя |
+| T05 | Defer-only Observe | Capture соединить с primary Store; недоступная отдельная операция не стоп остальных |
+| T06 | Скопированный token переживает смену роли | Реальные host/control permissions, не независимая authority-копия в памяти |
+| T07 | Переход через промежуточную роль теряет ограничение | Не вводить свою роль-платформу; исполнение и acceptance оставить внешнему владельцу |
+| T08 | Актуальный accessor отдаёт legacy relation | Чтение адресной текущей записи без compatibility facade |
+| T09 | Snapshot hook уже подключён | Не создавать заново; учитывается исправленный статус источника |
+| T10 | Requalification стирает чужой failure | Изменять состояние конкретного target; независимые проблемы сохраняются |
+| T11 | Неоднозначное legacy становится Available | Unknown capability не рабочий route; не выключать остальные |
+| T12 | ClientHello policy не доказательство её происхождения | Использовать configured реальный маршрут; не восстанавливать три реестра ради handshake |
+| T13 | Nonce в argv против старой нормы | Не заявлять доказанную утечку; credentials не кладутся в model context/ненужные командные строки |
+| T14 | Watchdog applicability есть, publisher не соединён | Один actual observer и reader его состояния, не новый sensor registry |
+| T15 | Повтор counted ID повышает threshold | Считать уникальные исходные события/попытки, не длину списка |
+| T16 | Diagnostic brief остаётся write-only | Нормальный status/context читает полезные сведения из owning data |
+| T17 | Trigger возвращается раньше своего gap report | Локальный исход и useful partial result не теряются за общей ветвью |
+| T18 | Production log-window всегда пуст | Подавать настоящий сохранённый вход; пустой carrier не анализ |
+| T19 | Proposal identity есть, privacy input нет | Настоящие source/route constraints в момент передачи, не ещё один identity object |
+| T20 | Positive Testd producer не подключён | Использовать наблюдаемый результат настоящего инструмента; fixture не effect |
+| T21 | Store теряет sub-minute timezone | Сохранять предоставленную точность/offset; unknown не округлённая выдумка |
+| T22 | MUST_PROVE_ZONES не mandatory denominator | Coverage сообщает фактические checks/scope; policy label не полнота |
+| T23 | Пять Observe variants defer-only при внутреннем owner | Один реальный capture entrypoint→writer; не полный V2 DTO inventory |
+| T24 | OpenCode default уходит в legacy executable | Первый поддержанный host route выбран явно; no permanent legacy fallback |
+| T25 | Packet работает, State flight отсутствует | Сохранить полезный packet; current continuation адресно связать с source events |
+| T26 | Material gate есть, публичного Act caller нет | Внешний Act остаётся host/controller; не копировать gate в Memory OS |
+| T27 | Coordinate компоненты есть, flight отсутствует | Рой/координация вне памяти; Concilium как разбор scoped вопроса |
+| T28 | Verify только admit | Actual tool result отдельно от acceptance входа; не изготовлять proof |
+| T29 | Prelude helpers не на live boundaries | Штатный host hook вызывает реальный capture/context, а не standalone helper в отчёте |
+| T30 | Finish path жив, binding неполон | Не объявлять Finish отсутствующим; в V3 внешний owner и точные task/outcome references |
+| T31 | Cold-start machinery без live caller/durability | Demand-start + primary read + реальная фоновая ориентация, не ещё один readiness lifecycle |
+| T32 | Backup owners существуют, нет transport | V3 один Store и выбранная обычная backup операция; не достраивать старую распределённую схему |
+| T33 | Maintenance composition fail-closed unpublished | Настоящий configured worker; отсутствие optional maintenance не выключает read/capture |
+| T34 | Research domain есть, source unadmitted; non-success теряется | Реальный adapter и сохранённый terminal failure/partial; недоступность источника не no-findings |
+| T35 | Runner/providers не поданы существующему state machine | Соединить настоящий executor; не ещё один runner/state engine |
+| T36 | ORS durable event есть, receiving owner не принимает | Один primary capture→job→reader; различать сохранение и интерпретацию без ORS-клона |
+| T37 | Bridge forward/recovery есть, дальнейший consumer/replay разорван | Не заявлять отсутствующим весь Bridge; подтверждать реально сохранённый input и продолжать с того же ID |
 
-Failed transfer is not absence of an asset. Original normative text can contain both useful goals and flawed compulsory mechanisms. Reading one does not qualify every implementation or justify silently dropping the goal.
+Сохранены самоисправления v9: отсутствие карты зависимостей, обязательность нового registry, тесты как установленная главная причина, blanket file limits и ряд выводов по счётчикам были отозваны или ограничены. Старые критерии ремонта V2 не становятся нормой переписывания. Аудит проекта не меняет сам code/issue state V2.
 
-## 5. What remains for an implementable V3 model
+## 4. Доноры: охват отдельно от выбора
 
-These subjects are connected design decisions, not new subsystems or permission gates.
+**Код** означает конкретные функции/callers, не полный review продукта. **Документы** означают документацию/статью, не runtime. **Не пересверен** означает, что сопоставимый source-level разбор не установлен в поддерживаемом корпусе. Решение не использовать продукт может быть принято по отсутствию потребности, без выдуманного утверждения о его качестве.
 
-| Work | Chosen direction | Remaining concrete result |
+| D | Источник | Уровень | Итог для V3 |
+|---|---|---|---|
+| 01 | MemMachine | Код | Взять episode/source expansion и понятное grouping; не messages×categories/oldest prefix или второй backend |
+| 02 | MemPalace | Не пересверен | Не dependency; source-event identity уже решена первичными данными |
+| 03 | Subcog | Код | Взять independent retrieval/fusion; не score=confidence и не отдельный HOT/WARM/COLD lifecycle |
+| 04 | MemOS local plugin | Код | Изученные L2/gain ограничены; не переносить causal claims из prior/association |
+| 05 | Claude Code memory/tool search | Документы | Штатный поддержанный host интерфейс; установленную версию проверить при реализации |
+| 06 | ClawVM | Не пересверен | Не dependency; compaction остаётся host, memory хранит источники |
+| 07 | Pichay / demand paging | Не пересверен | Не отдельная paging ОС; раскрытие решено обычным open |
+| 08 | Graphiti | Код | Временные различия и targeted contradictions; не graph runtime/managed Zep |
+| 09 | Hindsight | Код | Facet update, question views, delta и исключение injected echo; не полный layer stack |
+| 10 | Current EverOS | Код | Реальные foresight consumers, группы и coverage; не scoped full scan |
+| 11 | Historical EverMemOS | Документы | Идеи episodes/foresight; не приписывать исторические scores нынешнему коду |
+| 12 | Cloudflare managed Agent Memory | Не пересверен | Не выбранный backend; не обещать бесплатную библиотеку вместо сервиса |
+| 13 | Cloudflare Agents SDK Sessions | Не пересверен в итоговом корпусе | Host branch semantics полезны как направление; не перенос Cloudflare runtime на локальный Rust |
+| 14 | SurrealFS | Не пересверен | Не dependency; конкретные source/version handles уже выбраны |
+| 15 | MentisDB | Код выбранных функций, 0.24 | Method id/revision/body lookup; не binary store/signature/log-diff платформа |
+| 16 | LangMem | Код | Separate background work, trajectory proposals, обработанный keep; не второй scheduler |
+| 17 | Letta Code | Код | Continuation отдельно от learning, actual callers; не второй host/context manager |
+| 18 | Archived Letta V1 | Не пересверен | Не клонировать historical server вместо выбранных current механизмов |
+| 19 | Nocturne Memory | Код | Stable node/alias и useful disclosure clue; не persona/mandatory boot doctrine |
+| 20 | Mem0 OSS | Код | Реальный extraction caller; сохранить tools/ошибки, не embedding-before-primary |
+| 21 | Historical OpenMemory MCP | Не пересверен | Не выбранный runtime; historical/current identity не смешивать |
+| 22 | OpenMemory session CLI | Не пересверен | Не dependency; реализовать свой реальный import/export, не roadmap |
+| 23 | Cavira LongMemory | Не пересверен | Не dependency; exposure/supersession уже имеют конкретный owner |
+| 24 | ripgrep | Не пересверен как донор кода | Использовать существующий настроенный инструмент, не переписывать библиотеку |
+| 25 | ast-grep | Не пересверен как донор кода | При реальной structural query использовать внешний tool; не собственный parser |
+| 26 | SCIP | Не пересверен как донор кода | Формат/producer подключать по нужде; первый структурный источник D47 |
+| 27 | GitHub Copilot Memory | Не пересверен | Не зависимость и не доказанный публичный алгоритм; текущий путь не ждёт его |
+| 28 | Docling | Официальные документы, 22.10 | Выбран внешний converter для document/media input; не встроенная memory platform |
+| 29 | Docling Core | Официальные документы, 22.10 | Сохранить реальные hierarchy/provenance, не flatten всего в строку |
+| 30 | DocETL | Не пересверен | Не нужен workflow engine; simple finite transforms в existing jobs |
+| 31 | Vector / VRL | Не пересверен | Не вводить DSL ради capture; отдельная ingestion-потребность может изменить решение |
+| 32 | Kreuzberg v4 LTS | Не пересверен | Не параллельный parser по умолчанию; альтернатива при конкретном недостатке Docling |
+| 33 | Current Kreuzberg | Не пересверен | Не наследовать свойства LTS; не выбран автоматически вторым parser |
+| 34 | Cedar | Не пересверен | Не нужен baseline enterprise policy engine |
+| 35 | OPA | Не пересверен | Не нужен второй policy owner |
+| 36 | redb | Не пересверен как новый донор | Не вторая semantic DB; bounded spool обычными файлами |
+| 37 | duroxide | Не пересверен | Не выбранный workflow runtime; finite job уже определён |
+| 38 | Flawless | Не пересверен | Unknown-effect handling учтён, новый runtime не нужен |
+| 39 | FoundationDB testing | Не пересверен | Не prerequisite переписывания и не новая тестовая платформа |
+| 40 | Wasmtime | Не пересверен | Не baseline plugin/runtime; только будущая конкретная недоверенная extension |
+| 41 | SurrealDB Agent Memory / Spectron | Документы | Отдельный application tier, не встроенная семантика SurrealDB; не dependency |
+| 42 | MAGMA | Код и статья | Отношения под недостающий ответ, не full scans/keyword veto/multi-graph runtime |
+| 43 | A-MEM | Код и статья | Actual indexed evolution и IDs; не копировать positional update и neighbor-after-top-k |
+| 44 | Harness2 | Код и статья | Два improvement loops через existing owners; baseline/keep, не benchmark workload |
+| 45 | claude-mem | Код | Host capture, persistent input, stable delivery; не весь Bun/SQLite/provider runtime |
+| 46 | OpenHands Software Agent SDK | Код | Actual tool/result boundaries и view поверх events; не пустой summary как успех |
+| 47 | codebase-memory-mcp | Код выбранных handlers | Настроенный structural tool, не embedded parser/SQLite/daemon/UI |
+
+Уровни: 17 позиций с конкретным кодом, 5 с документами/статьёй, 25 без сопоставимого пересмотра. Это учёт представленных разборов, не 17 полностью изученных продуктов или процент готовности. Hy-Memory, V1/V2, controller и Research учитываются отдельно. MemP остаётся отдельным исследовательским источником: actual workflow→prompt→outcome→update прочитан в подготовке 0.24; его benchmark не запускался.
+
+Дополнительные имена из Claude (basic-memory, mcp-memory-service, дополнительные host plugins и другие кандидаты) не скрыто объявляются изученными. Для текущего решения другие memory stores не выбираются, а поддержка дополнительных host interfaces выполняется адаптерами при реализации. Неполученный полный union архивного P/S-реестра остаётся пределом источников; число библиографических строк не доказывает их проверку.
+
+## 5. Из исследований в реализацию
+
+| Прежний открытый вопрос | Решение в итоговом аудите | Что реально написать позже |
 |---|---|---|
-| Original-purpose reconciliation | UL autonomy in §35; disagreement, research and self-revision in §36 now have Architecture/Implementation choices | Finish unreviewed Canonical Master/UL and historical findings; no blanket requirements-completeness claim |
-| Actual host/controller boundary | Native events; synthesis Task→dispatch→result mapping in §6 | Real wiring and missing controller batch-vector operation, without copying controller state |
-| Concrete storage/read operations | Six initial primary tables; current/history; five operations in §§2.6–2.9 | Actual DDL/bindings/queries/plans on selected build; sketches are not executed code |
-| Autonomous useful work | Existing finite jobs for material changes, useful questions and feedback; targeted self-diagnosis in §7.5 | Implement configured scheduling and meaningful input selection, not a model call on every event or global health gate |
-| Grounded project understanding | Configured CBM plus actual source/docs, affected ordinary views and next-context consumer | Connect tool and actual coverage/change behavior; no live parser-quality qualification |
-| Concilium and research | Existing claims/links and discriminating observations; external acquisition stays with Research; §§8.6–8.7 | Actual Research request/result mapping, selected route and source opening; its current refactoring plan is not a verified endpoint |
-| Practical lifecycle and consistency | Demand start, one observer, usable primary memory and ordinary recovery/control | Concrete first-use/setup/process ownership and remaining interface choices; preserve useful operation without an installation/admission platform |
+| Current work вместо похожего прошлого | Адрес project/session/task/branch и свежие события | Reader continuation и обычные сохранённые updates |
+| Реальный consumer метода | Job хранит id/revision; builder открывает body | Prompt/config consumption в существующих модулях |
+| Межпроектный перенос | Origin отдельно от reuse scope | Scoped find и генерация условного общего метода |
+| Составные основания | Roles и необязательные группы существующих links; unknown не угадывается | Targeted dependency lookup/recompute, не общий ATMS |
+| Не-кодовые источники | Native text + внешний Docling и реальные source locators | Конкретные converters/open сегментов, preserve raw |
+| Первое включение | Local config, один instance, малый standalone supervisor + daemon + DB | Windows launch, IPC, lifecycle и файловые primitives |
+| Модели и embeddings | Существующий controller text path; новая batch-vector функция у controller | Реальное request/result/readback и correct usage |
+| Research | Один domain adapter через реальную configured task/tool surface | Request/result/source mapping, не второй research engine |
+| Итоговая документация | Один смысловой baseline аудита; drafts переписать согласованно | Architecture — цель; Implementation — connected paths; Cognition — алгоритмы |
 
-A decided independent capability need not wait for completion of all research once implementation is authorized. Conversely, reading sources does not implement it. Performance and a fifty-fold reduction require a functioning comparable product, not another mock or certificate programme.
-
-### Controller, Store and structural choices retained
-
-Controller `912df90f`: open is preparation; the chosen first Claude query requires task.dispatch. Input admission is not completed inference; later send and a dispatch-only result reader do not automatically form a pair. The missing vector operation remains controller work. [Audit §33](AUDIT.md#33-controller-execution-and-embedding-boundary-020) retains the scope; no new live qualification here.
-
-`stream`/`observation`, `memory`/`memory_history`, `link` and `job` remain the initial Store layout. Capture/pending work commit together; running input is finite; primary reads need no mirrored publisher. [§34](AUDIT.md#34-native-store-operations-without-mirrored-state-021) retains the source/API basis. No schema was deployed.
-
-D47 supplies a compact structural summary and selected actual source; explanation and relevant knowledge stay in Eliot's ordinary views. Its parser/daemon/index are not copied. First useful orientation does not require a complete pyramid, and a placeholder is not understanding. The [0.22 map](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/d7a9de88b87020585a02194c4b51189063f97d96/docs/v3/AUDIT-MAP.md) retains the precise UL/CBM/Git reads and counterchecks.
-
-### New choices for Architecture and Implementation
-
-Architecture §§6–8 preserves disagreement, self-correction and autonomous inquiry as product functions, without adding owners. Implementation §7.5 identifies the actual failed step before changing a lesson. §8.6 uses scoped claims, evidence, dissent and the cheapest useful discriminating observation; no compulsory agent panel. §8.7 uses a real configured external research route and existing memory jobs, not V2's complete federation machinery.
-
-Failed repair prevents unsupported repetition of that repair, not new diagnosis. Partial overall monitoring cannot establish global health, but does not hide a known local error. Mixed Pass/Fail in a broad dimension is not automatically a contradiction. Useful provisional memory remains available while a question is unresolved. The application's own source/job/result records support these distinctions without a SelfQualityStore or ResearchRegistry.
-
-## 6. Fresh source reads and useful next action
-
-| Source | Read in 0.23 | Remaining boundary |
-|---|---|---|
-| V1 Canonical Master `b5c84d4e` | Opening 1–240 and beginning principles through §3.6, including self-improvement gating | Not the full Master; universal gate differs from preserved goal of avoiding self-justified improvement |
-| V2 cognitive requirements `5aac0948` | Short A0.5, A9.3, A10.5, I13.4; I14.22, I16.23 and I21.11 | Not all Concilium/research implementation or every old normative cross-reference |
-| V2 self-quality | `lib.rs`, `diagnose.rs`1–280; contract250–650,680–1010,1060–1380 | Findings about pure algorithm and valid input; production caller/history selection and live behavior not established |
-| V2 Research | Researcher facade1–240; module composition1–300 | Interface/delegation and surrounding shapes, not the complete actual provider execution or retained-data path |
-| Current Eliot Research `7c034569b908d3b03a8b821b7c537477a24b10f7` | README, Implementation navigation, backend-entrypoints1–210 | Current simplification plan, not completed ordinary/deep/federation implementation; actual Memory adapter still to choose |
-| Attached Claude revision4 | Relevant function-preservation/Concilium/Research excerpts and exact-title report search | Not full report reconciliation or retrieval of the missing work-system report |
-| Current V3 | Instructions, Architecture baseline and relevant current Cognition; full maintained audit and Implementation baseline/changed sections | No independent review, full checkout or whole-repository link verification |
-
-Counterchecks: original Concilium explicitly rejects voting and allows one agent; original conflict rules are local. Self-quality requirements already reject a global intelligence score. The pure diagnosis function declares inert handoffs, not an executed repair. A failed narrow name search does not prove absence of all Research routes. Current Research README expressly says refactoring is in progress.
-
-**Next:** concrete first-use/process ownership and configuration of actual routes, then the missing callable Research integration and remaining original/audit reconciliation. Keep the main input→memory→interpretation→next-context path coherent; do not reopen primary reads or add a permission platform to compensate for an unconnected method. The remaining twenty-eight donor rows and full archive are still unfinished.
-
-A01–A14 continue to cover requirements, control, processes, Store, retrieval, producers/consumers, development overhead, own design, Hy coding/transfer, Harness2, donor/archive, interfaces and publication. Graphiti temporal filtering, complete Hindsight commits, Letta automatic reflection, historical EverMemOS and ORS responsibility tracing remain partial.
-
-## 7. Verification and publication boundary
-
-This pass is source/document reading and design review. No product/donor/model/database run, synthetic behavioral test, Rust/Clippy, benchmark or independent subagent review. Local network transfer did not provide a current checkout; actual GitHub commit/compare/ref/readback checks are reported rather than a local full-repository verification.
-
-Changes are confined to Architecture, Implementation §§7.5,8.6–8.7 and associated navigation, Audit §36, this map and README. Cognition0.16 is unchanged. The 34 requirement groups, 29 A15 cases, D01–D47, S1–S32 and 36 cognitive examples remain. Runtime, deployed schema, dependency files, permissions, CI, validators, ACTIVE registry, main and user data are untouched. Product implementation remains after documentation, using the owner's code/minimum-Clippy/tests-later order.
+Оставшиеся пункты — реализация выбранной конструкции, а не разрешение снова плодить каталоги. Не заявляются работающий V3, успешный model/DB/Windows run, независимые субагенты или повтор всех прошлых тестов. Форматирование/ссылки документов проверяются отдельно от продуктового поведения. Существующие CI и main не меняются этим аудитом.
