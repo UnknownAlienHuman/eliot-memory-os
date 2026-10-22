@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.1 · 2026-10-22 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.2 · 2026-10-22 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -57,16 +57,15 @@ It is not a policy database or generated registry.
 
 ### 1.3 Demand start
 
-A relay or host adapter:
+The supervisor, not the transient relay, owns a named mutex for the selected local data directory throughout startup, operation and shutdown. A relay first connects; if no endpoint answers, it starts a supervisor candidate and waits for the endpoint. Only the candidate that acquires the mutex starts children. Losing candidates exit; their relays can still connect to the winner. An existing owner with an unready daemon is not permission to launch another database. A stable supervisor thread holds the mutex until its children have exited; an abandoned mutex invokes recovery of that same data directory, not creation of another store.
 
-1. connects to the local endpoint;
-2. if absent, acquires the launch mutex and starts `eliot supervisor`;
-3. waits for daemon readiness;
-4. performs the requested operation.
+The supervisor creates a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, keeps its handle non-inheritable and remains outside that job. It creates each child suspended, assigns it to the job, then resumes it. If assignment fails, terminate that still-suspended child and report the actual launch failure. Start SurrealDB and establish the actual configured database connection before starting/readying the daemon. Do not kill an unrelated process merely because its name or port matches.
 
-The supervisor starts SurrealDB, waits for concrete readiness, then starts the daemon. Planned idle shutdown stops new external dispatch, settles short mutations, leaves pending work in the database, stops daemon and database, and exits.
+The supervisor observes owned process handles and daemon service progress. Restarting a failed daemon does not restart a healthy database. If the supervisor dies, closing its last job handle terminates its owned children; the next demand start reopens the existing store. This does not promise automatic revival while the entire application is inactive. Planned idle shutdown stops new dispatch, settles short mutations, stops daemon and database, waits for their exit, then releases ownership. Requests arriving during startup/shutdown reconnect; capture may stage input with its original identity instead of reporting it committed.
 
 Primary capture and exact/full-text reads become available as soon as Store is ready. They do not wait for embeddings, Dreamer, project orientation or a graph.
+
+These are selected uses of Windows [mutex ownership](https://learn.microsoft.com/en-us/windows/win32/sync/mutex-objects), [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) and [suspended process creation](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags), read on 2026-10-22. The actual installed launch environment, including any parent job restrictions, still needs implementation-time verification.
 
 ## 2. Code structure
 
@@ -140,12 +139,13 @@ Key fields:
 - available task/session/branch/call/parent references;
 - optional continuation key;
 - optional context packet ID;
+- optional committed correction result/version handles;
 - source locator and revision;
 - capture limit if content was partial.
 
 Unique identity: `(project, stream, event_key)`.
 
-An observed tool result, an agent's report about that result, a prepared packet and an observed host handoff are different observations.
+An observed tool result, an agent's report about that result, a prepared packet and an observed host handoff are different observations. Immutable source content is separate from optional application metadata. A structured correction observation can hold its committed mutation outcome and exact result handles for replay/readback; it does not need an Operation table.
 
 ### 4.3 `memory`
 
@@ -241,11 +241,23 @@ Key fields:
 - result refs and processed input;
 - error or no-change result.
 
-At most one job runs for a `(purpose, target_key)`. New events coalesce into one pending successor; they never mutate the running job's input.
+One target is `(project, purpose, target_key)`. It has at most one active job and one coalesced pending successor. Active includes waiting for or reconciling an already dispatched execution, not merely holding a live worker claim. Completed jobs retain their own input/result history and no longer occupy a slot. Inputs freeze when the pending job becomes active; later events extend the successor only.
+
+Enforce those slots with one database-derived optional key and a native unique index, not only a query asking whether a job already exists. The selected SurrealQL shape is:
+
+```surql
+DEFINE FIELD slot_key ON job VALUE
+    IF state IN ['pending', 'active'] {
+        [project, purpose, target_key, state]
+    } ELSE { NONE };
+DEFINE INDEX job_slot ON job FIELDS slot_key... UNIQUE;
+```
+
+`slot_key...` indexes the complete tuple rather than each array element; absent keys leave terminal history unrestricted. This is a schema design excerpt, not an applied or executed migration. Native [conditional uniqueness and array indexing](https://surrealdb.com/docs/reference/query-language/statements/define/indexes) support this shape. The row and index are owned by Store, not a second queue coordinator.
 
 ### 4.7 Blobs and source locators
 
-Large source bytes live under `blobs/`; database rows keep an opaque reference and digest.
+Large source bytes live under `blobs/`; database rows keep an opaque reference and digest. Save new blob bytes before committing a row that refers to them. A failed row transaction can leave an unreferenced file for later cleanup; a committed row must not point to a file that was never saved.
 
 Supported locators are concrete:
 
@@ -262,70 +274,71 @@ A generic payload alone does not mean a source type is supported.
 
 Store is private application code using the official network Rust SDK and one reusable WebSocket connection to the SurrealDB child. Fixed parameterized query files are preferred to a generic query builder.
 
+One writer means one application owner, not that async requests are automatically serialized. Uniqueness belongs in native record keys/indexes; a preceding existence read alone cannot prevent concurrent duplicates. All dependent writes use one explicit transaction. Check statement errors, affected rows and commit, not just a successful SDK response. A zero-row conditional update needs an explicit transaction abort; returning an error-shaped value is not rollback.
+
+Retry a database transaction conflict with the same saved input and identity, without repeating controller calls, parsing or embeddings. A stale semantic revision is different: do not silently replace the expected revision and overwrite another change. For an uncertain commit, read the owning observation/job result first. These choices follow the [transaction](https://surrealdb.com/docs/learn/querying/concepts-and-guides/transactions) and [Rust query](https://surrealdb.com/docs/reference/rust/methods/query) references read on 2026-10-22.
+
 ### 5.1 `capture_event`
 
 Inside one short transaction:
 
-1. resolve/create the stream;
+1. resolve/create the stream through its unique source identity;
 2. read the event key;
-3. if the same input already exists, return it without duplicate work;
-4. if the key exists with different input, record a conflict/correction path;
-5. advance local ingestion sequence;
-6. insert the observation;
-7. create or extend necessary pending work;
-8. commit.
+3. if identical source input already exists, return its saved result without another observation, sequence increment or queued interpretation;
+4. if that identity names different source content, preserve the original and report the mismatch; an explicit correction is a distinct event;
+5. advance the stream's ingestion sequence and insert the observation;
+6. apply the event's known follow-up rule below;
+7. commit.
 
-Semantic classification, embeddings and source parsing do not run inside this transaction.
+Native unique indexes back stream/event identity. Compare source content, not the new receipt timestamp or retry metadata. One stream's sequence orders intake, not the time at which the external event happened. New work and source capture commit together, so a lost in-process wakeup is recovered by polling due jobs.
 
-When Store is unavailable, write one complete bounded spool file under the stable event identity. Staged input is not confirmed semantic memory. Replay calls `capture_event` with the same key.
+Follow-up is selected by the actual event kind and producer, not another model or a generic rule that every write is new experience:
+
+| Input | Necessary next work |
+|---|---|
+| New host/source event or observed result | Coalesce the relevant unprocessed episode or affected-view work |
+| Explicit structured correction | Apply the addressed edit as described in §5.3; schedule only its affected derived work |
+| Model-created lesson or view revision | Refresh its search representation and genuinely affected dependants; do not re-enqueue the same interpretation merely because it wrote a result |
+| Packet preparation/handoff, read/status, claim renewal or embedding completion | Optional operational/attribution recording only; no new episode inference or independent support |
+
+Self-diagnosis may select operational events for a concrete observed failure. That does not turn routine accounting into fresh task evidence or start a reflection after every read.
+
+Semantic interpretation, embeddings and source parsing run outside this transaction. When Store is unavailable, publish a complete spool file under the same source identity; acknowledge staged only after its bytes are durably saved using the actual filesystem primitives. A retry must not overwrite another payload under the same key. Replay uses the same application operation and removes the file only after primary readback. For a structured correction, retain the target, expected revision and edit in that same staged command; staged never means applied.
 
 ### 5.2 `claim_due_job`
 
-Conditionally claim a due job and freeze its finite inputs.
+In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
 
-The worker reads the named method revision and input/source material after the claim. It does not expand the input to every record now visible.
+The worker then reads the named method revision and source material outside the transaction. Reclaiming an expired worker claim keeps the same job, frozen inputs and controller execution reference. It first checks any saved model output or ongoing execution; expiry is not permission to buy another model call. Completion requires the current claim and finishes that same row atomically with its memory result.
 
-Independent targets proceed independently. There is no project-wide head-of-line barrier.
+Independent projects and targets proceed independently. There is no project-wide head-of-line barrier or separate lock table.
 
 ### 5.3 `publish_revision`
 
-All semantic mutation uses one internal function. It is not a public service or another lifecycle.
+All semantic mutation uses one internal function with a caller-owned transaction. It does not open or commit a nested transaction. Both direct corrections and a multi-item job result use the same mutation logic.
 
-Inputs:
+Inputs are the create/update target, expected revision for an update, new semantic fields, actual source handles, revision-aware links/grounds, and reason/source identity. The function checks the addressed revision, archives its predecessor, updates the current item and links, and returns the exact resulting version. A replacement also retires the specifically replaced claim within this transaction. Direct creates use a stable ID selected for that command; retries do not create another item.
 
-- create or update target;
-- expected current revision when updating;
-- new semantic fields;
-- source observation/handles;
-- revision-aware links/grounds;
-- reason and actor/source identity.
+A structured correction is one application command: save its correction observation, apply the edit and record the exact mutation result on that observation in the same transaction. Read an existing result before comparing the target's now-current revision. Retrying a correction that produced revision 4 still returns revision 4 even if another edit has since produced revision 5; it does not reapply the old edit or invent a new conflict.
 
-Inside one transaction it:
-
-1. verifies the expected current revision when required;
-2. archives the predecessor;
-3. creates or updates the current item;
-4. inserts the links for the new revision;
-5. returns the exact current version handle.
-
-A structured user correction first exists as a captured correction observation, then calls `publish_revision` directly. A Dreamer job uses the same function inside `apply_job_result`. No fake job is created merely to satisfy the mutation path.
+If the expected revision is already stale and no result exists for this command, retain the correction observation with an unapplied conflict result and leave the target unchanged. A concurrent conflict at commit retries this short transaction and re-evaluates the same expected revision. Natural-language corrections whose target or edit is not yet known remain captured input for ordinary interpretation, not falsely applied commands. No fake job, additional operation ledger or approval service is required.
 
 ### 5.4 `apply_job_result`
 
-Prepare model/source results outside the transaction.
+Persist the actual completed controller output, its execution reference and observed/unknown usage under the existing job (or its referenced blob) before releasing provider-side temporary state. A target conflict must not discard an already obtained answer and silently purchase the same inference again.
 
 Inside one transaction:
 
-1. verify the current job claim;
-2. apply each addressed create/update through `publish_revision` semantics;
-3. record the actual result or explicit no-change;
-4. finish the job for exactly its supplied input;
-5. create genuinely necessary successor work;
+1. return the stored result immediately if this job has already applied it;
+2. otherwise verify the current claim and addressed expected revisions;
+3. publish the dependent changes through `publish_revision` in this same transaction;
+4. save exact result handles or explicit no-change and the actually processed input;
+5. finish the job, releasing its active slot, and retain/create any necessary pending successor;
 6. commit.
 
-A zero-row conditional update fails the transaction. Do not use `UPSERT` when an existing item was required.
+A failed conditional mutation aborts the whole dependent write, including history and job completion. Never implement this as separately committed per-item helpers. Use saved output to retry a storage conflict. If the semantic target has genuinely changed, a short follow-up transaction with the current claim records this job as not applied, releases its slot and coalesces any still-needed reconciliation into the pending successor with the saved output and unconsumed inputs. Do not mark those inputs successfully interpreted or leave an expired active job permanently blocking the successor. Reconciliation uses the current target and saved proposal; a necessary new inference is explicit new work, not automatic repetition of the original request.
 
-A lost commit acknowledgement is resolved by reading the same job/result identity before repeating external work.
+An uncertain commit is read back by job ID. An unknown provider outcome is read back by its existing execution reference where supported. Neither is repaired by assigning a new ID and repeating the external request.
 
 ### 5.5 `find_context`
 
@@ -371,7 +384,7 @@ Initial mapping:
 | Tool failure | capture call identity and actual error |
 | Batch/turn boundary when supported | request context informed by recent results |
 | Resume/compaction boundary | refresh current work and changed advice |
-| Explicit user correction | capture correction and call `publish_revision` when sufficiently structured |
+| Explicit user correction | save and apply a structured correction command together; otherwise capture for interpretation |
 
 `attach` returns the exact continuation key chosen from the narrowest available native task/branch/session identity. Subsequent host events and context requests carry that key when available.
 
@@ -513,11 +526,13 @@ Dreamer is a job purpose, not a separate service.
 
 Initial controller mapping uses the supported text-execution path:
 
-1. prepare/open an executor/session as required;
-2. dispatch a finite synthesis task containing saved input handles and selected method revision;
-3. retain the controller execution reference;
-4. read the actual completed output and usage;
-5. persist the useful result before releasing temporary executor state.
+1. prepare the finite request from saved inputs and the exact method revision;
+2. retain the controller request identity before submission when its actual API supports client identity/readback;
+3. prepare/open and dispatch through the supported request/result pair;
+4. save the returned execution reference and read the actual completed output and usage;
+5. preserve that output under the job before applying memory changes or releasing temporary executor state.
+
+When a route supplies an ID only after acceptance, a lost acceptance response is an explicit unresolved dispatch, not proof that nothing ran. Use the controller's real lookup/idempotency capability when available. If it has none, do not promise exactly-once execution; a configured retry of pure inference is a potentially charged new attempt. Database retry never automatically makes that decision.
 
 Input admission is not completed inference.
 
@@ -583,7 +598,7 @@ It may create a provisional lesson, update a named lesson, create/update a proje
 
 Parse failure or provider failure is not no-change.
 
-A direct explicit correction is first captured and then applied through `publish_revision` without a model call. It still retains its source event and expected revision where applicable.
+A direct explicit correction uses the atomic observation-and-edit command in §5.3, without a model call. Replay returns the saved version handles or unapplied conflict; it does not repeat the edit.
 
 ### 10.3 Method consumer
 
