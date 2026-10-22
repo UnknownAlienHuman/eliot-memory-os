@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft · 2026-10-22 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.1 · 2026-10-22 · concrete design for the greenfield rewrite.**
 
-This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced.
+This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
 No schema, controller method or host adapter described here is claimed implemented until the product code exists.
 
@@ -13,7 +13,7 @@ No schema, controller method or host adapter described here is claimed implement
 The initial Windows profile uses one executable with modes:
 
 ```text
-eliot supervisor     persistent owner of the local process family
+eliot supervisor     owner of the active local process family
 eliot daemon         memory service
 eliot relay ...      transient host/CLI relay
 ```
@@ -41,7 +41,7 @@ Use the platform local application-data directory, for example:
   logs\
 ```
 
-`config.toml` contains only practical local settings:
+`config.toml` contains practical local settings:
 
 - data directory;
 - selected projects/workspaces;
@@ -51,9 +51,9 @@ Use the platform local application-data directory, for example:
 - idle timeout;
 - optional host adapters;
 - optional external research and source tools;
-- several concurrently selected projects and any explicitly allowed cross-project reuse scopes.
+- explicitly allowed cross-project reuse scopes.
 
-It is not a policy database or a generated registry.
+It is not a policy database or generated registry.
 
 ### 1.3 Demand start
 
@@ -64,9 +64,9 @@ A relay or host adapter:
 3. waits for daemon readiness;
 4. performs the requested operation.
 
-The supervisor starts SurrealDB, waits for its concrete readiness, then starts the daemon. Planned idle shutdown stops new external dispatch, settles short mutations, leaves pending work in the database, stops daemon and database, and exits.
+The supervisor starts SurrealDB, waits for concrete readiness, then starts the daemon. Planned idle shutdown stops new external dispatch, settles short mutations, leaves pending work in the database, stops daemon and database, and exits.
 
-Primary capture and exact/lexical reads become available as soon as Store is ready. They do not wait for embeddings, Dreamer, project orientation or a graph.
+Primary capture and exact/full-text reads become available as soon as Store is ready. They do not wait for embeddings, Dreamer, project orientation or a graph.
 
 ## 2. Code structure
 
@@ -84,13 +84,7 @@ Start with one Rust package and ordinary modules:
 
 Pure transformations remain functions. A module does not automatically get a trait, service, registry or crate.
 
-The external boundaries are:
-
-- SurrealDB;
-- host events/MCP;
-- controller text execution and embeddings;
-- optional source tools;
-- optional Eliot Research.
+External boundaries are SurrealDB, host events/MCP, controller text execution/embeddings, optional source tools and optional Eliot Research.
 
 ## 3. Application surface
 
@@ -98,9 +92,9 @@ All host surfaces call the same application functions.
 
 | Operation | Result |
 |---|---|
-| `attach(workspace, session)` | bound project/session and actual capabilities |
+| `attach(workspace, session)` | bound project/session, exact continuation key and actual capabilities |
 | `capture(event)` | committed, staged, unknown or rejected |
-| `context(decision_frame, budget)` | useful packet plus expansion handles and gaps |
+| `context(decision_frame, budget)` | packet ID, rendered context, exact included revisions, expansion handles and gaps |
 | `open(handle)` | exact current/historical item or source segment |
 | `record_outcome(report)` | captured observed result or explicitly sourced report |
 | `dream(request)` | finite interpretation/research/improvement job |
@@ -110,7 +104,7 @@ All host surfaces call the same application functions.
 
 ## 4. Physical data model
 
-The initial schema uses six primary tables plus filesystem blobs.
+The initial schema uses six primary tables plus filesystem blobs. Context packets and handoff events are ordinary observations and links; they do not require a seventh packet table.
 
 ### 4.1 `stream`
 
@@ -129,7 +123,7 @@ Unique identity: `(project, source_kind, source_native_id)`.
 
 ### 4.2 `observation`
 
-Preserves an actual source event or explicitly sourced report.
+Preserves an actual source event, an explicitly sourced report or a directly observed Eliot application event.
 
 Key fields:
 
@@ -144,12 +138,14 @@ Key fields:
 - `body` or `blob_ref`;
 - searchable excerpt;
 - available task/session/branch/call/parent references;
+- optional continuation key;
+- optional context packet ID;
 - source locator and revision;
 - capture limit if content was partial.
 
 Unique identity: `(project, stream, event_key)`.
 
-An observed tool result and an agent's report about a result are different observations.
+An observed tool result, an agent's report about that result, a prepared packet and an observed host handoff are different observations.
 
 ### 4.3 `memory`
 
@@ -162,6 +158,7 @@ Key fields:
 - `reuse_scope`;
 - `revision`;
 - `kind`;
+- optional `address_kind` and `address_key` for exact non-semantic lookup;
 - `content`;
 - `search_text`;
 - exact cues and advisory aliases;
@@ -173,6 +170,14 @@ Key fields:
 - optional active embedding profile/vector/revision.
 
 `origin_project` never changes. `reuse_scope` may be project-local, selected projects or local-owner-wide.
+
+`address_key` is application-generated from a real native address, not inferred from text. The initial exact-address uses are:
+
+- continuation: project/workspace plus the narrowest available task, branch or session identity;
+- project view: project plus stable view/question key;
+- named method: stable method key where an external caller needs it.
+
+When present, exact lookup is indexed by `(origin_project, kind, address_kind, address_key)`. Interleaved tasks in one session remain distinct when the host supplies task/branch identity. Session/workspace is only the fallback when no narrower identity exists.
 
 ### 4.4 `memory_history`
 
@@ -204,13 +209,15 @@ Relation kinds include:
 - episode membership/order;
 - outcome of;
 - used method;
+- included in context packet;
+- handed off in context packet;
 - navigation/related.
 
 For compound grounds:
 
 - links in one non-null `grounds_group` are required together;
 - different groups are alternatives;
-- ungrouped evidence is supportive unless the item explicitly names it as required.
+- ungrouped evidence is supportive.
 
 This is sufficient for addressable revision. It is not a general theorem prover.
 
@@ -240,7 +247,7 @@ At most one job runs for a `(purpose, target_key)`. New events coalesce into one
 
 Large source bytes live under `blobs/`; database rows keep an opaque reference and digest.
 
-Supported source locators are concrete:
+Supported locators are concrete:
 
 - code: repository/worktree, revision, path, lines or symbol;
 - document/PDF: URI/file, revision, page and element/span;
@@ -265,7 +272,7 @@ Inside one short transaction:
 4. if the key exists with different input, record a conflict/correction path;
 5. advance local ingestion sequence;
 6. insert the observation;
-7. create or extend necessary pending jobs;
+7. create or extend necessary pending work;
 8. commit.
 
 Semantic classification, embeddings and source parsing do not run inside this transaction.
@@ -280,32 +287,52 @@ The worker reads the named method revision and input/source material after the c
 
 Independent targets proceed independently. There is no project-wide head-of-line barrier.
 
-### 5.3 `apply_job_result`
+### 5.3 `publish_revision`
+
+All semantic mutation uses one internal function. It is not a public service or another lifecycle.
+
+Inputs:
+
+- create or update target;
+- expected current revision when updating;
+- new semantic fields;
+- source observation/handles;
+- revision-aware links/grounds;
+- reason and actor/source identity.
+
+Inside one transaction it:
+
+1. verifies the expected current revision when required;
+2. archives the predecessor;
+3. creates or updates the current item;
+4. inserts the links for the new revision;
+5. returns the exact current version handle.
+
+A structured user correction first exists as a captured correction observation, then calls `publish_revision` directly. A Dreamer job uses the same function inside `apply_job_result`. No fake job is created merely to satisfy the mutation path.
+
+### 5.4 `apply_job_result`
 
 Prepare model/source results outside the transaction.
 
 Inside one transaction:
 
 1. verify the current job claim;
-2. verify each addressed current memory revision;
-3. archive replaced revisions;
-4. update/create addressed memory items;
-5. insert revision-aware links/grounds;
-6. record the actual result or explicit no-change;
-7. finish the job for exactly its supplied input;
-8. create any genuinely necessary successor work;
-9. commit.
+2. apply each addressed create/update through `publish_revision` semantics;
+3. record the actual result or explicit no-change;
+4. finish the job for exactly its supplied input;
+5. create genuinely necessary successor work;
+6. commit.
 
 A zero-row conditional update fails the transaction. Do not use `UPSERT` when an existing item was required.
 
 A lost commit acknowledgement is resolved by reading the same job/result identity before repeating external work.
 
-### 5.4 `find_context`
+### 5.5 `find_context`
 
 Run independent retrieval arms:
 
 - direct handles and exact identifiers;
-- current-work address;
+- exact continuation address;
 - full-text search;
 - compatible vector search;
 - scoped claim-group alternatives;
@@ -314,7 +341,9 @@ Run independent retrieval arms:
 
 Union candidates before applicability and final packing. Page broad enumeration. A per-page limit is not total corpus capacity.
 
-### 5.5 `open_handle`
+The result contains a new stable `packet_id`, the exact item/method revisions included, rendered content, handles and declared gaps. Recording packet preparation is useful attribution but is not allowed to suppress an otherwise useful context result. If that application-event write fails, return the packet with an explicit tracking gap.
+
+### 5.6 `open_handle`
 
 Open:
 
@@ -322,7 +351,8 @@ Open:
 - observation;
 - source segment/blob;
 - view and its examined scope;
-- job/result status.
+- job/result status;
+- context packet content and included revision handles when recorded.
 
 Missing content is reported as missing. Do not generate a plausible substitute.
 
@@ -341,7 +371,9 @@ Initial mapping:
 | Tool failure | capture call identity and actual error |
 | Batch/turn boundary when supported | request context informed by recent results |
 | Resume/compaction boundary | refresh current work and changed advice |
-| Explicit user correction | capture and publish/update a memory item directly when sufficiently structured |
+| Explicit user correction | capture correction and call `publish_revision` when sufficiently structured |
+
+`attach` returns the exact continuation key chosen from the narrowest available native task/branch/session identity. Subsequent host events and context requests carry that key when available.
 
 The adapter records what the host supplies. It does not invent a task ID, verifier, successful step or project. Subagent events remain in their native child/parent streams and are not flattened into a fictitious single sequence.
 
@@ -355,7 +387,7 @@ Each adapter maps native events into the same `capture`, `context`, `open` and `
 
 Do not create a universal plugin framework before a second real adapter proves the common boundary. Host-specific lifecycle traps remain in that adapter.
 
-### 6.3 Delivery semantics
+### 6.3 Delivery and packet attribution
 
 Build the packet before optional diagnostics.
 
@@ -366,7 +398,9 @@ Distinguish:
 - observed by the host if such feedback exists;
 - applied by the agent, usually unknown unless later evidence supports it.
 
-Do not mark delivered before handoff. Logging failure cannot erase a known primary result.
+`context` returns `packet_id`. The adapter records an observed handoff event under that ID when it actually hands the packet to the host. The packet record links to every included method/item revision. Later action/outcome observations carry the packet ID only when the host can correlate them; otherwise adherence remains unknown.
+
+Packet accounting failure does not erase the rendered packet or transform a known primary action into failure. Do not mark handed off before the handoff. Logging failure cannot erase a known primary result.
 
 Repeat suppression is a small cache keyed by context incarnation and material revision. New corrections or newly available orientation may be offered again.
 
@@ -377,6 +411,7 @@ Repeat suppression is a small cache keyed by context incarnation and material re
 A decision frame carries available:
 
 - project/workspace;
+- exact continuation key;
 - task/session/branch IDs;
 - current user goal and criteria;
 - selected resources;
@@ -390,8 +425,8 @@ Unknown fields remain unknown.
 
 Context construction:
 
-1. directly open current task/session/branch continuation;
-2. merge later observations not represented by that continuation;
+1. directly open the continuation by exact key;
+2. merge later observations not represented by its covered input;
 3. retrieve exact constraints and corrections;
 4. retrieve applicable methods and episodes;
 5. resolve current claim groups and dissent;
@@ -400,7 +435,7 @@ Context construction:
 
 A cancelled plan or old continuation does not regain authority by similarity.
 
-A continuation is an ordinary versioned memory item containing:
+A continuation is an ordinary versioned `memory` item with `address_kind = current_work` and the exact continuation key. It contains:
 
 - active goal;
 - current plan;
@@ -432,7 +467,7 @@ Render useful content, not only record IDs and scores. Details remain available 
 
 Primary full-text and exact queries operate on `memory` and selected observation fields. Vector search is an additional arm.
 
-Embedding identity includes encoder, preprocessing and content revision. A failed or pending vector leaves exact/lexical retrieval available.
+Embedding identity includes encoder, preprocessing and content revision. A failed or pending vector leaves exact/full-text retrieval available.
 
 Background embedding work is batched and limited so foreground query capacity remains.
 
@@ -479,7 +514,7 @@ Dreamer is a job purpose, not a separate service.
 Initial controller mapping uses the supported text-execution path:
 
 1. prepare/open an executor/session as required;
-2. dispatch a finite synthesis task containing the saved input handles and selected method revision;
+2. dispatch a finite synthesis task containing saved input handles and selected method revision;
 3. retain the controller execution reference;
 4. read the actual completed output and usage;
 5. persist the useful result before releasing temporary executor state.
@@ -535,7 +570,7 @@ Host events are grouped using actual session/task/call/result relationships. Chu
 
 Coalesce wakeups, not observations. A running interpretation job sees a finite saved range; later events remain for the pending successor.
 
-### 10.2 Interpret or keep
+### 10.2 Interpret, correct or keep
 
 A normal Dreamer job receives:
 
@@ -544,17 +579,11 @@ A normal Dreamer job receives:
 - a small set of related current lessons;
 - the selected method revision used to interpret or improve.
 
-It may:
-
-- create a provisional lesson;
-- update a named lesson;
-- create/update a project view;
-- identify contradiction/unknown;
-- keep/no-change.
+It may create a provisional lesson, update a named lesson, create/update a project view, identify conflict/unknown, or keep/no-change.
 
 Parse failure or provider failure is not no-change.
 
-A direct explicit correction may publish without a model call.
+A direct explicit correction is first captured and then applied through `publish_revision` without a model call. It still retains its source event and expected revision where applicable.
 
 ### 10.3 Method consumer
 
@@ -576,18 +605,16 @@ Applicability is three-valued:
 
 Similarity finds candidates; it does not prove conditions. Negation, version and observed execution results must not be reduced to word overlap.
 
-Cross-project retrieval considers:
-
-1. current project items;
-2. reusable methods whose `reuse_scope` includes the current project.
+Cross-project retrieval considers current-project items and reusable methods whose `reuse_scope` includes the current project.
 
 Origin and source restrictions remain visible. Transfer may be provisional; broad effectiveness requires later comparable outcomes.
 
 ### 10.5 Outcome feedback
 
-Outcome records distinguish:
+Outcome reduction uses the exact packet and method revision when available. Records distinguish:
 
-- method offered/delivered;
+- method included in packet;
+- packet handed off;
 - action observed;
 - method followed or unknown;
 - criterion coverage;
@@ -597,14 +624,11 @@ Outcome records distinguish:
 
 One attempt/criterion contributes once. Corrections replace the current contribution with history.
 
-A missing diagnostic is success only if the relevant check actually covered the target.
+A missing diagnostic is success only if the relevant check actually covered the target. Absence of packet/action correlation leaves adherence unknown rather than assigning credit or blame.
 
 ### 10.6 Recursive improvement
 
-Use the same jobs, methods and outcomes for:
-
-- task-local Propose–Probe–Compose;
-- cross-task lessons about how to improve.
+Use the same jobs, methods and outcomes for task-local Propose–Probe–Compose and cross-task lessons about how to improve.
 
 Baseline/no-change remains eligible. Repeatable local calculations and copies are preferred probes. Do not repeat irreversible external actions merely to compare candidates.
 
@@ -634,27 +658,13 @@ Unresolved alternatives remain available; unrelated work continues.
 
 ### 11.2 Anticipation
 
-A conditional anticipation is a method or claim describing:
-
-- trigger situation;
-- expected future observation/risk;
-- material conditions;
-- useful check/action;
-- expiry/reconsideration condition.
+A conditional anticipation is a method or claim describing trigger situation, expected risk/opportunity, material conditions, useful check/action and expiry/reconsideration condition.
 
 It enters ordinary context when relevant. Expiry of the warning does not fabricate an outcome.
 
 ### 11.3 Research use
 
-Research findings preserve:
-
-- the question;
-- sources examined;
-- report/findings;
-- alternatives;
-- coverage/gaps;
-- source handles;
-- method/version used.
+Research findings preserve the question, sources examined, findings, alternatives, coverage/gaps, source handles and method/version used.
 
 A source acquisition failure and completed but uninformative research are different. Repeated no-change on unchanged inputs does not automatically rerun.
 
@@ -700,7 +710,7 @@ Direct controls:
 - backup/restore;
 - graceful shutdown.
 
-Status is derived from actual process, Store, jobs and recent results. Heartbeat is not progress; acknowledgement is not resolution; prepared context is not delivery.
+Status is derived from actual process, Store, jobs and recent results. Heartbeat is not progress; acknowledgement is not resolution; prepared context is not handoff.
 
 Optional notification failure does not block status or control.
 
@@ -721,8 +731,9 @@ Build vertical slices in this order.
 
 - first Claude adapter;
 - actual tool result/error capture;
-- current-work continuation;
-- full-text/exact context;
+- exact continuation key and current-work lookup;
+- exact/full-text context;
+- stable packet ID and handoff observation;
 - `open` expansion;
 - advice delivered at a real model boundary.
 
@@ -730,9 +741,10 @@ Build vertical slices in this order.
 
 - actual controller text execution;
 - finite episode job;
+- shared `publish_revision` for job output and direct correction;
 - create/update/keep;
 - method revision consumed by the next job;
-- outcome capture and correction.
+- packet-linked outcome capture and correction.
 
 ### Slice 4 — Understanding and transfer
 
@@ -756,4 +768,4 @@ Build vertical slices in this order.
 - targeted self-diagnosis;
 - additional host/source adapters.
 
-For each slice, implement the real production path first. Run minimum relevant build/Clippy checks. Add broader tests after the connected behavior exists. Do not create success-shaped stubs, fixtures in the production branch or unused framework code to satisfy a planned test.
+For each slice, implement the real production path first. Run minimum relevant build/Clippy checks. Add broader tests after connected behavior exists. Do not create success-shaped stubs, fixtures in the production branch or unused framework code to satisfy a planned test.
