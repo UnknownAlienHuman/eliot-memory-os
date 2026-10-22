@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.2 · 2026-10-22 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.3 · 2026-10-22 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -94,12 +94,12 @@ All host surfaces call the same application functions.
 | `attach(workspace, session)` | bound project/session, exact continuation key and actual capabilities |
 | `capture(event)` | committed, staged, unknown or rejected |
 | `context(decision_frame, budget)` | packet ID, rendered context, exact included revisions, expansion handles and gaps |
-| `open(handle)` | exact current/historical item or source segment |
+| `open(handle, read_context)` | exact current/historical item or source segment within the bound project/route |
 | `record_outcome(report)` | captured observed result or explicitly sourced report |
 | `dream(request)` | finite interpretation/research/improvement job |
 | `control(command)` | status, configure, pause/cancel, correct, erase, backup or restore |
 
-`record_outcome` reuses capture. It does not create an execution-proof subsystem.
+`record_outcome` reuses capture. It does not create an execution-proof subsystem. The adapter supplies the bound project and configured route in `read_context`; opening a source does not require an agent to complete another permissions form.
 
 ## 4. Physical data model
 
@@ -169,15 +169,18 @@ Key fields:
 - created/updated times;
 - optional active embedding profile/vector/revision.
 
-`origin_project` never changes. `reuse_scope` may be project-local, selected projects or local-owner-wide.
+`origin_project` is the stable configured project ID and never changes when the workspace is renamed. Store `reuse_scope` as `{ mode, projects }`: `mode` is `project`, `selected` or `owner`; `projects` is an array of stable project IDs, empty outside selected mode. This describes where a method can be considered, not whether it is true or whether every source can be disclosed. Project-local is the default. Shared methods use the owner's configured reuse choice without a separate approval for every item.
 
-`address_key` is application-generated from a real native address, not inferred from text. The initial exact-address uses are:
+`address_key` is an unambiguous application serialization of the full address: project, item kind, address kind and the relevant native components. For continuation, include the host/source namespace, workspace and the task/branch/session identity in its documented uniqueness scope. A session-local task ID needs its session component; a Git branch name alone does not identify an agent task. Do not lowercase native IDs or concatenate them with an ambiguous delimiter. A canonical encoded tuple is enough; no digest or address registry is needed.
 
-- continuation: project/workspace plus the narrowest available task, branch or session identity;
-- project view: project plus stable view/question key;
-- named method: stable method key where an external caller needs it.
+Project views use a stable view/question key; externally named methods use their stable method key. Ordinary anonymous notes have no address. Enforce one current item per complete address, not just faster lookup:
 
-When present, exact lookup is indexed by `(origin_project, kind, address_kind, address_key)`. Interleaved tasks in one session remain distinct when the host supplies task/branch identity. Session/workspace is only the fallback when no narrower identity exists.
+```surql
+DEFINE FIELD address_key ON memory TYPE option<string>;
+DEFINE INDEX memory_address ON memory FIELDS address_key UNIQUE;
+```
+
+The native unique index permits multiple records with no address. On concurrent first creation, read the winning addressed item and continue with its revision; do not create a second continuation or overwrite the winner. A more specific task identity discovered later selects its own address and may refer to earlier session observations. It does not silently rename a shared session continuation or merge interleaved tasks. No matching address means no saved continuation, not permission to use the latest unrelated one.
 
 ### 4.4 `memory_history`
 
@@ -185,7 +188,9 @@ Stores previous semantic revisions.
 
 Unique identity: `(item, revision)`.
 
-A version handle is `(item_id, revision)`. `open` returns that exact version. It never substitutes the latest historical row for a missing current item.
+A version handle is `(item_id, revision)`. Within a short consistent Store read, return `memory` only if its revision matches; otherwise query this exact history key. No match is missing content, not permission to return the newest revision. An unversioned current-item read uses `memory` only and never resurrects the last historical row after deletion.
+
+Historical reads return their actual editorial status; opening old text is not making it current advice. Keep links/grounds scoped to the requested revision. A current scope or disclosure change still applies to what may be sent now; an old handle is not a permission token.
 
 ### 4.5 `link`
 
@@ -352,9 +357,33 @@ Run independent retrieval arms:
 - relevant typed relations;
 - project-local and eligible reusable methods.
 
-Union candidates before applicability and final packing. Page broad enumeration. A per-page limit is not total corpus capacity.
+The project comes from the bound request, not from query prose. Addressed work is read directly:
 
-The result contains a new stable `packet_id`, the exact item/method revisions included, rendered content, handles and declared gaps. Recording packet preparation is useful attribution but is not allowed to suppress an otherwise useful context result. If that application-event write fails, return the packet with an explicit tracking gap.
+```surql
+SELECT id, revision, content FROM memory WHERE address_key = $address;
+```
+
+Local items and reusable methods must be eligible before each retrieval arm's limit. For example, the scope/lexical part of a candidate query is:
+
+```surql
+SELECT id, revision, search::score(0) AS score FROM memory
+WHERE (
+    origin_project = $project OR
+    (kind = 'method' AND (
+        reuse_scope.mode = 'owner' OR
+        (reuse_scope.mode = 'selected' AND reuse_scope.projects CONTAINS $project)
+    ))
+) AND search_text @0@ $query
+ORDER BY score DESC, id ASC LIMIT $candidate_limit;
+```
+
+This excerpt specifies scope and lexical ranking, not the whole query: the production query also applies recorded influence and configured disclosure predicates before its candidate limit. It never selects a global top-k and then discards other projects. A shared method does not make all raw observations, private project views or its source neighbors shared. Scoped direct expansion and `open` retain that distinction; useful method content can be returned with a specific unavailable-source gap rather than denied wholesale.
+
+Store uses declared scalar types for project/mode/kind, an array type for selected projects, native indexes on the actual selector fields and `reuse_scope.projects.*` for containment. Keep full-text indexing separate from uniqueness. Use the same eligibility conditions in the native vector query; array containment need not receive the same prefilter optimization as scalar equality. Check the selected server's actual plan before adding another cache or search engine. The [index](https://surrealdb.com/docs/reference/query-language/statements/define/indexes) and [filtered-vector](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) references were read on 2026-10-22; these excerpts were not executed.
+
+Union candidate version handles before applicability and final packing. Hydrate their exact versions and revision-specific links, not a later head under the old handle. Do not retain a DB transaction across a query-embedding call or host handoff. If current advice needs a newly changed version, fetch it as that version and rebuild the affected unit. Page broad enumeration; a per-page limit is not total corpus capacity.
+
+The result contains a new stable `packet_id`, rendered content, its exact item/method revisions, handles and gaps. Record the versions actually rendered. Packet preparation is useful attribution but cannot suppress useful context on a recording failure; return the packet with a tracking gap instead.
 
 ### 5.6 `open_handle`
 
@@ -367,7 +396,7 @@ Open:
 - job/result status;
 - context packet content and included revision handles when recorded.
 
-Missing content is reported as missing. Do not generate a plausible substitute.
+Use the bound read context for every item and source expansion, including links from shared methods. Return requested immutable source bytes/segments or an explicit availability gap; a live URL or file that now contains different content is not the previously cited revision. A recorded packet opens its saved text and version list, not a fresh rendering with today's methods. Missing content is reported as missing, without a plausible substitute or an implicit latest-version fallback.
 
 ## 6. Host capture and delivery
 
@@ -534,9 +563,13 @@ Initial controller mapping uses the supported text-execution path:
 
 When a route supplies an ID only after acceptance, a lost acceptance response is an explicit unresolved dispatch, not proof that nothing ran. Use the controller's real lookup/idempotency capability when available. If it has none, do not promise exactly-once execution; a configured retry of pure inference is a potentially charged new attempt. Database retry never automatically makes that decision.
 
-Input admission is not completed inference.
+Input admission is not completed inference. A completed result-read operation may have stored only one page; its EOF flag does not prove that previous pages were collected. The adapter reads retained bytes through controller artifact operations, rather than parsing an Operation receipt as model prose.
 
-Do not rely on a later-message API unless its result reader supports that origin. Fix such a gap in the controller adapter, not by scraping logs inside Memory OS.
+For a selected route with paged output, retain page artifact references and offsets on the same job, fetch missing pages through the supported `agent.result` path, and use controller's existing `artifact.assemble` when a complete body is needed. Read the resulting artifact through `artifact.read` and preserve the input needed by Eliot before releasing executor-side state. This is an adapter flow to implement, not a claim that every route/successor already supports it. It does not require a second assembler or provider-result journal inside Memory OS.
+
+Keep three outcomes distinct: model execution status; complete coverage of the retained bytes; and usefulness/validity of the parsed proposal. The inspected assembler can cover a retained command-output prefix completely while still reporting `capture_truncated` or `capture_read_error`. Preserve those limits. An empty, truncated, failed or unavailable model output is not a successful no-change. A partial output may support an explicitly partial result only when that part is independently usable; it cannot mark the whole input processed.
+
+Selected controller registration and assembly paths were read at `c3e331a37ef58b3b98f7859bfb9e40935501e106`; exact scope and remaining gaps are in R-014 of the registry. Runtime qualification still must cover the chosen public read path, credentials, request-ID recovery, adapter restart and retention. The controller's A2 durable-delivery design is not evidence that those missing pieces already run. Do not rely on a later-message API unless its result reader supports that origin; fix a gap in that adapter, not by scraping logs or repeating the model call in Memory OS.
 
 ### 9.2 Request content
 
