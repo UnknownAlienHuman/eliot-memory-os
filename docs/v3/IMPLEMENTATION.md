@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.9 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.10 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -29,13 +29,15 @@ The daemon does not supervise itself. Hosts and controller do not also own this 
 
 ### 1.2 Data directory and configuration
 
-Use the platform local application-data directory, for example:
+Use the platform local application-data directory as the stable installation root, for example:
 
 ```text
 %LOCALAPPDATA%\Eliot\
   config.toml
-  db\
-  blobs\
+  data\
+    db\
+    blobs\
+  deletions\
   spool\
   backups\
   logs\
@@ -43,7 +45,7 @@ Use the platform local application-data directory, for example:
 
 `config.toml` contains practical local settings:
 
-- data directory;
+- selected data directory (initially `data/`, containing DB and blobs together);
 - selected projects/workspaces;
 - capture exclusions and retention;
 - controller endpoint/routes;
@@ -53,11 +55,11 @@ Use the platform local application-data directory, for example:
 - optional external research and source tools;
 - explicitly allowed cross-project reuse scopes.
 
-It is not a policy database or generated registry.
+It is not a policy database or generated registry. Configuration, spool and the text-free deletion notices in §12 remain installation-owned when restore selects a replacement data directory; an old backup does not overwrite them.
 
 ### 1.3 Demand start
 
-The supervisor, not the transient relay, owns a named mutex for the selected local data directory throughout startup, operation and shutdown. A relay first connects; if no endpoint answers, it starts a supervisor candidate and waits for the endpoint. Only the candidate that acquires the mutex starts children. Losing candidates exit; their relays can still connect to the winner. An existing owner with an unready daemon is not permission to launch another database. A stable supervisor thread holds the mutex until its children have exited; an abandoned mutex invokes recovery of that same data directory, not creation of another store.
+The supervisor, not the transient relay, owns a named mutex for the stable installation root throughout startup, operation and shutdown. Selecting a restored data directory does not create a second mutex identity. A relay first connects; if no endpoint answers, it starts a supervisor candidate and waits for the endpoint. Only the candidate that acquires the mutex starts children. Losing candidates exit; their relays can still connect to the winner. An existing owner with an unready daemon is not permission to launch another database. A stable supervisor thread holds the mutex until its children have exited; an abandoned mutex invokes recovery of the selected data directory, not creation of another store.
 
 The supervisor creates a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, keeps its handle non-inheritable and remains outside that job. It creates each child suspended, assigns it to the job, then resumes it. If assignment fails, terminate that still-suspended child and report the actual launch failure. Start SurrealDB and establish the actual configured database connection before starting/readying the daemon. Do not kill an unrelated process merely because its name or port matches.
 
@@ -281,7 +283,7 @@ A generic payload alone does not mean a source type is supported. Keep byte offs
 
 ## 5. Store and transaction operations
 
-Store is private application code using the official network Rust SDK and one reusable WebSocket connection to the SurrealDB child. Fixed parameterized query files are preferred to a generic query builder.
+Store is private application code using the official network Rust SDK and one reusable WebSocket connection to the SurrealDB child. Fixed parameterized query files are preferred to a generic query builder. Export/import use a temporary HTTP connection owned by this same Store, with the SDK `protocol-http` feature and explicit namespace/database selection (§12); the documented Rust WebSocket transport does not support those methods. This is a maintenance transport, not a second application writer.
 
 One writer means one application owner, not that async requests are automatically serialized. Uniqueness belongs in native record keys/indexes; a preceding existence read alone cannot prevent concurrent duplicates. All dependent writes use one explicit transaction. Check statement errors, affected rows and commit, not just a successful SDK response. A zero-row conditional update needs an explicit transaction abort; returning an error-shaped value is not rollback.
 
@@ -334,7 +336,7 @@ If the expected revision is already stale and no result exists for this command,
 
 ### 5.4 `apply_job_result`
 
-Persist the actual completed worker/controller result and available execution reference under the existing job or its referenced blob before releasing temporary output. Retain observed/unknown provider usage where applicable; a source converter does not require a fictitious model execution. A target conflict must not discard an already obtained result and silently repeat its conversion or inference.
+For a still-live job, persist the actual completed worker/controller result and available execution reference under the existing job or its referenced blob before releasing temporary output. Retain observed/unknown provider usage where applicable; a source converter does not require a fictitious model execution. A target conflict must not discard an already obtained result and silently repeat its conversion or inference. An erasure-cancelled job follows §12.1 instead of retaining deleted input/output again.
 
 Inside one transaction:
 
@@ -780,32 +782,52 @@ A source acquisition failure and completed but uninformative research are differ
 
 ## 12. Deletion, backup and restore
 
+`control` coordinates these operations through the existing Store, jobs and supervisor. A derived explanation is not disposable merely because a model produced it: restoring the same knowledge requires its saved text and revisions, not another inference.
+
 ### 12.1 Deletion
 
-Publish withdrawal before acknowledging it. Remove controlled current/history rows, links, vectors, blobs, staged input and controlled backup copies as required.
+Withdrawal and erasure have different completion results. A committed withdrawal stops guidance; it does not claim that all physical copies are gone. For erasure, record the owner's exact selected source/item scope and command ID as a small durable notice under installation-owned `deletions/` before removing content. It contains stable identifiers and any selected source-occurrence cutoffs, not excerpts or model input. Capture replay, result application and restore consume these notices; unrelated equal text is not a match.
 
-Keep the minimum replay/deletion information outside rollback-prone copies. Do not retain deleted text in that record. Loss of a required premise is recorded on the affected conclusion/group before removing its link (§8.5); removing provenance is not a new derivation or a way to preserve erased content.
+Withdraw the selected material and cancel affected pending/active jobs through ordinary mutations, clearing their claims. Settle their local writers before cleanup; a late controller/converter result must not recreate the erased content through result persistence or spool. Work for unrelated sources continues. Keep only the external execution references needed to report unresolved remote work, not its deleted body. Remote cancellation or external copy deletion is not asserted when the provider cannot perform it.
+
+Page through actual source/derivation references and remove controlled observations, current/history text, conversion JSON/assets, source-excerpt views, packet copies, job input/output blobs, staged files and content-bearing links in the selected scope. Native row/index maintenance removes their indexed entries. Preserve the text-free loss-of-ground qualification before deleting a required link (§8.5). An independently grounded replacement is new content from remaining inputs, not permission to keep the old erased synthesis.
+
+Owned backup sets containing the selected data must be removed or replaced with completed cleaned sets; a deletion notice beside an unchanged dump does not erase its bytes. Never edit a SurrealQL dump with text replacement. Include retained pre-restore data directories in this cleanup. Report incomplete file removals and unavailable controlled destinations; do not label withdrawal as completed erasure. User-exported copies and host/provider logs outside Eliot's control are stated limits. This promises removal from controlled application storage, not forensic sanitization of storage media.
 
 ### 12.2 Backup
 
-1. pause primary mutations and new external dispatch;
-2. let short transactions finish;
-3. seal the current spool batch and open a new one;
-4. export primary DB state and referenced blobs into a temporary directory;
-5. include the sealed input cutoff and known deletion information;
-6. verify required components;
-7. publish the completed-backup marker;
-8. resume.
+Use native logical export, not V2's per-record restore protocol or a copy of a live database directory. The backup contains:
 
-New input remains in the new spool batch. An interrupted copy is not a restore point.
+- schema and all six tables, including explicit `memory_history`, revision-scoped links, exact method text, saved continuations/outcomes and job execution/result references;
+- every retained blob referenced by those rows, including original sources, conversion representations/assets, packet text and collected worker/Research results;
+- a finite list of complete staged inputs/results and their referenced bytes;
+- non-secret project/adapter settings, schema/server/SDK versions and text-free deletion notices known at the cutoff.
+
+Remote handles alone do not back up remote bytes. Existing unavailable sources remain explicit gaps. Search indexes are rebuildable; exact retained representations and paid model outputs are not replaced by re-extraction. A native export contains current database records, not earlier engine-level versions: Eliot's history survives because `memory_history` contains ordinary records. Do not depend on `.versions()` for it.
+
+The initial backup operation is deliberately serial:
+
+1. Pause new dispatch and primary mutations, drain short transactions and pause blob cleanup. Reads remain available. Do not wait for remote inference to finish; arriving input/results are durably staged under their existing identities.
+2. Record the frozen DB scope and finite set of complete spool files. Later arrivals stay outside this backup; no rename of an actively written spool directory is needed.
+3. With the same owned server, export the selected database over the Store's temporary HTTP SDK connection into a temporary backup directory. Include records and required schema/analyzers. Keep installation credentials and provider secrets outside the portable copy; provision the target connection through current configuration.
+4. Copy the referenced immutable blobs and selected staged files. Consume the export to completion and propagate any stream, statement or file error. A stopped stream or a created filename is not a completed dump.
+5. Save a small manifest of actual component paths, sizes/checksums, table counts, versions and spool membership; publish the completed marker only after those bytes are saved. Resume mutations and cleanup on both success and failure. A failed attempt leaves the live data intact and is not offered as a complete restore point.
+
+The [Rust export/import documentation](https://surrealdb.com/docs/reference/rust/methods/export) requires HTTP with `protocol-http`; [backup documentation](https://surrealdb.com/docs/manage/self-hosted/backups-and-recovery) states the limits of record history and copying live datastore files. Both were read on 2026-10-23. These are API choices, not an executed backup or a measured pause duration. No application-wide semantic validation, signed chain or separate backup service is selected.
 
 ### 12.3 Restore
 
-Restore into a fresh directory. Apply known current deletions, import primary data/blobs and make primary reads available before embeddings and views finish rebuilding.
+The owner's restore command selects one backup and a fresh candidate directory containing DB and blobs together. Keep the installation root, current configuration, spool and newer deletion notices outside that candidate. The same supervisor enters maintenance, stops the live daemon/database child and runs only the candidate database child for import. It does not expose a half-imported target or start another supervision system. On failure, stop the candidate and reopen the unchanged prior data directory.
 
-If current deletion history was lost, the owner may explicitly restore the selected copy with the limitation reported. Do not quarantine all intact data behind an impossible proof.
+Import over HTTP into an empty target with the recorded compatible schema/server format. [Native import can commit partially](https://surrealdb.com/docs/manage/instances/import-and-export#partial-imports); failure is not rollback. Retry into a new empty candidate, not over the live database or a half-imported target. Check the actual import result, retained record counts and exact current/history/blob reads. A generated success marker cannot substitute for those reads. Missing components are reported specifically; the owner may select partial recovery of intact content without it being called a full restore.
 
-Old external jobs do not restart automatically. Reconcile execution references before any repeated provider/tool effect.
+Before exposing the candidate, apply the union of known current deletion notices and those accompanying the backup, remove their controlled content and cancel affected work. Clear restored worker claims; hold unfinished external jobs for reconciliation instead of treating their old pending/active state as permission to dispatch. A collected result may be applied against current revisions; otherwise read its original external execution reference. Unknown remote execution remains unknown. No new model call is purchased merely to restore memory.
+
+Publish the selected data-directory path through one durable update of the existing installation configuration, under the same installation mutex. Keep the prior directory until explicit retirement, subject to erasure. Startup reads that selection rather than choosing whichever directory looks newest. Current installation credentials/routes are not overwritten by old backup settings. This is a selected cutover design; Windows replacement/durability behavior remains to be verified in implementation.
+
+Replay restored and current spool entries through normal capture/deletion rules with original identities. A staged job result must match its retained job/request; an unmatched result stays unapplied, not a new dispatch. Make primary reads usable after successful import and required native index work; optional embeddings, refreshed maps and new learning do not gate access. Do not imply native import rebuilds indexes asynchronously before it returns.
+
+If current deletion history was lost, the owner may explicitly restore the selected copy with that limitation reported. Intact memory is not quarantined behind an impossible proof. Restoring historical observations or packets does not deliver them again, reinstate old host sessions, or count another successful attempt.
 
 ## 13. Control and observability
 
@@ -874,7 +896,7 @@ Build vertical slices in this order.
 
 ### Slice 6 — Recovery and advanced improvement
 
-- backup/restore/erase;
+- native HTTP backup/import of retained data, candidate-directory cutover and scope erasure, without replaying old external jobs;
 - recursive improvement;
 - targeted self-diagnosis;
 - additional host/source adapters.
