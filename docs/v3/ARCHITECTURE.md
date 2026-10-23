@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.2 · 2026-10-23 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.3 · 2026-10-23 · normative design for the greenfield rewrite.**
 
 V1 and V2 are donors. V3 is a new implementation, not a compatibility migration. This document defines **why the product exists, what it owns, and which invariants must survive implementation**. [Implementation](IMPLEMENTATION.md) defines the concrete process, data and integration design. [Cognition](COGNITION.md) defines the algorithms. The [audit conclusion](AUDIT.md) records the evidence, rejected mechanisms and known limits.
 
@@ -81,6 +81,14 @@ Optional capabilities are optional in construction, startup and execution, not m
 
 Keep one current data model and shared application operations across configurations. Extra depth must not silently change an earlier record's meaning or make it unreadable without the module that produced it. Changing an extension can require a real schema migration, but not a permanent parallel generation or compatibility framework for the discarded V1/V2 runtimes.
 
+### 3.3 Project, working instance and current state
+
+A project is a configured scope of work, not necessarily a Git repository. A directory, document set, service, remote resource or ad hoc task can supply the same memory operations. A workspace identifies a particular working instance; its location, branch and resource versions describe changing state. Neither a matching folder name nor shared Git history makes two instances the same task.
+
+Keep stable work identity separate from observations of its changing environment. A branch switch does not erase a continuing task's goal and commitments; a result from another checkout does not establish the current checkout's condition. A move, fork or transfer retains its actual association and historical sources instead of silently relabelling old events. Unknown association limits the claim about that resource, not permission to capture input or use unrelated knowledge.
+
+Change propagation follows the resources and conditions a view actually depends on. There is no universal workspace generation whose mismatch disables the whole project. General methods may transfer under their recorded conditions; instance-bound facts remain attributed to that instance. This needs ordinary bindings, source references and applicability checks, not a second scope authority or discovery-lease system.
+
 ## 4. Memory model invariants
 
 ### 4.1 Preserve before interpretation
@@ -95,11 +103,13 @@ An observation records what a source supplied, not that every assertion inside i
 
 Derived knowledge retains addressable source handles and the source revisions it used. A model-generated ID is not source content. Retrieval of a claim does not increase its evidential support. Keep the actual qualification, negation and counterexample with a useful summary; expanding a source must not silently fetch a newer substitute.
 
+Resource identity, source version and derived representation are distinct. A renamed file may preserve continuity; a crop, conversion or export produces another representation. Similarity or equal bytes alone do not establish that two objects or occurrences are identical. Retain the actual relation and its uncertainty without rewriting old locators.
+
 ### 4.3 Current value and history are different
 
 Historical evidence remains available after current applicability changes. A procedure can retain valid historical evidence while its exact repair is no longer applicable. Source unavailability limits disclosure or checking; it is not automatically refutation of retained knowledge.
 
-Corrections create revisions. Incompatible alternatives may coexist. Removing a successor does not automatically restore its predecessor as current.
+Corrections create revisions. Incompatible alternatives may coexist. Removing a successor does not automatically restore its predecessor as current. Occurrence, stated validity, receipt and editorial revision times answer different questions; a late import or fresh summary does not make old evidence a new observation of the world.
 
 ### 4.4 Origin and reuse scope are different
 
@@ -109,7 +119,7 @@ Every item retains where it came from. Reusable methods separately state where t
 - selected projects;
 - the local owner's projects.
 
-Cross-project reuse never erases origin, conditions, counterexamples or disclosure limits.
+Cross-project reuse never erases origin, conditions, counterexamples or disclosure limits. Permission to consider an item in a project is not evidence that its workspace-, task- or version-specific conditions hold there.
 
 ### 4.5 Grounds are explicit enough to revise
 

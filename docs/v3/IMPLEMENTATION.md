@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.13 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.14 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -141,7 +141,7 @@ All host surfaces call the same application functions.
 
 | Operation | Result |
 |---|---|
-| `attach(workspace, session)` | bound project/session, exact continuation key and actual capabilities |
+| `attach(workspace, session)` | selected project and stable workspace identity, exact continuation key, binding gaps and actual capabilities |
 | `capture(event)` | committed, staged, unknown or rejected |
 | `context(decision_frame, budget, retrieval=local)` | packet ID, rendered context, exact included revisions, expansion handles and gaps; explicit `semantic` mode may obtain a query vector (§8.1) |
 | `open(handle, read_context)` | exact current/historical item or source segment within the bound project/route |
@@ -150,6 +150,18 @@ All host surfaces call the same application functions.
 | `control(command)` | status/inbox, configure, pause/cancel, correct, erase, backup or restore |
 
 `record_outcome` reuses capture. It does not create an execution-proof subsystem. The adapter supplies the bound project and configured route in `read_context`; opening a source does not require an agent to complete another permissions form. Publish only implemented operations on a host surface; an unavailable handler does not justify a success-shaped stub.
+
+### 3.1 Binding work without a scope platform
+
+Keep stable project/workspace IDs and their configured roots or native resource selectors in the existing configuration. A project can be a repository, ordinary directory, document collection, service or ad hoc work; Git metadata is optional. A workspace ID identifies one configured working instance, not its current path or branch. A confirmed relocation changes that mapping and records the observed move through capture; adding another checkout creates another workspace ID, even when both belong to the same project. Do not derive either ID from a display name, remote URL, commit or copied marker.
+
+`attach` uses the caller's explicit selection or an unambiguous existing configured binding consistent with observed host resources. Native Git worktree metadata can identify linked instances; it does not decide that an unrelated clone belongs to the same Eliot project. An unbound input can be retained under an ad hoc session scope and read there while an existing-project association remains unknown. Do not mix candidate projects or deny all capture until a complete survey is finished. Ask only when choosing an existing binding materially changes the work. A later association is recorded, not a rewrite of old source identities.
+
+Resolve bindings per request/event, not through one mutable global `session.current_project`. A tool reading another root retains that resource's known project/workspace and its link to the originating task; this does not move the whole session. Late events and spool replay use their captured binding, not today's cwd. Composite tasks retain separately addressed inputs and results; no cross-project transaction or automatic union of all project memories is implied. Ordinary configured access still applies.
+
+Continuation addresses use stable project/workspace IDs plus the actual host task identity, or the narrowest actor/session fallback when no task exists. A Git branch, HEAD, dirty status or root path is observed state, not a changing component of that task key. A native conversation fork is different and keeps its own identity. An explicit transfer to another workspace selects the destination continuation and links the prior one; it does not silently rename or merge an interleaved source task. Preserve its goal/commitments while reconsidering only environment-dependent facts.
+
+At attach/resume or a relevant observed resource change, refresh the available location/branch/resource information with ordinary adapter reads. Do not scan neighboring directories, hash the whole repository or acquire a discovery lease before a normal memory operation. Missing state stays unknown. The official [Git worktree documentation](https://git-scm.com/docs/git-worktree), checked 2026-10-23, distinguishes per-worktree HEAD/index and shared repository data and supports relocation; these are adapter inputs, not a new identity service.
 
 ## 4. Physical data model
 
@@ -165,12 +177,12 @@ Key fields:
 - `project`;
 - `source_kind`;
 - `source_native_id`;
-- `workspace`;
+- optional origin workspace ID;
 - `last_ingest_seq`.
 
 Unique identity: `(project, source_kind, source_native_id)`.
 
-`last_ingest_seq` records intake in this stream only. It is neither a project-wide clock nor a learning cursor. A source-native cursor belongs to its adapter; interpretation progress belongs to the particular job purpose/target. Parent and child streams keep separate sequence spaces even when they contribute to one continuation.
+`last_ingest_seq` records intake in this stream only. It is neither a project-wide clock nor a learning cursor. A source-native cursor belongs to its adapter; interpretation progress belongs to the particular job purpose/target. Parent and child streams keep separate sequence spaces even when they contribute to one continuation. Per-event workspace/resource state belongs on the observation; changing a stream's current metadata cannot relabel its history.
 
 ### 4.2 `observation`
 
@@ -183,11 +195,12 @@ Key fields:
 - `stream`;
 - `event_key`;
 - `ingest_seq`;
-- `occurred_at`;
+- `occurred_at` when supplied, retaining precision/timezone uncertainty;
 - `received_at`;
 - `kind`;
 - `body` or `blob_ref`;
 - searchable excerpt;
+- captured workspace ID and available resource/version or branch state;
 - available task/session/branch/call/parent references;
 - optional continuation key;
 - optional context packet ID;
@@ -197,7 +210,7 @@ Key fields:
 
 Unique identity: `(project, stream, event_key)`.
 
-An observed tool result, an agent's report about that result, a prepared packet and an observed host handoff are different observations. Immutable source content is separate from optional application metadata. A structured correction observation can hold its committed mutation outcome and exact result handles for replay/readback; it does not need an Operation table.
+An observed tool result, an agent's report about that result, a prepared packet and an observed host handoff are different observations. Immutable source content is separate from optional application metadata. A structured correction observation can hold its committed mutation outcome and exact result handles for replay/readback; it does not need an Operation table. Receipt time does not fill an unknown occurrence or validity time. Replaying an old event preserves these source facts and its original binding.
 
 ### 4.3 `memory`
 
@@ -216,7 +229,7 @@ Key fields:
 - `search_text`;
 - exact cues and advisory aliases;
 - `subject`, `aspect`, `perspective`;
-- applicability conditions and exceptions;
+- applicability conditions and exceptions, including structured `applies_to` selectors when known;
 - validity interval;
 - support assessment/limitations with their reason and source links, separately from retrieval exposure and advisory influence;
 - optional commitment data when that kind is implemented (§11.4);
@@ -227,9 +240,11 @@ Support is a recorded, scoped assessment, not a universal numeric truth score. M
 
 `origin_project` is the stable configured project ID and never changes when the workspace is renamed. Store `reuse_scope` as `{ mode, projects }`: `mode` is `project`, `selected` or `owner`; `projects` is an array of stable project IDs, empty outside selected mode. This describes where a method can be considered, not whether it is true or whether every source can be disclosed. Project-local is the default. Shared methods use the owner's configured reuse choice without a separate approval for every item.
 
-`address_key` is an unambiguous application serialization of the full address: project, item kind, address kind and the relevant native components. For continuation, include the host/source namespace, workspace and the task/branch/session identity in its documented uniqueness scope. A session-local task ID needs its session component; a Git branch name alone does not identify an agent task. Do not lowercase native IDs or concatenate them with an ambiguous delimiter. A canonical encoded tuple is enough; no digest or address registry is needed.
+`applies_to` holds only material selectors: optional `workspace_id`, exact `task_key` and known resource/version requirements. Current-work and instance-state producers carry their actual workspace/task association from the input rather than generalizing it to the whole project. A missing state/version cannot be invented from a project match. A reusable method may instead describe portable conditions; unknown conditions stay qualified. This is data used by the existing candidate/packing path, not a scope registry or a classifier required before raw capture. Different working instances can legitimately have contrary current facts without either refuting the other.
 
-Project views use a stable view/question key; externally named methods use their stable method key. Processing recipes use an address for the actual project and implemented job purpose (§10.3). Method-outcome contributions use the method revision, actual attempt and criterion identity (§10.5). Both remain ordinary `memory` items. Ordinary anonymous notes have no address. Enforce one current item per complete address, not just faster lookup:
+`address_key` is an unambiguous application serialization of the full address: project, item kind, address kind and the relevant native components. Continuation uses the stable workspace and actual task or actor/session identity from §3.1; a session-local task ID needs its session component. Git branch/HEAD and mutable root paths are not substituted for that identity. Do not lowercase native IDs or concatenate them with an ambiguous delimiter. A canonical encoded tuple is enough; no digest or address registry is needed.
+
+Project views use a stable view/question key plus the workspace/resource scope they describe; a checkout-specific view is not one shared mutable answer for every checkout. Externally named methods use their stable method key. Processing recipes use an address for the actual project and implemented job purpose (§10.3). Method-outcome contributions use the method revision, actual attempt and criterion identity (§10.5). Both remain ordinary `memory` items. Ordinary anonymous notes have no address. Enforce one current item per complete address, not just faster lookup:
 
 ```surql
 DEFINE FIELD address_key ON memory TYPE option<string>;
@@ -268,6 +283,7 @@ Relation kinds include:
 - contradiction;
 - replacement;
 - episode membership/order;
+- resource continuity/derivation with its observed or inferred qualification;
 - outcome of;
 - used method;
 - included in context packet;
@@ -303,7 +319,7 @@ Key fields:
 - result refs, actually covered input and remaining/unavailable portions;
 - error or no-change result.
 
-One target is `(project, purpose, target_key)`. It has at most one active job and one coalesced pending successor. Active includes waiting for or reconciling an already dispatched execution, not merely holding a live worker claim. Completed jobs retain their own input/result history and no longer occupy a slot. Inputs freeze when the pending job becomes active; later events extend the successor only. The multi-stream selection and coverage rules in §10.1 apply to those frozen inputs, not to a global processed flag on observations.
+One target is `(project, purpose, target_key)`. It has at most one active job and one coalesced pending successor. Active includes waiting for or reconciling an already dispatched execution, not merely holding a live worker claim. Completed jobs retain their own input/result history and no longer occupy a slot. Inputs freeze when the pending job becomes active; later events extend the successor only. The multi-stream selection and coverage rules in §10.1 apply to those frozen inputs, not to a global processed flag on observations. Workspace/resource-specific jobs include that scope in `target_key` and freeze it with their inputs. A late completion never resolves its target from the user's newly selected workspace.
 
 Enforce those slots with one database-derived optional key and a native unique index, not only a query asking whether a job already exists. The selected SurrealQL shape is:
 
@@ -323,14 +339,19 @@ Large source bytes live under `blobs/`; database rows keep an opaque reference a
 
 Locator shapes to implement are concrete; a converter must actually supply the claimed precision:
 
-- code: repository/worktree, revision, path, lines or symbol;
+- code: stable workspace, captured source identity, available revision, path, lines or symbol;
 - document/PDF: captured source revision, saved conversion representation and element reference; page/span/region only when available;
 - spreadsheet: file, revision, sheet and range;
 - image: file/revision and region;
 - transcript/media: stream/session, event/turn or time range;
-- web/research: captured source or remote revision, retrieval time and representation-specific passage range.
+- web/research: captured source or remote revision, retrieval time and representation-specific passage range;
+- service/runtime: configured service/environment, actual instance/run identity when available, observation time and retained result.
 
 A generic payload alone does not mean a source type is supported. Keep byte offsets, text-character spans, page coordinates and table-cell positions tagged with their representation and units; they are not interchangeable. A Docling JSON pointer belongs to one saved converted document, not to every conversion of the original file. A newer extraction cannot silently replace the representation named by an old handle (§8.4).
+
+Retain dirty/untracked source bytes or the actually captured range as the cited representation; HEAD identifies a commit, not all working-file contents. A partial tool read is not a full-file snapshot. Existing observation/blob identity is enough to address the retained bytes; no whole-tree checksum is needed before each read. When only metadata was captured, record that limit instead of claiming the old body can be reconstructed from today's path.
+
+A known rename, copy, conversion, crop or export adds an ordinary relation between the captured source representations, retaining the original locators. Use native resource IDs or an observed operation when available. Git's [rename detection](https://git-scm.com/docs/gitdiffcore#_diffcore_rename_for_detecting_renames_and_copies), checked 2026-10-23, is similarity-based; keep that inference distinct from observed object identity. Equal content may share physical storage if supported, but cannot merge logical sources or their evidence counts. Follow exact old handles without resolving through a mutable alias, and do not invent a universal object registry to support these links.
 
 ## 5. Store and transaction operations
 
@@ -418,13 +439,13 @@ Run the independent retrieval arms available in the selected composition:
 
 Base uses exact/lexical candidates and already recorded state/relations. Optional enrichment supplies candidates to this same assembly path; its absence does not require another context implementation. The caller's local/semantic mode determines whether a query-encoder call is allowed (§8.1), not whether exact knowledge can be read.
 
-The project comes from the bound request, not from query prose. Addressed work is read directly:
+The project and workspace come from the bound request, not query prose or a process-wide last selection. Addressed work is read directly:
 
 ```surql
 SELECT id, revision, content FROM memory WHERE address_key = $address;
 ```
 
-Local items and reusable methods must be eligible before each retrieval arm's limit. For example, the scope/lexical part of a candidate query is:
+Local items and reusable methods must be eligible before each retrieval arm's limit. For example, the project/lexical part of a candidate query is:
 
 ```surql
 SELECT id, revision, search::score(0) AS score FROM memory
@@ -439,9 +460,11 @@ WHERE (
 ORDER BY score DESC, id ASC LIMIT $candidate_limit;
 ```
 
-This ordinary task-context excerpt excludes internal processing recipes; explicit method inspection still uses `open`. It specifies scope and lexical ranking, not the whole query: the production query also applies recorded influence and configured disclosure predicates before its candidate limit. It never selects a global top-k and then discards other projects. A shared method does not make all raw observations, private project views or its source neighbors shared. Scoped direct expansion and `open` retain that distinction; useful method content can be returned with a specific unavailable-source gap rather than denied wholesale.
+This ordinary task-context excerpt excludes internal processing recipes; explicit method inspection still uses `open`. It specifies project membership and lexical ranking, not the whole query: the production query also applies recorded influence, configured disclosure and known `applies_to.workspace_id`/`task_key` selectors before its candidate limit. Use typed equality against the frame, not substring matches. A state claim scoped to workspace B is not current state of A merely because both share a project; similarly, project-wide view keys cannot substitute for an addressed task. Historical case retrieval can select such evidence with its original scope and time clearly retained. Unknown conditions remain qualified candidates, not fabricated matches or a global read denial.
 
-Store uses declared scalar types for project/mode/kind, an array type for selected projects, native indexes on the actual selector fields and `reuse_scope.projects.*` for containment. Keep full-text indexing separate from uniqueness. Use the same eligibility conditions in the native vector query; array containment need not receive the same prefilter optimization as scalar equality. Check the selected server's actual plan before adding another cache or search engine. The [index](https://surrealdb.com/docs/reference/query-language/statements/define/indexes) and [filtered-vector](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) references were read on 2026-10-22; these excerpts were not executed.
+It never selects a global top-k and then discards other projects. A shared method does not make all raw observations, private project views or its source neighbors shared. Scoped direct expansion and `open` retain that distinction; useful method content can be returned with a specific unavailable-source gap rather than denied wholesale.
+
+Store uses declared scalar types for project/mode/kind and implemented applicability selectors, an array type for selected projects, native indexes on the actual selector fields and `reuse_scope.projects.*` for containment. Keep full-text indexing separate from uniqueness. Use the same eligibility conditions in the native vector query; array containment need not receive the same prefilter optimization as scalar equality. Check the selected server's actual plan before adding another cache or search engine. The [index](https://surrealdb.com/docs/reference/query-language/statements/define/indexes) and [filtered-vector](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) references were read on 2026-10-22; these excerpts were not executed.
 
 Union candidate version handles before applicability and final packing. Hydrate their exact versions and revision-specific links, not a later head under the old handle. For selected methods, include relevant recorded outcome qualifications/counterexamples from §10.5 before rendering; a high retrieval score does not erase a known exception. Internal processing recipes are selected by job purpose, not injected as ordinary task advice merely because their text matches. Do not retain a DB transaction across a query-embedding call or host handoff. If current advice needs a newly changed version, fetch it as that version and rebuild the affected unit. Page broad enumeration; a per-page limit is not total corpus capacity.
 
@@ -477,7 +500,7 @@ Use a command hook calling the same `eliot relay`, not a model-based hook. The [
 | `Stop`, `SubagentStop`, `StopFailure` | Capture the supplied closing text or error with its actual event kind and make relevant background work due. Do not request another agent turn merely to finish memory work. |
 | `PostCompact`, when supported | Record a host-produced view and refresh presentation state, not a new independent observation of the underlying work. Deliver later through a supported context boundary. |
 
-**Identity and correlation.** Encode `source_native_id` from the configured host namespace, `session_id` and `agent_id` when present; otherwise use the main actor within that session. `agent_type` describes a role, not an instance. `prompt_id` correlates a prompt, not every task or execution under it. Keep task IDs only where actually supplied. Session membership does not establish an immediate parent agent or spawning tool call; record such links only from an explicit native association, and use §10.1 if it arrives late. A directory change alone neither creates a new project nor merges workspaces. Forked sessions get their own continuation; inherit earlier material only through an observed link, not a similar title or shared path.
+**Identity and correlation.** Encode `source_native_id` from the configured host namespace, `session_id` and `agent_id` when present; otherwise use the main actor within that session. `agent_type` describes a role, not an instance. `prompt_id` correlates a prompt, not every task or execution under it. Keep task IDs only where actually supplied. Session membership does not establish an immediate parent agent or spawning tool call; record such links only from an explicit native association, and use §10.1 if it arrives late. Apply §3.1 to directory/resource changes: refresh the event binding without moving every task in the session. Forked sessions get their own continuation; inherit earlier material only through an observed link, not a similar title or shared path.
 
 For a tool observation, use the scoped call ID plus event phase/representation as its source key. Keep the structured result and the model-visible batch representation distinguishable: they can contain different bytes without being a conflicting replay or two independent outcomes. Reference one execution in §10.5. Preserve actual content in each representation; do not run the tool again to make them agree. For events without a stable occurrence ID, allocate an ingress ID once and retain it through spool retries. This deduplicates Eliot's delivery, not undocumented host re-emission. Do not collapse repeated user text or all starts/stops of one agent into a single event; obtain transcript message identity when available and otherwise retain the uncertainty.
 
@@ -505,7 +528,7 @@ Use `SessionStart`/`UserPromptSubmit` and a supported `PostToolBatch` boundary; 
 
 `context` returns `packet_id`. Record the actual handoff under that ID when observable, linking exact rendered revisions. Native call IDs correlate actions/results; the hook schema does not promise to echo Eliot's packet ID. Without further host evidence, offered context is known but adherence remains unknown. Packet-accounting failure cannot erase useful output or change a completed tool's result. Do not demand an additional agent acknowledgement or method-ID form to compensate for missing native correlation.
 
-Repeat suppression is a small cache keyed by recipient, context incarnation and material revision. Resume/compact can re-offer current orientation; old injected context in a resumed transcript is historical delivery, not a new observation or proof that its contents remain current. Re-offer changed corrections without repeatedly sending an unchanged full timeline.
+Repeat suppression is a small cache keyed by recipient, bound project/workspace/task, context incarnation and the rendered item's material qualification/revision. A changed relevant resource condition or binding can require a different qualification even when the method text is unchanged. Resume/compact can re-offer current orientation; old injected context in a resumed transcript is historical delivery, not a new observation or proof that its contents remain current. Re-offer changed corrections without repeatedly sending an unchanged full timeline.
 
 ## 7. Current work and context
 
@@ -513,16 +536,17 @@ Repeat suppression is a small cache keyed by recipient, context incarnation and 
 
 A decision frame carries available:
 
-- project/workspace;
+- selected project and stable workspace ID;
 - exact continuation key;
-- task/session/branch IDs;
+- native task/session identity and observed Git branch/HEAD separately;
 - current user goal and criteria;
-- selected resources;
+- selected resources and their actually observed versions/conditions;
+- relevant decision time or explicitly historical question;
 - tool/model profile;
 - context incarnation;
 - token budget.
 
-Unknown fields remain unknown. Goal/criteria retain their user or host source references. An explicit owner revision updates them; a proposed plan, retrieved suggestion or generated continuation does not silently replace them. A factual statement inside a user message remains a sourced assertion rather than an automatically verified external fact.
+Unknown fields remain unknown. Goal/criteria retain their user or host source references. An explicit owner revision updates them; a proposed plan, retrieved suggestion or generated continuation does not silently replace them. A factual statement inside a user message remains a sourced assertion rather than an automatically verified external fact. Currentness is checked against supplied facts and recorded changes of relevant resources, not a whole-project fence. An unknown or outdated source condition is shown as such without blocking unrelated context.
 
 ### 7.2 Continuation before similarity
 
@@ -549,7 +573,7 @@ A continuation is an ordinary versioned `memory` item with `address_kind = curre
 - next useful step;
 - source handles, represented streams/segments and coverage gaps.
 
-It does not replace the original events. Reading or delivering a newer tail does not itself advance the saved continuation's coverage. A failed synthesis leaves the last saved continuation plus available unsummarized facts usable.
+It does not replace the original events. Reading or delivering a newer tail does not itself advance the saved continuation's coverage. A failed synthesis leaves the last saved continuation plus available unsummarized facts usable. A continuing task can retain its plan across a branch switch while old build/runtime facts are qualified for the state in which they were observed. Do not merge all events in a session merely because a task address is known; use its recorded membership and resource associations.
 
 ### 7.3 Packing
 
@@ -610,10 +634,10 @@ Project views are ordinary versioned memory items:
 - purpose and boundaries;
 - subsystem/area explanations;
 - recurring question answers;
-- examined scope and source revisions;
+- examined workspace/resource scope and source revisions;
 - known gaps.
 
-Source additions, removals, renamed resources and new consumers refresh affected views through ordinary jobs. A failed refresh leaves the prior qualified view usable.
+Source additions, removals, renamed resources and new consumers refresh affected views through ordinary jobs. A failed refresh leaves the prior qualified view usable. Distinguish project-wide intent from an explanation of a particular checkout or document version in the view address and job target. A result computed from an older source remains attributed to it; it cannot certify the newly selected branch. An unrelated edit does not require a whole-project rebuild. A complete-set view also tracks the examined collection boundary so a new member can make it incomplete without changing old cited files.
 
 When the project is Eliot, use the same source/view path for its selected Architecture, implementation sources and observed incidents. `status` supplies current process/job facts; a project view relates those facts to intended behavior without treating either source as proof of the other. Changes refresh affected views normally. No SelfModel service, conformance database or mandatory architecture-read receipt is introduced.
 
@@ -828,7 +852,7 @@ Baseline/no-change remains eligible. Repeatable local calculations and copies ar
 
 ### 10.7 Self-diagnosis
 
-When a useful result fails, identify the first failed step:
+When a useful result fails, identify the first step supported by available evidence:
 
 - event not captured;
 - lesson not produced;
@@ -950,7 +974,7 @@ Connect the first Claude adapter, exact continuation lookup and available raw ta
 
 Base is runnable with all model/vector/document/Research capabilities disabled and without their credentials. Its initial useful scenario is a captured result or explicit lesson in session A, a process restart, and the same source-linked knowledge delivered in the relevant session B. It does not claim to infer a new lesson automatically.
 
-After this path is implemented, test it before layering more capabilities onto it: actual Store persistence/replay, revision/correction, scoped retrieval, host delivery and source readback. Include an absent optional endpoint and a failed capture so neither gets disguised as an empty successful memory. Use the real application operations and the selected database path; no second implementation inside the test or production fake success branch. This is Base acceptance, not a new test platform or release-proof bureaucracy.
+After this path is implemented, test it before layering more capabilities onto it: actual Store persistence/replay, revision/correction, scoped retrieval, host delivery and source readback. Include two workspaces of one project, a branch switch with an unchanged task, late input retaining its old binding, and a non-Git scope; these exercise the same Base operations, not a new test platform. Include an absent optional endpoint and a failed capture so neither gets disguised as an empty successful memory. Use the real application operations and the selected database path; no second implementation inside the test or production fake success branch. This is Base acceptance, not a new test platform or release-proof bureaucracy.
 
 ### Slice 3 — First learning extension
 

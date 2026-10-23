@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.3 · 2026-10-23 · normative algorithms used by the V3 implementation.**
+**Revision 1.0-draft.4 · 2026-10-23 · normative algorithms used by the V3 implementation.**
 
 This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves useful context, learns from outcomes and improves connected methods. It does not define additional services. All state and work use the owners in [Implementation](IMPLEMENTATION.md).
 
@@ -24,17 +24,17 @@ A source event, search chunk and episode are different. Search chunks help locat
 
 ## 2. Decision frame and current work
 
-The decision frame contains available project, workspace, task, session, branch, goal, criteria, selected resources, execution profile and context incarnation.
+The decision frame separates stable project/workspace/task identity from observed location, branch, resource versions and time. It also contains available session, goal, criteria, execution profile and context incarnation. Non-Git work uses the same distinctions without inventing a branch or commit.
 
 Current work is reconstructed in this order:
 
-1. open the addressed task/session/branch continuation;
+1. open the continuation by stable task or actor/session address within its workspace;
 2. read relevant observations outside its per-stream/segment coverage, including retained material newly associated with this work;
 3. apply explicit goal/plan corrections;
 4. preserve abandoned alternatives and open commitments;
 5. only then retrieve similar prior work.
 
-If no task identity exists, use the narrowest known session/workspace continuation. Do not attach interleaved events to the latest prompt merely because it is latest. Keep goal/criteria tied to their explicit user/host sources; generated plans and summaries cannot silently revise them.
+If no task identity exists, use the narrowest known session/workspace continuation. Do not attach interleaved events to the latest prompt merely because it is latest. Keep goal/criteria tied to their explicit user/host sources; generated plans and summaries cannot silently revise them. A Git branch switch changes environmental applicability, not the identity of a continuing task. A native conversation fork or explicit cross-workspace transfer has its own association; neither silently renames the source task.
 
 A continuation revision contains:
 
@@ -46,24 +46,24 @@ A continuation revision contains:
 - next useful step;
 - represented streams and observation IDs/segments or exact ranges, source handles and gaps.
 
-A summary never replaces the original observations. Reading a tail is not publishing a new summary or proving that every stream was processed.
+A summary never replaces the original observations. Reading a tail is not publishing a new summary or proving that every stream was processed. Late observations retain the resource/task association in which they arose rather than inheriting today's session selection.
 
 ## 3. Claim identity and current-state resolution
 
 A comparison group uses the minimum useful identity:
 
-- scope;
+- project and material workspace/task scope;
 - subject/resource;
 - aspect;
 - perspective;
-- relevant time.
+- relevant time and known resource conditions.
 
-Perspective distinguishes intended behavior, observed implementation and proposed explanation.
+Perspective distinguishes intended behavior, observed implementation and proposed explanation. Different workspaces or versions can legitimately have different values. Compare them before declaring contradiction, replacement or transfer; project membership alone is insufficient.
 
 `resolve_current(group, decision_time)`:
 
 1. load accessible alternatives and relevant revisions outside semantic top-k;
-2. apply validity intervals and explicit replacements;
+2. apply stated validity, known resource conditions and explicitly scoped replacements;
 3. preserve alternatives whose conditions differ;
 4. evaluate compound grounds when explicitly represented;
 5. return current alternatives, conflict or unknown;
@@ -75,7 +75,7 @@ Last write, highest similarity, retrieval frequency and model confidence are not
 
 Prepare a proposed replacement outside the transaction. Publish new revision, revision-specific grounds, scoped retirement and job result atomically.
 
-A failed publication leaves the prior committed state intact. Competing replacements revalidate the current revision.
+A failed publication leaves the prior committed state intact. Competing replacements revalidate the current revision. A result for a particular source version may be retained for that version; it does not become current evidence about a different workspace or newer resource merely because publication happened later.
 
 ### 3.2 Withdrawal
 
@@ -104,13 +104,16 @@ Erasing a required premise must not silently turn an AND group into a smaller, a
 
 ### 3.4 Time
 
-Preserve:
+Keep distinct:
 
-- occurrence/validity time;
-- receipt time;
-- revision time.
+- occurrence time: when the source says an event happened;
+- stated validity: the situation or interval a claim concerns;
+- receipt time: when Eliot obtained it;
+- editorial revision time: when Eliot changed the stored account.
 
-A late import of old evidence does not become the newest world state. A real A→B→A sequence creates a new A occurrence; it is not deduplicated into the retired first A.
+Preserve unknown precision/timezone instead of substituting receipt time as occurrence. A late import or newly written summary does not become the newest world state. A real A→B→A sequence creates a new A occurrence; it is not deduplicated into the retired first A.
+
+A question about what happened then and a question about what was known then may need different source/editorial revisions. Do not answer the latter by filtering today's heads alone. Use retained history and source handles or state the reconstruction limit; no automatic full historical-world rebuild is required. New information and known dependent-resource changes qualify the affected claims, not every item in the project. Absence of a later event is not proof that a service, file or external condition remained unchanged.
 
 ## 4. Episodes and source reconstruction
 
@@ -129,6 +132,8 @@ When retrieval finds a compact lesson, optional expansion follows source links t
 
 Deduplicate overlapping expansion by source identity. Timestamp proximity across unrelated streams does not create one episode. Missing counterparts remain explicit; available useful material does not wait for a global all-agents-finished barrier.
 
+A source object, its version, and a transformed representation are not one identity. Keep observed rename/copy/export/crop relations with their exact inputs and outputs; inferred continuity remains a hypothesis. Equal names, bytes or embeddings cannot merge objects or establish independent evidence. Old locators open the captured representation, including an actually retained dirty-file range, not a new file reached through a changed path. These are ordinary links and source reads under [Implementation §§3.1 and 4.7](IMPLEMENTATION.md#31-binding-work-without-a-scope-platform), not an object-identity service.
+
 ## 5. Project understanding
 
 A project view is a versioned answer to a useful question over an examined scope.
@@ -145,14 +150,14 @@ Examples:
 A view records:
 
 - question/purpose;
-- examined source scope and revisions;
+- examined workspace/resource scope and source revisions;
 - answer;
 - source handles;
 - completeness/gaps.
 
 A list of old cited files does not prove that no new consumer exists. Membership-affecting changes mark the affected view dirty.
 
-Refresh only affected views. Until refresh completes, serve the previous view with its qualification and direct source access. A known refuted part needs its actual correction/limitation, not merely a generic stale label.
+Refresh only affected views. Until refresh completes, serve the previous view with its qualification and direct source access. A known refuted part needs its actual correction/limitation, not merely a generic stale label. Checkout-specific views keep distinct addresses; late synthesis cannot overwrite another checkout's answer. Stable project intent can remain shared while implementation views differ.
 
 ## 6. Retrieval and context selection
 
@@ -170,7 +175,7 @@ Generate candidates independently from:
 - project-local methods;
 - reusable methods allowed for the current project.
 
-Union candidates before final selection. A lexical-only candidate does not need a vector score.
+Union candidates before final selection. A lexical-only candidate does not need a vector score. Current-state candidates use known workspace/task selectors before their limit; historical case selection retains original scope rather than presenting another instance's state as current. Exact source access remains available under existing access rules.
 
 ### 6.2 Applicability
 
