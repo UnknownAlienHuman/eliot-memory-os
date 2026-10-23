@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.4 · 2026-10-22 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.5 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -158,6 +158,7 @@ Key fields:
 - `reuse_scope`;
 - `revision`;
 - `kind`;
+- for methods, `method_role` (`advice` or `processing`) and the implemented `processing_purpose` when applicable;
 - optional `address_kind` and `address_key` for exact non-semantic lookup;
 - `content`;
 - `search_text`;
@@ -173,7 +174,7 @@ Key fields:
 
 `address_key` is an unambiguous application serialization of the full address: project, item kind, address kind and the relevant native components. For continuation, include the host/source namespace, workspace and the task/branch/session identity in its documented uniqueness scope. A session-local task ID needs its session component; a Git branch name alone does not identify an agent task. Do not lowercase native IDs or concatenate them with an ambiguous delimiter. A canonical encoded tuple is enough; no digest or address registry is needed.
 
-Project views use a stable view/question key; externally named methods use their stable method key. Ordinary anonymous notes have no address. Enforce one current item per complete address, not just faster lookup:
+Project views use a stable view/question key; externally named methods use their stable method key. Processing recipes use an address for the actual project and implemented job purpose (§10.3). Method-outcome contributions use the method revision, actual attempt and criterion identity (§10.5). Both remain ordinary `memory` items. Ordinary anonymous notes have no address. Enforce one current item per complete address, not just faster lookup:
 
 ```surql
 DEFINE FIELD address_key ON memory TYPE option<string>;
@@ -313,7 +314,7 @@ Semantic interpretation, embeddings and source parsing run outside this transact
 
 ### 5.2 `claim_due_job`
 
-In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
+In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. For model-based work, also resolve the configured purpose-specific method and save its current ID/revision under §10.3; reclamation retains the already selected version. The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
 
 The worker then reads the named method revision and source material outside the transaction. Reclaiming an expired worker claim keeps the same job, frozen inputs and controller execution reference. It first checks any saved model output or ongoing execution; expiry is not permission to buy another model call. Completion requires the current claim and finishes that same row atomically with its memory result.
 
@@ -374,15 +375,16 @@ WHERE (
         reuse_scope.mode = 'owner' OR
         (reuse_scope.mode = 'selected' AND reuse_scope.projects CONTAINS $project)
     ))
-) AND search_text @0@ $query
+) AND (kind != 'method' OR method_role = 'advice')
+  AND search_text @0@ $query
 ORDER BY score DESC, id ASC LIMIT $candidate_limit;
 ```
 
-This excerpt specifies scope and lexical ranking, not the whole query: the production query also applies recorded influence and configured disclosure predicates before its candidate limit. It never selects a global top-k and then discards other projects. A shared method does not make all raw observations, private project views or its source neighbors shared. Scoped direct expansion and `open` retain that distinction; useful method content can be returned with a specific unavailable-source gap rather than denied wholesale.
+This ordinary task-context excerpt excludes internal processing recipes; explicit method inspection still uses `open`. It specifies scope and lexical ranking, not the whole query: the production query also applies recorded influence and configured disclosure predicates before its candidate limit. It never selects a global top-k and then discards other projects. A shared method does not make all raw observations, private project views or its source neighbors shared. Scoped direct expansion and `open` retain that distinction; useful method content can be returned with a specific unavailable-source gap rather than denied wholesale.
 
 Store uses declared scalar types for project/mode/kind, an array type for selected projects, native indexes on the actual selector fields and `reuse_scope.projects.*` for containment. Keep full-text indexing separate from uniqueness. Use the same eligibility conditions in the native vector query; array containment need not receive the same prefilter optimization as scalar equality. Check the selected server's actual plan before adding another cache or search engine. The [index](https://surrealdb.com/docs/reference/query-language/statements/define/indexes) and [filtered-vector](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) references were read on 2026-10-22; these excerpts were not executed.
 
-Union candidate version handles before applicability and final packing. Hydrate their exact versions and revision-specific links, not a later head under the old handle. Do not retain a DB transaction across a query-embedding call or host handoff. If current advice needs a newly changed version, fetch it as that version and rebuild the affected unit. Page broad enumeration; a per-page limit is not total corpus capacity.
+Union candidate version handles before applicability and final packing. Hydrate their exact versions and revision-specific links, not a later head under the old handle. For selected methods, include relevant recorded outcome qualifications/counterexamples from §10.5 before rendering; a high retrieval score does not erase a known exception. Internal processing recipes are selected by job purpose, not injected as ordinary task advice merely because their text matches. Do not retain a DB transaction across a query-embedding call or host handoff. If current advice needs a newly changed version, fetch it as that version and rebuild the affected unit. Page broad enumeration; a per-page limit is not total corpus capacity.
 
 The result contains a new stable `packet_id`, rendered content, its exact item/method revisions, handles and gaps. Record the versions actually rendered. Packet preparation is useful attribution but cannot suppress useful context on a recording failure; return the packet with a tracking gap instead.
 
@@ -644,11 +646,15 @@ A direct explicit correction uses the atomic observation-and-edit command in §5
 
 ### 10.3 Method consumer
 
-Every method-affecting job stores `method_id` and `method_revision`.
+Separate a processing recipe (how a job interprets an episode or revises a view) from task advice (what an external agent should do in a situation). Both are versioned methods, distinguished by `method_role`; a processing method also names its implemented `processing_purpose`. `job.purpose` selects its matching processing recipe; context retrieval selects relevant task advice. Similar text does not change this role.
 
-The request builder opens that exact text and includes it in the actual controller request. The job result records which revision was used.
+Ship real default recipe text for each implemented model-based purpose as application assets. First project setup saves the needed defaults as ordinary `memory` methods using the actual project and a stable purpose address, through the same retry-safe mutation path as other creates. Record their bundled-file/version origin, not a fictitious successful episode. Concurrent setup resolves the unique address. Do not generate these defaults with Dreamer, seed placeholder purposes that have no worker, or require embeddings before using them.
 
-A new revision affects new jobs. Existing running work continues with its selected revision unless explicitly restarted.
+An optional project/purpose setting may select another existing method ID. Otherwise use the purpose's default address. When claiming a new job, freeze the selected ID and its current revision along with the inputs. The request builder opens that exact body outside the transaction and includes it in the actual controller request. Reclaimed work retains its selection and saved request, not a fresh search for a better method. Deterministic jobs such as applying embeddings or reducing structured outcomes do not need a prompt recipe.
+
+Restart and software upgrade do not overwrite learned/user-edited methods with bundled defaults. Missing or withdrawn explicitly selected content is reported for that job; it is not silently replaced by a semantically similar note. First-use initialization is not a repair loop that recreates deliberately removed methods. Other capture/read paths remain available.
+
+Textual improvement updates the addressed method through `publish_revision`; subsequent jobs read the new revision automatically, while running work keeps its original input. Proposals for another recipe remain separate until selected; a freshly generated method does not replace the current one merely because it exists. No promotion ladder or new approval step is required for an ordinary permitted revision. Code algorithms and configuration change through their actual owners, not because a prompt describes a different implementation.
 
 A method without a real consumer is stored knowledge, not implemented self-improvement.
 
@@ -668,20 +674,17 @@ Origin and source restrictions remain visible. Transfer may be provisional; broa
 
 ### 10.5 Outcome feedback
 
-Outcome reduction uses the exact packet and method revision when available. Records distinguish:
+Keep source events in `observation`. A tool result and an agent's report about it may both be retained, but they are not two independent attempts. `packet_id` identifies offered context, not an execution or proof of adherence.
 
-- method included in packet;
-- packet handed off;
-- action observed;
-- method followed or unknown;
-- criterion coverage;
-- result;
-- competing failures/cost;
-- comparative benefit or unknown.
+`learning` reduces attributable feedback into an ordinary versioned `memory` item of kind `outcome`, with `address_kind = method_outcome`. Its complete address includes project, exact method ID/revision, the actual attempt/execution identity in its native namespace, and the criterion including the checked target/profile. A whole Task or session is not the attempt identity when it contains several executions; use their actual operation/run association or retain the uncertainty. Keep multiple checks of one attempt as criterion-specific results; do not count them as several independent attempts. Without a reliable attempt or method association, preserve the useful report/episode with that gap instead of inventing an ID or crediting every method in its packet.
 
-One attempt/criterion contributes once. Corrections replace the current contribution with history.
+The item retains source observation handles, offered/handoff facts where known, actual action, adherence or unknown, criterion coverage, result, competing failures/cost and comparative benefit or unknown. Use `publish_revision` for a changed interpretation or explicit correction. Reprocessing the same sources with the same result is no-change, not another contribution or semantic revision. An explicit correction replaces that contribution with history; two incompatible reports without an ordering basis retain disagreement, not last-writer success. Aggregates read current contributions for comparable conditions rather than incrementing permanent success counters on every delivery.
 
-A missing diagnostic is success only if the relevant check actually covered the target. Absence of packet/action correlation leaves adherence unknown rather than assigning credit or blame.
+Structured check results use ordinary reduction code. Ambiguous explanations may use the existing episode/method interpretation job. A missing diagnostic is success only if the relevant check covered the target; an unrelated failure is not automatically a failed method.
+
+There are two actual consumers. `context` loads relevant limitations and observed counterexamples with a selected method, even before its prose has been revised; it labels reports and unknown attribution accordingly. `learning` supplies materially new feedback, the addressed method and original observations to a coalesced revision job when interpretation can change the next decision. That job may keep the method, narrow a condition, add an exception or produce a useful alternative. A successful repair, cheaper successful route or explicit correction can trigger this path too; not every successful tool invocation needs reflection. No-change and operational accounting do not retrigger it by themselves.
+
+Example of the selected design, not an executed result: a lesson is shown for API v2, then a real failed attempt reveals that it applies only to v1. The outcome and its conditions become visible with the lesson; a revision narrows that lesson, and the next v2 context no longer presents it as applicable. Merely logging the failure or increasing a score would not complete this loop.
 
 ### 10.6 Recursive improvement
 
@@ -798,11 +801,11 @@ Build vertical slices in this order.
 
 - actual controller text execution and same-request admission recovery;
 - public result handle through authorized artifact bytes, including the controller projection repair in §9.1;
-- finite episode job;
+- finite episode job with bundled initial recipe and purpose-based selection;
 - shared `publish_revision` for job output and direct correction;
 - create/update/keep;
 - method revision consumed by the next job;
-- packet-linked outcome capture and correction.
+- source-linked current outcome contribution, correction and a changed subsequent context/method; packet linkage alone is not demonstrated use.
 
 ### Slice 4 — Understanding and transfer
 

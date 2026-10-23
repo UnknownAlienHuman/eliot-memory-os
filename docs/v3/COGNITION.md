@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft · 2026-10-22 · normative algorithms used by the V3 implementation.**
+**Revision 1.0-draft.1 · 2026-10-23 · normative algorithms used by the V3 implementation.**
 
 This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves useful context, learns from outcomes and improves connected methods. It does not define additional services. All state and work use the owners in [Implementation](IMPLEMENTATION.md).
 
@@ -245,25 +245,17 @@ It is eligible for provisional use immediately when appropriate.
 
 ### 8.2 Method consumption
 
-A job selects a method ID and revision. The request builder opens that exact body and inserts it into the actual request.
+A model-based job selects its processing method by implemented purpose and project configuration, not by similarity to arbitrary task advice. First use has a real bundled recipe saved as an ordinary method; it does not need an earlier model call to create the method that permits learning. Initialization, selection and upgrade behavior are defined in [Implementation §10.3](IMPLEMENTATION.md#103-method-consumer).
 
-The job and outcome retain that revision. New revisions affect later jobs. Therefore a changed method has an observable consumer; storage alone is not self-improvement.
+The claim freezes method ID/revision. The request builder opens that exact body and inserts it into the actual request. New revisions affect later jobs; retries retain the selected method. Deterministic work needs no model recipe. A method changes behavior through this consumer, not by being stored or receiving a higher score.
 
 ### 8.3 Outcome reduction
 
-For each attempt and criterion, retain one current contribution:
+For each exact method revision, actual attempt and criterion/checked target, retain one current contribution with sources, offered/delivered facts, observed action, adherence, coverage, result and cost/competing failures. These are an ordinary `memory` outcome and its history, not another outcome store. Native event identity prevents replay duplication; attempt/criterion identity prevents counting two reports about one result as two trials.
 
-- offered/delivered;
-- action observed;
-- adherence known/unknown;
-- coverage;
-- result;
-- cost/other failures;
-- comparative benefit known/unknown.
+A packet establishes what was offered, not which method caused the outcome. Missing association remains unknown; useful raw experience is still retained. An explicit correction replaces the addressed contribution. Unresolved incompatible reports remain disagreement. A no-change reduction adds neither a contribution nor a revision; multiple criteria in one attempt are not independent attempts. A missing diagnostic is success only when a relevant complete check covered the target.
 
-Repeated delivery and summaries do not multiply support. Corrected results replace the current contribution with history.
-
-A missing diagnostic is success only when the relevant complete check covered the target.
+Feedback must reach a consumer. A relevant counterexample accompanies the method in context; materially new feedback may revise that method through the existing interpretation job. The next context/request consumes the revised conditions or recipe. This works for successful repairs and cheaper paths as well as failures. A score update, log entry or new proposal without such a consumer is not the completed learning loop. No experiment or approval is required before showing a useful provisional qualification.
 
 ### 8.4 Transfer
 
