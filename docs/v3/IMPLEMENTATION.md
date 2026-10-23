@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.6 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.7 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -310,7 +310,7 @@ Follow-up is selected by the actual event kind and producer, not another model o
 | Model-created lesson or view revision | Refresh its search representation and genuinely affected dependants; do not re-enqueue the same interpretation merely because it wrote a result |
 | Packet preparation/handoff, read/status, claim renewal or embedding completion | Optional operational/attribution recording only; no new episode inference or independent support |
 
-Self-diagnosis may select operational events for a concrete observed failure. That does not turn routine accounting into fresh task evidence or start a reflection after every read.
+Self-diagnosis may select operational events for a concrete observed failure. That does not turn routine accounting into fresh task evidence or start a reflection after every read. Host hooks around Eliot's own `context`, `open` and status tools are operational events too: returning a memory item through MCP does not turn it into independent evidence. Recognize these calls from the configured tool/server mapping, not from words in their output. Explicit new user input or an actual external action remains ordinary capture.
 
 Semantic interpretation, embeddings and source parsing run outside this transaction. When Store is unavailable, publish a complete spool file under the same source identity; acknowledge staged only after its bytes are durably saved using the actual filesystem primitives. A retry must not overwrite another payload under the same key. Replay uses the same application operation and removes the file only after primary readback. For a structured correction, retain the target, expected revision and edit in that same staged command; staged never means applied.
 
@@ -407,26 +407,28 @@ Use the bound read context for every item and source expansion, including links 
 
 ### 6.1 First adapter: Claude Code
 
-Use supported host events rather than inferred execution proofs.
+Use a command hook calling the same `eliot relay`, not a model-based hook. The [official hook reference](https://code.claude.com/docs/en/hooks), read 2026-10-23, is the source for event fields and delivery behavior below. This is a selected adapter design, not qualification of the owner's installed version. Record that version and available events at setup; an unavailable optional event does not disable supported capture or MCP reads.
 
-Initial mapping:
-
-| Host boundary | Eliot action |
+| Native event | Eliot operation |
 |---|---|
-| Session start / prompt boundary | attach and request orientation/current context |
-| Tool success | capture call identity, input reference and actual result |
-| Tool failure | capture call identity and actual error |
-| Batch/turn boundary when supported | request context informed by recent results |
-| Resume/compaction boundary | refresh current work and changed advice |
-| Explicit user correction | save and apply a structured correction command together; otherwise capture for interpretation |
+| `SessionStart`, `UserPromptSubmit` | Attach to the actual session/actor and request current orientation. Preserve available `source` and `prompt_id`; resume/compact refresh presentation, not source evidence. |
+| `SubagentStart` | Address the child by session plus `agent_id`, retain the observed association and offer initial child context. A repeated start is not a new child merely because the hook fired again. |
+| `PostToolUse`, `PostToolUseFailure` | Capture the call's actual input and structured response or error under its `tool_use_id`. Preserve interruption/partial-result fields when supplied. |
+| `PostToolBatch`, when supported | Relate rendered results to those same calls, then obtain one packet at the next-model boundary; do not create another execution per batch entry. |
+| `Stop`, `SubagentStop`, `StopFailure` | Capture the supplied closing text or error with its actual event kind and make relevant background work due. Do not request another agent turn merely to finish memory work. |
+| `PostCompact`, when supported | Record a host-produced view and refresh presentation state, not a new independent observation of the underlying work. Deliver later through a supported context boundary. |
 
-`attach` returns the exact continuation key chosen from the narrowest available native task/branch/session identity. Subsequent host events and context requests carry that key when available.
+**Identity and correlation.** Encode `source_native_id` from the configured host namespace, `session_id` and `agent_id` when present; otherwise use the main actor within that session. `agent_type` describes a role, not an instance. `prompt_id` correlates a prompt, not every task or execution under it. Keep task IDs only where actually supplied. Session membership does not establish an immediate parent agent or spawning tool call; record such links only from an explicit native association, and use §10.1 if it arrives late. A directory change alone neither creates a new project nor merges workspaces. Forked sessions get their own continuation; inherit earlier material only through an observed link, not a similar title or shared path.
 
-The adapter records what the host supplies. It does not invent a task ID, verifier, successful step or project. Subagent events remain in their native child/parent streams and are not flattened into a fictitious single sequence.
+For a tool observation, use the scoped call ID plus event phase/representation as its source key. Keep the structured result and the model-visible batch representation distinguishable: they can contain different bytes without being a conflicting replay or two independent outcomes. Reference one execution in §10.5. Preserve actual content in each representation; do not run the tool again to make them agree. For events without a stable occurrence ID, allocate an ingress ID once and retain it through spool retries. This deduplicates Eliot's delivery, not undocumented host re-emission. Do not collapse repeated user text or all starts/stops of one agent into a single event; obtain transcript message identity when available and otherwise retain the uncertainty.
 
-The adapter tags Eliot-injected context. When later conversation is captured, exact injected blocks are excluded as new source evidence while genuinely new user/agent actions and results remain. Previously delivered advice is not counted as independent confirmation merely because it reappears in the transcript.
+**Final text and late transcripts.** Normalize `last_assistant_message` before passing the event to its handler; preserve absent versus explicitly empty and the event kind. Stop text is an assistant report, not verified execution; on `StopFailure` the same field contains a rendered API error, not a successful final answer. The transcript may lag the hook. A missing/empty current response must not be replaced with an older assistant message labelled current. At `SubagentStop`, keep `agent_transcript_path` separate from the main `transcript_path`; the latter is not the child's log. Where the installed host uses `SubagentHandback` (documented from v2.1.271), capture its `tool_input.message` through the actual tool hook as the submitted report; later closing text is not a substitute. Preserve the call/result association without inferring parent receipt merely from the child's stopping.
 
-Capture returns without waiting for Dreamer. A wakeup only makes interpretation due.
+Any additional transcript reconciliation reads complete available records in a finite job, with source identity/cursor retained in the existing stream/job. A temporarily unwritten tail remains incomplete. Later matching records can enrich the episode without adding another successful attempt. Parent membership alone does not prove that the parent model received the child's answer.
+
+**Capture before expensive work.** The initial relay synchronously commits or durably stages the permitted event, then exits promptly; it does not await Dreamer, transcript synthesis or a whole-service readiness loop. This avoids relying on a host-owned async process to survive session teardown. Spool/disk failure is visible in Eliot status without blocking the host's tool or claiming capture succeeded. Ordinary memory hooks do not emit permission decisions, `decision: block`, `continue: false` or a blocking exit code. The host remains the task owner.
+
+The adapter tags Eliot-injected blocks and recognizes its own read-tool results (§5.1). Later transcript capture retains new actions and corrections but does not turn those copies into new evidence. Use ordinary observations, links and jobs; no hook coordinator, second transcript store or agent-per-event classifier is needed.
 
 ### 6.2 Other hosts
 
@@ -436,20 +438,15 @@ Do not create a universal plugin framework before a second real adapter proves t
 
 ### 6.3 Delivery and packet attribution
 
-Build the packet before optional diagnostics.
+Build the packet before optional diagnostics. Distinguish preparation, successful local response handoff, host acceptance where observed, and later use. A completed stdout write alone does not prove that the host parsed or retained every field.
 
-Distinguish:
+For Claude, return only valid event-specific JSON on stdout, with useful text in `hookSpecificOutput.additionalContext`; diagnostics stay outside that channel. Fit essential claims and exceptions within both the model budget and the documented 10,000-character hook-string cap, leaving details to `open`. Host overflow can become a file preview rather than the full text; the packet record must not claim that omitted material reached the model. The cap and actual installed serialization behavior belong to this adapter, not the general memory schema.
 
-- packet prepared;
-- handed to the host;
-- observed by the host if such feedback exists;
-- applied by the agent, usually unknown unless later evidence supports it.
+Use `SessionStart`/`UserPromptSubmit` and a supported `PostToolBatch` boundary; use per-tool context only as the chosen fallback, not a duplicate full packet on both paths. Initial child orientation can use `SubagentStart`; changed child advice needs a later supported boundary rather than an assumption that a repeated start reinserts new text. Keep the actual recipient session/actor with the packet. A late background learning result becomes available for the next relevant request; do not inject a precomputed packet into a different current task or wake a stopped agent through `Stop`/`SubagentStop` feedback. If no next boundary occurs, the result remains stored rather than called delivered.
 
-`context` returns `packet_id`. The adapter records an observed handoff event under that ID when it actually hands the packet to the host. The packet record links to every included method/item revision. Later action/outcome observations carry the packet ID only when the host can correlate them; otherwise adherence remains unknown.
+`context` returns `packet_id`. Record the actual handoff under that ID when observable, linking exact rendered revisions. Native call IDs correlate actions/results; the hook schema does not promise to echo Eliot's packet ID. Without further host evidence, offered context is known but adherence remains unknown. Packet-accounting failure cannot erase useful output or change a completed tool's result.
 
-Packet accounting failure does not erase the rendered packet or transform a known primary action into failure. Do not mark handed off before the handoff. Logging failure cannot erase a known primary result.
-
-Repeat suppression is a small cache keyed by context incarnation and material revision. New corrections or newly available orientation may be offered again.
+Repeat suppression is a small cache keyed by recipient, context incarnation and material revision. Resume/compact can re-offer current orientation; old injected context in a resumed transcript is historical delivery, not a new observation or proof that its contents remain current. Re-offer changed corrections without repeatedly sending an unchanged full timeline.
 
 ## 7. Current work and context
 
@@ -742,7 +739,7 @@ Unresolved alternatives remain available; unrelated work continues.
 
 A conditional anticipation is a method or claim describing trigger situation, expected risk/opportunity, material conditions, useful check/action and expiry/reconsideration condition.
 
-It enters ordinary context when relevant. Expiry of the warning does not fabricate an outcome.
+It enters ordinary context when relevant. Expiry of the warning does not fabricate the outcome.
 
 ### 11.3 Research use
 
@@ -811,13 +808,13 @@ Build vertical slices in this order.
 
 ### Slice 2 — Host capture and context
 
-- first Claude adapter;
-- actual tool result/error capture;
+- first Claude adapter with native session/actor/call identity and preserved final-message fields;
+- short durable capture before background interpretation; structured and rendered tool results remain one execution;
 - exact continuation key and current-work lookup;
 - exact/full-text context;
-- stable packet ID and handoff observation;
+- recipient-bound packet and actual hook handoff, within the host's output limit;
 - `open` expansion;
-- advice delivered at a real model boundary.
+- advice at a supported next-model boundary, without a Stop-driven learning loop.
 
 ### Slice 3 — Dreamer and lessons
 
