@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.11 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.12 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -143,7 +143,7 @@ All host surfaces call the same application functions.
 |---|---|
 | `attach(workspace, session)` | bound project/session, exact continuation key and actual capabilities |
 | `capture(event)` | committed, staged, unknown or rejected |
-| `context(decision_frame, budget)` | packet ID, rendered context, exact included revisions, expansion handles and gaps |
+| `context(decision_frame, budget, retrieval=local)` | packet ID, rendered context, exact included revisions, expansion handles and gaps; explicit `semantic` mode may obtain a query vector (§8.1) |
 | `open(handle, read_context)` | exact current/historical item or source segment within the bound project/route |
 | `record_outcome(report)` | captured observed result or explicitly sourced report |
 | `dream(request)` | finite interpretation/research/improvement job when its handler is available |
@@ -220,7 +220,7 @@ Key fields:
 - validity interval;
 - exposure/influence state;
 - created/updated times;
-- optional active embedding profile/vector/revision.
+- optional embedding vector, effective space and encoded representation/revision (§9.3).
 
 `origin_project` is the stable configured project ID and never changes when the workspace is renamed. Store `reuse_scope` as `{ mode, projects }`: `mode` is `project`, `selected` or `owner`; `projects` is an array of stable project IDs, empty outside selected mode. This describes where a method can be considered, not whether it is true or whether every source can be disclosed. Project-local is the default. Shared methods use the owner's configured reuse choice without a separate approval for every item.
 
@@ -292,7 +292,7 @@ Key fields:
 - `state`;
 - finite input observation IDs/segments, or exact per-stream ranges with their selection scope;
 - input memory IDs/revisions;
-- selected method ID/revision;
+- selected method ID/revision when the purpose uses one;
 - current claim and expiry;
 - due time/attempt;
 - saved controller connection/caller, request method/ID and immutable parameters or their blob reference;
@@ -366,9 +366,9 @@ Semantic interpretation, embeddings and source parsing run outside this transact
 
 ### 5.2 `claim_due_job`
 
-Select due work only for handlers present and enabled in the actual composition. In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. For model-based work, also resolve the configured purpose-specific method and save its current ID/revision under §10.3; reclamation retains the already selected version. The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
+Select due work only for handlers present and enabled in the actual composition. In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. For text-interpretation work, also resolve the configured purpose-specific method and save its current ID/revision under §10.3; reclamation retains the already selected version. Encoding uses its configured profile, not a Dreamer recipe (§9.3). The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
 
-The worker then reads the named method revision and source material outside the transaction. Reclaiming an expired worker claim keeps the same job, frozen inputs and controller execution reference. It first checks any saved model output or ongoing execution; expiry is not permission to buy another model call. Completion requires the current claim and finishes that same row atomically with its memory result.
+The worker then reads its source material and any selected method revision outside the transaction. Reclaiming an expired worker claim keeps the same job, frozen inputs and controller execution reference. It first checks any saved output or ongoing execution; expiry is not permission to buy another model call. Completion requires the current claim and finishes that same row atomically with its result.
 
 Independent projects and targets proceed independently. There is no project-wide head-of-line barrier or separate lock table.
 
@@ -386,16 +386,18 @@ If the expected revision is already stale and no result exists for this command,
 
 For a still-live job, persist the actual completed worker/controller result and available execution reference under the existing job or its referenced blob before releasing temporary output. Retain observed/unknown provider usage where applicable; a source converter does not require a fictitious model execution. A target conflict must not discard an already obtained result and silently repeat its conversion or inference. An erasure-cancelled job follows §12.1 instead of retaining deleted input/output again.
 
-Inside one transaction:
+For one dependent publication, inside one transaction:
 
 1. return the stored result immediately if this job has already applied it;
 2. otherwise verify the current claim and addressed expected revisions;
-3. publish the dependent changes through `publish_revision` in this same transaction;
+3. publish semantic changes through `publish_revision`, or update only matching derived fields for an embedding result (§9.3);
 4. save exact result handles or explicit no-change and only the input covered by that applied processing (§10.1);
 5. finish the job, releasing its active slot, and retain/create any necessary pending successor;
 6. commit.
 
 A failed conditional mutation aborts the whole dependent write, including history and job completion. Never implement this as separately committed per-item helpers. Use saved output to retry a storage conflict. If the semantic target has genuinely changed, a short follow-up transaction with the current claim records this job as not applied, releases its slot and coalesces any still-needed reconciliation into the pending successor with the saved output and unconsumed inputs. Do not mark those inputs successfully interpreted or leave an expired active job permanently blocking the successor. Reconciliation uses the current target and saved proposal; a necessary new inference is explicit new work, not automatic repetition of the original request.
+
+An embedding batch groups independent derived updates, not one dependent semantic edit. Its handler may commit bounded groups with per-item applied, stale or error results on the existing job, then finish when every input has a disposition or a retained successor. One edited item does not discard usable vectors for other items. No semantic history revision or reflection is created for vector completion.
 
 An uncertain commit is read back by job ID. An unknown provider outcome is read back by its existing execution reference where supported. Neither is repaired by assigning a new ID and repeating the external request.
 
@@ -406,12 +408,12 @@ Run the independent retrieval arms available in the selected composition:
 - direct handles and exact identifiers;
 - exact continuation address;
 - full-text search;
-- compatible vector search when enabled;
+- compatible vector search when enabled and a matching query vector is available;
 - scoped claim-group alternatives;
 - relevant typed relations;
 - project-local and eligible reusable methods.
 
-Base uses exact/lexical candidates and already recorded state/relations. Optional enrichment supplies candidates to this same assembly path; its absence does not require another context implementation.
+Base uses exact/lexical candidates and already recorded state/relations. Optional enrichment supplies candidates to this same assembly path; its absence does not require another context implementation. The caller's local/semantic mode determines whether a query-encoder call is allowed (§8.1), not whether exact knowledge can be read.
 
 The project comes from the bound request, not from query prose. Addressed work is read directly:
 
@@ -492,7 +494,7 @@ Do not create a universal plugin framework before a second real adapter proves t
 
 ### 6.3 Delivery and packet attribution
 
-Build the packet before optional diagnostics. Distinguish preparation, successful local response handoff, host acceptance where observed, and later use. A completed stdout write alone does not prove that the host parsed or retained every field.
+Build the packet before optional diagnostics. Distinguish preparation, successful local response handoff, host acceptance where observed, and later use. A completed stdout write alone does not prove that the host parsed or retained every field. Automatic hook context uses `retrieval=local`: it does not cold-call an encoder or wait for reindexing (§8.1). Explicit semantic retrieval is a request to the same application path, not hidden work in the hook.
 
 For Claude, return only valid event-specific JSON on stdout, with useful text in `hookSpecificOutput.additionalContext`; diagnostics stay outside that channel. Fit essential claims and exceptions within both the model budget and the documented 10,000-character hook-string cap, leaving details to `open`. Host overflow can become a file preview rather than the full text; the packet record must not claim that omitted material reached the model. The cap and actual installed serialization behavior belong to this adapter, not the general memory schema.
 
@@ -563,11 +565,17 @@ Render useful content, not only record IDs and scores. Details remain available 
 
 ### 8.1 Search
 
-Primary full-text and exact queries operate on `memory` and selected observation fields. Vector search is an additional arm.
+Primary full-text and exact queries operate on `memory` and selected observation fields. Exact cues use the same pure normalization on capture and lookup; preserve canonical path/native-ID spelling and keep any comparison key separate. A cue is a lookup route, not a claim of truth. A note without a cue remains searchable rather than rejected.
 
-Embedding identity includes encoder, preprocessing and content revision. A failed or pending vector leaves exact/full-text retrieval available.
+**One pipeline, two waiting policies.** `retrieval=local` is the default for hooks and Base. It uses available local candidates; the optional vector arm runs only with an already available query vector for the exact query representation and effective space. It never waits for encoder startup, network inference or a background job. An optional bounded cache stores vectors, not packets: its key includes route/disclosure scope, effective space, role and exact encoded query. A cache miss does not borrow a similar query's vector or create a compulsory job after every read.
 
-Background embedding work is batched and limited so foreground query capacity remains.
+An explicit `retrieval=semantic` call may obtain one query embedding through §9.3 within that request's configured wait budget. Exact/local reads do not depend on its success. If the encoder is unavailable or times out, return useful local results with the missing semantic arm stated; do not call an empty vector result a completed semantic search. Both modes use the same candidate, applicability, expansion and packing code. New query input is encoded as a query, not looked up among document vectors by text similarity. No Dreamer task is needed to produce it.
+
+**Native candidate fusion.** Use SurrealDB's vector index and `search::rrf` for the lexical/vector candidate union, not a second vector store or an uncalibrated sum of BM25 and cosine scores. Supply lists ordered by their own relevance with deterministic tie-breaking. Obtain their IDs/revisions in a short consistent Store read after any encoder call; fuse ID/rank lists and retain the corresponding version handles rather than letting a generic field merge choose between conflicting revisions. The fusion limit is the candidate-examination budget, not the final packet count. Exact addressed state, explicit corrections and material linked exceptions are fetched independently and cannot disappear merely because they lack a vector score. No mandatory LLM reranker is introduced.
+
+Scope, recorded eligibility and current embedding space belong inside the vector arm before its result limit. Native HNSW evaluates predicates during candidate traversal; indexed prefiltering is a distinct optimization, not promised for every array predicate. Check the actual query plan at implementation time. A full-text match with score zero remains a match: on a small corpus BM25 can give zero to all matches. Keep stable ordering and exact cues instead of filtering `score > 0` or interpreting zero as absence.
+
+These choices follow the [native hybrid search](https://surrealdb.com/docs/learn/data-models/vector-search/hybrid-search), [fusion contract](https://surrealdb.com/docs/reference/query-language/functions/database-functions/search) and [filtered-vector](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) documentation checked 2026-10-23. Quality, latency and the selected server's query plans are not yet measured. Applicability and whole-unit packing remain in Cognition §§6.2–6.5; rank is not support or proof.
 
 ### 8.2 Relations and episodes
 
@@ -676,16 +684,26 @@ The model may propose memory revisions and links. Application code checks parsea
 
 ### 9.3 Embeddings
 
-Controller needs a batch vector operation:
+This optional module adds one controller client, a handler on the existing jobs and the candidate arm in §8.1. The actual controller vector endpoint remains unconfirmed/unimplemented under R-015; the following is the required application contract, not the name of an existing API:
 
 ```text
-encoder profile + [(item_id, text_revision, text)]
-→ per-item vector or per-item error
+configured profile + role (query or document) + [(input_key, text)]
+→ effective space + [(input_key, vector or error)] + observed usage when supplied
 ```
 
-This is controller model infrastructure, not an agent task. Until implemented, V3 remains useful through exact/full-text retrieval.
+Memory retains the item/revision/representation association for each key. Controller owns provider-specific request splitting, authentication and model invocation. The caller requests independent embeddings, never one aggregate for all input texts. The adapter translates provider indexes or documented response order back to the original keys; duplicate, missing or unresolvable positions cannot be repaired by padding vectors or assigning the next output to the next record. Validate finite numeric values and expected dimension before storing the vector. Equal vector values for different inputs remain valid separate results.
 
-Applying a vector updates derived fields for the matching content/profile. It does not create a semantic revision or trigger another learning episode.
+**Space and input.** The configured space identifies the actual model or documented compatible query/document model pair, dimensions, numeric representation, preprocessing and the role-specific instructions. A route alias or equal dimension alone does not establish compatibility. Map `query`/`document` into the selected model's actual task parameter or prefix; symmetric models may legitimately use the same encoding. Do not silently switch to an incompatible fallback. Text-generation and embedding routes are independent.
+
+Encode an explicitly selected search representation, retaining its identity with the job/vector. Originals and semantic records remain intact. Overlength input is split into addressable source excerpts through the existing representation path, or reported unsupported; a provider's implicit truncation must not be advertised as coverage of the entire source. Applying a vector never converts an excerpt into a new independent observation.
+
+**Real batching and partial completion.** Coalesce changed texts in existing jobs by project, route/space and role. Freeze finite item revisions and group them into requests respecting actual per-input and total token/byte/count limits; a fixed item count is not a universal capacity rule. Use native multi-input calls where they supply independent results. Preserve successful sub-batches as they arrive under the existing job/result path. Retry only remaining failed or unresolved inputs, not an entire completed prefix after one later failure. A sequential fallback is still multiple provider calls, not claimed batching. Background work leaves capacity for foreground queries through controller's existing execution limits; no second rate-limit service is added to Memory.
+
+**Publish only the derived result.** In a short Store update, match the current item/revision and encoded representation, effective space and non-erased job. An old result does not attach to newly edited text. For an applicable result, update only embedding fields and job progress; do not invoke `publish_revision`, rewrite semantic history or trigger interpretation. A content change invalidates its old vector with the primary mutation; the text remains available lexically while replacement is pending. Link/accounting/index maintenance does not call the encoder merely to maintain an unchanged representation. One stale item in a transport batch leaves other matched items usable (§5.4).
+
+**Changing encoders without changing memory.** The first extension uses one configured space in its vector field/index, independently of the Dreamer model. Multiple simultaneous incompatible spaces are not smuggled into that field. On an incompatible space change, pause only vector dispatch/query, settle old vector writers, clear old derived vectors in finite pages and recreate the native index when its dimension/metric changes. Existing job progress makes interruption resumable. Backfill current eligible text through the same handler; the new arm can search the populated portion and report partial coverage without waiting for the whole corpus. Exact/lexical reads and source opening remain available. No dual semantic database, hot-generation platform or model call to regenerate original knowledge is required.
+
+Provider semantics are deliberately adapter-specific. The [Gemini reference](https://ai.google.dev/gemini-api/docs/embeddings) distinguishes independent string-list embeddings in 001 from multi-input aggregation in Embedding 2, and task parameters from task prefixes. [Voyage](https://docs.voyageai.com/docs/embeddings) exposes role, truncation, dimensionality and aggregate request limits. Both were checked 2026-10-23. These examples define what the narrow controller boundary must preserve; they do not select a default provider or establish an installed Eliot route. Source findings and remaining checks are recorded in R-034.
 
 ### 9.4 Research
 
@@ -750,9 +768,9 @@ A direct explicit correction uses the atomic observation-and-edit command in §5
 
 Separate a processing recipe (how a job interprets an episode or revises a view) from task advice (what an external agent should do in a situation). Both are versioned methods, distinguished by `method_role`; a processing method also names its implemented `processing_purpose`. `job.purpose` selects its matching processing recipe; context retrieval selects relevant task advice. Similar text does not change this role.
 
-Ship real default recipe text for each implemented model-based purpose as application assets. First enablement of that purpose for a project saves its needed default as an ordinary `memory` method using the actual project and a stable purpose address, through the same retry-safe mutation path as other creates. Base setup alone does not seed every future recipe. Record the bundled-file/version origin, not a fictitious successful episode. Concurrent setup resolves the unique address. Do not generate these defaults with Dreamer, seed placeholder purposes that have no worker, or require embeddings before using them.
+Ship real default recipe text for each implemented text-interpretation purpose as application assets. First enablement of that purpose for a project saves its needed default as an ordinary `memory` method using the actual project and a stable purpose address, through the same retry-safe mutation path as other creates. Base setup alone does not seed every future recipe. Record the bundled-file/version origin, not a fictitious successful episode. Concurrent setup resolves the unique address. Do not generate these defaults with Dreamer, seed placeholder purposes that have no worker, or require embeddings before using them.
 
-An optional project/purpose setting may select another existing method ID. Otherwise use the purpose's default address. When claiming a new job, freeze the selected ID and its current revision along with the inputs. The request builder opens that exact body outside the transaction and includes it in the actual controller request. Reclaimed work retains its selection and saved request, not a fresh search for a better method. Deterministic jobs such as applying embeddings or reducing structured outcomes do not need a prompt recipe.
+An optional project/purpose setting may select another existing method ID. Otherwise use the purpose's default address. When claiming a new job, freeze the selected ID and its current revision along with the inputs. The request builder opens that exact body outside the transaction and includes it in the actual controller request. Reclaimed work retains its selection and saved request, not a fresh search for a better method. Encoding uses the provider-specific profile in §9.3, not this recipe selection; deterministic jobs such as applying embeddings or reducing structured outcomes also need no prompt recipe.
 
 Restart and software upgrade do not overwrite learned/user-edited methods with bundled defaults. Missing or withdrawn explicitly selected content is reported for that job; it is not silently replaced by a semantically similar note. First-use initialization is not a repair loop that recreates deliberately removed methods. Other capture/read paths remain available.
 
@@ -923,6 +941,8 @@ Test the implemented extension with its real boundary and rerun the relevant Bas
 Use the dependency table in §2.2 rather than treating every earlier slice as a prerequisite. Vector retrieval, project structure/views, document acquisition, Research and additional hosts can be developed separately once their actual inputs exist. Each connects its output to an existing reader and extends maintenance for the content it adds. Keep the specific algorithms and external gaps in §§8–11; do not duplicate those implementations in a module framework.
 
 For each assembled increment, test its actual useful path and disabling/unavailability behavior against Base. Reuse small module-local tests for pure transformations and existing integration checks for changed I/O. A substituted external response exercises local mapping, not proof of the live provider or installed host. Focus on the changed dependency edges rather than generating every hypothetical feature combination.
+
+For vectors, the connected increment is changed text → real independent encoding → matching derived update → semantic query candidates → the existing packet. Check role/index mapping, a failed later sub-batch, an edited item, a space change and the same Base path with the encoder absent. A vector stored in a row without this reader is not delivered semantic retrieval; these checks follow implementation rather than require a new benchmark platform first.
 
 ### Slice 6 — Advanced improvement and broader operation
 
