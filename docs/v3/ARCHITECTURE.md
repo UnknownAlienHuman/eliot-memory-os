@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft · 2026-10-22 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.1 · 2026-10-23 · normative design for the greenfield rewrite.**
 
 V1 and V2 are donors. V3 is a new implementation, not a compatibility migration. This document defines **why the product exists, what it owns, and which invariants must survive implementation**. [Implementation](IMPLEMENTATION.md) defines the concrete process, data and integration design. [Cognition](COGNITION.md) defines the algorithms. The [audit conclusion](AUDIT.md) records the evidence, rejected mechanisms and known limits.
 
@@ -55,11 +55,27 @@ The initial product is:
 - transient host relays/adapters;
 - ordinary internal modules, not one process or crate per concept.
 
-The implementation may contain modules named `store`, `memory`, `context`, `learning`, `jobs`, `adapters` and `control`. These are code ownership boundaries, not mandated services.
-
 A new process is justified only by a real external runtime or failure boundary. A new crate is justified only by an actual dependency, deployment or change boundary. A noun in the design is not an instruction to create a registry, protocol, lifecycle or state machine.
 
 One mutable fact has one writer. Dashboards, packets, scores, maps and status reports are views unless they genuinely own independent state.
+
+### 3.1 Layers remain; mandatory machinery does not
+
+Separate the domain model and pure transformations, application operations, external I/O, and host/user surfaces. Pure reasoning over supplied values does not import the database SDK, model provider or host protocol. Application operations own the useful transaction or workflow; adapters translate actual external inputs and results. Surfaces invoke those same operations instead of owning another implementation.
+
+These are dependency and responsibility boundaries, not four processes or a compulsory chain of pass-through calls. A small function does not need its own contract package, port, actor, service and manifest. Use narrow public module interfaces and private internals; share a type directly when no representation change is needed. Introduce a trait when an actual substitutable boundary benefits from it, not once per noun.
+
+An extension is a vertical capability across the layers it actually uses. It may supply a search arm, a source reader, an interpretation job or a host adapter. It reuses existing storage, context assembly and finite work rather than constructing its own miniature platform. Calls between application modules use their public functions and an acyclic dependency direction; independent modules need not communicate through a broker or catalogue.
+
+### 3.2 A usable Base, then additive capabilities
+
+Ship a lightweight Base that captures real events, preserves and corrects explicit knowledge, retrieves exact/lexical material, delivers useful context to one host, and reopens its sources after restart. It has real local lifecycle and data controls. It does not require a model, vector encoder, project graph, document converter or Research connection.
+
+Base is a useful limited product, not the claim that self-learning is complete. The first learning extension closes the episode → actual model result → lesson → later context loop. Further retrieval, understanding, source and meta-learning capabilities extend the same product and data, not a second Lite implementation. The complete target in this document remains; unavailable depth is described honestly rather than replaced with a successful stub.
+
+Optional capabilities are optional in construction, startup and execution, not merely hidden in the UI. Their absence or failure cannot make primary capture/read depend on them. Disabling a producer stops its new work without deleting already retained readable knowledge. Enabling it does not demand a full-corpus rebuild before ordinary use. An explicit request for a missing capability returns that fact, not a fabricated empty success.
+
+Keep one current data model and shared application operations across configurations. Extra depth must not silently change an earlier record's meaning or make it unreadable without the module that produced it. Changing an extension can require a real schema migration, but not a permanent parallel generation or compatibility framework for the discarded V1/V2 runtimes.
 
 ## 4. Memory model invariants
 
@@ -227,4 +243,4 @@ Each capability must identify:
 4. the next real consumer;
 5. the failure visible to the user.
 
-Implementation follows the owner's sequence: product code first, minimum relevant checks/Clippy, broader tests after the connected product exists. A test later exercises the same production path; it must not create a second implementation inside the product.
+Implement the usable Base first, with minimum relevant build/Clippy checks during coding. Once it runs, test that Base before adding further depth. Then implement and test each connected extension against the same product paths, keeping Base usable without it. Testing does not wait for the entire future cognitive system, and tests do not justify speculative infrastructure or production stubs. Module-local tests may substitute an external dependency; they do not establish that the real integration works.

@@ -1,10 +1,10 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.10 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.11 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
-No schema, controller method or host adapter described here is claimed implemented until the product code exists.
+No schema, controller method or host adapter described here is claimed implemented until the product code exists. Sections describe the complete target; §2 defines the usable Base and optional capabilities, and §14 defines their delivery order. They are not a requirement to construct every capability before running Base.
 
 ## 1. Runtime and first use
 
@@ -71,21 +71,69 @@ These are selected uses of Windows [mutex ownership](https://learn.microsoft.com
 
 ## 2. Code structure
 
-Start with one Rust package and ordinary modules:
+### 2.1 Source layers and responsibility modules
 
-| Module | Owns |
-|---|---|
-| `store` | SurrealDB schema, queries, transactions and readback |
-| `memory` | observations, semantic revisions, sources and correction |
-| `context` | current-work recovery, retrieval, applicability and rendering |
-| `learning` | procedures, improvement lessons and outcome reduction |
-| `jobs` | finite background work and claims |
-| `adapters` | host, controller, source and research boundaries |
-| `control` | configuration, status, maintenance, backup and restore |
+Start with one Rust package, a library containing the application and a thin executable selecting supervisor/daemon/relay modes. Ordinary modules provide boundaries; one package is a starting choice, not a prohibition on a later useful crate.
 
-Pure transformations remain functions. A module does not automatically get a trait, service, registry or crate.
+| Area | Owns and exposes | Does not own |
+|---|---|---|
+| `model` | Small shared values: observations, version handles, input/result data and errors actually crossing module boundaries | Vendor SDKs, runtime, a universal contract catalogue |
+| `store` | Schema/migrations, fixed queries, atomic writes, exact reads and blobs through its public operations | Interpretation, host protocol, model selection |
+| `memory`, `context`, `learning` | Memory operations, pure semantic transformations, context assembly and implemented learning handlers | Raw SDK connections, another scheduler or persistent store |
+| `jobs` | Claim/retry/result application for implemented finite work; explicit dispatch to its handlers | Semantic algorithms copied from the handlers |
+| `adapters` | Inbound host normalization and outbound controller/source/Research translation, in separate submodules | Task acceptance or a second memory writer |
+| `control` | Owner operations, configuration and maintenance using the same application functions | A general policy engine |
+| `runtime` | Construction and owned process/task lifetime; `main` selects a mode | Memory algorithms or a global mutable service locator |
 
-External boundaries are SurrealDB, host events/MCP, controller text execution/embeddings, optional source tools and optional Eliot Research.
+The dependency direction is concrete:
+
+```text
+model and pure transformations       -> no application or I/O imports
+store and outbound adapters         -> shared values; their own external dependencies
+application operations              -> shared values, Store API, the outbound clients they use
+host / CLI / MCP adapters           -> application operations and shared values
+runtime composition                 -> concrete constructors and startup/shutdown
+```
+
+Inbound and outbound adapters are not one all-to-all layer. Keep pure packing/reduction code separate from I/O within its owning module; it need not become another crate. Application modules may call another module's public operation where the dependency stays acyclic. A job handler returns its actual result/proposed changes; it does not call back into the runner or implement its own claim loop. Store does not import learning or host code to interpret a row.
+
+Keep SDK connection fields, SQL helpers and module internals private. Expose the few actual entrypoints using normal Rust visibility. `pub(crate)` alone does not enforce an acyclic import graph; review the real imports rather than claiming the compiler proves the architecture. Do not pass the entire application object to every function. Use the concrete Store and small client references; add a trait at a genuinely substitutable I/O boundary, not a repository/service/facade trio for every table. Internal calls share Rust values; serialization belongs at real process/network/storage boundaries.
+
+### 2.2 Base and extensions
+
+**Base** is the first usable configuration, assembled in Slices 1–2: capture from one host, exact/lexical retrieval, addressed current-work facts, explicit notes/corrections with history, source opening, context delivery, local restart/spool and basic data controls. It uses the selected SurrealDB Store, not a temporary substitute to be rewritten later. No controller credentials, embedding model, parser runtime or Research account are needed. Without a synthesis handler, continuation consists of explicitly supplied state plus relevant source events; it is not advertised as automatic understanding.
+
+The following capabilities are separate increments, not a dependency chain:
+
+| Capability | Required input/dependency | Output and existing consumer |
+|---|---|---|
+| First learning | Base observations, one real controller text/result route, one recipe | Lesson/continuation revision; ordinary `context` and `open` |
+| Vector retrieval | Base text revisions, a real batch encoder route | Derived vectors; an additional `context` candidate arm. Does not require Dreamer. |
+| Project understanding | Base source access; configured structure tool for structural facts; text route only for generated explanations | Source-linked views; ordinary context. No mandatory full project graph. |
+| Document acquisition | Base blobs and jobs, selected external converter | Retained representation and searchable excerpts; source `open`. Does not require Research. |
+| Research acquisition | Base result/source storage, selected Research client | External findings/report and excerpts; ordinary memory/context. Does not require a local document converter. |
+| Richer cognition | Relevant stored claims/methods/outcomes; text route only for operations that actually infer | Disagreement, anticipation, method revisions and self-diagnosis through the same memory/jobs |
+| Another host | Existing application API and that host's real events | The same capture/context paths, not a second memory engine |
+
+The six-table model in §4 is the shared initial storage model, not six fully implemented subsystems required before the first capture. Add fields/indexes with their first real writer and reader. Do not seed fictional recipes or enqueue future job purposes. Common content, provenance and history remain readable when a producer is disabled; rich format-specific presentation may report its own unavailable decoder. Enabling a module uses retained data, not migration to a separate Lite/Full database.
+
+### 2.3 The integration path is ordinary code
+
+For a new capability, implement its operation in the owning module and connect its real caller and consumer. The runtime constructs its client only when selected. Background work adds an explicit branch to the existing job dispatch; foreground enrichment adds a direct call in the owning context/source path. Use the existing capture/publication/result operations. Extend Store migrations and backup/erasure handling only for data actually introduced. This is a small code change set, not a mandatory collection of manifest files or an approval protocol.
+
+For example, vector retrieval adds a controller batch client, an embedding job handler and one candidate query. A content revision schedules that handler only when enabled; it saves matching derived vectors. Context combines those candidates with its unchanged exact/lexical arms. Turning it off stops its new work and queries while the same notes, revisions and source handles remain usable. No second context compiler, vector database, worker supervisor or event bus is created. The actual embedding API is still open work under §9.3/R-015; this example defines its integration, not implemented code.
+
+A function needs no actor. Finite expensive work uses the existing jobs; a long-lived task is used only when it must continuously receive input or retain an actual resource. A subprocess is justified by an external runtime or failure isolation, not by the module name. Replacement is normally a rebuild and graceful restart with retained data. Runtime plugin discovery, dynamic Rust ABI, WASM packaging, hot-reload generations and service-location frameworks are not selected.
+
+### 2.4 Optional means optional in the real path
+
+Runtime configuration chooses enabled operations/routes. Construct an optional client without making every startup probe its remote service; a failure belongs to that capability and must not escape the optional branch as a whole-daemon failure. `attach/status` report supported/configured/unavailable facts from the actual composition and observed operations, not a separate readiness registry. An explicit unavailable operation fails specifically; it does not return successful no-change.
+
+Capture always preserves permitted source input. Only implemented, enabled consumers create optional follow-up jobs; necessary core maintenance remains connected. Disabling a capability stops new dispatch for its purposes. Its pending work is held rather than repeatedly claimed and failed; already dispatched external work keeps its original identity and can retain a useful completion unless explicitly cancelled/erased. Re-enable can continue selected pending work or a finite backfill from retained sources. No full-history interpretation or global reindex is required before reads resume.
+
+A runtime switch prevents work; it does not remove compiled dependencies. Use Cargo optional dependencies/features only where omitting an extension actually reduces the build or package. Keep shared storage readers independent of those features. Do not add a negative `lite` feature that changes record semantics, or a flag per helper. Cargo features combine additively, and transitive dependencies can re-enable defaults: inspect the actual feature graph for a reduced build. Cheap pure logic needs no separate compile flag. External Docling/models are not bundled or downloaded merely because Base starts.
+
+These implementation choices use [Rust visibility](https://doc.rust-lang.org/reference/visibility-and-privacy.html) and [Cargo features](https://doc.rust-lang.org/cargo/reference/features.html), checked 2026-10-23. They require no third-party plugin framework. The old requirements and the deliberately discarded machinery are reconciled in R-033 of the [analysis registry](ANALYSIS-REGISTRY.md).
 
 ## 3. Application surface
 
@@ -98,10 +146,10 @@ All host surfaces call the same application functions.
 | `context(decision_frame, budget)` | packet ID, rendered context, exact included revisions, expansion handles and gaps |
 | `open(handle, read_context)` | exact current/historical item or source segment within the bound project/route |
 | `record_outcome(report)` | captured observed result or explicitly sourced report |
-| `dream(request)` | finite interpretation/research/improvement job |
+| `dream(request)` | finite interpretation/research/improvement job when its handler is available |
 | `control(command)` | status, configure, pause/cancel, correct, erase, backup or restore |
 
-`record_outcome` reuses capture. It does not create an execution-proof subsystem. The adapter supplies the bound project and configured route in `read_context`; opening a source does not require an agent to complete another permissions form.
+`record_outcome` reuses capture. It does not create an execution-proof subsystem. The adapter supplies the bound project and configured route in `read_context`; opening a source does not require an agent to complete another permissions form. Publish only implemented operations on a host surface; an unavailable handler does not justify a success-shaped stub.
 
 ## 4. Physical data model
 
@@ -298,16 +346,16 @@ Inside one short transaction:
 3. if identical source input already exists, return its saved result without another observation, sequence increment or queued interpretation;
 4. if that identity names different source content, preserve the original and report the mismatch; an explicit correction is a distinct event;
 5. advance the stream's ingestion sequence and insert the observation;
-6. apply the event's known follow-up rule below;
+6. apply the event's known follow-up rule below for implemented/enabled consumers (§2.4);
 7. commit.
 
-Native unique indexes back stream/event identity. Compare source content, not the new receipt timestamp or retry metadata. One stream's sequence orders intake, not the time at which the external event happened. New work and source capture commit together, so a lost in-process wakeup is recovered by polling due jobs.
+Native unique indexes back stream/event identity. Compare source content, not the new receipt timestamp or retry metadata. One stream's sequence orders intake, not the time at which the external event happened. Necessary selected work and source capture commit together, so a lost in-process wakeup is recovered by polling due jobs. With learning disabled, capture still commits and retains material for later selected processing; it does not create an unexecutable job after every event.
 
 Follow-up is selected by the actual event kind and producer, not another model or a generic rule that every write is new experience:
 
 | Input | Necessary next work |
 |---|---|
-| New host/source event or observed result | Coalesce the relevant unprocessed episode or affected-view work |
+| New host/source event or observed result | Coalesce relevant unprocessed episode or affected-view work when its handler is enabled |
 | Explicit structured correction | Apply the addressed edit as described in §5.3; schedule only its affected derived work |
 | Model-created lesson or view revision | Refresh its search representation and genuinely affected dependants; do not re-enqueue the same interpretation merely because it wrote a result |
 | Packet preparation/handoff, read/status, claim renewal or embedding completion | Optional operational/attribution recording only; no new episode inference or independent support |
@@ -318,7 +366,7 @@ Semantic interpretation, embeddings and source parsing run outside this transact
 
 ### 5.2 `claim_due_job`
 
-In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. For model-based work, also resolve the configured purpose-specific method and save its current ID/revision under §10.3; reclamation retains the already selected version. The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
+Select due work only for handlers present and enabled in the actual composition. In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. For model-based work, also resolve the configured purpose-specific method and save its current ID/revision under §10.3; reclamation retains the already selected version. The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
 
 The worker then reads the named method revision and source material outside the transaction. Reclaiming an expired worker claim keeps the same job, frozen inputs and controller execution reference. It first checks any saved model output or ongoing execution; expiry is not permission to buy another model call. Completion requires the current claim and finishes that same row atomically with its memory result.
 
@@ -353,15 +401,17 @@ An uncertain commit is read back by job ID. An unknown provider outcome is read 
 
 ### 5.5 `find_context`
 
-Run independent retrieval arms:
+Run the independent retrieval arms available in the selected composition:
 
 - direct handles and exact identifiers;
 - exact continuation address;
 - full-text search;
-- compatible vector search;
+- compatible vector search when enabled;
 - scoped claim-group alternatives;
 - relevant typed relations;
 - project-local and eligible reusable methods.
+
+Base uses exact/lexical candidates and already recorded state/relations. Optional enrichment supplies candidates to this same assembly path; its absence does not require another context implementation.
 
 The project comes from the bound request, not from query prose. Addressed work is read directly:
 
@@ -700,7 +750,7 @@ A direct explicit correction uses the atomic observation-and-edit command in §5
 
 Separate a processing recipe (how a job interprets an episode or revises a view) from task advice (what an external agent should do in a situation). Both are versioned methods, distinguished by `method_role`; a processing method also names its implemented `processing_purpose`. `job.purpose` selects its matching processing recipe; context retrieval selects relevant task advice. Similar text does not change this role.
 
-Ship real default recipe text for each implemented model-based purpose as application assets. First project setup saves the needed defaults as ordinary `memory` methods using the actual project and a stable purpose address, through the same retry-safe mutation path as other creates. Record their bundled-file/version origin, not a fictitious successful episode. Concurrent setup resolves the unique address. Do not generate these defaults with Dreamer, seed placeholder purposes that have no worker, or require embeddings before using them.
+Ship real default recipe text for each implemented model-based purpose as application assets. First enablement of that purpose for a project saves its needed default as an ordinary `memory` method using the actual project and a stable purpose address, through the same retry-safe mutation path as other creates. Base setup alone does not seed every future recipe. Record the bundled-file/version origin, not a fictitious successful episode. Concurrent setup resolves the unique address. Do not generate these defaults with Dreamer, seed placeholder purposes that have no worker, or require embeddings before using them.
 
 An optional project/purpose setting may select another existing method ID. Otherwise use the purpose's default address. When claiming a new job, freeze the selected ID and its current revision along with the inputs. The request builder opens that exact body outside the transaction and includes it in the actual controller request. Reclaimed work retains its selection and saved request, not a fresh search for a better method. Deterministic jobs such as applying embeddings or reducing structured outcomes do not need a prompt recipe.
 
@@ -848,57 +898,34 @@ Optional notification failure does not block status or control.
 
 ## 14. Implementation sequence
 
-Build vertical slices in this order.
+First assemble and test the usable Base; then add independently useful modules. The slices below are work increments, not six compulsory runtime layers or a reason to postpone all testing until the complete cognitive system exists.
 
 ### Slice 1 — Store and local lifecycle
 
-- supervisor, daemon and SurrealDB child;
-- configuration/data directories;
-- capture event;
-- exact open/read after restart;
-- spool when Store is unavailable;
-- direct status/shutdown.
+Implement supervisor/daemon/SurrealDB ownership, configuration, capture, exact read after restart, spool and direct status/shutdown. Add shared revision/history operations when explicit notes/corrections first use them. This is the first connected persistence path, not a dummy runtime extraction or a claim of finished user memory.
 
-### Slice 2 — Host capture and context
+### Slice 2 — Usable Base and its tests
 
-- first Claude adapter with native session/actor/call identity and preserved final-message fields;
-- short durable capture before background interpretation; structured and rendered tool results remain one execution;
-- exact continuation key and current-work lookup;
-- exact/full-text context;
-- recipient-bound packet and actual hook handoff, within the host's output limit;
-- `open` expansion;
-- advice at a supported next-model boundary, without a Stop-driven learning loop.
+Connect the first Claude adapter, exact continuation lookup and available raw tail, exact/full-text retrieval, explicit notes/corrections, bounded context delivery and source opening. Include pause/stop and backup/restore/erase for the content Base actually stores using §12. Do not wait for advanced self-diagnosis to make retained user data recoverable; later modules extend the same maintenance path for their additional data.
 
-### Slice 3 — Dreamer and lessons
+Base is runnable with all model/vector/document/Research capabilities disabled and without their credentials. Its initial useful scenario is a captured result or explicit lesson in session A, a process restart, and the same source-linked knowledge delivered in the relevant session B. It does not claim to infer a new lesson automatically.
 
-- actual controller text execution and same-request admission recovery;
-- public result handle through authorized artifact bytes, including the controller projection repair in §9.1;
-- finite multi-stream episode input and actual processing coverage, with bundled initial recipe and purpose-based selection;
-- shared `publish_revision` for job output and direct correction;
-- create/update/keep;
-- method revision consumed by the next job;
-- source-linked current outcome contribution, correction and a changed subsequent context/method; packet linkage alone is not demonstrated use.
+After this path is implemented, test it before layering more capabilities onto it: actual Store persistence/replay, revision/correction, scoped retrieval, host delivery and source readback. Include an absent optional endpoint and a failed capture so neither gets disguised as an empty successful memory. Use the real application operations and the selected database path; no second implementation inside the test or production fake success branch. This is Base acceptance, not a new test platform or release-proof bureaucracy.
 
-### Slice 4 — Understanding and transfer
+### Slice 3 — First learning extension
 
-- codebase-memory-mcp adapter;
-- affected project views and premise-change reconsideration through existing links/jobs;
-- origin/reuse scope;
-- cross-project method retrieval;
-- disagreement and anticipation.
+Add one supported controller text/result pair, finite episode input, one bundled recipe, create/update/keep and the existing result-publication path. Repair the external result gap in §9.1 at its owner. The next actual context consumes the saved lesson. Then add attributable outcomes and method revision consumption as connected increments, checking the changed subsequent request/context rather than just a stored reference.
 
-### Slice 5 — Vectors, documents and research
+Test the implemented extension with its real boundary and rerun the relevant Base scenario with learning disabled. A missing text route blocks this extension, not Base, vectors or a deterministic source reader. Do not make its first useful lesson wait for clustering, a whole-project map, Research or recursive improvement.
 
-- controller batch embeddings;
-- captured document → retained conversion → source-excerpt retrieval → exact representation open, including partial results;
-- Research adapter preserving the selected request, same-run recovery, actual section/citation reads and direct retained-source opening; repair the existing Research boundaries identified in §9.4 rather than emulate them in Memory;
-- hybrid retrieval and richer sources.
+### Slices 4–5 — Independent capability increments
 
-### Slice 6 — Recovery and advanced improvement
+Use the dependency table in §2.2 rather than treating every earlier slice as a prerequisite. Vector retrieval, project structure/views, document acquisition, Research and additional hosts can be developed separately once their actual inputs exist. Each connects its output to an existing reader and extends maintenance for the content it adds. Keep the specific algorithms and external gaps in §§8–11; do not duplicate those implementations in a module framework.
 
-- native HTTP backup/import of retained data, candidate-directory cutover and scope erasure, without replaying old external jobs;
-- recursive improvement;
-- targeted self-diagnosis;
-- additional host/source adapters.
+For each assembled increment, test its actual useful path and disabling/unavailability behavior against Base. Reuse small module-local tests for pure transformations and existing integration checks for changed I/O. A substituted external response exercises local mapping, not proof of the live provider or installed host. Focus on the changed dependency edges rather than generating every hypothetical feature combination.
 
-For each slice, implement the real production path first. Run minimum relevant build/Clippy checks. Add broader tests after connected behavior exists. Do not create success-shaped stubs, fixtures in the production branch or unused framework code to satisfy a planned test.
+### Slice 6 — Advanced improvement and broader operation
+
+Extend recursive improvement, targeted self-diagnosis, richer disagreement/anticipation and additional source/host integrations when their real consumers exist. Broaden recovery and workload checks for the assembled product; core backup/restore is already part of Base, not withheld until this stage.
+
+Throughout coding, run minimum relevant compilation/Clippy checks. Once each useful increment is assembled, test that increment; do not postpone Base tests until all planned modules exist, and do not start with a speculative test framework. Inspect actual latency, calls, dependencies and retained content before claiming an optimization. Line count is a diagnostic, not a code quota or permission to compress responsibilities into an unreadable monolith.
