@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.15 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.16 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -53,6 +53,7 @@ Use the platform local application-data directory as the stable installation roo
 - idle timeout;
 - optional host adapters;
 - optional external research and source tools;
+- automatic-work timing and limits for enabled purposes (§10.8);
 - explicitly allowed cross-project reuse scopes.
 
 It is not a policy database or generated registry. Configuration, spool and the text-free deletion notices in §12 remain installation-owned when restore selects a replacement data directory; an old backup does not overwrite them.
@@ -63,7 +64,7 @@ The supervisor, not the transient relay, owns a named mutex for the stable insta
 
 The supervisor creates a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, keeps its handle non-inheritable and remains outside that job. It creates each child suspended, assigns it to the job, then resumes it. If assignment fails, terminate that still-suspended child and report the actual launch failure. Start SurrealDB and establish the actual configured database connection before starting/readying the daemon. Do not kill an unrelated process merely because its name or port matches.
 
-The supervisor observes owned process handles and daemon service progress. Restarting a failed daemon does not restart a healthy database. If the supervisor dies, closing its last job handle terminates its owned children; the next demand start reopens the existing store. This does not promise automatic revival while the entire application is inactive. Planned idle shutdown stops new dispatch, settles short mutations, stops daemon and database, waits for their exit, then releases ownership. Requests arriving during startup/shutdown reconnect; capture may stage input with its original identity instead of reporting it committed.
+The supervisor observes owned process handles and daemon service progress. Restarting a failed daemon does not restart a healthy database. If the supervisor dies, closing its last job handle terminates its owned children; the next demand start reopens the existing store. This does not promise automatic revival while the entire application is inactive. Before normal idle shutdown, the existing runner may use one finite automatic-work interval under §10.8. Pending data, an open problem or a background completion does not by itself renew that interval. Planned shutdown then stops new dispatch, settles short mutations and retained worker results, stops daemon and database, waits for their exit, and releases ownership. Requests arriving during startup/shutdown reconnect; capture may stage input with its original identity instead of reporting it committed. An explicit shutdown does not start a last-minute DreamCycle.
 
 Primary capture and exact/full-text reads become available as soon as Store is ready. They do not wait for embeddings, Dreamer, project orientation or a graph.
 
@@ -129,7 +130,7 @@ A function needs no actor. Finite expensive work uses the existing jobs; a long-
 
 Runtime configuration chooses enabled operations/routes. Construct an optional client without making every startup probe its remote service; a failure belongs to that capability and must not escape the optional branch as a whole-daemon failure. `attach/status` report supported/configured/unavailable facts from the actual composition and observed operations, not a separate readiness registry. An explicit unavailable operation fails specifically; it does not return successful no-change.
 
-Capture always preserves permitted source input. Only implemented, enabled consumers create optional follow-up jobs; necessary core maintenance remains connected. Disabling a capability stops new dispatch for its purposes. Its pending work is held rather than repeatedly claimed and failed; already dispatched external work keeps its original identity and can retain a useful completion unless explicitly cancelled/erased. Re-enable can continue selected pending work or a finite backfill from retained sources. No full-history interpretation or global reindex is required before reads resume.
+Capture always preserves permitted source input. Only implemented, enabled consumers create selected automatic follow-up jobs; §10.8 distinguishes automatic timing from module availability. Necessary core maintenance remains connected. Disabling a capability stops new dispatch for its purposes. Its pending work is held rather than repeatedly claimed and failed; already dispatched external work keeps its original identity and can retain a useful completion unless explicitly cancelled/erased. Do not destroy an in-flight result reader simply because its producer was disabled. Re-enable can continue selected pending work or a finite backfill from retained sources. No full-history interpretation or global reindex is required before reads resume.
 
 A runtime switch prevents work; it does not remove compiled dependencies. Use Cargo optional dependencies/features only where omitting an extension actually reduces the build or package. Keep shared storage readers independent of those features. Do not add a negative `lite` feature that changes record semantics, or a flag per helper. Cargo features combine additively, and transitive dependencies can re-enable defaults: inspect the actual feature graph for a reduced build. Cheap pure logic needs no separate compile flag. External Docling/models are not bundled or downloaded merely because Base starts.
 
@@ -311,11 +312,13 @@ Key fields:
 - `purpose`;
 - `target_key`;
 - `state`;
+- explicit/automatic origin and source cause references;
+- first queued time, due time, retry attempt and current waiting/error reason;
 - finite input observation IDs/segments, or exact per-stream ranges with their selection scope;
 - input memory IDs/revisions;
 - selected method ID/revision when the purpose uses one;
 - current claim and expiry;
-- due time/attempt;
+- execution limits actually passed to the worker/controller;
 - saved controller connection/caller, request method/ID and immutable parameters or their blob reference;
 - controller execution and result-artifact references;
 - result refs, actually covered input and remaining/unavailable portions;
@@ -372,17 +375,17 @@ Inside one short transaction:
 3. if identical source input already exists, return its saved result without another observation, sequence increment or queued interpretation;
 4. if that identity names different source content, preserve the original and report the mismatch; an explicit correction is a distinct event;
 5. advance the stream's ingestion sequence and insert the observation;
-6. apply the event's known follow-up rule below for implemented/enabled consumers (§2.4);
+6. apply the event's known follow-up rule below for implemented/enabled consumers (§2.4), using the automatic-work selection in §10.8;
 7. commit.
 
-Native unique indexes back stream/event identity. Compare source content, not the new receipt timestamp or retry metadata. One stream's sequence orders intake, not the time at which the external event happened. Necessary selected work and source capture commit together, so a lost in-process wakeup is recovered by polling due jobs. With learning disabled, capture still commits and retains material for later selected processing; it does not create an unexecutable job after every event.
+Native unique indexes back stream/event identity. Compare source content, not the new receipt timestamp or retry metadata. One stream's sequence orders intake, not the time at which the external event happened. Necessary selected work and source capture commit together, so a lost in-process wakeup is recovered by polling due jobs. With automatic learning off, capture still commits and retains material for later selected processing; it does not create an unexecutable job or proactive recommendation after every event.
 
 Follow-up is selected by the actual event kind and producer, not another model or a generic rule that every write is new experience:
 
 | Input | Necessary next work |
 |---|---|
-| New host/source event or observed result | Coalesce relevant unprocessed episode or affected-view work when its handler is enabled |
-| Explicit structured correction | Apply the addressed edit as described in §5.3; schedule only its affected derived work |
+| New host/source event or observed result | Coalesce relevant unprocessed episode or affected-view work when its automatic handler is enabled |
+| Explicit structured correction | Apply the addressed edit as described in §5.3; retain the known affected-state qualification even when optional reinterpretation is off |
 | Model-created lesson or view revision | Refresh its search representation and genuinely affected dependants; do not re-enqueue the same interpretation merely because it wrote a result |
 | Packet preparation/handoff, read/status, claim renewal or embedding completion | Optional operational/attribution recording only; no new episode inference or independent support |
 
@@ -392,7 +395,7 @@ Semantic interpretation, embeddings and source parsing run outside this transact
 
 ### 5.2 `claim_due_job`
 
-Select due work only for handlers present and enabled in the actual composition. In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. For text-interpretation work, also resolve the configured purpose-specific method and save its current ID/revision under §10.3; reclamation retains the already selected version. Encoding uses its configured profile, not a Dreamer recipe (§9.3). The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
+Select due work only for handlers present and enabled in the actual composition and eligible under §10.8. Waiting for idle time, configuration or a paused runner is not a failed attempt. In one short transaction, move a due pending row into the active slot, set its current claim and freeze finite inputs. For text-interpretation work, also resolve the configured purpose-specific method and save its current ID/revision under §10.3; reclamation retains the already selected version. Encoding uses its configured profile, not a Dreamer recipe (§9.3). The unique slot prevents a second active job for that target; a conflict causes another due target to be considered or the short transaction to retry. Concurrent capture either extends the still-pending row or creates its successor after activation. It cannot edit the active input.
 
 The worker then reads its source material and any selected method revision outside the transaction. Reclaiming an expired worker claim keeps the same job, frozen inputs and controller execution reference. It first checks any saved output or ongoing execution; expiry is not permission to buy another model call. Completion requires the current claim and finishes that same row atomically with its result.
 
@@ -402,7 +405,7 @@ Independent projects and targets proceed independently. There is no project-wide
 
 All semantic mutation uses one internal function with a caller-owned transaction. It does not open or commit a nested transaction. Both direct corrections and a multi-item job result use the same mutation logic.
 
-Inputs are the create/update target, expected revision for an update, new semantic fields, actual source handles, revision-aware links/grounds, and reason/source identity. The function checks the addressed revision, archives its predecessor, updates the current item and links, and returns the exact resulting version. A replacement also retires the specifically replaced claim within this transaction. Direct creates use a stable ID selected for that command; retries do not create another item. A material premise correction also retains the source-change cause and necessary reconsideration job in this transaction (§8.5); the dependency walk itself runs afterward.
+Inputs are the create/update target, expected revision for an update, new semantic fields, actual source handles, revision-aware links/grounds, and reason/source identity. The function checks the addressed revision, archives its predecessor, updates the current item and links, and returns the exact resulting version. A replacement also retires the specifically replaced claim within this transaction. Direct creates use a stable ID selected for that command; retries do not create another item. A material premise correction also retains the source-change cause and necessary reconsideration work in this transaction (§8.5); the dependency walk itself runs afterward. Deterministic qualification is separate from optional model interpretation.
 
 A structured correction is one application command: save its correction observation, apply the edit and record the exact mutation result on that observation in the same transaction. Read an existing result before comparing the target's now-current revision. Retrying a correction that produced revision 4 still returns revision 4 even if another edit has since produced revision 5; it does not reapply the old edit or invent a new conflict.
 
@@ -691,7 +694,7 @@ These choices follow the inspected Docling/Core paths recorded under R-018. They
 
 A source correction, refutation, relevant live-requirement change or erasure records its actual scope and a follow-up job with the primary mutation. Ordinary new editions, temporary source unavailability and reduced exposure are not automatically refutations. The worker uses the reverse grounding index to page through affected conclusion revisions, then loads each conclusion's own complete groups. It does not walk navigation links as evidence or rebuild every project view.
 
-Use the group rules in Cognition §3.3 to preserve an unaffected alternative basis, identify a broken basis or retain uncertainty. This reduces known dependency facts; it does not decide arbitrary semantic truth. An unresolved relation may require one targeted interpretation with the changed premise and affected conclusion. No model call is needed merely to identify the incoming links or a declared broken group. The actual consumer is `context`: return the known qualification with the selected claim/method before a replacement explanation is ready, rather than silently serving it as unchanged established advice.
+Use the group rules in Cognition §3.3 to preserve an unaffected alternative basis, identify a broken basis or retain uncertainty. This reduces known dependency facts; it does not decide arbitrary semantic truth. An unresolved relation may require one targeted interpretation with the changed premise and affected conclusion. No model call is needed merely to identify the incoming links or a declared broken group. The actual consumer is `context`: return the known qualification with the selected claim/method before a replacement explanation is ready, rather than silently serving it as unchanged established advice. Automatic interpretation settings do not suppress the deterministic qualification of a known correction; when model work is off, retain the unresolved part without dispatching it.
 
 A change job retains its cause, traversal position and remaining IDs in the existing `job`. Continue in finite pages, deduplicating a conclusion revision within that cause. A material change to a conclusion can affect its dependants; a timestamp, repeated visit or unchanged assessment cannot start an endless cascade. Cyclic citations alone supply no independent ground. Newer source changes remain pending rather than being swallowed by completion of the earlier cause. No-change cannot mean that an unvisited branch was checked.
 
@@ -703,7 +706,7 @@ When erasing a premise, retain the permitted fact that an affected required grou
 
 ### 9.1 Text execution
 
-Dreamer is a job purpose, not a separate service. The adapter uses controller's existing command and artifact operations. Source review at `70b99db3d8732d10a69d03d1dbe83afdd39a7229` confirms the replay and byte-read mechanisms below, but also a public-result projection gap. The complete Memory OS integration is not implemented; R-014 and R-027 in the [registry](ANALYSIS-REGISTRY.md) separate the useful existing paths from the required repair.
+Dreamer is text interpretation performed by jobs, not a separate service. The adapter uses controller's existing command and artifact operations. Source review at `70b99db3d8732d10a69d03d1dbe83afdd39a7229` confirms the replay and byte-read mechanisms below, but also a public-result projection gap. The complete Memory OS integration is not implemented; R-014 and R-027 in the [registry](ANALYSIS-REGISTRY.md) separate the useful existing paths from the required repair.
 
 **Submit and recover the same request.** Prepare finite input and open the exact method revision. Before each state-changing controller request, save its configured connection, caller identity, `client_request_id`, method and submitted parameters on the existing job or referenced blob. Do not regenerate the request from newer memory or a new timestamp when reconnecting.
 
@@ -888,6 +891,37 @@ When a useful result fails, identify the first step supported by available evide
 
 Correct that step. A failed repair blocks unsupported repetition of that repair, not all diagnosis under the same configuration.
 
+### 10.8 Autonomous curation without a second scheduler
+
+Autonomy connects a real cause to the existing handler and its next reader. A timer, completed job or growing row count is not itself evidence that another model call is useful. First learning uses the same episode handler whether requested explicitly or selected automatically; richer cross-episode curation is an additional implemented purpose on that runner. A DreamCycle is one finite invocation of curation, not a new daemon, phase engine, maintenance registry or conversation kept alive forever.
+
+**Availability and automatic timing.** Keep module enablement separate from `automatic = off | idle | background` for its implemented purposes. Base enables no model work. When the owner enables learning and chooses its route, `idle` is the initial automatic setting; merely saving provider credentials does not enable it. These are ordinary configuration values, not approvals minted per job.
+
+| Setting | Actual behavior |
+|---|---|
+| Module disabled | No new work from that producer, including explicit work; retained content remains readable and prior external requests remain reconcilable. |
+| Enabled, automatic off | Explicit `dream` requests still work. No automatic inference or proactive curation recommendations; retained sources can be selected later. |
+| Enabled, automatic idle | Coalesced work may run when observed interactive activity leaves capacity, including the finite end-of-activity interval below. |
+| Enabled, automatic background | The same runner can progress during an active interval under its configured capacity limits; capture, control and context retain priority. |
+
+Pausing jobs stops new starts without pretending that a submitted provider request was cancelled. Explicit cancellation uses the existing cancellation/result path. Expensive optional interpretation being off does not disable source capture, applying a structured correction, deterministic qualification of affected knowledge or owner-requested backup/erasure. Those operations do not acquire a model dependency through a general maintenance mode. An unavailable route is visible in status; do not create repeated advice to enable a feature the owner switched off.
+
+**Coalesce, then actually execute.** Source/result arrival, relevant feedback and an explicit question use §5.1 to retain a pending target and its cause. Repeated events extend that pending selection, not a per-event advice heap. A short quiet delay batches nearby events; retain the first queued time so later arrivals cannot postpone eligibility forever. A turn/episode boundary can make existing work due immediately. Maximum batch age makes work eligible, not permission to ignore an idle-only setting or unavailable capacity. The claim freezes only one finite input slice; the remainder stays pending under §10.1 rather than becoming an unbounded serialized request.
+
+The runner checks due jobs at startup and after relevant input/configuration changes, using an in-process wakeup or timed wait while the daemon is running. A missed wakeup is recovered from the saved jobs; timer ticks need no observations or decision receipts. Select eligible targets before claiming them, retaining age across deferral so one busy project does not continually displace the others. Work waiting for idle time or missing configuration does not burn retries. Transient execution failures use bounded delayed retries; an uncertain external execution first follows its saved reference under §9.1. A new ID is not a retry strategy.
+
+`idle` is an observed scheduling condition, not proof that no human or unintegrated agent is active. Use actual foreground requests and available host turn/tool signals; an open session alone does not mean constant work, and a quiet terminal alone does not establish an idle agent. Where only a quiet-period heuristic is available, identify that limit and keep concurrency modest. Resume of foreground work stops new idle-only starts; already paid work may finish or checkpoint without cancelling and repurchasing it on every keystroke. CPU/source handlers yield between finite pages and do not hold Store transactions during inference. Provider concurrency remains controller-owned.
+
+**End of activity and wake.** Before normal idle drain, runtime lets already eligible work use a finite configured time/call allowance. Freeze that allowance for the interval: job completion, produced lessons, status polling and internal bookkeeping cannot reset it. New external work can return the application to normal active use. At the end, stop new automatic dispatch, persist collected results and progress, and perform bounded shutdown. A remaining backlog stays pending; it is not a reason to run all night or mark unvisited material processed. An external operation still unresolved at its deadline retains its request/reference and explicit uncertainty. Request cancellation when supported; do not call timeout proof of cancellation. Controller result retention remains a real integration requirement, not a guarantee created by this timing rule.
+
+A stopped process cannot execute its due rows. Default demand-start resumes them at the next use. Optional unattended windows are an external host/OS-scheduler invocation of the same relay/application maintenance request with selected project, purpose and finite limits; they are not another scheduler inside Eliot and are not required by Base. Repeated or missed wake occurrences coalesce onto still-relevant pending input instead of buying one run per missed tick. No eligible new input means no inference. Use a route actually available in that execution environment; a desktop-bound connection is not silently converted into an unattended credential. The wake adapter and installed behavior still require implementation; no always-on guarantee is implied.
+
+**Curation output and cost.** Select recent uncovered episodes plus the exact older lessons, conflicts or views relevant to the current cause. Do not reread the whole corpus or require a model to decide whether every event deserves a model. The ordinary recipe may consolidate a continuation/view, update a method, qualify a relation, preserve an alternative, repair a false merge, or return no-change. These go through §5.4 into the existing context/open/method consumers, not merely into an unread maintenance report. A larger curation horizon does not require a parallel memory store. Sources and minority evidence remain available; physical erasure follows retention/user controls, not a model's claim that material is uninteresting.
+
+Completion records the input actually covered, resulting revisions and available model usage. An unchanged target/input already processed for that purpose does not become new work just because another idle interval began. A recipe change affects subsequently selected work; it is not automatic permission to reinterpret all history. Deliberate backfill/review names a finite scope. If execution keeps failing or produces repeated unchanged proposals, retain one waiting/error result and reconsider on changed input/configuration or an explicit request, rather than recursively creating diagnosis jobs. Failure of one purpose does not stop independent capture, recall or other targets.
+
+Use observed feedback to narrow or improve expensive curation. Missing acknowledgement or unknown later benefit is not proof that a lesson is useless, and initial learning does not wait for a pre-existing benefit score. No extra model run is mandatory merely to grade the last model run. Useful provisional knowledge remains usable; measurable quality and cost are implementation observations, not achievements of this design.
+
 ## 11. Disagreement, anticipation and research use
 
 ### 11.1 Disagreement
@@ -980,7 +1014,7 @@ Direct controls:
 - backup/restore;
 - graceful shutdown.
 
-Status is derived from actual process, Store, jobs and recent results. Heartbeat is not progress; acknowledgement is not resolution; prepared context is not handoff.
+Status is derived from actual process, Store, jobs and recent results. Heartbeat is not progress; acknowledgement is not resolution; prepared context is not handoff. Show whether work is disabled, waiting for an idle interval/route, executing, unresolved externally, or applied, using existing configuration and job fields rather than another maintenance-decision store.
 
 Optional notification failure does not block status or control.
 
@@ -1006,6 +1040,8 @@ For the connected reader, include a natural-language query whose useful note lac
 
 Add one supported controller text/result pair, finite episode input, one bundled recipe, create/update/keep and the existing result-publication path. Repair the external result gap in §9.1 at its owner. The next actual context consumes the saved lesson. Then add attributable outcomes and method revision consumption as connected increments, checking the changed subsequent request/context rather than just a stored reference.
 
+Connect its automatic mode to that same handler: relevant episode → coalesced due job → bounded idle/background execution → retained lesson → next context. Include normal idle drain, resumed foreground work, automatic off with an explicit request, interrupted readback and unchanged input at the next wake. These are checks of the assembled extension, not prerequisites for building an automation platform. A catalogue of proposed actions is not this executable path.
+
 Test the implemented extension with its real boundary and rerun the relevant Base scenario with learning disabled. A missing text route blocks this extension, not Base, vectors or a deterministic source reader. Do not make its first useful lesson wait for clustering, a whole-project map, Research or recursive improvement.
 
 ### Slices 4–5 — Independent capability increments
@@ -1018,6 +1054,6 @@ For vectors, the connected increment is changed text → real independent encodi
 
 ### Slice 6 — Advanced improvement and broader operation
 
-Extend recursive improvement, targeted self-diagnosis, richer disagreement/anticipation and additional source/host integrations when their real consumers exist. Broaden recovery and workload checks for the assembled product; core backup/restore is already part of Base, not withheld until this stage.
+Extend cross-episode curation, recursive improvement, targeted self-diagnosis, richer disagreement/anticipation and additional source/host integrations when their real consumers exist. They reuse §10.8; first automatic learning does not wait for this stage. Broaden recovery and workload checks for the assembled product; core backup/restore is already part of Base, not withheld until this stage.
 
 Throughout coding, run minimum relevant compilation/Clippy checks. Once each useful increment is assembled, test that increment; do not postpone Base tests until all planned modules exist, and do not start with a speculative test framework. Inspect actual latency, calls, dependencies and retained content before claiming an optimization. Line count is a diagnostic, not a code quota or permission to compress responsibilities into an unreadable monolith.
