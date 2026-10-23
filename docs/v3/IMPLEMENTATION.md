@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.12 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.13 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -147,7 +147,7 @@ All host surfaces call the same application functions.
 | `open(handle, read_context)` | exact current/historical item or source segment within the bound project/route |
 | `record_outcome(report)` | captured observed result or explicitly sourced report |
 | `dream(request)` | finite interpretation/research/improvement job when its handler is available |
-| `control(command)` | status, configure, pause/cancel, correct, erase, backup or restore |
+| `control(command)` | status/inbox, configure, pause/cancel, correct, erase, backup or restore |
 
 `record_outcome` reuses capture. It does not create an execution-proof subsystem. The adapter supplies the bound project and configured route in `read_context`; opening a source does not require an agent to complete another permissions form. Publish only implemented operations on a host surface; an unavailable handler does not justify a success-shaped stub.
 
@@ -218,9 +218,12 @@ Key fields:
 - `subject`, `aspect`, `perspective`;
 - applicability conditions and exceptions;
 - validity interval;
-- exposure/influence state;
+- support assessment/limitations with their reason and source links, separately from retrieval exposure and advisory influence;
+- optional commitment data when that kind is implemented (§11.4);
 - created/updated times;
 - optional embedding vector, effective space and encoded representation/revision (§9.3).
+
+Support is a recorded, scoped assessment, not a universal numeric truth score. Missing assessment stays unknown; it does not prevent capture or a clearly sourced provisional note. Source kind identifies who reported something, not whether the proposition inside the report is verified. `context` reads relevant support limitations and counterevidence alongside the item; exposure changes do not rewrite that assessment. A withdrawn historical item can still be inspected through `open` when retained and accessible, without becoming advice again.
 
 `origin_project` is the stable configured project ID and never changes when the workspace is renamed. Store `reuse_scope` as `{ mode, projects }`: `mode` is `project`, `selected` or `owner`; `projects` is an array of stable project IDs, empty outside selected mode. This describes where a method can be considered, not whether it is true or whether every source can be disclosed. Project-local is the default. Shared methods use the owner's configured reuse choice without a separate approval for every item.
 
@@ -500,7 +503,7 @@ For Claude, return only valid event-specific JSON on stdout, with useful text in
 
 Use `SessionStart`/`UserPromptSubmit` and a supported `PostToolBatch` boundary; use per-tool context only as the chosen fallback, not a duplicate full packet on both paths. Initial child orientation can use `SubagentStart`; changed child advice needs a later supported boundary rather than an assumption that a repeated start reinserts new text. Keep the actual recipient session/actor with the packet. A late background learning result becomes available for the next relevant request; do not inject a precomputed packet into a different current task or wake a stopped agent through `Stop`/`SubagentStop` feedback. If no next boundary occurs, the result remains stored rather than called delivered.
 
-`context` returns `packet_id`. Record the actual handoff under that ID when observable, linking exact rendered revisions. Native call IDs correlate actions/results; the hook schema does not promise to echo Eliot's packet ID. Without further host evidence, offered context is known but adherence remains unknown. Packet-accounting failure cannot erase useful output or change a completed tool's result.
+`context` returns `packet_id`. Record the actual handoff under that ID when observable, linking exact rendered revisions. Native call IDs correlate actions/results; the hook schema does not promise to echo Eliot's packet ID. Without further host evidence, offered context is known but adherence remains unknown. Packet-accounting failure cannot erase useful output or change a completed tool's result. Do not demand an additional agent acknowledgement or method-ID form to compensate for missing native correlation.
 
 Repeat suppression is a small cache keyed by recipient, context incarnation and material revision. Resume/compact can re-offer current orientation; old injected context in a resumed transcript is historical delivery, not a new observation or proof that its contents remain current. Re-offer changed corrections without repeatedly sending an unchanged full timeline.
 
@@ -519,7 +522,7 @@ A decision frame carries available:
 - context incarnation;
 - token budget.
 
-Unknown fields remain unknown.
+Unknown fields remain unknown. Goal/criteria retain their user or host source references. An explicit owner revision updates them; a proposed plan, retrieved suggestion or generated continuation does not silently replace them. A factual statement inside a user message remains a sourced assertion rather than an automatically verified external fact.
 
 ### 7.2 Continuation before similarity
 
@@ -550,22 +553,31 @@ It does not replace the original events. Reading or delivering a newer tail does
 
 ### 7.3 Packing
 
-Pack semantic units, not isolated rows:
+`context` constructs whole decision units using ordinary functions over hydrated values; it is not another model or a chain of receipt-producing stages.
 
-- claim with material exception;
-- failure with repair/result;
-- method with conditions;
-- dissent with its distinguishing check.
+1. Keep addressed current work and explicit relevant corrections outside semantic ranking. Resolve a named replacement by its recorded target/scope, not simply the newest timestamp.
+2. For candidate items, batch-load the recorded conditions, relevant contrary outcomes and replacement/contradiction links by their IDs. These qualifications need not independently match the query or survive lexical/vector top-k. Follow only relations needed for the selected decision; an unvisited branch remains a specific gap, not a whole-graph readiness requirement.
+3. Build a claim with its material exception, a method with its conditions, or an episode with the actual action/result/repair. Structured scope/version facts may determine applicability. Unresolved natural-language conditions stay conditional; lexical overlap and a negation keyword are not an entailment engine.
+4. Pack these units within the actual rendered host/model budget. Prefer current corrections and decision-changing limitations before optional background detail. A long high-scoring item cannot evict its own contraindication. Shorten using a faithful stored/extractive unit where possible; otherwise show the qualification plus an expansion handle, or omit that whole unit with the gap stated. Never cut away a negation, version or exception to make a recommendation fit.
+5. Deduplicate repeated inclusion by item revision and source occurrence/range. Equal wording alone does not merge distinct sources, claims or obligations. Render saved content, not normalized search tokens, IDs or scores alone.
 
-Candidate examination and final packet size are different budgets. If early candidates are inapplicable, inspect later candidates within the request work limit.
-
-Render useful content, not only record IDs and scores. Details remain available through `open`.
+Candidate examination and final packet size are different budgets. If early candidates are inapplicable, inspect later candidates within the request work limit. Unknown usefulness does not automatically mean exclusion, but not every unknown must be inserted. Empty sections are omitted. Incomplete optional expansion does not suppress unrelated useful units or claim complete coverage. Diagnostic recording and a predicted quality score never gate this return path.
 
 ## 8. Retrieval and project understanding
 
 ### 8.1 Search
 
 Primary full-text and exact queries operate on `memory` and selected observation fields. Exact cues use the same pure normalization on capture and lookup; preserve canonical path/native-ID spelling and keep any comparison key separate. A cue is a lookup route, not a claim of truth. A note without a cue remains searchable rather than rejected.
+
+**Initial mixed-text analyzer.** Use the native language-neutral tokenization/case-folding path for Base, without a model-language classifier or external NLP service:
+
+```surql
+DEFINE ANALYZER eliot_text TOKENIZERS blank, class, camel FILTERS lowercase;
+```
+
+Attach it to each implemented full-text field through Store migrations. This is a starting query design, not executed DDL or a claim of optimal Russian/English relevance. It matches token forms; it does not promise stemming, translation or semantic equivalence. Do not apply one Russian or English Snowball stemmer to the entire mixed code/prose corpus, chain language stemmers as a language detector, or strip negations through a generic stop-word list. Language-specific stemming can later add a measured retrieval arm without changing originals or exact identities. Native analyzer behavior and single-field full-text indexes are documented in [DEFINE ANALYZER](https://surrealdb.com/docs/reference/query-language/statements/define/analyzer) and [search indexes](https://surrealdb.com/docs/learn/data-models/full-text-search/search-indexes), checked 2026-10-23.
+
+Paths, qualified symbols, commands, error codes and versions retain typed exact cue keys alongside full-text indexing. Tokenizing a technical identifier must not redefine its identity. Keep the original query and use the same selected analyzer on write and lookup; do not send an entire transcript as an undifferentiated lexical query. Before implementation claims, inspect native `search::analyze` and actual matches for mixed Cyrillic/Latin text, identifier punctuation, case and negative phrases. No custom tokenizer framework is selected.
 
 **One pipeline, two waiting policies.** `retrieval=local` is the default for hooks and Base. It uses available local candidates; the optional vector arm runs only with an already available query vector for the exact query representation and effective space. It never waits for encoder startup, network inference or a background job. An optional bounded cache stores vectors, not packets: its key includes route/disclosure scope, effective space, role and exact encoded query. A cache miss does not borrow a similar query's vector or create a compulsory job after every read.
 
@@ -602,6 +614,8 @@ Project views are ordinary versioned memory items:
 - known gaps.
 
 Source additions, removals, renamed resources and new consumers refresh affected views through ordinary jobs. A failed refresh leaves the prior qualified view usable.
+
+When the project is Eliot, use the same source/view path for its selected Architecture, implementation sources and observed incidents. `status` supplies current process/job facts; a project view relates those facts to intended behavior without treating either source as proof of the other. Changes refresh affected views normally. No SelfModel service, conformance database or mandatory architecture-read receipt is introduced.
 
 ### 8.4 Documents and other sources
 
@@ -758,9 +772,9 @@ A normal Dreamer job receives:
 - a small set of related current lessons;
 - the selected method revision used to interpret or improve.
 
-It may create a provisional lesson, update a named lesson, create/update a project view, identify conflict/unknown, or keep/no-change.
+It may create a provisional lesson, update a named lesson, create/update a project view, identify conflict/unknown, or keep/no-change. Once that purpose is configured, the existing handler applies ordinary permitted revisions through §5.4; no new approval queue is required for each lesson. The result retains its provisional/sourced character and cannot rewrite user goals, grant permissions or mark the external task complete. An unresolved semantic alternative may remain alongside existing knowledge rather than force a merge.
 
-Parse failure or provider failure is not no-change.
+Parse failure or provider failure is not no-change. No-change describes an actual completed processing attempt, not a required report from the external agent after every action.
 
 A direct explicit correction uses the atomic observation-and-edit command in §5.3, without a model call. Replay returns the saved version handles or unapplied conflict; it does not repeat the edit.
 
@@ -840,13 +854,21 @@ Unresolved alternatives remain available; unrelated work continues.
 
 A conditional anticipation is a method or claim describing trigger situation, expected risk/opportunity, material conditions, useful check/action and expiry/reconsideration condition.
 
-It enters ordinary context when relevant. Expiry of the warning does not fabricate the outcome.
+It enters ordinary context when relevant. Expiry of the warning does not fabricate the outcome or close a separate commitment (§11.4).
 
 ### 11.3 Research use
 
 Research findings preserve the question, sources examined, findings, alternatives, coverage/gaps, source handles and method/version used.
 
-A source acquisition failure and completed but uninformative research are different. Repeated no-change on unchanged inputs does not automatically rerun.
+A source acquisition failure and completed but uninformative research are different. Repeated no-change on unchanged inputs does not automatically rerun. A clarification asks a concrete question that can change the task or resolve an owner choice; it is not required merely because an internal metadata field is absent.
+
+### 11.4 Commitments and attention without another task manager
+
+An explicitly captured commitment is an ordinary `memory` item. Its kind-specific data contains `state` (open, resolved or cancelled), the known recipient/scope, optional native task reference, optional due time or review condition, and the source of its creation or resolution. It describes what remains owed; it does not own execution of the host task. Base can store explicit commitments without inferring them from arbitrary prose. Later interpretation may propose them with the same source and uncertainty handling as other memory.
+
+`context` reads relevant open commitments by scope/address; `control(inbox)` lists them and actual actionable job/capture failures through existing Store/status reads. Neither depends on vector relevance or another model call. A due time changes ordering/visibility, not resolution. A host result closes a commitment only when its recorded criterion actually matches; otherwise it supplies evidence for the existing interpretation path. An explicit user change uses `publish_revision`. Notification acknowledgement or suppression affects delivery/exposure, not the commitment state.
+
+Optional notification work uses the same finite jobs and existing record references. Do not repeat alerts on every lookup or require an acknowledgement before returning useful memory. With the demand-start service inactive, due items are surfaced on the next start/request; this is not an always-on alarm guarantee. Notifications, semantic extraction of commitments and any external action are independent additions, not prerequisites for the explicit record and its two readers. No AttentionStore, incident workflow engine or global blocking state is introduced.
 
 ## 12. Deletion, backup and restore
 
@@ -901,7 +923,7 @@ If current deletion history was lost, the owner may explicitly restore the selec
 
 Direct controls:
 
-- status;
+- status and scoped inbox;
 - inspect/open;
 - pause/resume jobs;
 - cancel owned work;
@@ -924,7 +946,7 @@ Implement supervisor/daemon/SurrealDB ownership, configuration, capture, exact r
 
 ### Slice 2 — Usable Base and its tests
 
-Connect the first Claude adapter, exact continuation lookup and available raw tail, exact/full-text retrieval, explicit notes/corrections, bounded context delivery and source opening. Include pause/stop and backup/restore/erase for the content Base actually stores using §12. Do not wait for advanced self-diagnosis to make retained user data recoverable; later modules extend the same maintenance path for their additional data.
+Connect the first Claude adapter, exact continuation lookup and available raw tail, exact/full-text retrieval, explicit notes/corrections, bounded context delivery and source opening. Include explicit commitments and their context/inbox reads (§11.4), not a notification platform. Include pause/stop and backup/restore/erase for the content Base actually stores using §12. Do not wait for advanced self-diagnosis to make retained user data recoverable; later modules extend the same maintenance path for their additional data.
 
 Base is runnable with all model/vector/document/Research capabilities disabled and without their credentials. Its initial useful scenario is a captured result or explicit lesson in session A, a process restart, and the same source-linked knowledge delivered in the relevant session B. It does not claim to infer a new lesson automatically.
 

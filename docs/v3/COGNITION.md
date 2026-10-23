@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.2 · 2026-10-23 · normative algorithms used by the V3 implementation.**
+**Revision 1.0-draft.3 · 2026-10-23 · normative algorithms used by the V3 implementation.**
 
 This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves useful context, learns from outcomes and improves connected methods. It does not define additional services. All state and work use the owners in [Implementation](IMPLEMENTATION.md).
 
@@ -17,9 +17,10 @@ Eliot distinguishes:
 - **prediction** — expected future observation;
 - **outcome** — observed result of an attempt;
 - **continuation** — current work state;
-- **unknown** — an explicit missing fact or unresolved relation.
+- **unknown** — an explicit missing fact or unresolved relation;
+- **commitment** — something still owed in a recorded scope, separate from its notification.
 
-A source event, search chunk and episode are different. Search chunks help locate material; they do not replace the source or define the task.
+A source event, search chunk and episode are different. Search chunks help locate material; they do not replace the source or define the task. Receiving an assertion is an observation of that assertion, not verification of its contents; distinct record IDs do not establish independent corroboration.
 
 ## 2. Decision frame and current work
 
@@ -33,7 +34,7 @@ Current work is reconstructed in this order:
 4. preserve abandoned alternatives and open commitments;
 5. only then retrieve similar prior work.
 
-If no task identity exists, use the narrowest known session/workspace continuation. Do not attach interleaved events to the latest prompt merely because it is latest.
+If no task identity exists, use the narrowest known session/workspace continuation. Do not attach interleaved events to the latest prompt merely because it is latest. Keep goal/criteria tied to their explicit user/host sources; generated plans and summaries cannot silently revise them.
 
 A continuation revision contains:
 
@@ -68,7 +69,7 @@ Perspective distinguishes intended behavior, observed implementation and propose
 5. return current alternatives, conflict or unknown;
 6. include qualifications and history handles.
 
-Last write, highest similarity, retrieval frequency and model confidence are not universal authority rules.
+Last write, highest similarity, retrieval frequency and model confidence are not universal authority rules. Support assessment, retrieval exposure and advisory influence remain separate from physical existence. Archiving changes exposure, not truth; inspection of withdrawn history does not restore its influence.
 
 ### 3.1 Replacement
 
@@ -207,13 +208,13 @@ Pack semantic units:
 
 - current work;
 - exact constraints;
-- applicable methods;
+- applicable or explicitly conditional methods;
 - relevant prior episodes;
 - dissent/alternatives;
 - unknowns and next checks;
 - handles for detail.
 
-Preserve material exceptions. Candidate examination budget is larger than final display count. If selected material cannot fit, state what was omitted and provide expansion handles.
+Load a selected item's relevant exceptions through its recorded relations before final packing; they do not need their own high retrieval score. Keep the qualification with the claim. Candidate examination budget is larger than final display count. If selected material cannot fit, prefer a concise qualified unit or state the omission with expansion handles; do not make an unconditional recommendation by dropping its exception. The concrete reader/packing order is in [Implementation §7.3](IMPLEMENTATION.md#73-packing).
 
 ## 7. Interpretation and revision
 
@@ -236,7 +237,7 @@ Application checks:
 - current job claim;
 - permitted source route.
 
-These checks do not prove semantic truth.
+These checks do not prove semantic truth. A configured handler may publish ordinary provisional revisions automatically; doing so does not grant permissions or certify external task completion.
 
 A direct structured user correction may update memory without Dreamer.
 
@@ -258,9 +259,9 @@ It is eligible for provisional use immediately when appropriate.
 
 ### 8.2 Method consumption
 
-A model-based job selects its processing method by implemented purpose and project configuration, not by similarity to arbitrary task advice. First use has a real bundled recipe saved as an ordinary method; it does not need an earlier model call to create the method that permits learning. Initialization, selection and upgrade behavior are defined in [Implementation §10.3](IMPLEMENTATION.md#103-method-consumer).
+A text-interpretation job selects its processing method by implemented purpose and project configuration, not by similarity to arbitrary task advice. First use has a real bundled recipe saved as an ordinary method; it does not need an earlier model call to create the method that permits learning. Initialization, selection and upgrade behavior are defined in [Implementation §10.3](IMPLEMENTATION.md#103-method-consumer).
 
-The claim freezes method ID/revision. The request builder opens that exact body and inserts it into the actual request. New revisions affect later jobs; retries retain the selected method. Deterministic work needs no model recipe. A method changes behavior through this consumer, not by being stored or receiving a higher score.
+The claim freezes method ID/revision. The request builder opens that exact body and inserts it into the actual request. New revisions affect later jobs; retries retain the selected method. Encoding uses its provider profile, and deterministic work needs no model recipe. A method changes behavior through this consumer, not by being stored or receiving a higher score.
 
 ### 8.3 Outcome reduction
 
@@ -280,7 +281,7 @@ Transfer can be conditional from one useful case. A claim of broad effectiveness
 
 A successful no-change completes the job for its exact input and method. Reuse it until relevant inputs/methods change.
 
-Invalid output, missing sources, partial processing and provider failure are not no-change.
+Invalid output, missing sources, partial processing and provider failure are not no-change. No-change is not an obligatory agent report after every external action.
 
 ## 9. Recursive improvement
 
@@ -337,7 +338,7 @@ An anticipation is a conditional method/claim about a future risk or opportunity
 
 It becomes ordinary advisory context when its trigger is relevant. Expiry means the warning is no longer automatically surfaced; it does not fabricate the event outcome.
 
-Commitments and unresolved contradictions are memory state. Notification and acknowledgement do not resolve them. Resolution requires the relevant observed event or explicit user decision.
+Commitments and unresolved contradictions are memory state. Notification and acknowledgement do not resolve them. Resolution requires the relevant observed event or explicit user decision. A due date passing is not resolution. [Implementation §11.4](IMPLEMENTATION.md#114-commitments-and-attention-without-another-task-manager) connects ordinary commitment records to scoped context and the inbox, independently of optional notifications.
 
 ## 12. Research
 
