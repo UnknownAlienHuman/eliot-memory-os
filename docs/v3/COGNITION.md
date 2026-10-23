@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.4 · 2026-10-23 · normative algorithms used by the V3 implementation.**
+**Revision 1.0-draft.5 · 2026-10-23 · normative algorithms used by the V3 implementation.**
 
 This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves useful context, learns from outcomes and improves connected methods. It does not define additional services. All state and work use the owners in [Implementation](IMPLEMENTATION.md).
 
@@ -207,6 +207,8 @@ Several selected relation types form a union. Intermediate nodes need not repeat
 
 Keep traversal finite by scope, relation purpose, nodes/edges and work budget. Do not scan the whole graph or re-embed unchanged nodes.
 
+A relation about item A at revision 2 does not automatically describe A at revision 3. Current-context expansion and any relation-based ranking use the revision actually read; historical expansion uses the requested old revision. Replacing text does not copy old semantic links into the new account without a stated basis. Reader correctness cannot depend on whether an optional client happened to be initialized earlier in this process.
+
 ### 6.5 Packet packing
 
 Pack semantic units:
@@ -220,6 +222,8 @@ Pack semantic units:
 - handles for detail.
 
 Load a selected item's relevant exceptions through its recorded relations before final packing; they do not need their own high retrieval score. Keep the qualification with the claim. Candidate examination budget is larger than final display count. If selected material cannot fit, prefer a concise qualified unit or state the omission with expansion handles; do not make an unconditional recommendation by dropping its exception. The concrete reader/packing order is in [Implementation §7.3](IMPLEMENTATION.md#73-packing).
+
+Display grouping can reduce repeated equivalent guidance without merging stored identities. Compare the actual content and material scope, time, perspective, conditions and exceptions, not a text hash alone. Keep the contributing handles and any distinct qualifications; uncertain equivalence remains separate or explicitly related. A summary can replace detail in this packet only within its represented scope. A relevant exception in a source still accompanies it. Grouping is packet-local, never a new count of independent evidence or a permanent alias redirect.
 
 ## 7. Interpretation and revision
 
@@ -246,6 +250,44 @@ These checks do not prove semantic truth. A configured handler may publish ordin
 
 A direct structured user correction may update memory without Dreamer.
 
+### 7.1 Consolidate without merging source identities
+
+Use the smallest change that supplies the missing behavior:
+
+| Situation | Operation and consumer |
+|---|---|
+| Same source event replayed | Existing capture identity returns the prior result; no new evidence or inference. |
+| Repeated wording in the current packet | Group compatible guidance under §6.5 while retaining its source handles. No stored-ID merge. |
+| New detail about the same addressed claim or method | Revise that item and its conditions; subsequent context/request reads the new revision. |
+| Several episodes suggest a broader pattern | Create a separate provisional claim, method or view with links to the exact contributing versions. Sources remain distinct. |
+| Existing synthesis conflates different cases | Correct or split that derived account under §7.3; do not delete the underlying episodes. |
+
+The first curation implementation does not union source IDs, rewrite every inbound link to a chosen survivor, or build permanent equivalence classes. A shared hash may shortlist equal text, not establish the same event, object or proposition. Same words about different services or API versions remain distinct. Physical byte deduplication, when provided by storage, changes none of those identities.
+
+### 7.2 Find a useful change from actual content
+
+Start from the changed episode/item and a finite neighborhood selected by exact subject/cues, current claim group, known links and lexical candidates; vectors can enrich that selection. Compare contents and conditions before deciding to keep, revise or synthesize. An input must not require writer-supplied `duplicate_of`, `scope_match` or a preassigned usefulness label to be examined. Known structured equality needs no model; semantic generalization can use the configured curation recipe. Ambiguity may remain a relation or alternative instead of forcing a merge.
+
+Supply relevant source passages and counterexamples to that recipe, not just existing summaries. Its new pattern states the conditions and limits actually inferred. Repetition of one source through several summaries adds no independent support. One useful episode can yield conditional advice; broad effectiveness is not established by many similar sentences. No full-corpus pairwise comparison, mandatory transfer experiment or minimum record count precedes the first useful lesson.
+
+Reuse a known addressed target or the previously saved result for that job/input. Retry preserves created IDs. Later processing can update that item rather than append another paraphrase. Do not claim global semantic uniqueness from these identity rules: independently created similar items can remain candidates for a later focused review, without blocking new capture.
+
+### 7.3 Publish and repair a derived account
+
+A transformation carries the exact input/source versions, addressed edits with expected revisions, stable IDs for creates, and the selected per-output grounds/conditions. These are the existing job result and publication inputs, not a separate merge ledger. Apply one dependent set of creates, revisions, explicit retirements, links and job outcome through the caller-owned transaction in [Implementation §§5.3–5.4](IMPLEMENTATION.md#53-publish_revision). A storage conflict retries that saved proposal; a genuine target change uses the existing reconciliation path. Neither silently repeats the inference.
+
+Synthesizing C from A and B normally adds C; it does not retire A and B. A deliberate retirement names its exact scope and reason. Each output receives only its relevant sources and exceptions. Do not distribute every old link to every split output, carry historical outcome credit onto a different method, or widen reuse scope merely because the new text is more general. Unknown attribution remains a gap. History retains old text and old links; current queries consume the new revision's links. New derived text uses the ordinary lexical/vector maintenance path, not a second entity database to synchronize.
+
+To repair a false synthesis, open its retained inputs and actual correction, then narrow its current revision or create separately scoped outputs and withdraw the erroneous guidance in the same dependent publication. Reuse still-valid original items when possible. If an original has since changed, preserve that later change rather than restoring an old snapshot over it. This is a new corrective revision, not automatic resurrection or a universal undo stack.
+
+A conclusion grounded in the erroneous revision is reconsidered through [Implementation §8.5](IMPLEMENTATION.md#85-reconsider-affected-grounds). A conclusion grounded directly in an unchanged original is not invalidated merely because presentation changed. Unknown dependent mappings are not bulk-rewired to a new output; retain the specific qualification and address them separately. The corrected material is usable without waiting for the whole dependency walk. Exact old handles still open their own retained versions, not a redirected survivor presented as the original.
+
+### 7.4 Required next reader
+
+An implemented curation improvement must reach ordinary context, source expansion or the next selected method request. Successful no-change remains valid and does not require inventing a revision. Fewer preview findings or an applied-action count alone does not establish cleaner recall. Check the same relevant request before and after an implemented change, including the exception and the original sources; this is a product observation, not a new approval gate before provisional use.
+
+Example: A records a failure under API v1, B a successful repair under v2, and C incorrectly says the method always fails. A correction narrows C or replaces it with the two scoped accounts. The next v2 context receives the applicable repair rather than the universal warning; a historical v1 query can still open A. Merely deleting C, hiding a preview row or increasing B's score does not complete that repair. This is a design example, not an executed V3 result.
+
 ## 8. Methods and learning
 
 ### 8.1 Method contents
@@ -266,7 +308,7 @@ It is eligible for provisional use immediately when appropriate.
 
 A text-interpretation job selects its processing method by implemented purpose and project configuration, not by similarity to arbitrary task advice. First use has a real bundled recipe saved as an ordinary method; it does not need an earlier model call to create the method that permits learning. Initialization, selection and upgrade behavior are defined in [Implementation §10.3](IMPLEMENTATION.md#103-method-consumer).
 
-The claim freezes method ID/revision. The request builder opens that exact body and inserts it into the actual request. New revisions affect later jobs; retries retain the selected method. Encoding uses its provider profile, and deterministic work needs no model recipe. A method changes behavior through this consumer, not by being stored or receiving a higher score.
+The claim freezes method ID/revision. The request builder opens that exact body and inserts it into the actual request. New revisions affect later jobs; retries retain the selected method. Encoding uses its provider profile, and deterministic work needs no prompt recipe. A method changes behavior through this consumer, not by being stored or receiving a higher score.
 
 ### 8.3 Outcome reduction
 
@@ -363,15 +405,21 @@ New material can reopen a question. Repeating the same uncertainty without new i
 
 ## 13. Forgetting and correction
 
-Reducing exposure changes selection, not truth.
+Use the operation that matches the reason, not one universal decay score:
 
-Withdrawing influence stops guidance but preserves permitted history.
+| Reason | Change and reader |
+|---|---|
+| Repeated material crowds a packet | Packet-local grouping/shortening under §6.5; no truth or source mutation. |
+| A view is verbose or outdated | Revise the view from retained inputs; preserve material exceptions, open commitments and source handles. |
+| Guidance no longer applies in a named situation | Narrow its conditions or withdraw that scoped influence with a reason; context uses the qualification. |
+| Owner-selected archival/retention | Change exposure or remove the specified retained data through the existing control path. Archival is not refutation. |
+| Material must be erased | Use [Implementation §12.1](IMPLEMENTATION.md#121-deletion); hiding search results is not physical erasure. |
 
-Superseding/refuting publishes a reasoned revision.
+Low use does not lower factual support; frequent retrieval does not raise it. Missing use/outcome telemetry is not evidence of uselessness. Do not erase an uncommon counterexample, unresolved commitment or source needed by a retained explanation merely because its last-access time is old. A model may propose a narrower view or exposure change without gaining authority to purge source bytes. Storage limits and retention remain explicit owner settings, not an invented learned truth threshold.
 
-Erasure removes the defined controlled scope and derivatives. It does not claim to recall external copies.
+Negative memory is also revisable. A changed environment or a relevant successful attempt may narrow an avoidance rule; compare the actual action, version and conditions. Passage of time, an unrelated success or disappearance of one diagnostic is not evidence that the original failure is fixed. Preserve that failure episode and its historical warning while current context receives the qualified rule. Eliot does not rerun irreversible actions simply to extinguish a warning.
 
-Compression must preserve material exceptions, open commitments and source handles. A summary is a view, not an independent observation.
+Ordinary guidance queries honor withdrawal and scope before ranking; explicit history/source inspection can still open permitted archived material without reviving its influence. A transformed summary is a view, not an independent observation. Corrections and splits use §7.3, so the benefit reaches the next reader rather than stopping at a lifecycle label.
 
 ## 14. Placement
 
@@ -380,7 +428,7 @@ Compression must preserve material exceptions, open commitments and source handl
 | source capture and episode links | `memory` + `adapters` |
 | current-state resolution and grounds | `memory` |
 | candidate generation, applicability and packing | `context` |
-| interpretation, methods, outcomes and recursive improvement | `learning` |
+| interpretation, consolidation/split, methods, outcomes and recursive improvement | `learning`, publishing through `memory`/Store |
 | finite work, no-change and successor input | `jobs` |
 | model/tool/source execution | `adapters` to controller/research/source tools |
 | correction, deletion, backup and direct owner actions | `control` |
