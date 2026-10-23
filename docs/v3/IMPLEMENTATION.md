@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.14 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.15 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -144,7 +144,7 @@ All host surfaces call the same application functions.
 | `attach(workspace, session)` | selected project and stable workspace identity, exact continuation key, binding gaps and actual capabilities |
 | `capture(event)` | committed, staged, unknown or rejected |
 | `context(decision_frame, budget, retrieval=local)` | packet ID, rendered context, exact included revisions, expansion handles and gaps; explicit `semantic` mode may obtain a query vector (§8.1) |
-| `open(handle, read_context)` | exact current/historical item or source segment within the bound project/route |
+| `open(handle, read_context, read_request?)` | exact item/source or bounded page, returned range and continuation; omitted read options use a bounded default (§5.6) |
 | `record_outcome(report)` | captured observed result or explicitly sourced report |
 | `dream(request)` | finite interpretation/research/improvement job when its handler is available |
 | `control(command)` | status/inbox, configure, pause/cancel, correct, erase, backup or restore |
@@ -199,7 +199,7 @@ Key fields:
 - `received_at`;
 - `kind`;
 - `body` or `blob_ref`;
-- searchable excerpt;
+- bounded searchable excerpt with its source ranges and available body length;
 - captured workspace ID and available resource/version or branch state;
 - available task/session/branch/call/parent references;
 - optional continuation key;
@@ -211,6 +211,8 @@ Key fields:
 Unique identity: `(project, stream, event_key)`.
 
 An observed tool result, an agent's report about that result, a prepared packet and an observed host handoff are different observations. Immutable source content is separate from optional application metadata. A structured correction observation can hold its committed mutation outcome and exact result handles for replay/readback; it does not need an Operation table. Receipt time does not fill an unknown occurrence or validity time. Replaying an old event preserves these source facts and its original binding.
+
+An excerpt is a bounded source extract or typed diagnostic view, not a substitute for the retained body. Keep native exit/error fields when provided; generic head/tail text does not prove that the middle contains no error. Generate a cheap preview from the already available input or finite source-processing work, never by rereading an entire blob at every context request. Missing preview does not fail capture: return available metadata and the source handle. Searching an excerpt is not searching the unindexed remainder (§8.1).
 
 ### 4.3 `memory`
 
@@ -442,10 +444,10 @@ Base uses exact/lexical candidates and already recorded state/relations. Optiona
 The project and workspace come from the bound request, not query prose or a process-wide last selection. Addressed work is read directly:
 
 ```surql
-SELECT id, revision, content FROM memory WHERE address_key = $address;
+SELECT id, revision FROM memory WHERE address_key = $address;
 ```
 
-Local items and reusable methods must be eligible before each retrieval arm's limit. For example, the project/lexical part of a candidate query is:
+Local items and reusable methods must be eligible before each retrieval arm's limit. For example, the project/lexical part of the focused any-term candidate query in §8.1 is:
 
 ```surql
 SELECT id, revision, search::score(0) AS score FROM memory
@@ -456,7 +458,7 @@ WHERE (
         (reuse_scope.mode = 'selected' AND reuse_scope.projects CONTAINS $project)
     ))
 ) AND (kind != 'method' OR method_role = 'advice')
-  AND search_text @0@ $query
+  AND search_text @0,OR@ $query_text
 ORDER BY score DESC, id ASC LIMIT $candidate_limit;
 ```
 
@@ -466,7 +468,9 @@ It never selects a global top-k and then discards other projects. A shared metho
 
 Store uses declared scalar types for project/mode/kind and implemented applicability selectors, an array type for selected projects, native indexes on the actual selector fields and `reuse_scope.projects.*` for containment. Keep full-text indexing separate from uniqueness. Use the same eligibility conditions in the native vector query; array containment need not receive the same prefilter optimization as scalar equality. Check the selected server's actual plan before adding another cache or search engine. The [index](https://surrealdb.com/docs/reference/query-language/statements/define/indexes) and [filtered-vector](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search) references were read on 2026-10-22; these excerpts were not executed.
 
-Union candidate version handles before applicability and final packing. Hydrate their exact versions and revision-specific links, not a later head under the old handle. For selected methods, include relevant recorded outcome qualifications/counterexamples from §10.5 before rendering; a high retrieval score does not erase a known exception. Internal processing recipes are selected by job purpose, not injected as ordinary task advice merely because their text matches. Do not retain a DB transaction across a query-embedding call or host handoff. If current advice needs a newly changed version, fetch it as that version and rebuild the affected unit. Page broad enumeration; a per-page limit is not total corpus capacity.
+Union candidate version handles before applicability and final packing. Fetch bounded metadata/preview fields first, then only selected bodies/ranges within the request's aggregate byte/work budget. `LIMIT` on rows does not bound body size; `SELECT *` followed by local truncation is not a bounded reader. Hydrate exact versions and revision-specific links, not a later head under the old handle. Batch qualification reads for selected IDs; do not open every candidate's complete source graph. Missing or over-budget detail remains an expandable gap, not a reason to withhold other useful units.
+
+For selected methods, include relevant recorded outcome qualifications/counterexamples from §10.5 before rendering; a high retrieval score does not erase a known exception. Internal processing recipes are selected by job purpose, not injected as ordinary task advice merely because their text matches. Do not retain a DB transaction across a query-embedding call or host handoff. If current advice needs a newly changed version, fetch it as that version and rebuild the affected unit. Page broad enumeration; a per-page limit is not total corpus capacity.
 
 The result contains a new stable `packet_id`, rendered content, its exact item/method revisions, handles and gaps. Record the versions actually rendered. Packet preparation is useful attribution but cannot suppress useful context on a recording failure; return the packet with a tracking gap instead.
 
@@ -477,11 +481,16 @@ Open:
 - current or historical memory revision;
 - observation;
 - source segment/blob;
+- a bounded stream/episode page;
 - view and its examined scope;
 - job/result status;
 - context packet content and included revision handles when recorded.
 
 Use the bound read context for every item and source expansion, including links from shared methods. Return requested immutable source bytes/segments or an explicit availability gap; a live URL or file that now contains different content is not the previously cited revision. A recorded packet opens its saved text and version list, not a fresh rendering with today's methods. Missing content is reported as missing, without a plausible substitute or an implicit latest-version fallback.
+
+`read_request` selects a range in that representation and a maximum returned size, or supplies the previous page's continuation. The default is a bounded first page, not an unbounded body. For a text blob, use byte offset/length with valid UTF-8 boundaries and report the actual returned range and next offset; byte, character and line coordinates are not interchangeable. A long single line or JSON value can be a labelled raw fragment, not a fabricated complete record. Preserve total retained size when known and distinguish end of retained bytes from completeness of the original capture. The response carries the same source/version handle throughout. No OmissionRegistry, signed ticket or saved paging session is needed.
+
+A stream/episode continuation carries its frozen stream bounds, last examined keys and selection scope (§7.2); normal access and erasure rules still apply. No cursor permits reading another project. A native document-element locator uses its saved representation and adapter; a JSON pointer does not promise constant-time access to an arbitrarily large JSON file. Use retained excerpts/offsets when present. Otherwise stop an over-budget decode or scan with a specific gap and the available source-read path, rather than parsing the whole source inside an automatic hook. The same applies to line-number requests without an existing line map. Ordinary explicit reading can continue without another inference or re-execution of the source tool.
 
 Resolve an exact source locator from its retained representation, not through the current search projection. Reindexing or a changed chunk layout must not make retained, readable source bytes disappear. Source access and actual erasure remain properties of the source, not of a search-generation readiness flag.
 
@@ -540,20 +549,21 @@ A decision frame carries available:
 - exact continuation key;
 - native task/session identity and observed Git branch/HEAD separately;
 - current user goal and criteria;
+- optional explicit retrieval question and typed cues from the current host event;
 - selected resources and their actually observed versions/conditions;
 - relevant decision time or explicitly historical question;
 - tool/model profile;
 - context incarnation;
-- token budget.
+- token budget and request-local input/read/work limits supplied by the adapter.
 
-Unknown fields remain unknown. Goal/criteria retain their user or host source references. An explicit owner revision updates them; a proposed plan, retrieved suggestion or generated continuation does not silently replace them. A factual statement inside a user message remains a sourced assertion rather than an automatically verified external fact. Currentness is checked against supplied facts and recorded changes of relevant resources, not a whole-project fence. An unknown or outdated source condition is shown as such without blocking unrelated context.
+Unknown fields remain unknown. Goal/criteria retain their user or host source references. An explicit owner revision updates them; a proposed plan, retrieved suggestion or generated continuation does not silently replace them. A factual statement inside a user message remains a sourced assertion rather than an automatically verified external fact. Currentness is checked against supplied facts and recorded changes of relevant resources, not a whole-project fence. An unknown or outdated source condition is shown as such without blocking unrelated context. Limits have ordinary adapter defaults; the user need not fill a new budget form or obtain a reservation before reading.
 
 ### 7.2 Continuation before similarity
 
 Context construction:
 
 1. directly open the continuation by exact key;
-2. merge relevant observations outside its recorded per-stream/segment coverage (§10.1), including late-linked child material;
+2. select and read a bounded relevant tail outside its recorded per-stream/segment coverage (§10.1), including late-linked child material;
 3. retrieve exact constraints and corrections;
 4. retrieve applicable methods and episodes;
 5. resolve current claim groups and dissent;
@@ -575,6 +585,12 @@ A continuation is an ordinary versioned `memory` item with `address_kind = curre
 
 It does not replace the original events. Reading or delivering a newer tail does not itself advance the saved continuation's coverage. A failed synthesis leaves the last saved continuation plus available unsummarized facts usable. A continuing task can retain its plan across a branch switch while old build/runtime facts are qualified for the state in which they were observed. Do not merge all events in a session merely because a task address is known; use its recorded membership and resource associations.
 
+**Large unsummarized tails.** First load addressed goal/corrections/open commitments and the saved continuation. Separately freeze an upper ingestion bound for each relevant stream and read a finite page of event metadata, typed results and saved excerpts, not all event bodies. The indexed `(project, stream, ingest_seq)` order supports recent-first selection and continuation before the last examined key, bounded by the original upper sequence. Apply actual task membership and exclude only known covered inputs; a sparse coverage set does not consume its holes. A long-lived busy stream must not exhaust the allowance before an available child's result is considered.
+
+Union this recent sample with directly linked call/result/repair observations and relevant indexed hits. Load only selected source ranges through §5.6 within the aggregate read budget, then render the included events in their known order. Old exact corrections and open commitments use their own addressed reads rather than relying on arrival among the newest N log entries. A correction buried in unexamined unstructured prose is not claimed recognized; return the unsummarized gap and an expansion path.
+
+The page records actual examined keys/ranges and remaining scope; it is a read position, not learning coverage or evidence that omitted work was processed. Explicit `open` can continue the frozen stream/episode selection without a model call. New arrivals are considered on the next context request. No full count, replay of every old body, whole-log summary or transcript scan is required before returning useful current context. Enabled background interpretation can separately process older uncovered input using its existing jobs. The hook never waits for that catch-up or schedules a new reflection merely because it read a partial tail.
+
 ### 7.3 Packing
 
 `context` constructs whole decision units using ordinary functions over hydrated values; it is not another model or a chain of receipt-producing stages.
@@ -585,7 +601,7 @@ It does not replace the original events. Reading or delivering a newer tail does
 4. Pack these units within the actual rendered host/model budget. Prefer current corrections and decision-changing limitations before optional background detail. A long high-scoring item cannot evict its own contraindication. Shorten using a faithful stored/extractive unit where possible; otherwise show the qualification plus an expansion handle, or omit that whole unit with the gap stated. Never cut away a negation, version or exception to make a recommendation fit.
 5. Deduplicate repeated inclusion by item revision and source occurrence/range. Equal wording alone does not merge distinct sources, claims or obligations. Render saved content, not normalized search tokens, IDs or scores alone.
 
-Candidate examination and final packet size are different budgets. If early candidates are inapplicable, inspect later candidates within the request work limit. Unknown usefulness does not automatically mean exclusion, but not every unknown must be inserted. Empty sections are omitted. Incomplete optional expansion does not suppress unrelated useful units or claim complete coverage. Diagnostic recording and a predicted quality score never gate this return path.
+Candidate examination, source bytes read and final packet size are different budgets. Apply read/work limits before hydration and decoding, not only after producing the final string. If early candidates are inapplicable, inspect later candidates within the request work limit. Unknown usefulness does not automatically mean exclusion, but not every unknown must be inserted. Empty sections are omitted. Incomplete optional expansion does not suppress unrelated useful units or claim complete coverage. Diagnostic recording and a predicted quality score never gate this return path.
 
 ## 8. Retrieval and project understanding
 
@@ -601,7 +617,15 @@ DEFINE ANALYZER eliot_text TOKENIZERS blank, class, camel FILTERS lowercase;
 
 Attach it to each implemented full-text field through Store migrations. This is a starting query design, not executed DDL or a claim of optimal Russian/English relevance. It matches token forms; it does not promise stemming, translation or semantic equivalence. Do not apply one Russian or English Snowball stemmer to the entire mixed code/prose corpus, chain language stemmers as a language detector, or strip negations through a generic stop-word list. Language-specific stemming can later add a measured retrieval arm without changing originals or exact identities. Native analyzer behavior and single-field full-text indexes are documented in [DEFINE ANALYZER](https://surrealdb.com/docs/reference/query-language/statements/define/analyzer) and [search indexes](https://surrealdb.com/docs/learn/data-models/full-text-search/search-indexes), checked 2026-10-23.
 
-Paths, qualified symbols, commands, error codes and versions retain typed exact cue keys alongside full-text indexing. Tokenizing a technical identifier must not redefine its identity. Keep the original query and use the same selected analyzer on write and lookup; do not send an entire transcript as an undifferentiated lexical query. Before implementation claims, inspect native `search::analyze` and actual matches for mixed Cyrillic/Latin text, identifier punctuation, case and negative phrases. No custom tokenizer framework is selected.
+Paths, qualified symbols, commands, error codes and versions retain typed exact cue keys alongside full-text indexing. Tokenizing a technical identifier must not redefine its identity. Keep the original query and use the same selected analyzer on write and lookup. Before implementation claims, inspect native `search::analyze` and actual matches for mixed Cyrillic/Latin text, identifier punctuation, case and negative phrases. No custom tokenizer framework is selected.
+
+**Decision frame to query.** Build the inputs with a small `context` function, not a model query-planner service. Batch exact lookup for known handles, touched resources, symbols and typed error/command cues from the current event. For the lexical arm use one explicit retrieval question; otherwise use the current user request, or the already supplied goal/error text when no request text exists. Do not concatenate the transcript, every tool output and all frame fields into one query. Keep the original input and the literal text actually searched. For an oversized input, honor a supplied focus; otherwise select bounded contiguous source spans at available line/sentence boundaries and state the omitted scope. This is a partial candidate query, not a replacement goal or a complete interpretation of the user's request. Empty usable text skips that arm while addressed context still works.
+
+Use `search_text @0,OR@ $query_text` for this focused natural-language candidate arm. The prior bare `@0@` means all analyzed terms by default; it can reject a useful note simply because it lacks a question's connective words. A prepared all-term variant is appropriate when that conjunction is explicitly requested. Neither form proves phrase order, negation or applicability. Exact technical identity uses the cue lookup, not token conjunction. Values are SDK parameters; query prose does not become SurrealQL or a second Boolean query language. Do not fan out one database/model call per word or recursively rewrite a query until something matches.
+
+The [official MATCHES reference](https://surrealdb.com/docs/reference/query-language/language-primitives/operators#matches), checked 2026-10-23, documents AND/OR behavior. In reviewed SurrealDB v3.3.4 (`1ac2b1db`), [operator formatting](https://github.com/surrealdb/surrealdb/blob/1ac2b1dba7cd177621a4cf5d507caebeb2414395/surrealdb/sql/src/operator.rs#L153-L207) and [the actual parser](https://github.com/surrealdb/surrealdb/blob/1ac2b1dba7cd177621a4cf5d507caebeb2414395/surrealdb/syn/src/parser/expression.rs#L550-L601) confirm the numbered `@0,OR@` form. The syntax/source trace is not an executed relevance or query-plan check. Broad OR can introduce noise; preserve separate exact candidates, scope predicates and bounded ranking rather than claiming it solves semantic search.
+
+**Search coverage.** A full-text index covers the field actually indexed, not the body behind its blob handle. Long text/log acquisition may publish addressable `source_segment` views through the same finite source-processing path used in §8.4, with original range links; plain text needs no Docling or model. Until those segments exist, return available excerpt matches and the unindexed-body limitation. Do not scan every blob to compensate on a hook, call an empty excerpt result proof of absence, or make exact source opening wait for indexing. Native `search::offsets` refers to the indexed field; it is not automatically an offset into a contextualized source, a PDF page or the original blob. Use an actual mapping or disclose the containing excerpt/element.
 
 **One pipeline, two waiting policies.** `retrieval=local` is the default for hooks and Base. It uses available local candidates; the optional vector arm runs only with an already available query vector for the exact query representation and effective space. It never waits for encoder startup, network inference or a background job. An optional bounded cache stores vectors, not packets: its key includes route/disclosure scope, effective space, role and exact encoded query. A cache miss does not borrow a similar query's vector or create a compulsory job after every read.
 
@@ -659,7 +683,7 @@ captured original bytes
 
 **Use document structure without inventing precision.** Run the native chunker over `DoclingDocument`, retaining `doc_items`, headings and available provenance beside the chunk text. Use `contextualize` for search/model input when useful, but distinguish its heading/caption prefixes from a literal source quotation. In the inspected `HybridChunker`, plain-text splits reuse the parent chunk metadata; they do not compute a new exact source span for every segment. Merged chunks can reference several elements/pages; table splitting can repeat headers. Do not deduplicate distinct source occurrences by their shared text or count repeated headers as independent support. A fine quote/cell locator is used only when an actual mapping establishes it; otherwise expose the containing element/table and the real excerpt, not a fabricated exact bounding box.
 
-**Open without inference.** The locator carries the source observation, conversion-result identity and item references, plus a representation-specific subrange only when available. Resolve pointers against the retained JSON, then expose the saved text/table structure and available original page/region. Preserve `page_no`, bounding box, coordinate origin and page size together. `prov` can be empty; image cropping requires a page image and the correct coordinate conversion. Missing layout or image data does not prevent reading available text. Keep emitted assets referenced by the saved representation in controlled blob storage, or mark them unavailable before deleting a converter's temporary directory. Opening a citation never buys another OCR/model call or substitutes a newer file.
+**Open without inference.** The locator carries the source observation, conversion-result identity and item references, plus a representation-specific subrange only when available. Resolve pointers against the retained JSON, then expose the saved text/table structure and available original page/region. Preserve `page_no`, bounding box, coordinate origin and page size together. `prov` can be empty; image cropping requires a page image and the correct coordinate conversion. Missing layout or image data does not prevent reading available text. Keep emitted assets referenced by the saved representation in controlled blob storage, or mark them unavailable before deleting a converter's temporary directory. Opening a citation never buys another OCR/model call or substitutes a newer file. Apply §5.6 read/decode limits; a small selected element does not justify parsing an unbounded document on the hook path.
 
 These choices follow the inspected Docling/Core paths recorded under R-018. They do not establish extraction accuracy or installed compatibility. Spreadsheet cells, media timestamps and other format-native locators still require their own actual adapter mapping; a common document type does not prove those mappings. Retain original material and state the available precision instead of manufacturing them.
 
@@ -767,7 +791,7 @@ Read each used section's citation mapping separately. Retain `original_handle_re
 
 The inspected section operation has no range/cursor argument, whereas `eliotr_open` ranges apply to evidence handles, not arbitrary report bodies. The MCP body/envelope bound is 512 KiB; JSON overhead means this is not a safe raw-section allowance. A larger saved section needs bounded reading in the existing Research report reader. Until that path exists, retain the specific read gap; do not invent a range parameter, truncate silently or buy a shorter replacement answer. Byte ranges remain UTF-8 byte ranges, not character indexes.
 
-**Separate citation identity from search readiness.** The current citation reauthorization path calls `pinnedCandidate`, requiring exactly one active, READY/verified search span with the saved parent range before reading the original source. Changed chunk boundaries can therefore make a retained citation unavailable even while its source bytes remain readable. Repair the Research reader to use the saved source representation/range under existing source access, independently of active search projection. Memory's exact reader follows the same separation (§5.6); it must not rebuild an index or rerun research just to open a known source.
+**Separate citation identity from search readiness.** The current citation reauthorization path calls `pinnedCandidate`, requiring exactly one active, READY/verified search span with the saved parent range before reading the original source. Changed chunk boundaries can therefore make a retained citation unavailable even while its source bytes remain readable. Repair the Research reader to use the saved source representation/range under existing source access; independently of active search projection. Memory's exact reader follows the same separation (§5.6); it must not rebuild an index or rerun research just to open a known source.
 
 A failed citation expansion is not proof that the report is false or that research found nothing. Retain permitted report text with its unresolved-source qualification, respecting actual access/erasure changes. Publish useful findings as ordinary memory revisions linked to the generated report and available primary excerpts. Large corpora stay with Research unless explicitly imported. Existing read-status gaps, deployed credentials and runtime recovery remain in R-016; the old Research receipts, stage graph and activation guards are not adopted as V3 infrastructure. Local recall remains usable.
 
@@ -785,7 +809,7 @@ On apply, save only that processing's covered set, method revision and explicit 
 
 Continuation carries the coverage used to build it, per stream and segment where necessary. `context` reads relevant material outside that coverage; a sparse set must not become a contiguous high-water mark across a hole. Reading the same observation for a project view does not consume it for episode learning. No global processed flag, second cursor database or event broker is needed.
 
-Use indexed `(project, stream, ingest_seq)` reads with a frozen upper bound and continuation by the last actual sequence, not an ever-growing offset or occurrence timestamp. Select useful portions across relevant streams so a busy stream does not indefinitely displace a quieter child's result. Keep available call/result and repair/check links; if a counterpart has not arrived, retain that gap and proceed with independent useful material. The saved observation is not deleted to make a model's input format convenient. New arrivals extend only the pending successor, never the running request.
+Use indexed `(project, stream, ingest_seq)` reads with a frozen upper bound and continuation by the last actual sequence, not an ever-growing offset or occurrence timestamp. Select useful portions across relevant streams so a busy stream does not indefinitely displace a quieter child's result. Keep available call/result and repair/check links; if a counterpart has not arrived, retain that gap and proceed with independent useful material. The saved observation is not deleted to make a model's input format convenient. New arrivals extend only the pending successor, never the running request. Foreground reading follows the finite-tail policy in §7.2; it never advances this job's processing coverage merely by returning a page.
 
 ### 10.2 Interpret, correct or keep
 
@@ -975,6 +999,8 @@ Connect the first Claude adapter, exact continuation lookup and available raw ta
 Base is runnable with all model/vector/document/Research capabilities disabled and without their credentials. Its initial useful scenario is a captured result or explicit lesson in session A, a process restart, and the same source-linked knowledge delivered in the relevant session B. It does not claim to infer a new lesson automatically.
 
 After this path is implemented, test it before layering more capabilities onto it: actual Store persistence/replay, revision/correction, scoped retrieval, host delivery and source readback. Include two workspaces of one project, a branch switch with an unchanged task, late input retaining its old binding, and a non-Git scope; these exercise the same Base operations, not a new test platform. Include an absent optional endpoint and a failed capture so neither gets disguised as an empty successful memory. Use the real application operations and the selected database path; no second implementation inside the test or production fake success branch. This is Base acceptance, not a new test platform or release-proof bureaucracy.
+
+For the connected reader, include a natural-language query whose useful note lacks some query words, an empty query, a large raw tail with learning disabled, a late child result and a correction older than the recent page. Inspect actual query plans and bytes read/decoded, not only final response length. Exercise UTF-8 range continuation and a retained but unindexed body. These checks follow the implementation; they do not require a benchmark service or a new test harness before Base exists.
 
 ### Slice 3 — First learning extension
 
