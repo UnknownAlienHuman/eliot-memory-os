@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.5 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.6 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -120,6 +120,8 @@ Key fields:
 
 Unique identity: `(project, source_kind, source_native_id)`.
 
+`last_ingest_seq` records intake in this stream only. It is neither a project-wide clock nor a learning cursor. A source-native cursor belongs to its adapter; interpretation progress belongs to the particular job purpose/target. Parent and child streams keep separate sequence spaces even when they contribute to one continuation.
+
 ### 4.2 `observation`
 
 Preserves an actual source event, an explicitly sourced report or a directly observed Eliot application event.
@@ -225,7 +227,7 @@ For compound grounds:
 - different groups are alternatives;
 - ungrouped evidence is supportive.
 
-This is sufficient for addressable revision. It is not a general theorem prover.
+For grounding links, the source is the conclusion revision and the target is the premise/source revision. A group ID is local to that conclusion revision, not a global category. An index by target ID/revision and relation kind finds affected conclusions; an index by source ID/revision loads that conclusion's groups. Only grounding relations carry this meaning: navigation, packet inclusion and episode membership cannot acquire it by sharing a group-like label. Reconsideration is defined in §8.5 and [Cognition §3.3](COGNITION.md#33-multiple-grounds), not a general theorem prover.
 
 ### 4.6 `job`
 
@@ -238,17 +240,17 @@ Key fields:
 - `purpose`;
 - `target_key`;
 - `state`;
-- finite input observation IDs/ranges;
+- finite input observation IDs/segments, or exact per-stream ranges with their selection scope;
 - input memory IDs/revisions;
 - selected method ID/revision;
 - current claim and expiry;
 - due time/attempt;
 - saved controller connection/caller, request method/ID and immutable parameters or their blob reference;
 - controller execution and result-artifact references;
-- result refs and processed input;
+- result refs, actually covered input and remaining/unavailable portions;
 - error or no-change result.
 
-One target is `(project, purpose, target_key)`. It has at most one active job and one coalesced pending successor. Active includes waiting for or reconciling an already dispatched execution, not merely holding a live worker claim. Completed jobs retain their own input/result history and no longer occupy a slot. Inputs freeze when the pending job becomes active; later events extend the successor only.
+One target is `(project, purpose, target_key)`. It has at most one active job and one coalesced pending successor. Active includes waiting for or reconciling an already dispatched execution, not merely holding a live worker claim. Completed jobs retain their own input/result history and no longer occupy a slot. Inputs freeze when the pending job becomes active; later events extend the successor only. The multi-stream selection and coverage rules in §10.1 apply to those frozen inputs, not to a global processed flag on observations.
 
 Enforce those slots with one database-derived optional key and a native unique index, not only a query asking whether a job already exists. The selected SurrealQL shape is:
 
@@ -324,7 +326,7 @@ Independent projects and targets proceed independently. There is no project-wide
 
 All semantic mutation uses one internal function with a caller-owned transaction. It does not open or commit a nested transaction. Both direct corrections and a multi-item job result use the same mutation logic.
 
-Inputs are the create/update target, expected revision for an update, new semantic fields, actual source handles, revision-aware links/grounds, and reason/source identity. The function checks the addressed revision, archives its predecessor, updates the current item and links, and returns the exact resulting version. A replacement also retires the specifically replaced claim within this transaction. Direct creates use a stable ID selected for that command; retries do not create another item.
+Inputs are the create/update target, expected revision for an update, new semantic fields, actual source handles, revision-aware links/grounds, and reason/source identity. The function checks the addressed revision, archives its predecessor, updates the current item and links, and returns the exact resulting version. A replacement also retires the specifically replaced claim within this transaction. Direct creates use a stable ID selected for that command; retries do not create another item. A material premise correction also retains the source-change cause and necessary reconsideration job in this transaction (§8.5); the dependency walk itself runs afterward.
 
 A structured correction is one application command: save its correction observation, apply the edit and record the exact mutation result on that observation in the same transaction. Read an existing result before comparing the target's now-current revision. Retrying a correction that produced revision 4 still returns revision 4 even if another edit has since produced revision 5; it does not reapply the old edit or invent a new conflict.
 
@@ -339,7 +341,7 @@ Inside one transaction:
 1. return the stored result immediately if this job has already applied it;
 2. otherwise verify the current claim and addressed expected revisions;
 3. publish the dependent changes through `publish_revision` in this same transaction;
-4. save exact result handles or explicit no-change and the actually processed input;
+4. save exact result handles or explicit no-change and only the input covered by that applied processing (§10.1);
 5. finish the job, releasing its active slot, and retain/create any necessary pending successor;
 6. commit.
 
@@ -471,7 +473,7 @@ Unknown fields remain unknown.
 Context construction:
 
 1. directly open the continuation by exact key;
-2. merge later observations not represented by its covered input;
+2. merge relevant observations outside its recorded per-stream/segment coverage (§10.1), including late-linked child material;
 3. retrieve exact constraints and corrections;
 4. retrieve applicable methods and episodes;
 5. resolve current claim groups and dissent;
@@ -489,9 +491,9 @@ A continuation is an ordinary versioned `memory` item with `address_kind = curre
 - open commitments;
 - last relevant results;
 - next useful step;
-- source handles and coverage.
+- source handles, represented streams/segments and coverage gaps.
 
-It does not replace the original events.
+It does not replace the original events. Reading or delivering a newer tail does not itself advance the saved continuation's coverage. A failed synthesis leaves the last saved continuation plus available unsummarized facts usable.
 
 ### 7.3 Packing
 
@@ -549,6 +551,18 @@ Use external converters when useful; do not embed another memory runtime.
 Docling is the initial document/PDF converter candidate. The adapter preserves the original file/revision and maps converted elements back to pages/spans.
 
 Spreadsheets, images and transcripts use their concrete locators. Unsupported detail remains accessible as original bytes/handle and is not silently treated as indexed.
+
+### 8.5 Reconsider affected grounds
+
+A source correction, refutation, relevant live-requirement change or erasure records its actual scope and a follow-up job with the primary mutation. Ordinary new editions, temporary source unavailability and reduced exposure are not automatically refutations. The worker uses the reverse grounding index to page through affected conclusion revisions, then loads each conclusion's own complete groups. It does not walk navigation links as evidence or rebuild every project view.
+
+Use the group rules in Cognition §3.3 to preserve an unaffected alternative basis, identify a broken basis or retain uncertainty. This reduces known dependency facts; it does not decide arbitrary semantic truth. An unresolved relation may require one targeted interpretation with the changed premise and affected conclusion. No model call is needed merely to identify the incoming links or a declared broken group. The actual consumer is `context`: return the known qualification with the selected claim/method before a replacement explanation is ready, rather than silently serving it as unchanged established advice.
+
+A change job retains its cause, traversal position and remaining IDs in the existing `job`. Continue in finite pages, deduplicating a conclusion revision within that cause. A material change to a conclusion can affect its dependants; a timestamp, repeated visit or unchanged assessment cannot start an endless cascade. Cyclic citations alone supply no independent ground. Newer source changes remain pending rather than being swallowed by completion of the earlier cause. No-change cannot mean that an unvisited branch was checked.
+
+Normal reads use recorded premises, corrections and affected-state information for selected items, not fresh remote validation or a whole-corpus proof. If a relevant dependency expansion is unfinished, identify that qualification; do not call the item fully resolved, deny all memory, or wait for unrelated work. Historical evidence is not invalid merely because a live requirement has changed. A known refutation is not hidden behind a generic stale-view label.
+
+When erasing a premise, retain the permitted fact that an affected required group lost a member before removing that member's link. Do not evaluate the shortened or empty group as the original complete derivation. Keep no deleted content in that marker. An alternative ground can preserve the conclusion's support, but cannot authorize retaining prohibited bytes in its old synthesis; required cleanup or a new derivation from allowed inputs remains separate. Exact deletion and restore implementation is still covered by §12 and R-020, not declared complete here.
 
 ## 9. Dreamer and controller
 
@@ -625,9 +639,17 @@ This contract is a required implementation target, not a claim of an existing en
 
 ### 10.1 Episode input
 
-Host events are grouped using actual session/task/call/result relationships. Chunking a large log for search does not define a task boundary.
+Host events are grouped using actual session/task/call/result relationships. Chunking a large log for search does not define a task boundary. A shared episode may use several streams without flattening their native order or waiting for every child agent to finish.
 
-Coalesce wakeups, not observations. A running interpretation job sees a finite saved range; later events remain for the pending successor.
+A job freezes the relevant stream membership and observation IDs/segments. Per-stream ranges may compact that identity only when the recorded selection scope and omissions make the set exact. There is no single `last_processed_seq` across streams: A through 120 says nothing about B through 8. A newly received B:9 is still new even when its occurrence time precedes A:120. When a known parent/task relationship is learned late, capture of that relationship also schedules the already retained child observations not covered by this target; considering only future arrivals would miss them.
+
+Keep input selection, request material and committed processing coverage distinct on the existing job. The request builder records which observation bodies/segments were actually supplied and which older material was reread only for context. An opaque handle that was never expanded does not establish that its body was processed. A token limit, unread blob or missing tool result cannot be hidden by advancing coverage to the highest selected sequence. Use actual source IDs/segments, not a model's assertion that it read everything; this is input accounting, not proof of understanding.
+
+On apply, save only that processing's covered set, method revision and explicit gaps with the result. Complete no-change covers the actual input for that purpose, not omitted material or all future uses of those sources. Deferred IDs/segments are coalesced into the pending successor without duplicating newer events. Deliberately excluded or currently unavailable material has an explicit disposition, not a false success and not an unchanged automatic retry forever. Source return, new membership, new evidence or an explicit request can reopen the affected work.
+
+Continuation carries the coverage used to build it, per stream and segment where necessary. `context` reads relevant material outside that coverage; a sparse set must not become a contiguous high-water mark across a hole. Reading the same observation for a project view does not consume it for episode learning. No global processed flag, second cursor database or event broker is needed.
+
+Use indexed `(project, stream, ingest_seq)` reads with a frozen upper bound and continuation by the last actual sequence, not an ever-growing offset or occurrence timestamp. Select useful portions across relevant streams so a busy stream does not indefinitely displace a quieter child's result. Keep available call/result and repair/check links; if a counterpart has not arrived, retain that gap and proceed with independent useful material. The saved observation is not deleted to make a model's input format convenient. New arrivals extend only the pending successor, never the running request.
 
 ### 10.2 Interpret, correct or keep
 
@@ -734,7 +756,7 @@ A source acquisition failure and completed but uninformative research are differ
 
 Publish withdrawal before acknowledging it. Remove controlled current/history rows, links, vectors, blobs, staged input and controlled backup copies as required.
 
-Keep the minimum replay/deletion information outside rollback-prone copies. Do not retain deleted text in that record.
+Keep the minimum replay/deletion information outside rollback-prone copies. Do not retain deleted text in that record. Loss of a required premise is recorded on the affected conclusion/group before removing its link (§8.5); removing provenance is not a new derivation or a way to preserve erased content.
 
 ### 12.2 Backup
 
@@ -801,7 +823,7 @@ Build vertical slices in this order.
 
 - actual controller text execution and same-request admission recovery;
 - public result handle through authorized artifact bytes, including the controller projection repair in §9.1;
-- finite episode job with bundled initial recipe and purpose-based selection;
+- finite multi-stream episode input and actual processing coverage, with bundled initial recipe and purpose-based selection;
 - shared `publish_revision` for job output and direct correction;
 - create/update/keep;
 - method revision consumed by the next job;
@@ -810,7 +832,7 @@ Build vertical slices in this order.
 ### Slice 4 — Understanding and transfer
 
 - codebase-memory-mcp adapter;
-- affected project views;
+- affected project views and premise-change reconsideration through existing links/jobs;
 - origin/reuse scope;
 - cross-project method retrieval;
 - disagreement and anticipation.

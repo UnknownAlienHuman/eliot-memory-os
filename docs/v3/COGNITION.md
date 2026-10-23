@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.1 · 2026-10-23 · normative algorithms used by the V3 implementation.**
+**Revision 1.0-draft.2 · 2026-10-23 · normative algorithms used by the V3 implementation.**
 
 This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves useful context, learns from outcomes and improves connected methods. It does not define additional services. All state and work use the owners in [Implementation](IMPLEMENTATION.md).
 
@@ -28,7 +28,7 @@ The decision frame contains available project, workspace, task, session, branch,
 Current work is reconstructed in this order:
 
 1. open the addressed task/session/branch continuation;
-2. read observations after the continuation's covered input;
+2. read relevant observations outside its per-stream/segment coverage, including retained material newly associated with this work;
 3. apply explicit goal/plan corrections;
 4. preserve abandoned alternatives and open commitments;
 5. only then retrieve similar prior work.
@@ -43,9 +43,9 @@ A continuation revision contains:
 - abandoned approaches and reasons;
 - open commitments/unknowns;
 - next useful step;
-- covered observation range and source handles.
+- represented streams and observation IDs/segments or exact ranges, source handles and gaps.
 
-A summary never replaces the original observations.
+A summary never replaces the original observations. Reading a tail is not publishing a new summary or proving that every stream was processed.
 
 ## 3. Claim identity and current-state resolution
 
@@ -82,13 +82,24 @@ After A→B, withdrawing B does not make A current automatically. Return another
 
 ### 3.3 Multiple grounds
 
-For a conclusion:
+A grounds group belongs to one conclusion revision. Every declared member is required for that derivation; different explicitly alternative groups offer other derivations. Ungrouped support is not silently made necessary. Navigation, shared episode membership and repeated summaries do not create new evidence or independent alternatives.
 
-- every link in one grounds group is required;
-- different grounds groups are alternatives;
-- supportive ungrouped material is not automatically required.
+Evaluate the recorded basis, not a universal truth score:
 
-When composition is unknown, do not infer it from citation count. Reconsider the item using its actual source/method.
+| Recorded situation | Consequence for that basis |
+|---|---|
+| Every required member remains usable for the stated scope | The declared basis remains available; this does not certify the conclusion |
+| A required premise is known refuted or a required live condition is known inapplicable here | That group cannot justify the conclusion in this situation |
+| A required member or its relevance is unresolved | That group is unresolved, not automatically true or false |
+| No declared group exists, composition is unknown, or a required member disappeared | Do not obtain support from an empty set or from the remaining citation count |
+
+For an explicit `(A and B) or C` derivation, loss of B does not erase an intact C basis. If all bases fail, the old conclusion lacks its declared justification; that does not prove the opposite conclusion. A surviving group also does not erase a direct counterexample to the conclusion: retain the conflict and examine it. If only unresolved bases remain, return the limitation or a conditional account instead of prohibiting all memory use.
+
+Distinguish historical evidence from present requirements. A newer source edition does not automatically refute its old observation. Temporary inability to open a source does not make stored knowledge false, though it limits verification. A live requirement that no longer holds affects current applicability. Reduced exposure changes none of these facts. Refutation/correction must address what was actually used, not just a newer object with a similar name.
+
+Reconsider changed grounds through the existing `memory`, `context` and job path in [Implementation §8.5](IMPLEMENTATION.md#85-reconsider-affected-grounds). Use indexed reverse links, preserve distinct groups and stop repeated visits within a cause. A cycle such as A citing B citing A is not independent support; consider a genuinely separate grounded alternative or leave the cyclic basis unresolved. Do not expand every possible proof combination or require full-graph validation before an ordinary read.
+
+Erasing a required premise must not silently turn an AND group into a smaller, apparently satisfied group. Record the permitted loss-of-ground fact before removing its link. Support and permission to retain or disclose derived text remain separate: an alternative basis does not cleanse old text containing erased material. Unknown composition calls for targeted reconsideration, not an invented Boolean formula or a global quarantine.
 
 ### 3.4 Time
 
@@ -104,7 +115,9 @@ A late import of old evidence does not become the newest world state. A real A�
 
 Use host-native call/result, task/session and parent relationships to group observations. Keep a tool call with its result and observed repair/check.
 
-An episode can be interpreted in finite portions while work continues. New observations enter a pending successor rather than changing the running input.
+An episode can be interpreted in finite portions while work continues. New observations enter a pending successor rather than changing the running input. Each stream retains its own intake order. Freeze the selected membership and actual observation segments; a late child result or newly learned parent relationship can add previously uncovered material without reopening every other stream.
+
+Selection, material actually supplied to a recipe, and committed processing coverage are distinct. A token-trimmed body, unexpanded handle or incomplete output does not count as processing the entire source. No-change covers only the completed input/purpose, and rereading earlier context does not add independent support. The concrete range, omission and successor rules are in [Implementation §10.1](IMPLEMENTATION.md#101-episode-input); there is no global processed bit on an observation.
 
 When retrieval finds a compact lesson, optional expansion follows source links to the relevant episode neighborhood:
 
@@ -113,7 +126,7 @@ When retrieval finds a compact lesson, optional expansion follows source links t
 - repair/change;
 - subsequent check/outcome.
 
-Deduplicate overlapping expansion by source identity. Timestamp proximity across unrelated streams does not create one episode.
+Deduplicate overlapping expansion by source identity. Timestamp proximity across unrelated streams does not create one episode. Missing counterparts remain explicit; available useful material does not wait for a global all-agents-finished barrier.
 
 ## 5. Project understanding
 
@@ -138,7 +151,7 @@ A view records:
 
 A list of old cited files does not prove that no new consumer exists. Membership-affecting changes mark the affected view dirty.
 
-Refresh only affected views. Until refresh completes, serve the previous view with its qualification and direct source access.
+Refresh only affected views. Until refresh completes, serve the previous view with its qualification and direct source access. A known refuted part needs its actual correction/limitation, not merely a generic stale label.
 
 ## 6. Retrieval and context selection
 
