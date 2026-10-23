@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.8 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.9 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -403,6 +403,8 @@ Open:
 
 Use the bound read context for every item and source expansion, including links from shared methods. Return requested immutable source bytes/segments or an explicit availability gap; a live URL or file that now contains different content is not the previously cited revision. A recorded packet opens its saved text and version list, not a fresh rendering with today's methods. Missing content is reported as missing, without a plausible substitute or an implicit latest-version fallback.
 
+Resolve an exact source locator from its retained representation, not through the current search projection. Reindexing or a changed chunk layout must not make retained, readable source bytes disappear. Source access and actual erasure remain properties of the source, not of a search-generation readiness flag.
+
 ## 6. Host capture and delivery
 
 ### 6.1 First adapter: Claude Code
@@ -635,25 +637,31 @@ Applying a vector updates derived fields for the matching content/profile. It do
 
 ### 9.4 Research
 
-Use a narrow client of the existing Research MCP application boundary, not a new research executor or a second source corpus. The abstract result remains `status + findings/report + versioned sources + coverage/gaps`, but it is assembled from distinct operations, not assumed to be the response to starting work.
+Use the existing Research MCP application boundary, not a new executor or source corpus. At inspected revision `7c034569b908d3b03a8b821b7c537477a24b10f7`, the operations below have real callers, but selected request and citation-reading paths require repairs recorded in R-031/R-032. This is not a qualified deployed integration.
 
-Research at `7c034569b908d3b03a8b821b7c537477a24b10f7` has the following dispatcher/service paths. They establish callable code, not a qualified deployed Memory↔Research integration:
-
-| Need | Existing path and actual distinction |
+| Need | Existing operation and consumed result |
 |---|---|
-| Find existing material without synthesis | `eliotr_query` accepts only `FAST_SEARCH`; its response states `synthesis_status: NOT_REQUESTED`. Search hits are not a generated answer or corpus-completeness claim. |
-| Request synthesis/research | `eliotr_run` delegates to the run service and returns investigation/workflow identity. Save the exact configured request and resulting `workflow_instance_id` on the memory job; do not mark the question answered on admission. |
-| Read progress and discover output | `eliotr_run_status` reads that workflow. Inspect `answer.availability` and the returned `artifact_ref` separately from execution state; the inspected reader can return unavailable, and exposes a draft only through its supported result path. |
-| Read retained output and citations | `eliotr_report`, `eliotr_section`, `eliotr_citations` address the returned artifact/section revisions. Read actual section content, not just metadata; retain supplied coverage and gaps, without inventing fields absent from the response. |
-| Expand evidence | `eliotr_open` consumes a versioned evidence handle and optional byte range. `eliotr_source_read` pages a source revision only under the inspected managed-owner profile; it is not available to the service-token profile. |
+| Find material without synthesis | `eliotr_query` accepts `FAST_SEARCH` and returns `synthesis_status: NOT_REQUESTED`; hits are not a generated answer. |
+| Start requested work | `eliotr_run` returns investigation/workflow identity, not report text or completed execution. |
+| Discover retained output | `eliotr_run_status` exposes `answer.availability` and, when available, `artifact_ref` separately from execution state. |
+| Read the report | `eliotr_report` returns an artifact envelope with ordered `artifact.sections`; `eliotr_section` returns one exact section's body envelope. |
+| Read and expand citations | `eliotr_citations` pairs saved and freshly authorized handles; `eliotr_open` reads evidence, optionally by byte range. |
 
-Configure the Research endpoint, explicit Memory-project→Research-project mapping and one existing authorized client profile. Do not assume equal project names are identity. In this revision, managed OAuth does not expose MCP cancel/recover, while service-token clients use project grants and cannot call `eliotr_source_read`. Use supported evidence opening for that profile and record any missing capability; do not impersonate the owner or create another authorization layer in Memory OS. Required changes belong to Research's existing application boundary. Current Access/grant checks remain there, not in every memory helper.
+**Preserve the selected request.** Research's application service parses v5 method/model selection through `parseResearchRunTransportRequest`, but its MCP composition first invokes the v1/v2-only `parseResearchRunRequest`; discovery also advertises the older shape. A v5 owner request is rejected before reaching the capable service. Correct the existing Research schema/decoder/caller chain to share one current application request contract, retaining method, model selection and scope through execution. Do not silently remove those fields, select a default provider, add a Memory-only endpoint or implement a compatibility framework for every discarded request generation. Existing legacy requests remain a separate supported source path, not evidence that the selected newer request works.
 
-The body wrapper for section/evidence reads returns `body.text`, byte length and selected source/range headers. Decode that envelope and retain the original range units; character counts are not UTF-8 byte offsets. An oversized body error is not an empty answer. Use available bounded reads or report the specific unsupported read. Do not refetch a live URL as if it were the cited revision.
+Configure the endpoint, explicit Memory-project→Research-project mapping and one authorized profile. Current profile limits remain: managed OAuth excludes MCP cancel/recover; service-token clients use project grants and cannot use `eliotr_source_read` or the inspected owner-only exact model-selection path. Implement a missing selected capability at Research's existing boundary, rather than changing caller identity or putting access machinery in memory helpers. Equal project names are not identity.
 
-Keep the acquired report as an explicitly generated external result and preserve remote source/representation handles with the used excerpts. Publish useful findings through ordinary memory revisions with links to both the report and actual source material. Neither repeated citations nor copying the report creates independent supporting evidence. Large corpora and remote originals stay with Research unless explicitly imported; reconnection reads saved run/output references, not a newly launched investigation.
+**Recover submission, not a new investigation.** Save the endpoint/profile, exact submitted arguments and a stable idempotency key on the existing memory job before sending. If only admission was lost, repeat that request under the same authorized principal. The inspected service binds principal, key and parsed request/selection to the original run, rejects mismatched reuse and dispatches the same Workflow ID. It still performs current scope/configuration checks; replay is not unconditional receipt delivery. Once the workflow ID is known, read status/output instead of repeatedly invoking `run`. A current-access or configuration failure is neither no findings nor justification for a new key. Do not promise permanent exactly-once model execution: native instance identity is retained for a finite period, and the provider-stage recovery path has separate limits. Keep unresolved execution distinguishable from failed acquisition.
 
-The precise run-request profile, lost-admission idempotency path, report payload/section traversal and deployed credentials still require qualification in R-016. Research's selected simplification plan is not proof that its replacement runtime is already installed. Do not copy the old stage/receipt machinery into Eliot or build a compatibility framework around unselected API versions. Ordinary local recall continues when remote acquisition is unavailable.
+**Consume retained content.** Save the returned artifact revision and its section list. Read the needed section revisions in that order, decode `body.text` and retain the actual received bodies plus missing/omitted sections under the job/result. Metadata alone covers no report text. Interrupted reading resumes from those references; it does not regenerate the report. A useful selected section can be retained without claiming the whole report or source collection was read.
+
+Read each used section's citation mapping separately. Retain `original_handle_ref` as the saved citation identity and use the returned `handle_ref` for the authorized evidence read; refreshing a handle adds no independent evidence. Section-level citations do not automatically establish claim-level support. Preserve `semantic_verification: NOT_EXECUTED` when supplied without introducing a mandatory new verifier before useful provisional knowledge can be shown.
+
+The inspected section operation has no range/cursor argument, whereas `eliotr_open` ranges apply to evidence handles, not arbitrary report bodies. The MCP body/envelope bound is 512 KiB; JSON overhead means this is not a safe raw-section allowance. A larger saved section needs bounded reading in the existing Research report reader. Until that path exists, retain the specific read gap; do not invent a range parameter, truncate silently or buy a shorter replacement answer. Byte ranges remain UTF-8 byte ranges, not character indexes.
+
+**Separate citation identity from search readiness.** The current citation reauthorization path calls `pinnedCandidate`, requiring exactly one active, READY/verified search span with the saved parent range before reading the original source. Changed chunk boundaries can therefore make a retained citation unavailable even while its source bytes remain readable. Repair the Research reader to use the saved source representation/range under existing source access, independently of active search projection. Memory's exact reader follows the same separation (§5.6); it must not rebuild an index or rerun research just to open a known source.
+
+A failed citation expansion is not proof that the report is false or that research found nothing. Retain permitted report text with its unresolved-source qualification, respecting actual access/erasure changes. Publish useful findings as ordinary memory revisions linked to the generated report and available primary excerpts. Large corpora stay with Research unless explicitly imported. Existing read-status gaps, deployed credentials and runtime recovery remain in R-016; the old Research receipts, stage graph and activation guards are not adopted as V3 infrastructure. Local recall remains usable.
 
 ## 10. Learning
 
@@ -861,7 +869,7 @@ Build vertical slices in this order.
 
 - controller batch embeddings;
 - captured document → retained conversion → source-excerpt retrieval → exact representation open, including partial results;
-- selected Research MCP search/run/status/report/evidence adapter with explicit profile capabilities;
+- Research adapter preserving the selected request, same-run recovery, actual section/citation reads and direct retained-source opening; repair the existing Research boundaries identified in §9.4 rather than emulate them in Memory;
 - hybrid retrieval and richer sources.
 
 ### Slice 6 — Recovery and advanced improvement
