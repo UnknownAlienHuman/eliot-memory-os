@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.7 · 2026-10-23 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.8 · 2026-10-23 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into processes, data, operations and integration paths. [Cognition](COGNITION.md) defines the algorithms used by those paths. The [audit conclusion](AUDIT.md) explains why the rejected V1/V2 machinery is not reproduced. The [analysis registry](ANALYSIS-REGISTRY.md) tracks what is checked and what remains open.
 
@@ -268,16 +268,16 @@ DEFINE INDEX job_slot ON job FIELDS slot_key... UNIQUE;
 
 Large source bytes live under `blobs/`; database rows keep an opaque reference and digest. Save new blob bytes before committing a row that refers to them. A failed row transaction can leave an unreferenced file for later cleanup; a committed row must not point to a file that was never saved.
 
-Supported locators are concrete:
+Locator shapes to implement are concrete; a converter must actually supply the claimed precision:
 
 - code: repository/worktree, revision, path, lines or symbol;
-- document/PDF: URI/file, revision, page and element/span;
+- document/PDF: captured source revision, saved conversion representation and element reference; page/span/region only when available;
 - spreadsheet: file, revision, sheet and range;
 - image: file/revision and region;
 - transcript/media: stream/session, event/turn or time range;
-- web/research: URL, retrieval time and quoted/span locator.
+- web/research: captured source or remote revision, retrieval time and representation-specific passage range.
 
-A generic payload alone does not mean a source type is supported.
+A generic payload alone does not mean a source type is supported. Keep byte offsets, text-character spans, page coordinates and table-cell positions tagged with their representation and units; they are not interchangeable. A Docling JSON pointer belongs to one saved converted document, not to every conversion of the original file. A newer extraction cannot silently replace the representation named by an old handle (§8.4).
 
 ## 5. Store and transaction operations
 
@@ -334,7 +334,7 @@ If the expected revision is already stale and no result exists for this command,
 
 ### 5.4 `apply_job_result`
 
-Persist the actual completed controller output, its execution reference and observed/unknown usage under the existing job (or its referenced blob) before releasing provider-side temporary state. A target conflict must not discard an already obtained answer and silently purchase the same inference again.
+Persist the actual completed worker/controller result and available execution reference under the existing job or its referenced blob before releasing temporary output. Retain observed/unknown provider usage where applicable; a source converter does not require a fictitious model execution. A target conflict must not discard an already obtained result and silently repeat its conversion or inference.
 
 Inside one transaction:
 
@@ -543,11 +543,25 @@ Source additions, removals, renamed resources and new consumers refresh affected
 
 ### 8.4 Documents and other sources
 
-Use external converters when useful; do not embed another memory runtime.
+Use one narrow external Docling adapter for selected document formats, not a Rust reimplementation, another memory service or a conversion on every read. The chosen path is:
 
-Docling is the initial document/PDF converter candidate. The adapter preserves the original file/revision and maps converted elements back to pages/spans.
+```text
+captured original bytes
+→ finite conversion job
+→ retained DoclingDocument JSON + conversion result
+→ searchable source-excerpt views
+→ context / exact open of the saved representation
+```
 
-Spreadsheets, images and transcripts use their concrete locators. Unsupported detail remains accessible as original bytes/handle and is not silently treated as indexed.
+**Capture and convert.** Save the original under its source observation before conversion. Pass that retained file/stream to `DocumentConverter.convert`, not a URL that can now serve different bytes. Record converter/core versions, selected backend/options and requested page range on the job. Preserve returned status, errors and available coverage; `PARTIAL_SUCCESS` is returned even with `raises_on_error=True` in the inspected converter. A successful conversion of a requested page range is not coverage of the whole file. Useful partial elements remain readable; unavailable pages are not silently classified as empty.
+
+**Persist one representation.** A conversion-result observation links to the original source observation and to the immutable JSON blob, with its status and processing metadata. The same job publishes searchable excerpts as ordinary `memory` views with `address_kind = source_segment`, addresses including the conversion identity and chunking profile. Their links retain the contributing document-item references. Store only the excerpts needed for retrieval, not an alternative document database. Rechunking a retained representation does not rerun conversion; a new extraction is another representation of the same source, not independent evidence. Old handles continue to resolve their old representation or report its loss.
+
+**Use document structure without inventing precision.** Run the native chunker over `DoclingDocument`, retaining `doc_items`, headings and available provenance beside the chunk text. Use `contextualize` for search/model input when useful, but distinguish its heading/caption prefixes from a literal source quotation. In the inspected `HybridChunker`, plain-text splits reuse the parent chunk metadata; they do not compute a new exact source span for every segment. Merged chunks can reference several elements/pages; table splitting can repeat headers. Do not deduplicate distinct source occurrences by their shared text or count repeated headers as independent support. A fine quote/cell locator is used only when an actual mapping establishes it; otherwise expose the containing element/table and the real excerpt, not a fabricated exact bounding box.
+
+**Open without inference.** The locator carries the source observation, conversion-result identity and item references, plus a representation-specific subrange only when available. Resolve pointers against the retained JSON, then expose the saved text/table structure and available original page/region. Preserve `page_no`, bounding box, coordinate origin and page size together. `prov` can be empty; image cropping requires a page image and the correct coordinate conversion. Missing layout or image data does not prevent reading available text. Keep emitted assets referenced by the saved representation in controlled blob storage, or mark them unavailable before deleting a converter's temporary directory. Opening a citation never buys another OCR/model call or substitutes a newer file.
+
+These choices follow the inspected Docling/Core paths recorded under R-018. They do not establish extraction accuracy or installed compatibility. Spreadsheet cells, media timestamps and other format-native locators still require their own actual adapter mapping; a common document type does not prove those mappings. Retain original material and state the available precision instead of manufacturing them.
 
 ### 8.5 Reconsider affected grounds
 
@@ -621,16 +635,25 @@ Applying a vector updates derived fields for the matching content/profile. It do
 
 ### 9.4 Research
 
-The required Research adapter contract is:
+Use a narrow client of the existing Research MCP application boundary, not a new research executor or a second source corpus. The abstract result remains `status + findings/report + versioned sources + coverage/gaps`, but it is assembled from distinct operations, not assumed to be the response to starting work.
 
-```text
-question + scope + source constraints + budget
-→ status + report + source handles + examined coverage + gaps
-```
+Research at `7c034569b908d3b03a8b821b7c537477a24b10f7` has the following dispatcher/service paths. They establish callable code, not a qualified deployed Memory↔Research integration:
 
-Eliot Research owns acquisition and large corpora. Eliot stores the compact findings/alternatives needed later and links to the underlying sources.
+| Need | Existing path and actual distinction |
+|---|---|
+| Find existing material without synthesis | `eliotr_query` accepts only `FAST_SEARCH`; its response states `synthesis_status: NOT_REQUESTED`. Search hits are not a generated answer or corpus-completeness claim. |
+| Request synthesis/research | `eliotr_run` delegates to the run service and returns investigation/workflow identity. Save the exact configured request and resulting `workflow_instance_id` on the memory job; do not mark the question answered on admission. |
+| Read progress and discover output | `eliotr_run_status` reads that workflow. Inspect `answer.availability` and the returned `artifact_ref` separately from execution state; the inspected reader can return unavailable, and exposes a draft only through its supported result path. |
+| Read retained output and citations | `eliotr_report`, `eliotr_section`, `eliotr_citations` address the returned artifact/section revisions. Read actual section content, not just metadata; retain supplied coverage and gaps, without inventing fields absent from the response. |
+| Expand evidence | `eliotr_open` consumes a versioned evidence handle and optional byte range. `eliotr_source_read` pages a source revision only under the inspected managed-owner profile; it is not available to the service-token profile. |
 
-This contract is a required implementation target, not a claim of an existing endpoint.
+Configure the Research endpoint, explicit Memory-project→Research-project mapping and one existing authorized client profile. Do not assume equal project names are identity. In this revision, managed OAuth does not expose MCP cancel/recover, while service-token clients use project grants and cannot call `eliotr_source_read`. Use supported evidence opening for that profile and record any missing capability; do not impersonate the owner or create another authorization layer in Memory OS. Required changes belong to Research's existing application boundary. Current Access/grant checks remain there, not in every memory helper.
+
+The body wrapper for section/evidence reads returns `body.text`, byte length and selected source/range headers. Decode that envelope and retain the original range units; character counts are not UTF-8 byte offsets. An oversized body error is not an empty answer. Use available bounded reads or report the specific unsupported read. Do not refetch a live URL as if it were the cited revision.
+
+Keep the acquired report as an explicitly generated external result and preserve remote source/representation handles with the used excerpts. Publish useful findings through ordinary memory revisions with links to both the report and actual source material. Neither repeated citations nor copying the report creates independent supporting evidence. Large corpora and remote originals stay with Research unless explicitly imported; reconnection reads saved run/output references, not a newly launched investigation.
+
+The precise run-request profile, lost-admission idempotency path, report payload/section traversal and deployed credentials still require qualification in R-016. Research's selected simplification plan is not proof that its replacement runtime is already installed. Do not copy the old stage/receipt machinery into Eliot or build a compatibility framework around unselected API versions. Ordinary local recall continues when remote acquisition is unavailable.
 
 ## 10. Learning
 
@@ -837,8 +860,8 @@ Build vertical slices in this order.
 ### Slice 5 — Vectors, documents and research
 
 - controller batch embeddings;
-- Docling/source locators;
-- Research request/result adapter;
+- captured document → retained conversion → source-excerpt retrieval → exact representation open, including partial results;
+- selected Research MCP search/run/status/report/evidence adapter with explicit profile capabilities;
 - hybrid retrieval and richer sources.
 
 ### Slice 6 — Recovery and advanced improvement
