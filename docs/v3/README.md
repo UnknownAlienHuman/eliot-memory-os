@@ -9,11 +9,12 @@ V1 and V2 are donors. V3 is a greenfield implementation.
 1. [Architecture](ARCHITECTURE.md) — purpose, ownership, Base, extensions and non-goals.
 2. [Implementation](IMPLEMENTATION.md) — runtime, modules, data, narrow external contracts and implementation order.
 3. [Cognition](COGNITION.md) — current-work reconstruction, retrieval, learning, consolidation and self-improvement algorithms.
-4. [Active analysis registry](ANALYSIS-REGISTRY.md) — what was checked, exact gaps and the next work queue.
-5. [Audit conclusion](AUDIT.md) — evidence, root causes, rejected mechanisms and source limits.
-6. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for original requirements, audits and donors.
+4. [One-shot inference contract](INFERENCE-CONTRACT.md) — exact Memory↔controller boundary for profiles, disclosure, result readback and cleanup.
+5. [Active analysis registry](ANALYSIS-REGISTRY.md) — what was checked, exact gaps and the next work queue.
+6. [Audit conclusion](AUDIT.md) — evidence, root causes, rejected mechanisms and source limits.
+7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for original requirements, audits and donors.
 
-Architecture, Implementation and Cognition describe one product at increasing depth. The complete target is not a prerequisite for running Base. None of these documents is implemented product code.
+Architecture, Implementation and Cognition describe one product at increasing depth. `INFERENCE-CONTRACT.md` is the narrow cross-repository contract for one selected external boundary; it is not another architecture or workflow layer. The complete target is not a prerequisite for running Base. None of these documents is implemented product code.
 
 `ANALYSIS-REGISTRY.md` is the only active analysis ledger. `AUDIT-MAP.md` is the stable source/decision matrix; new work updates the registry rather than creating another chronological report.
 
@@ -46,7 +47,7 @@ retained episode + exact recipe revision + disclosure
 
 The first controller inference configuration is a small static `InferenceProfile`, not the old Governor route/capability platform and not the agent route's untyped `native_options`. It identifies only adapter/connection/model, `local|external` locality, automatic-use permission, finite input/output/time/concurrency limits and supported response formats. There is no implicit fallback to another provider, model, account, locality or billing path.
 
-Memory reduces contributing input to `local_only` or `external_allowed`. Protected input is not silently omitted to make a remote profile pass. Missing usage or cost remains unknown rather than zero. The controller retains result bytes until Memory confirms a durable copy, then its controlled duplicate must become releasable; erasure is incomplete while that copy remains.
+Memory reduces contributing input to `local_only` or `external_allowed`. Protected input is not silently omitted to make a remote profile pass. Missing usage or cost remains unknown rather than zero. The controller retains result bytes until Memory confirms a durable copy, then its controlled duplicate must become releasable; erasure is incomplete while that copy remains. The exact request/result/release lifecycle is defined in [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md).
 
 Real software-agent work with tools and continuation can still use controller Tasks/Attempts. One memory extraction request cannot justify copying that task system into Memory OS.
 
