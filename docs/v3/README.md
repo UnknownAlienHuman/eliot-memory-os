@@ -42,6 +42,28 @@ Repository delivery postmortems add a second causal layer: cheap deterministic b
 
 These rules constrain implementation and documentation. A new process artifact is justified only when a concrete product field cannot be represented by the existing owner and the new mechanism replaces or materially simplifies something already present.
 
+## Preserved goals, minimal mechanisms
+
+The old Architecture often stated the right intent: preserve sources, separate observation from interpretation, keep authority explicit, degrade locally, challenge false rules and prefer the simplest reversible mechanism. The later Implementation made many replaceable defaults globally mandatory. V3 keeps the intent and removes the machinery that is not needed by a connected product path.
+
+| Preserved goal | V3 minimum | Not carried forward by default |
+|---|---|---|
+| Resume interrupted work | Stable project/workspace/task address, retained observations and direct reconstruction | Universal Understanding State, route-continuation registry or mandatory checkpoint protocol |
+| Preserve source and provenance | Observation + immutable blob/range + exact source/revision handles | Separate EvidenceAtom, Truth Registry, evidence promotion service or receipt for every read |
+| Correct memory without rewriting history | One versioned memory item, revision history, grounds and current applicability | Global truth score, promotion ladder or dedicated correction subsystem |
+| Prevent repeated mistakes | Scoped negative memory or method revision returned by normal retrieval | FailureFingerprint platform, universal quarantine state or mandatory experiment campaign |
+| Deliver useful context | Exact/current-work lookup, lexical candidates, optional vector arm and bounded packet over actual revisions | Separate Context Compiler service, packet database or acknowledgement ceremony |
+| Learn from episodes | Finite Memory job, exact recipe revision, narrow one-shot inference, typed create/revise/no-change result and later consumer | Permanent Dreamer process, controller Task/Attempt for one completion or model-owned publication |
+| Add optional capabilities safely | Internal module and vertical increment; external process only for a real runtime/failure boundary | Crate/process per noun, mandatory `module.toml`, promotion contour or hot-swap framework for ordinary helpers |
+| Protect privacy and secrets | Disclosure propagated with content; deterministic check at the actual external-send boundary; controlled-copy release | General Governor policy engine, route classifier, approval packet or capability-evidence platform |
+| Recover after failure | One Store, source spool, native backup/restore, supervisor and idempotent operation/readback | Second recovery database, Operational Recovery State ontology or global Product Identity graph |
+| Keep authority explicit | Narrow application operations and authenticated external boundaries | One universal Governor for ordinary in-process calls or receipt-backed authority for every transition |
+| Improve methods from outcomes | Observed result linked to the exact method revision and a new revision when evidence changes it | Global intelligence score, StepOutcomeLedger or compulsory model judge |
+| Coordinate development | One issue, one branch/PR owner, one integrator and terminal disposition for overlap | Work-unit database, branch manager, generated inventory denominator or agent scheduler |
+| Verify product behavior | Lowest connected product edge that distinguishes the property; broader proof only at the corresponding boundary | Shape/module proof counted as product completion or full release identity for a local change |
+
+A mechanism enters V3 only after its real caller, owner, retained result and consumer are named. Until then the need remains a requirement or test case, not a new type, service, manifest, registry or process.
+
 ## Model execution without a second task manager
 
 Dreamer is the cognitive role of a finite Eliot learning job, not a permanent process or controller Task lifecycle.
