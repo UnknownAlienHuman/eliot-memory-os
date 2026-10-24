@@ -99,6 +99,10 @@
 | R-061 | Vertical completion criterion | Issue #3014; Architecture product path; Implementation §14 | `CHECKED` design | Completion requires shipped caller → owner admission → durable result or typed unknown → actual consumer/readback → restart/recovery. Types, ports, fixtures, receipts, plans and leaf compilation are intermediate evidence only. | Use this chain as the denominator for every implementation slice and later review. |
 | R-062 | Физическое дробление и manifest inversion | Root `Cargo.toml`; sampled `crates/smart/eliot-dreamer-bundle`, `eliot-cue-index` and `crates/meta/eliot-self-quality` manifests/source on `main` | `CHECKED` representative / `PARTIAL` corpus | Workspace содержит около 188 packages, а повторяющиеся 12–13 KiB per-module lifecycle/proof/promotion manifests превращают обычные helper-функции в отдельно управляемые продукты. V3 начинается одним Rust package и внутренними модулями; split разрешён только по реальной dependency, deployment или independently-changing boundary. | На implementation review оставлять обычный `mod`, пока не появится измеримая вторая граница. |
 | R-063 | Committed derived inventories as work | `.github/work-units/context-measurement-inventory.toml` and `long-lived-collection-inventory.toml` on `main` | `CHECKED` exact files | Generated repository scans with 126 and 408 candidates объявлены обязательными work-unit denominators и создают постоянную работу по синхронизации. Derived analysis является ephemeral; в Git попадает только реальный product input либо finite migration snapshot с owner и условием удаления. | Не переносить в V3; при cutover retire/archive после поиска реальных consumers. |
+| R-064 | Intent–mechanism inversion | Old Architecture A0.3–A0.6/A2.3/A10.6; old Implementation I0.4–I0.5/I6/I17–I18; current samples | `CHECKED` | Architecture прямо ставила intent выше literal compliance, требовала simplest reversible mechanism и запрещала append-only precedence. Implementation одновременно сделала content-addressed document identity, global Product Identity, module manifests, proof ladders and work schemas нормативным default. Антицеремониальный текст не ограничил производство церемоний. | V3 принимает механизм только после named caller/owner/result/consumer; replace/delete beats another corrective layer. |
+| R-065 | Crate-first decomposition as capacity target | Old Implementation document status/I17.17–I17.18; current ~188-member workspace | `CHECKED` design-to-structure correlation / `PARTIAL` causal attribution | Draft explicitly adopted crate-first micro-modularity, tens/low hundreds crates, three execution contours, `eliot-testd`, ModuleTestCapsules and generation promotion while saying crate count was not progress. The permitted capacity became the default architecture agents could satisfy locally. | One package/internal modules first; no contour, test daemon or generation lifecycle until one measured external/failure boundary needs it. |
+| R-066 | Identity/proof object multiplication | Old Implementation `NormativeDocumentIdentity`, conformance projection, Product Identity, CausalChangeUnit, ModuleTestCapsule, proof levels and receipts | `CHECKED` exact design constructs | Each object solved a local ambiguity, but together they formed a synchronization graph whose maintenance could outgrow the product edge. Generated projections did not remove the underlying owners, identities and invalidation work. | Use Git commit/schema migration/operation ID at actual boundaries; ordinary issue/PR text for development; product-edge evidence instead of proof-object families. |
+| R-067 | Anti-proxy rules lacked admission backpressure | Old Architecture/Implementation anti-ceremony clauses; issues #5305/#3014; current artifacts | `CHECKED` | The docs already said reports, tests, commits and forms were not progress and that prose instead of a discriminating artifact was failure. They did not make new artifact families wait for Product Proof or terminal overlap disposition, so agents could obey local contracts while the product remained disconnected. | Enforce one active ledger, one integrator, WIP stop, cheap preflight and no new mechanism before a connected need. |
 
 ## 3. Source coverage
 
@@ -122,6 +126,7 @@
 | S-016 | Direct IPC and provider transport donors | `CHECKED` для `swarm-client`, OpenCode HTTP/config, controller Cargo and reqwest 0.13.5 feature table; Hy-Memory provider path already partial | Установлены no-replay IPC, loopback HTTP hardening, private-file pattern and missing current TLS feature. Provider/model quality/live compatibility не проверены. |
 | S-017 | Repository delivery-collapse evidence | `CHECKED` для owner-authored issues #5305, #3014, #327 и current retained process surfaces | Подтверждены failure mechanisms и explicit anti-duplication decisions; полный текущий census всех branches/PRs/issues не обновлялся. |
 | S-018 | Workspace/manifests/generated-inventory sample | `CHECKED` для root `Cargo.toml`, exact sampled crate paths and exact two inventory files | Подтверждён повторяющийся механизм, но не заявлен полный semantic audit всех ~188 crates или каждого work-unit файла. |
+| S-019 | `ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md` and `ELIOT_IMPLEMENTATION(10)(1).md` retained library copies | `CHECKED` targeted sections named by R-064–R-067 | Exact intent/mechanism clauses inspected; not a fresh line-by-line audit of both complete books. |
 
 ### Источники прохода 2026-10-24 — controller implementation boundary
 
@@ -194,7 +199,10 @@
 - не считать prose, LOC, commits, agents, issues или PRs заменой merged product behavior;
 - не создавать crate/process на каждый concept или helper до реальной dependency/deployment/change boundary;
 - не переносить per-helper proof/promotion/lifecycle manifests в V3 по умолчанию;
-- не считать generated repository inventory живым authority или обязательным denominator после завершения конечной миграционной работы.
+- не считать generated repository inventory живым authority или обязательным denominator после завершения конечной миграционной работы;
+- не вводить `NormativeDocumentIdentity`, global `Product Identity`, `CausalChangeUnit` или `ModuleTestCapsule` как обязательные V3 work objects;
+- не строить three-contour execution fabric, separate test daemon или generation-promotion path до доказанной runtime/failure boundary;
+- не исправлять антицеремониальный rule добавлением ещё одного rule/projection/receipt.
 
 ## 5. Очередь
 
@@ -203,8 +211,9 @@
 | P1 | Синхронизировать Architecture/Implementation/Cognition с Contract 0.3: direct IPC, connection/profile split, actual destination, controlled input/result, `inference.release`, closed adapter IDs; README уже синхронизирован | R-024, R-050–R-057 |
 | P1 | В controller реализовать first production slice: caller role/allowlist, profile/connection parser, custom input staging, exact dedup, one Operation runner, loopback text adapter, pending-result recovery, public receipt/grant and release — без Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-057 |
 | P1 | Параллельно продолжать Memory Base Slices 1–2 независимо от model routes | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
-| P1 | До начала каждого implementation slice зафиксировать одного integrator, product-edge denominator, дешёвые preflight checks и terminal disposition для overlap; не добавлять process infrastructure | R-058–R-061 |
-| P1 | Начать V3 одним Rust package и внутренними модулями; второй crate/process допускается только после измеримой границы и должен упростить существующий путь | R-033, R-062 |
+| P1 | До начала каждого implementation slice зафиксировать одного integrator, product-edge denominator, дешёвые preflight checks и terminal disposition для overlap; не добавлять process infrastructure | R-058–R-061, R-067 |
+| P1 | Начать V3 одним Rust package и внутренними модулями; второй crate/process допускается только после измеримой границы и должен упростить существующий путь | R-033, R-062, R-065 |
+| P1 | Применять README goal→minimal-mechanism table как admission filter: unnamed caller/owner/result/consumer остаётся требованием, а не новым object family | R-064, R-066, R-067 |
 | P1 | После Base подключить learning через pinned direct IPC client and exact result lifecycle | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057 |
 | P2 | Добавить loopback embeddings through the same lifecycle, затем vector handler/query | R-015, R-034, R-048, R-050–R-057 |
 | P2 | Добавить direct HTTPS adapter только после explicit TLS feature/qualification | R-050, R-057 |
@@ -230,3 +239,4 @@
 | 2026-10-24 / `0da78d29` | Contract 0.3: direct swarm-client IPC, connection/profile split, actual destination and versioned loopback text/embedding adapters; direct HTTPS separated by explicit TLS dependency. |
 | 2026-10-24 / `c1401bb2` | AGENTS/README закрепили delivery-collapse causes, one-ledger/product-edge discipline и Contract 0.3 terminology; добавлены R-058–R-061/S-017. |
 | 2026-10-24 / `4fcee2f6` | Representative physical/process pass: ~188-member workspace, per-helper module manifests and committed generated inventories recorded as V3 anti-patterns. |
+| 2026-10-24 / `561fe900` | Старые цели сведены к minimal mechanisms; intent–mechanism inversion, crate-first expansion and identity/proof multiplication added as R-064–R-067/S-019. |
