@@ -1,5 +1,26 @@
 # Development workflow
 
+## Current phase: V3 documentation, V1/V2 donors
+
+The owner selected a fresh V3 implementation after documentation is refined.
+[V3 navigation](docs/v3/README.md) and
+[architecture authority](docs/ARCHITECTURE_CONTRACT.md) define that version
+boundary. Read the V3 Architecture/Implementation and relevant audit evidence
+for a V3 design change. The generated routing block below applies to retained
+V2 surfaces; it does not turn old physical architecture or delivery waves into
+requirements for V3.
+
+This phase permits the requested consolidated audit and documentation changes.
+It does not start runtime implementation, migrate data, close old programmes,
+or change CI. The V2 ACTIVE registry and validators remain unchanged and still
+encode their former programmes as active; this revision does not claim a
+machine-enforced freeze. The owner's task scope governs agent work.
+
+The independent writer/verifier/integration roles and required merge checks
+below remain applicable. Future product development follows the owner's order:
+product code, minimum relevant checks/Clippy, tests after the product is built.
+Do not apply a V2 test-first or audit-factory programme to the present prose task.
+
 <!-- eliot-doc-routing:start -->
 ## Mandatory documentation routing
 
@@ -38,6 +59,7 @@ Upstream synchronization is root-owned and controller-only. While online agents
 are active, the root controller performs the coordinated upstream fetch
 approximately hourly, and also at an explicit integration boundary when needed,
 then publishes an authority receipt recording:
+
 - remote URL;
 - upstream ref (`refs/heads/main` / `origin/main`);
 - commit SHA;
@@ -54,10 +76,11 @@ updating refs.
 Canonical navigation:
 
 - Architecture authority: `docs/ARCHITECTURE_CONTRACT.md`;
-- exact pair identity: `docs/normative-pair.toml`;
-- product/source map: `docs/PROJECT_MAP.md`;
+- V3 proposal and current documentation stage: `docs/v3/README.md`;
+- historical V2 pair identity: `docs/normative-pair.toml`;
+- retained V2 source map: `docs/PROJECT_MAP.md`;
 - documentation map: `docs/README.md`;
-- active programmes: `workstreams/ACTIVE.toml`;
+- retained V2 programme/branch registry: `workstreams/ACTIVE.toml` (not migrated by this revision);
 - repository agent rules: `AGENTS.md`.
 
 ## Work lifecycle
@@ -68,9 +91,9 @@ open issue with owner, causal property, scope, proof, and non-goals
 → verify local worktree and base commit against authority receipt (no fetch/pull by workers)
 → create a fresh issue-numbered branch from verified base commit
 → claim one mutable path scope
-→ route, verify, and read the bounded documentation bundle
-→ implement and run Module/Edge/Product proof as applicable
-→ report read-only agent operations; escalate to manager audit on drift/anomaly
+→ read the version-appropriate documentation and exact supporting sources
+→ complete the scoped change and run checks appropriate to its actual behavior
+→ report concrete anomalies and obtain independent review of the disputed property
 → open PR to main with read receipt, authority receipt, and attestation
 → integrate by squash after current-main and proof checks
 → close issue and retire the branch
@@ -116,31 +139,22 @@ the integration owner revalidates consumers after the contract change.
 
 ## Agent operations and audit escalation
 
-Agent operations operate under strict least-privilege governance:
-
-- **Read-only Antigravity operations reporting**: Antigravity is used for
-  read-only operational reporting, session state inspection, routing receipts,
-  and diagnostic telemetry. It does not possess completion, truth-promotion,
-  or patch-application authority, and must never be invoked recursively.
-- **Mandatory manager audit escalation**: Managers must immediately trigger a
-  bounded audit and assign an independent, different verifier when any of the
-  following conditions occur:
-  - *Scope drift*: mutation outside the assigned mutable path scope or issue
-    boundaries;
-  - *Forbidden commands*: attempts to execute uncoordinated `git fetch`,
-    `git pull`, `git push`, unauthorized network calls, or workflow mutations;
-  - *Unsupported claims*: assertions of completion or conformance lacking exact
-    evidence;
-  - *Missing tests*: code changes without matching unit, regression, or edge
-    proofs;
-  - *Provider/session anomalies*: Governor denials, session instability, stale
-    projections, or anomalous tool outputs.
+Keep agent operations inside their assigned scope and available permissions.
+Report a concrete source, change, or failed operation when scope drift,
+unsupported completion claims, stale inputs, or session/provider failures occur.
+Have an independent reviewer examine the disputed property and repair the
+responsible contract or implementation. Do not create a new audit programme for
+every routine error, use a diagnostic report as completion authority, or retry
+an unauthorized action through another route. Read-only reviewers do not need
+additional mutable worktrees. A specific external harness's telemetry API is
+not a prerequisite for ordinary repository work.
 
 ## Documentation and evidence placement
 
 Keep in Git:
 
-- current canonical Architecture and Implementation;
+- the current V3 design proposal and retained V2 reference pair;
+- the owner-requested consolidated V3 audit and stable decision rationale;
 - stable operator/developer documentation;
 - ADRs for accepted load-bearing decisions;
 - generated projections only when an active consumer and regeneration check
@@ -149,14 +163,15 @@ Keep in Git:
 
 Do not keep in the active tree:
 
-- historical audits, recovery programmes, progress logs, or one-off reports;
+- raw historical audit packages, recovery dumps, progress logs, or unrelated one-off reports;
 - donor research packages or reverse-engineering dumps;
 - copies of documentation owned by Eliot Search or Eliot Research;
 - swarm conversations/results;
 - local databases, code-graph snapshots, runtime state, or credentials;
 - generated documentation bundles or read receipts.
 
-Investigation findings belong in the owning issue/PR. Large generated evidence
+V3 design findings belong in the consolidated audit and corresponding issue/PR.
+Temporary investigations need not create another maintained document. Large generated evidence
 belongs in CI artifacts or an external content-addressed store. Retired content
 remains recoverable from Git history; it is not copied into an `archive/`
 directory that agents may mistake for current authority.
