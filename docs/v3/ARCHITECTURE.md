@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.6 · 2026-10-24 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.7 · 2026-10-24 · normative design for the greenfield rewrite.**
 
 V1 and V2 are donors. V3 is a new implementation, not a compatibility migration.
 
@@ -66,7 +66,7 @@ The controller may execute one model request for Eliot, but it does **not** own 
 
 **Dreamer** means model-assisted interpretation for a concrete finite Eliot job. It is not a permanent daemon, model vendor, special database, separate scheduler or second canonical writer.
 
-A learning handler freezes finite input and one exact processing-method revision, builds an exact request, calls the configured controller inference boundary outside the Store transaction, retains the verified result, decodes a purpose-specific response and publishes ordinary memory revisions. Deterministic reducers and embeddings do not become Dreamer jobs merely because they use computation.
+A learning handler freezes finite input and one exact processing-method revision, builds an exact request, calls the configured controller inference boundary outside the Store transaction, retains the verified result when one exists, decodes a purpose-specific response and publishes ordinary memory revisions. Deterministic reducers and embeddings do not become Dreamer jobs merely because they use computation.
 
 ### 2.2 One-shot inference is not agent orchestration
 
@@ -75,7 +75,7 @@ The first learning extension needs this semantic operation:
 ```text
 exact input + selected profile + disclosure + finite limits + stable request key
 → complete | partial | failed | unknown
-→ exact returned body + requested/observed execution facts
+→ exact returned body when present + requested/observed execution facts
 ```
 
 Memory calls narrow controller operations through the existing authenticated local IPC client:
@@ -116,7 +116,7 @@ Controller configuration owns two small static records.
 - finite input, output, timeout and concurrency limits;
 - supported response formats.
 
-The resolved profile inherits `actual_destination` from its connection. Controller computes an immutable digest over non-secret behavior-changing fields and freezes the resolved snapshot on admission. Reconfiguration affects a new explicit request; it cannot mutate an admitted Operation.
+The resolved profile inherits `actual_destination` from its connection. Controller computes immutable non-secret connection/profile digests and freezes the resolved snapshot on admission. Reconfiguration affects a new explicit request; it cannot mutate an admitted Operation.
 
 Memory selects only a profile name. It does not receive provider secrets or construct arbitrary headers, query parameters, provider extras or fallback ladders.
 
@@ -124,18 +124,18 @@ There is no implicit fallback. An unavailable connection, profile, provider, mod
 
 ### 2.4 Disclosure is checked at the actual send boundary
 
-Memory reduces the material actually supplied to one value:
+Memory reduces material actually supplied to one value:
 
 ```text
 local_only
 external_allowed
 ```
 
-Project configuration supplies the default; a source may be stricter. Derived content cannot widen the strictest source it still contains or reveals. Mixed input uses the strictest contributing class. Reuse scope does not widen disclosure.
+Project configuration supplies default; a source may be stricter. Derived content cannot widen the strictest source it still contains or reveals. Mixed input uses strictest contributing class. Reuse scope does not widen disclosure.
 
-`local_only` requires a connection whose `actual_destination` is `local`. Protected material is not silently omitted to make an external profile pass. The job waits or fails with a specific profile/disclosure gap; it is not successful no-change and does not mark input processed.
+`local_only` requires a connection whose `actual_destination` is `local`. Protected material is not silently omitted to make an external profile pass. Job waits or fails with specific profile/disclosure gap; it is not successful no-change and does not mark input processed.
 
-These are deterministic checks at the controller's actual provider-send boundary. They do not justify a general Governor, route classifier, approval ceremony, capability registry, portfolio planner or per-call proof package.
+These checks belong to controller admission after it resolves actual connection/profile. Memory must not infer destination from loopback address or stale duplicate config. This boundary does not justify general Governor, route classifier, approval ceremony, capability registry, portfolio planner or per-call proof package.
 
 ### 2.5 Controlled request and result copies have finite lifetime
 
@@ -146,15 +146,27 @@ inference_input
 inference_result
 ```
 
-The exact input is staged before provider I/O without copying raw content into generic Operation JSON. The exact visible result is retained long enough for readback after disconnect or restart.
+Exact input is staged before provider I/O without copying raw content into generic Operation JSON. Exact visible result, when one exists, is retained long enough for readback after disconnect or restart.
 
-Memory reads the result in bounded ranges, verifies length and digest, and durably copies it into its existing job/blob before decoding. It then calls idempotent `inference.release`, which removes **both** controller-owned content artifacts when present and retains only bounded text-free deduplication/status facts.
+Successful result path:
 
-Until release completes, the input/result artifacts are controlled duplicate content. Release failure does not invalidate a verified Memory copy, but it remains visible and prevents a claim of complete erasure. Provider-held copies are an external boundary; controller-managed files are not.
+1. Memory reads result in bounded ranges;
+2. verifies length/digest;
+3. durably copies it into existing job/blob;
+4. calls `inference.release(memory_copy_verified)`.
+
+Other cleanup paths remain first-class:
+
+- rejected, failed or queued-cancelled terminal Operation without result uses `terminal_without_result` to remove retained input;
+- unresolved work selected for physical erase uses explicit `abandon_for_erasure`, which fences future controller dispatch/settlement/publication before cleanup.
+
+Controller tracks input and result cleanup independently. One removed file cannot hide another retained, mismatched or unknown copy. Aggregate `released` is valid only when every created controller content artifact is removed or verified already absent.
+
+Release failure does not invalidate a verified Memory copy, but remains visible and prevents complete erasure. `abandon_for_erasure` cannot prove that provider execution, storage or billing did not occur. Provider-held copies/effects are an external boundary; controller-managed files are not.
 
 ### 2.6 User intent and factual reports remain distinct
 
-The user owns goals and preferences, not infallibility about external facts. Preserve an explicit change of intent as such. Preserve a factual assertion with its source, conditions and possible counterevidence. A generated continuation, learned method or retrieved suggestion cannot silently replace the user's goal, relax its criteria or grant execution authority.
+The user owns goals and preferences, not infallibility about external facts. Preserve explicit change of intent as such. Preserve factual assertion with source, conditions and possible counterevidence. Generated continuation, learned method or retrieved suggestion cannot silently replace user goal, relax criteria or grant execution authority.
 
 ## 3. Product shape
 
@@ -169,7 +181,7 @@ The initial product is:
 - ordinary internal modules;
 - optional outbound clients constructed only when enabled.
 
-A new process is justified only by a real external runtime or failure boundary. A new crate is justified only by an actual dependency, deployment or independently changing boundary. A noun in the design is not an instruction to create a registry, protocol, actor, state machine or service.
+A new process is justified only by real external runtime or failure boundary. A new crate is justified only by actual dependency, deployment or independently changing boundary. A noun in design is not instruction to create registry, protocol, actor, state machine or service.
 
 One stored mutable state has one application mutation owner. This does not mean one permitted author, one interpretation or one source. Dashboards, packets, scores, maps and status reports are views unless they own independent state.
 
@@ -182,9 +194,9 @@ Keep four responsibility layers:
 3. **external I/O** — Store, host, controller inference, document and Research adapters;
 4. **surfaces/runtime** — CLI, MCP/hooks, process startup and composition.
 
-These are dependency boundaries, not four processes or a compulsory `interface → facade → service → repository` chain. Internal calls use typed Rust values. Serialization belongs at actual storage, process or network boundaries. Add a trait only where a real interchangeable I/O boundary exists.
+These are dependency boundaries, not four processes or compulsory `interface → facade → service → repository` chain. Internal calls use typed Rust values. Serialization belongs at actual storage, process or network boundaries. Add trait only where real interchangeable I/O boundary exists.
 
-An extension is a vertical capability across the layers it actually uses. It adds a real writer/handler and real consumer to existing operations; it does not build a miniature platform with its own scheduler, database, context compiler and supervisor.
+An extension is a vertical capability across layers it actually uses. It adds real writer/handler and consumer to existing operations; it does not build miniature platform with scheduler, database, context compiler and supervisor.
 
 ### 3.2 Useful Base, then additive capabilities
 
@@ -198,9 +210,9 @@ An extension is a vertical capability across the layers it actually uses. It add
 - restart, spool, backup/restore and erase for retained Base data;
 - direct status and control.
 
-Base is a useful limited product, not a claim of automatic learning.
+Base is useful limited product, not claim of automatic learning.
 
-The first learning extension closes one connected loop:
+First learning extension closes one connected loop:
 
 ```text
 retained episode
@@ -209,140 +221,131 @@ retained episode
 → retained typed create/revise/no-change result
 → ordinary memory revision
 → changed later context
-→ controller input/result copies released
+→ controller input/result copies released or exact cleanup gap reported
 ```
 
-Vectors, project understanding, documents, Research, more hosts and richer cognition are independent increments. They reuse the same records, finite jobs, revision publication, context assembly and maintenance path. There is no separate Lite database, Full memory engine or compulsory all-module installation.
+A terminal no-result Operation still closes its cleanup edge without fabricating cognitive no-change.
 
-Optional means optional in construction, startup and execution. A failed or disabled extension cannot disable capture, exact reads or source opening. Disabling a producer stops new work without deleting readable retained knowledge. Re-enabling it does not require a full-corpus rebuild before ordinary use.
+Vectors, project understanding, documents, Research, more hosts and richer cognition are independent increments. They reuse same records, finite jobs, revision publication, context assembly and maintenance path. There is no separate Lite database, Full memory engine or compulsory all-module installation.
+
+Optional means optional in construction, startup and execution. Failed/disabled extension cannot disable capture, exact reads or source opening. Disabling producer stops new work without deleting readable retained knowledge. Re-enabling does not require full-corpus rebuild before ordinary use.
 
 ## 4. Identity and memory invariants
 
 ### 4.1 Project, workspace, work identity and environment are different
 
-A project is a configured scope of work; it need not be a Git repository. A workspace identifies one working instance. A task or actor/session address identifies continuing work. Path, branch, commit, resource version and time describe changing environment.
+A project is configured scope of work; it need not be Git repository. Workspace identifies one working instance. Task or actor/session address identifies continuing work. Path, branch, commit, resource version and time describe changing environment.
 
 Therefore:
 
-- switching branch does not erase a continuing goal or commitment;
-- a result from checkout B does not establish checkout A's current condition;
+- switching branch does not erase continuing goal/commitment;
+- result from checkout B does not establish checkout A's condition;
 - fork and explicit transfer retain relations rather than silently renaming work;
-- a late result keeps the binding captured when it was issued;
-- unknown association limits claims about that resource but does not block preservation of the input.
+- late result keeps binding captured when issued;
+- unknown association limits claims about resource but does not block preserving input.
 
-There is no universal workspace generation whose mismatch disables the whole project.
+There is no universal workspace generation whose mismatch disables whole project.
 
 ### 4.2 Preserve before interpretation
 
-Permitted source events are stored before model interpretation. Missing models, embeddings, maps or external services cannot destroy the original or prevent direct readback.
+Permitted source events are stored before model interpretation. Missing models, embeddings, maps or external services cannot destroy original or prevent direct readback.
 
-Replay is deduplicated by source identity, not text equality. Distinct real occurrences remain distinct even when their text matches. Several IDs, summaries or representations of one event do not create independent corroboration.
+Replay is deduplicated by source identity, not text equality. Distinct occurrences remain distinct even when text matches. Several IDs, summaries or representations of one event do not create independent corroboration.
 
 ### 4.3 Source, representation and claim are different
 
-An observation records what a source supplied, not that every statement inside it is true. A claim, explanation, method, prediction or project view is derived knowledge.
+Observation records what source supplied, not that every statement is true. Claim, explanation, method, prediction or project view is derived knowledge.
 
-Derived knowledge retains exact source handles and revisions. Retrieval does not strengthen support. Model-generated IDs are not source evidence. Exact names, versions, values, negations, limitations and counterexamples travel with a useful summary.
+Derived knowledge retains exact source handles/revisions. Retrieval does not strengthen support. Model-generated IDs are not evidence. Exact names, versions, values, negations, limitations and counterexamples travel with useful summary.
 
-A source object, its version and a transformed representation have different identities. Rename, copy, conversion, crop and export retain explicit relations. Similarity or equal bytes alone do not prove identity, continuity or independent support.
+Source object, version and transformed representation have different identities. Rename, copy, conversion, crop and export retain explicit relations. Similarity/equal bytes do not prove identity, continuity or independent support.
 
 ### 4.4 Current value and history are different
 
-Corrections create revisions. Historical evidence remains openable after current applicability changes. Incompatible alternatives may coexist. Removing a successor does not automatically restore its predecessor as current.
+Corrections create revisions. Historical evidence remains openable after current applicability changes. Incompatible alternatives may coexist. Removing successor does not automatically restore predecessor.
 
-Occurrence time, stated validity, receipt time and editorial revision time answer different questions. A late import or newly written summary does not become a fresh observation of the world.
+Occurrence time, stated validity, receipt time and editorial revision time answer different questions. Late import/new summary is not fresh world observation.
 
 ### 4.5 Origin, reuse scope and disclosure are different
 
-Every item retains where it came from. Reusable methods separately state where they may be considered:
+Every item retains origin. Reusable methods separately state where they may be considered: origin project, selected projects or local owner's projects.
 
-- origin project only;
-- selected projects;
-- the local owner's projects.
+Reuse never erases origin, material conditions, counterexamples or disclosure limits. Permission to consider method elsewhere does not prove workspace/task/version conditions and does not authorize sending sources to model.
 
-Reuse never erases origin, material conditions, counterexamples or disclosure limits. Permission to consider a method elsewhere does not prove its workspace-, task- or version-specific conditions and does not authorize sending its sources to a model.
-
-A generalized method may be `external_allowed` while a supporting episode remains `local_only` only when the generalized content no longer contains or reveals protected material. Otherwise the stricter disclosure remains.
+Generalized method may be `external_allowed` while supporting episode remains `local_only` only when generalized content no longer contains/reveals protected material. Otherwise stricter disclosure remains.
 
 ### 4.6 Grounds are explicit enough to revise
 
-A conclusion may depend on:
+A conclusion may depend on all members of required group, one of alternative groups, advisory support, or navigation links carrying no evidential meaning.
 
-- all members of one required grounds group;
-- one of several alternative groups;
-- advisory supporting material;
-- navigation links that carry no evidential meaning.
-
-Eliot does not infer Boolean meaning from citation count. Unknown composition remains unknown. A material source change triggers targeted reconsideration of affected conclusions, not a whole-graph proof before every read. Cycles supply no independent support.
+Eliot does not infer Boolean meaning from citation count. Unknown composition remains unknown. Material source change triggers targeted reconsideration, not whole-graph proof before every read. Cycles supply no independent support.
 
 ### 4.7 Support, exposure and influence are separate
 
-Existence, evidential support, retrieval exposure and advisory influence answer different questions. A frequently retrieved item is not thereby verified. An archived observation is not thereby false. An untested hypothesis can be useful when shown conditionally. Known refutation accompanies affected guidance rather than being replaced by a generic score.
+Existence, support, retrieval exposure and advisory influence answer different questions. Frequently retrieved item is not thereby verified. Archived observation is not false. Untested hypothesis can be useful conditionally. Known refutation accompanies affected guidance rather than becoming generic score.
 
-These distinctions live on ordinary records and links. They do not require a truth registry, universal confidence score or promotion ladder before capture.
+These distinctions live on ordinary records/links. They do not require truth registry, universal confidence score or promotion ladder before capture.
 
 ### 4.8 Forgetting is not one operation
 
 | Operation | Meaning |
 |---|---|
 | Reduce exposure | Show less often while permitted history remains |
-| Withdraw influence | Stop guidance in the stated situation |
-| Supersede/refute | Publish a scoped replacement or contradiction |
-| Erase scope | Remove controlled source and derivatives, including staged data, controlled backups and controller inference input/result copies |
+| Withdraw influence | Stop guidance in stated situation |
+| Supersede/refute | Publish scoped replacement or contradiction |
+| Erase scope | Remove controlled source/derivatives, staged data, controlled backups and every created controller inference copy |
 
-Already delivered provider copies are an external boundary. Restore cannot silently revive a known current deletion.
+Already delivered provider copies/effects are external boundary. Restore cannot silently revive known deletion. Erasure of unresolved Operation requires explicit abandonment and cannot be reported as proof of provider-side deletion/non-execution.
 
 ## 5. Current work and decision context
 
 Current work is addressed before similarity search.
 
-When the host supplies a usable task/session identity, Eliot opens that continuation directly, merges relevant later observations and then retrieves related experience. A branch or workspace alone does not distinguish every concurrent task. A cancelled or superseded direction does not become current because it is semantically similar.
+When host supplies usable task/session identity, Eliot opens continuation directly, merges relevant later observations and then retrieves related experience. Branch/workspace alone does not distinguish every concurrent task. Cancelled/superseded direction does not become current because semantically similar.
 
-A decision packet contains only material that can change the next action:
+Decision packet contains only material that can change next action:
 
-- current goal and known criteria;
+- current goal and criteria;
 - current plan, progress and open commitments;
-- exact constraints and explicit corrections;
-- applicable or conditional methods;
-- relevant prior episodes and material exceptions;
+- exact constraints/corrections;
+- applicable/conditional methods;
+- relevant prior episodes/exceptions;
 - dissent, uncertainty and missing checks;
-- source handles for expansion.
+- source handles.
 
-Exact values and qualifications travel together. A high-ranked method cannot crowd out its own exception. Prefer a concise qualified unit or a specific omission with an expansion handle over a misleading fragment. Empty sections add no filler.
+Exact values and qualifications travel together. High-ranked method cannot crowd out its own exception. Prefer concise qualified unit or specific omission with expansion handle over misleading fragment. Empty sections add no filler.
 
-Eliot supports:
+Eliot supports reactive context at real host boundary, explicit retrieval/open and optional model-assisted orientation for concrete question.
 
-- reactive context at a real host boundary;
-- explicit retrieval/open;
-- optional model-assisted orientation for a concrete question.
+Useful recall must not depend solely on agent remembering to ask. Prepared context is not handoff; handoff is not use; use is not success. Host without push hooks can pull at next supported boundary. Do not wake stopped agent for bookkeeping.
 
-Useful recall must not depend solely on an agent remembering to ask. Prepared context is not handoff; handoff is not use; use is not success. A host without push hooks can pull at its next supported boundary. Do not wake a stopped agent merely for bookkeeping.
-
-Advice and enforcement are separate. Negative memory is advisory by default. A host-enforced rule is explicit, narrow and opt-in.
+Advice and enforcement are separate. Negative memory is advisory by default. Host-enforced rule is explicit, narrow and opt-in.
 
 ## 6. Understanding
 
-A project view is a reconstructible, revisable answer to one useful question over an examined scope: purpose, boundaries, responsibilities, consumers, rationale, failed approaches or discrepancy between intended and observed behavior.
+A project view is reconstructible, revisable answer to useful question over examined scope: purpose, boundaries, responsibilities, consumers, rationale, failed approaches or intended-versus-observed discrepancy.
 
-Exact structure comes from actual sources and tools. Semantic explanation may use a learning handler. Intended behavior, observed implementation and inferred explanation remain distinguishable.
+Exact structure comes from sources/tools. Semantic explanation may use learning handler. Intended behavior, observed implementation and inferred explanation remain distinguishable.
 
 Project understanding is incremental:
 
-- first contact returns available exact facts immediately;
-- a bounded orientation job creates useful views;
+- first contact returns exact facts immediately;
+- bounded orientation job creates useful views;
 - source changes refresh affected views only;
-- a new consumer can invalidate a complete-set claim without changing old cited files;
-- failed refresh leaves the prior qualified view and direct source access available.
+- new consumer can invalidate complete-set claim without changing old cited files;
+- failed refresh leaves prior qualified view and direct source access.
 
-Understanding is not a compulsory pyramid, onboarding ceremony or placeholder card. The same source/view mechanism applies to Eliot itself. A summary or health check cannot certify that architecture is implemented; no separate self-model registry is needed.
+Understanding is not compulsory pyramid, onboarding ceremony or placeholder card. Same source/view mechanism applies to Eliot itself. Summary/health check cannot certify architecture implementation; no separate self-model registry needed.
 
 ## 7. Learning and self-improvement
 
 Initial learning changes external memory, methods, context construction and selected configurable strategies. It does not require model-weight training.
 
-Once a learning purpose and permitted profile are configured, Eliot may automatically interpret selected episodes, publish provisional lessons and revise connected methods through its ordinary write path. Reversible improvements do not require a vote, promotion ceremony or experiment before every suggestion. They cannot change permissions, user goals or external task acceptance.
+Once learning purpose and permitted profile are configured, Eliot may automatically interpret selected episodes, publish provisional lessons and revise methods through ordinary write path. Reversible improvements do not require vote, promotion ceremony or experiment before every suggestion. They cannot change permissions, user goals or external task acceptance.
 
 ### 7.1 One Memory job owns the semantic loop
+
+Successful result path:
 
 ```text
 frozen sources + exact recipe revision + disclosure
@@ -350,125 +353,145 @@ frozen sources + exact recipe revision + disclosure
 → direct authenticated controller IPC
 → controller inference_input + one inference Operation
 → frozen InferenceConnection / InferenceProfile behavior
-→ controller inference_result or typed failure/unknown
+→ controller inference_result
 → Memory range read + length/digest verification + durable copy
 → purpose-specific decoder
 → atomic publication or valid no-change
 → later consumer
-→ inference.release for controller input/result copies
+→ inference.release(memory_copy_verified)
 ```
 
-The controller owns only configured connection, adapter execution, Operation identity/readback and temporary controlled artifacts. It does not claim, complete or mutate the Memory job.
+Terminal no-result path:
 
-Store conflicts replay the retained result, not the model call. A request with ambiguous external outcome remains unknown until native readback resolves it or the Memory owner chooses a new explicit attempt. A new request ID is not recovery.
+```text
+rejection / failed attempt without result / queued cancellation
+→ no cognitive body and no no-change
+→ inference.release(terminal_without_result)
+→ retained input copy removed or exact cleanup gap
+```
+
+Erasure of unresolved path:
+
+```text
+queued / sending / unknown Operation selected for erase
+→ inference.release(abandon_for_erasure)
+→ controller fences future dispatch/settlement/publication
+→ controlled copies removed when exact
+→ provider effect/copy remains external unknown
+```
+
+Controller owns configured connection, adapter execution, Operation identity/readback and temporary artifacts. It does not claim, complete or mutate Memory job.
+
+Store conflicts replay retained result, not model call. Ambiguous external outcome remains unknown until native readback resolves or owner explicitly abandons it. New request ID is not recovery.
 
 ### 7.2 Model-independent cognitive contract
 
-The processing method and result schema define the cognitive operation. A profile selects a versioned adapter, connection and requested model. Interface compatibility does not guarantee equal quality.
+Processing method and result schema define cognitive operation. Profile selects versioned adapter, connection and requested model. Interface compatibility does not guarantee equal quality.
 
-Retain with the result:
+Retain:
 
-- profile digest and adapter ID;
-- non-secret connection identity and `actual_destination`;
-- requested and observed model/provider facts;
-- observed finish, limits, usage and cost when supplied;
-- unknown fields as unknown rather than zero or inferred.
+- profile and connection digests plus adapter ID;
+- `actual_destination`;
+- requested/observed model/provider facts;
+- observed finish, limits, usage/cost when supplied;
+- unknown fields as unknown, not zero/inferred;
+- input/result cleanup states independently.
 
-A text job consumes its exact processing-method revision. Embeddings consume a selected embedding profile. Deterministic reducers need neither. A stored proposal changes behavior only when a real consumer reads it.
+Text job consumes exact processing-method revision. Embeddings consume selected profile. Deterministic reducers need neither. Stored proposal changes behavior only when real consumer reads it.
 
 ### 7.3 Outcome attribution
 
-Where an external action can actually be correlated, retain the exact method revision offered or used. Otherwise preserve the episode without invented attribution. Distinguish:
+Where external action can be correlated, retain exact method revision offered/used. Otherwise preserve episode without invented attribution. Distinguish offered, handed off, action observed, adherence inferred/unknown, outcome observed and comparative benefit supported/unknown.
 
-- offered;
-- handed off;
-- action observed;
-- adherence inferred or unknown;
-- outcome observed;
-- comparative benefit supported or unknown.
+One attributable attempt/criterion contributes once. Replayed hooks/summaries are not independent successes. Missing correlation limits evaluation; it does not block capture, retrieval or provisional learning.
 
-One attributable attempt/criterion contributes once. Replayed hooks and summaries are not independent successes. Missing correlation limits evaluation; it does not block capture, retrieval or provisional learning.
+### 7.4 No-change, partial and cleanup
 
-### 7.4 No-change and partial results
+No-change is valid only for cognitive work completed on supplied input. It is not mandatory explanation after every event.
 
-No-change is valid only for work actually completed on the supplied input. It is not a mandatory explanation after every event.
+Unavailable/disallowed profile, admission rejection, provider failure, no result, malformed output, missing fields, truncation, unresolved execution and partial processing are not successful no-change. Useful partial output may be retained with exact coverage; it cannot mark omitted input processed.
 
-Unavailable/disallowed profile, admission rejection, provider failure, malformed output, missing fields, truncation, unresolved external execution and partial processing are not successful no-change. Useful partial output may be retained with exact coverage; it cannot mark omitted input processed.
+Cleanup outcome is separate from cognitive outcome. A failed/no-result request may complete cleanup successfully without producing learning. A useful result may remain cleanup-incomplete while Memory safely uses verified local copy.
 
 ### 7.5 Recursive improvement
 
-Self-improvement diagnoses the failed connected edge: capture, source selection, disclosure/profile admission, controller execution, result readback/release, decoding, publication, retrieval, delivery, use, applicability or method quality. Correct that edge instead of multiplying duplicate lessons or adding a global intelligence score.
+Self-improvement diagnoses failed connected edge: capture, source selection, admission, controller execution, result readback, cleanup, decoding, publication, retrieval, delivery, use, applicability or method quality. Correct that edge instead of multiplying duplicate lessons or adding global intelligence score.
 
-Within repeatable work, Eliot may use Propose–Probe–Compose. Across tasks, it retains lessons about how to improve. Baseline/no-change remains valid. A selected candidate is not automatically better. Irreversible external effects are not repeated merely to obtain a comparison.
+Within repeatable work, Eliot may use Propose–Probe–Compose. Across tasks, it retains lessons. Baseline/no-change remains valid. Selected candidate is not automatically better. Irreversible effects are not repeated merely for comparison.
 
 ## 8. Disagreement, prediction, research and commitments
 
-Disagreement belongs to a question, scope and time. Preserve rival explanations and their grounds, then identify the cheapest useful observation that can distinguish them. One source lookup, one agent or a human decision may be enough. A panel or vote is not required.
+Disagreement belongs to question, scope and time. Preserve rivals/grounds, then identify cheapest useful distinguishing observation. One source lookup, agent or human decision may be enough. Panel/vote not required.
 
-Unresolved disagreement does not block unrelated work. A provisional choice records why it was chosen and what would cause reconsideration.
+Unresolved disagreement does not block unrelated work. Provisional choice records rationale and reconsideration trigger.
 
-A prediction states expected observation before an action, its conditions and the available check. Static dependency, co-change and causal explanation are not interchangeable.
+Prediction states expected observation before action, conditions and available check. Static dependency, co-change and causal explanation are not interchangeable.
 
-Research begins with available memory and exact local sources. External acquisition is used for a concrete remaining gap. Eliot Research owns research execution and large corpora; Eliot stores compact findings, alternatives, coverage and exact source handles needed later.
+Research begins with available memory and exact local sources. External acquisition is for concrete remaining gap. Eliot Research owns execution/corpora; Memory stores compact findings, alternatives, coverage and exact handles.
 
-A failed source request, completed but uninformative research and useful partial answer are different outcomes. Repeating the same uncertainty does not justify an endless research loop.
+Failed source request, completed but uninformative research and useful partial answer differ. Repeating uncertainty does not justify endless research loop.
 
-Commitments and unresolved problems are retained state, not notifications. Showing or acknowledging one does not resolve it, and a passed due date does not complete it. Resolution follows a matching observed event or explicit owner change. Optional notifications do not create another task manager.
+Commitments/problems are retained state, not notifications. Showing/acknowledging does not resolve; passed due date does not complete. Resolution follows matching observed event or explicit owner change. Notifications do not create task manager.
 
 ## 9. Reliability, privacy and direct control
 
 Persist enough information to distinguish:
 
 - not requested;
-- waiting for an allowed/configured profile;
+- waiting for configured profile;
 - requested but not admitted;
-- queued or sending;
+- queued/sending;
 - external outcome unknown;
-- controller result retained;
+- result retained by controller;
 - result copied into Memory;
-- decoded;
-- applied to memory;
-- controller cleanup pending, incomplete or released;
+- decoded/applied;
+- terminal without result;
+- input cleanup state;
+- result cleanup state;
+- aggregate cleanup pending/incomplete/released;
+- abandoned for erasure;
+- provider-side effect/copy external unknown;
 - partial, failed, cancelled or erased.
 
-Acknowledgement is not completion. Heartbeat is not progress. Prepared context is not handoff. A provider body is not a decoded proposal. A proposal is not published memory. Published memory is not proof of external success.
+Acknowledgement is not completion. Heartbeat is not progress. Prepared context is not handoff. Provider body is not decoded proposal. Proposal is not published memory. Published memory is not proof of external success. Cleanup success is not cognitive success; cognitive success is not cleanup success.
 
-Primary capture and reads remain available when optional routes fail. External I/O never runs inside a Store transaction. Unknown external outcomes are reconciled through saved request identity and native readback where supported; they are not repaired by issuing a new request ID.
+Primary capture/reads remain available when optional routes fail. External I/O never runs inside Store transaction. Unknown outcomes reconcile through saved identity/native readback, not new request ID.
 
-Secrets remain in the controller credential system. Memory stores only profile names, frozen non-secret execution identity, Operation/result references and observed facts. Missing usage, cost or account identity remains unknown.
+Secrets remain in controller. Memory stores profile name, frozen non-secret execution identity, Operation/result refs and observed facts. Missing usage, cost or account identity remains unknown.
 
-Physical erasure traverses Memory inputs/results, spool, controlled backups and both controller inference content artifacts. A late result cannot reintroduce erased material. Do not report complete erasure while controlled duplicate content remains.
+Physical erasure traverses Memory inputs/results, spool, controlled backups and each controller content artifact. Late result cannot reintroduce erased material through abandoned Operation. Do not report complete erasure while controlled copy remains or mismatches; do not report provider-side deletion unless provider actually guarantees it.
 
-Direct control provides status/inbox, inspect/open, configure, pause/resume/cancel, correct/withdraw/erase, backup/restore and graceful shutdown. It reports profile/connection unavailable, destination mismatch, automatic-use denial, limits, unknown outcome and cleanup gaps directly.
+Direct control provides status/inbox, inspect/open, configure, pause/resume/cancel, correct/withdraw/erase, backup/restore and shutdown. It reports profile/connection unavailable, destination mismatch, automatic denial, limits, unknown outcome, abandonment and exact per-copy cleanup gaps.
 
 ## 10. Explicit non-goals
 
-V3 does not add these without a demonstrated consumer and owner decision:
+V3 does not add these without demonstrated consumer and owner decision:
 
-- a second task manager or workflow engine inside Memory OS;
-- a provider/credential/router stack duplicated inside Memory OS;
-- controller Task/Attempt for ordinary one-shot inference;
-- reuse of agent workspace/session route types as inference configuration;
-- the old Governor route/capability/fingerprint/portfolio platform;
-- a permanent Dreamer process or model loop;
-- a second semantic/vector database;
-- a truth registry, skill registry, outcome store or packet database;
-- a universal policy/approval/proof platform;
-- a route-classifier model or silent fallback ladder;
-- arbitrary provider headers/body fields under an unspecified compatibility claim;
-- a broker or event bus for internal function calls;
-- one actor, crate, contract package or service per concept;
-- mandatory per-helper lifecycle/proof/promotion manifests;
-- runtime Rust plugins, WASM packaging or hot-generation machinery;
-- global project/workspace fences before ordinary capture/read;
-- full-graph verification before useful recall;
-- a mandatory model judge for every model result;
-- success-shaped stubs for unavailable capabilities;
-- generated repository inventories as permanent work authorities.
+- second task manager/workflow engine inside Memory;
+- duplicated provider/credential/router stack;
+- controller Task/Attempt for one-shot inference;
+- agent workspace/session route types as inference config;
+- old Governor route/capability/fingerprint/portfolio platform;
+- permanent Dreamer process/model loop;
+- second semantic/vector DB;
+- truth/skill registry, outcome store or packet DB;
+- universal policy/approval/proof platform;
+- route-classifier model or silent fallback;
+- arbitrary provider fields under unspecified compatibility;
+- broker/event bus for internal calls;
+- actor/crate/contract/service per concept;
+- per-helper lifecycle/proof/promotion manifests;
+- runtime Rust plugins, WASM packaging or hot-generation;
+- global project/workspace fences before capture/read;
+- full-graph verification before recall;
+- mandatory model judge;
+- success-shaped stubs;
+- generated inventories as permanent authorities;
+- aggregate cleanup flag that hides which controlled content copy remains.
 
 ## 11. Product evidence
 
-A capability is present only when a real path exists:
+A capability is present only when real path exists:
 
 ```text
 real input
@@ -479,8 +502,10 @@ real input
 → restart/readback where relevant
 ```
 
-For Base, the minimum observation is: source knowledge captured in session A, service restart, relevant retrieval/delivery in session B, and exact source opening.
+For Base: source knowledge captured in session A, service restart, relevant retrieval/delivery in session B and exact source opening.
 
-For first learning, the minimum observation is: one retained episode, exact recipe and disclosure, one allowed frozen connection/profile behavior, one controller Operation, exact result read and Memory copy, one decoded publication or valid no-change, a later context that reads the resulting revision, and release or explicit cleanup gap for both controller input/result artifacts.
+For first learning: retained episode, exact recipe/disclosure, one frozen connection/profile behavior, one controller Operation, exact result read/Memory copy when result exists, decoded publication or valid no-change, later context reading resulting revision, and exact cleanup disposition showing input/result removed or explicit per-copy gap.
 
-A stored type, fixture, receipt, generated report, passing serializer or leaf compilation alone is not that evidence.
+For terminal no-result: exact operational failure/cancellation, no fabricated cognitive result, and successful input cleanup or explicit gap.
+
+Stored type, fixture, receipt, generated report, serializer or leaf compilation alone is not evidence.
