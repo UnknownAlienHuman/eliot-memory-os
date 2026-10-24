@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-24 · нормативная база Architecture draft.5 / Implementation draft.18 / Cognition draft.8 / Inference Contract 0.2; controller `e42c464d`; активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-24 · нормативная база Architecture draft.5 / Implementation draft.18 / Cognition draft.8 / Inference Contract 0.3; controller `e42c464d`; активный рабочий реестр, не runtime gate.**
 
 Этот файл отвечает на четыре вопроса:
 
@@ -56,10 +56,10 @@
 | R-018 | Document→representation→open | Docling/Core selected paths; Implementation §8.2 | `PARTIAL` | Original bytes, retained representation, excerpts и exact open определены; decode/asset path не выполнен. | Реальная conversion/readback с partial pages/images и cost bounds. |
 | R-019 | Backup/restore | Implementation §12; Surreal/V2 restore reads прежних проходов | `PARTIAL` | Native logical export + blobs + fresh candidate restore выбраны. | Выполнить Base round-trip и Windows cutover. |
 | R-020 | Erasure и reappearance | Architecture §4.7; Implementation §12.1; Cognition §13; R-051 | `PARTIAL` | Withdrawal, exposure, refutation и physical erase разделены. Controller inference input/result являются controlled copies до release. | Реализовать traversal, backups/spool/late-result cleanup и полный inference payload release. |
-| R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Исправляется конкретный failed edge; нет global intelligence score или mandatory grader. | Выполнить connected request→revision→next context после R-048/R-050/R-051/R-053–R-055. |
+| R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Исправляется конкретный failed edge; нет global intelligence score или mandatory grader. | Выполнить connected request→revision→next context после R-048/R-050/R-051/R-053–R-057. |
 | R-022 | Disagreement/anticipation | Architecture §8; Cognition §11 | `CHECKED` | Alternatives + grounds + cheapest discriminating observation; no voting; expiry != outcome. | Реализовать ordinary records after core path. |
 | R-023 | Direct control/status/inbox | Implementation §13 | `DECIDED` | Status выводится из actual process/jobs/results/profile facts; no separate readiness or attention store. | Реализовать configure/off/pause/cancel/status/inbox и inference profile visibility. |
-| R-024 | Normative-document consistency | Architecture draft.5; Implementation draft.18; Cognition draft.8; Inference Contract 0.2; README | `PARTIAL` | Task lifecycle и policy platform удалены. Contract 0.2 исправил raw-input copy, caller authority, artifact provenance и release method, но Implementation/Cognition ещё используют старый result-only lifecycle/name. | Синхронизировать Implementation/Cognition/Architecture references без добавления новой платформы. |
+| R-024 | Normative-document consistency | Architecture draft.5; Implementation draft.18; Cognition draft.8; Inference Contract 0.3; README | `PARTIAL` | Task lifecycle и policy platform удалены. Contract 0.3 добавил controlled input, direct IPC and versioned first adapters; Implementation/Cognition ещё используют старые names/result-only lifecycle и не фиксируют adapter/connection split. | Синхронизировать Implementation/Cognition/Architecture/README references без добавления новой платформы. |
 | R-025 | Что запускает интерпретацию | Implementation §§5.1,10.5 | `DECIDED` | New relevant input, correction or explicit question; accounting/read/release/embedding completion не self-trigger. | Проверить enqueue callers и absence of loops. |
 | R-026 | Active/pending job и eligibility | Implementation §§4.6,5.2,10.5 | `DECIDED` | Один active + coalesced pending target; first queued time сохраняется; waiting не retry. | Проверить continuous arrivals, two projects, off/idle/background и shutdown. |
 | R-027 | Controller agent result→public artifact handle | Controller result writers/projection on `5b6b5bee/e42c464d` | `GAP` | `agent.result`/assembly сохраняют nested artifact refs, public projection их теряет. | Исправить optional agent-route projection; inference methods получают отдельный закрытый receipt с первого implementation. |
@@ -80,17 +80,19 @@
 | R-042 | Curation result consumer | Cognition §§8–10 | `DECIDED` | Output must change normal context/open/method request; unread report not completion. | Проверить same relevant request before/after revision. |
 | R-043 | Consolidation/split without ID merge | Cognition §8 | `DECIDED` | Replay, grouping, revision, synthesis and split distinct; sources and old handles survive. | Реализовать ordinary curation publication and historical handles. |
 | R-044 | Forgetting changes reader | Cognition §13; Mem0 selected mutation/reader trace | `DECIDED` | Current reader uses current revision links; rare/unused not false. | Проверить correction after restart and scoped negative memory. |
-| R-045 | First episode recipe/result | Cognition §7; old I9.4/I9.5/I9.7/I9.10; Hy-Memory extractor path | `DECIDED` | Concrete instruction, zero-or-more changes, typed result, valid no-change and explicit partial/error. | Run after R-048/R-050/R-051/R-053–R-055; then useful/no-change/partial/malformed/conflict cases. |
+| R-045 | First episode recipe/result | Cognition §7; old I9.4/I9.5/I9.7/I9.10; Hy-Memory extractor path | `DECIDED` | Concrete instruction, zero-or-more changes, typed result, valid no-change and explicit partial/error. | Run after R-048/R-050/R-051/R-053–R-057; then useful/no-change/partial/malformed/conflict cases. |
 | R-046 | Claude terminal body durability | Controller Claude stream/result path | `GAP` | Current optional agent route keeps body in boot-local bounded LRU before page capture. | Fix in controller adapter if agent route is used; unrelated to direct inference artifact path. |
 | R-047 | One inference without second task manager | Old I9.1/I9.3/T12; controller Task path; V3 docs | `CHECKED` design / `NOT IMPLEMENTED` runtime | One Memory job owns input, coverage, decoding and publication; controller one-shot inference owns provider execution/readback only. | Implement R-048; do not create Task/Attempt or direct provider stack in Memory. |
-| R-048 | Controller `inference.text` / `inference.embed` | Controller method catalog/source `e42c464d`; Inference Contract 0.2 | `GAP` | Narrow methods are absent. Existing routes are agent/task/script-oriented. | Implement custom content-staging admission, exact dedup, frozen profile, Operation runner, result artifact and unknown outcome without Task/Attempt. |
+| R-048 | Controller `inference.text` / `inference.embed` | Controller method catalog/source `e42c464d`; Inference Contract 0.3 | `GAP` | Narrow methods are absent. Existing routes are agent/task/script-oriented. | Implement custom content-staging admission, exact dedup, frozen profile/connection, Operation runner, result artifact and unknown outcome without Task/Attempt. |
 | R-049 | Code-first and test timing | User direction; Implementation §14; README | `DECIDED` | Production path first, minimum build/Clippy per coherent increment; no speculative test platform. Full suite after connected product implementation. | During coding record minimum Clippy; later build tests around observable paths. |
-| R-050 | Minimal inference profile, privacy and budget | Old I9.4/I9.10/I3.6/I10.11/I10.4; Architecture §2.3; Contract §§3–4 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Small static profile with automatic canonical digest, two-state disclosure, finite limits, requested/observed facts and no implicit fallback. No classifier, registry or approval platform. | Implement controller profile parser/admission and Memory disclosure reducer; qualify actual local/external profiles only when configured. |
-| R-051 | Inference input/result copy lifecycle and erasure | Controller artifacts/operations `e42c464d`; Architecture §2.4; Contract §§5,12 | `GAP` | Controller must stage exact input before I/O and result after I/O, then idempotently release both after Memory verifies its copy. Result-only release leaves protected prompt/input indefinitely. | Implement `inference.release`, `remove_exact`, cleanup_pending recovery, bounded text-free receipt and erasure integration. |
+| R-050 | Minimal inference connection/profile, privacy and budget | Old I9.4/I9.10/I3.6/I10.11/I10.4; Architecture §2.3; Contract §§3–4,9 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Static connection + versioned adapter profile, actual destination, automatic canonical digest, two-state disclosure, finite limits, requested/observed facts and no implicit fallback. No classifier, registry or approval platform. | Implement config parser/admission and Memory disclosure reducer; qualify actual profiles only when configured. |
+| R-051 | Inference input/result copy lifecycle and erasure | Controller artifacts/operations `e42c464d`; Architecture §2.4; Contract §§5,13 | `GAP` | Controller stages exact input before I/O and result after I/O, then releases both after Memory verifies its copy. Result-only release leaves protected prompt/input indefinitely. | Implement `inference.release`, `remove_exact`, cleanup_pending recovery, bounded text-free receipt and erasure integration. |
 | R-052 | Taskless ScriptRun as inference donor | Controller taskless fixture and production `store/scripts.rs` on `e42c464d` | `CHECKED` / `NOT SELECTED` | Fixture qualifies Store admission but explicitly does not execute worker. Production path owns script registry, bundles, interpreter/process custody, start gates, automation authority, effects and three artifact classes. | Reuse only Operation/recovery ideas; do not route inference through `script.run`, ScriptEffect or automation cause. |
 | R-053 | Narrow inference caller authority | Controller Role/Store-call/object-scope path `e42c464d`; Contract §2 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing Manager/Operator are overbroad; Module requires binding; Observer is read-only. Add `inference_client` with exact method allowlist, no MCP discovery and no generic writer fallback. | Implement role serialization/registration, allowlist, self-owned queued cancel and exact-caller reads. |
-| R-054 | Closed inference artifact provenance | Controller `ArtifactFiles`, `object_scope` and artifacts schema `e42c464d`; Contract §§5,10,12 | `GAP` | Current artifact decoder accepts Task, Script and NativeResult domains only; supported file kinds omit inference; no verified deletion primitive exists. | Add `inference_input`/`inference_result`, exact Operation provenance, result-only public grant and private `remove_exact`. |
-| R-055 | Operation-only runner, recovery and cancellation | Generic mutation/dedup, Operation states, exact caller read and `operation.cancel` on `e42c464d`; Contract §§8–11 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing `(caller,request_id)` replay, Operation states, wake signal and queued cancellation are sufficient. Generic mutate cannot be called unchanged because it stores raw payload. No `inference_runs` table or second scheduler is selected initially. | Implement custom admission plus one bounded runner; queued cancel races CAS, sent/unknown work reconciles without automatic replay. |
+| R-054 | Closed inference artifact provenance | Controller `ArtifactFiles`, `object_scope` and artifacts schema `e42c464d`; Contract §§5,11,13 | `GAP` | Current artifact decoder accepts Task, Script and NativeResult domains only; supported file kinds omit inference; no verified deletion primitive exists. | Add `inference_input`/`inference_result`, exact Operation provenance, result-only public grant and private `remove_exact`. |
+| R-055 | Operation-only runner, recovery and cancellation | Generic mutation/dedup, Operation states, exact caller read and `operation.cancel` on `e42c464d`; Contract §§8,10,12 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing replay, states, wake signal and queued cancellation are sufficient. Generic mutate cannot be called unchanged because it stores raw payload. No `inference_runs` table or second scheduler is selected initially. | Implement custom admission plus one bounded runner; queued cancel races CAS, sent/unknown work reconciles without automatic replay. |
+| R-056 | Direct Memory→controller IPC dependency | `swarm-client` lib/client/config/Cargo on `e42c464d`; Contract §2.1 | `CHECKED` design / `NOT IMPLEMENTED` Memory adapter | Generic authenticated call already has no task policy or application replay; after-write cancel/disconnect/partial reply becomes unknown. Crate is `publish=false` but can remain exact-revision source dependency; no MCP/CLI/protocol copy is selected. | Pin exact controller revision, load private credential, verify frame bounds and exercise exact replay after reconnect during implementation. |
+| R-057 | First provider adapter and transport boundary | Controller OpenCode HTTP donor, Cargo reqwest features, reqwest 0.13.5 features, Hy-Memory provider donor; Contract §9 | `DECIDED` design / `NOT IMPLEMENTED` runtime | First adapters are versioned loopback Chat Completions/Embeddings with closed wire shape, no arbitrary extras/tools/stream/temperature/fallback/retry. Loopback hop does not imply local destination. Current controller reqwest build lacks TLS; direct HTTPS is later explicit adapter. | Implement/Clippy the loopback text adapter first; qualify local/external destination declarations and add HTTPS only with explicit TLS feature and its own qualification. |
 
 ## 3. Source coverage
 
@@ -108,47 +110,51 @@
 | S-010 | Donors D01–D47, Hy-Memory, Mem0, Docling, Research, controller | `PARTIAL` | Findings относятся к exact paths/revisions; ни один продукт не квалифицирован целиком. |
 | S-011 | Independent subagent review | `OPEN` | В этом проходе независимого subagent review не было. |
 | S-012 | Consolidated failure audit 2026-08-05 | `PARTIAL` | Проверен named curation preview path; historical counts/runtime not reproduced. |
-| S-013 | Controller inference boundary | `CHECKED` для Task/claim/dispatch, method catalog, config/Route and artifact surface through `e42c464d` | Установлена цена Task lifecycle, отсутствие narrow inference methods и отсутствие готового inference-specific release. Provider/live routes не запускались. |
+| S-013 | Controller inference boundary | `CHECKED` для Task/claim/dispatch, method catalog, config/Route and artifact surface through `e42c464d` | Установлена цена Task lifecycle, отсутствие narrow inference methods и отсутствие ready release. Provider/live routes не запускались. |
 | S-014 | Old inference privacy/routing corpus | `CHECKED` для I9.4, I9.10, I3.6, I10.11, I10.4 and old `RuntimeRoute` selected source | Сохранены finite limits, locality, requested/observed route and no silent fallback; rejected broader Governor/portfolio/fingerprint machinery. |
-| S-015 | Controller taskless execution and Store primitives | `CHECKED` для `o6_taskless_path_fixture`, production ScriptRun reconcile/finish, generic mutate/dedup, Role dispatch, operation/object scope, ArtifactFiles, core schema and operation.cancel on `e42c464d` | Установлены reusable primitives и конкретные anti-donor boundaries. Worker/provider execution не запускались. |
+| S-015 | Controller taskless execution and Store primitives | `CHECKED` для taskless fixture, production ScriptRun, generic mutate/dedup, Role dispatch, operation/object scope, ArtifactFiles, core schema and cancel on `e42c464d` | Установлены reusable primitives и anti-donor boundaries. Worker/provider execution не запускались. |
+| S-016 | Direct IPC and provider transport donors | `CHECKED` для `swarm-client`, OpenCode HTTP/config, controller Cargo and reqwest 0.13.5 feature table; Hy-Memory provider path already partial | Установлены no-replay IPC, loopback HTTP hardening, private-file pattern and missing current TLS feature. Provider/model quality/live compatibility не проверены. |
 
 ### Источники прохода 2026-10-24 — controller implementation boundary
 
 Проверены:
 
 - controller main `e42c464d58db770cc5490f46f391843f9fec8df2`;
-- `store/o6_taskless_path_fixture.rs`;
-- production `store/scripts.rs` admission/reconcile/finish/cancel paths;
-- `store/mod.rs` generic mutation, request replay, Role dispatch, apply and reads;
-- `store/operations.rs` public projection and cancellation;
-- `store/object_scope.rs` exact-caller Operation and artifact grants;
-- `artifacts.rs` immutable file kinds/publish/read verification;
-- `migrations/001_core.sql` Operation/artifact schema;
-- controller Cargo dependencies and existing HTTP transport usage.
+- taskless ScriptRun fixture and production paths;
+- generic mutation/dedup, Role dispatch, Operation projection/cancel and object scope;
+- immutable artifact files and core Operation/artifact schema;
+- `swarm-client` generic IPC, failure semantics, config and package boundary;
+- current OpenCode bounded HTTP/private connection patterns;
+- controller `reqwest` feature selection and upstream reqwest 0.13.5 feature table;
+- Hy-Memory configurable provider and retry/extra-field behavior from prior pass.
 
 Установлено:
 
-1. generic Operation dedup already rejects another method/payload under the same caller/request ID;
-2. exact caller can read its bounded Operation receipt without Task linkage;
-3. queued cancellation exists, but sent/unknown work cannot be declared cancelled locally;
-4. generic mutation stores the complete canonical public request and therefore is unsuitable unchanged for protected prompt/input bytes;
-5. current artifacts have closed provenance domains and no inference kind or verified delete primitive;
-6. result-only cleanup is insufficient because controller must retain the input before external I/O;
-7. taskless ScriptRun is a different product lifecycle and its fixture is admission-only;
-8. existing Operation table/states, artifacts table, wake signal, immutable file primitives and `reqwest` dependency are sufficient building blocks; no new scheduler/table is currently justified.
+1. exact Operation replay and direct authenticated IPC already exist;
+2. Memory needs no MCP surface, CLI process or copied transport;
+3. generic mutation stores raw payload and cannot admit protected inference unchanged;
+4. current artifacts need explicit inference provenance and deletion owner;
+5. ScriptRun is not a lightweight provider executor;
+6. first working provider adapter can be a closed loopback Chat-Completions path over the existing HTTP dependency;
+7. loopback transport does not prove local data destination;
+8. current controller build does not include reqwest TLS features, so direct external HTTPS is not yet present;
+9. arbitrary provider extras and blind retry are rejected anti-donors;
+10. Contract 0.3 now defines the minimal connection/profile/adapter/IPC boundary; code remains absent.
 
 Проектные контрпримеры, не прогоны:
 
-- conflicting request ID with another prompt digest → `REQUEST_ID_CONFLICT` before provider I/O;
-- protected prompt sent through generic mutate → raw duplicate remains in SQLite even after result release;
-- controller crash after input file before Operation commit → unregistered orphan, never executable;
-- crash after pending result metadata before file → result unavailable/unknown, not complete;
+- conflicting request ID with another prompt digest → conflict before provider I/O;
+- protected prompt through generic mutate → raw SQLite duplicate survives release;
+- crash after input file before Operation commit → unregistered orphan, never executable;
 - crash after result file before settle → verify deterministic file and finish settlement;
-- `operation.cancel` wins before runner CAS → no provider call;
+- queued cancel wins before runner CAS → no provider call;
 - runner CAS wins → local cancel cannot claim non-execution;
+- IPC reply lost after write → reconnect and exact replay, not new request ID;
+- loopback gateway forwards to cloud but profile says local → configuration defect; disclosure must not be inferred from host address;
+- provider returns tool call/no visible content → unsupported output, not no-change;
+- finish reason indicates length limit → partial, not complete;
+- current reqwest build attempts HTTPS direct adapter → unsupported until explicit TLS feature;
 - Memory verifies result but release reply is lost → exact release replay;
-- input deleted but result remains → cleanup incomplete;
-- artifact metadata claims inference result without matching settled Operation → read denied;
 - inference client attempts unrelated mutation → forbidden before generic writer path.
 
 ## 4. Решения, которые не открываются без нового основания
@@ -156,13 +162,15 @@
 - не переносить V1/V2 runtime и compatibility facades;
 - не создавать второй task manager, swarm, research engine или semantic DB;
 - не создавать provider/credential/router stack внутри Memory при выбранном controller owner;
-- не использовать controller Task/Attempt для обычного one-shot memory inference;
-- не использовать ScriptRun/Module binding как обход Task lifecycle;
+- не использовать controller Task/Attempt или ScriptRun для обычного one-shot memory inference;
 - не сохранять raw inference payload через generic mutation JSON;
+- не копировать controller IPC protocol в Memory и не запускать CLI на каждый call;
 - не создавать permanent Dreamer process or model loop;
-- не возвращать Governor route/capability/fingerprint/portfolio platform ради первого inference route;
+- не возвращать Governor route/capability/fingerprint/portfolio platform;
 - не создавать отдельный inference scheduler/table до реальной необходимости;
 - не добавлять public generic artifact deletion;
+- не использовать unversioned “OpenAI-compatible” arbitrary extras as a production contract;
+- не считать loopback доказательством local-only destination;
 - не блокировать capture/read из-за inference, vectors, graph, map или telemetry;
 - не использовать similarity как authority, truth или applicability proof;
 - не считать fixture, receipt, stored ID или shape-valid object работающей функцией;
@@ -176,17 +184,18 @@
 
 | Priority | Работа | Закрывает |
 |---|---|---|
-| P1 | Синхронизировать Implementation/Cognition с Contract 0.2: `inference_client`, controlled input/result, custom admission, `inference.release`, closed provenance and Operation-only runner | R-024, R-051–R-055 |
-| P1 | В controller реализовать первый production slice: caller role/allowlist, profile digest, custom input staging, exact dedup, one text runner, pending-result recovery, public receipt/grant and `inference.release` — без Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-055 |
-| P1 | Параллельно продолжать Memory Base Slices 1–2 независимо от model routes: lifecycle, capture, revisions, exact/lexical context/open, maintenance | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
-| P1 | После Base подключить learning: recipe→disclosure→saved request→controller result→digest verification→decode→revision→next context→release input/result | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-055 |
-| P2 | Добавить `inference.embed` через тот же Operation/artifact lifecycle, затем vector handler/query | R-015, R-034, R-048, R-050–R-055 |
-| P2 | Исправить optional controller agent-result projection/source retention только для реального agent-route consumer | R-014, R-027, R-046 |
+| P1 | Синхронизировать Architecture/Implementation/Cognition/README с Contract 0.3: direct IPC, connection/profile split, actual destination, controlled input/result, `inference.release`, closed adapter IDs | R-024, R-050–R-057 |
+| P1 | В controller реализовать first production slice: caller role/allowlist, profile/connection parser, custom input staging, exact dedup, one Operation runner, loopback text adapter, pending-result recovery, public receipt/grant and release — без Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-057 |
+| P1 | Параллельно продолжать Memory Base Slices 1–2 независимо от model routes | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
+| P1 | После Base подключить learning через pinned direct IPC client and exact result lifecycle | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057 |
+| P2 | Добавить loopback embeddings through the same lifecycle, затем vector handler/query | R-015, R-034, R-048, R-050–R-057 |
+| P2 | Добавить direct HTTPS adapter только после explicit TLS feature/qualification | R-050, R-057 |
+| P2 | Исправить optional agent-result projection/source retention только для real agent consumer | R-014, R-027, R-046 |
 | P2 | Исправить Research parser/citation reader и подключить один профиль | R-016, R-031, R-032 |
 | P2 | Реализовать Docling/project-view/grounds paths как независимые increments | R-008, R-017, R-018, R-038, R-040 |
 | P3 | Получить недоступные ZIP/report | S-008, S-009 |
 | P3 | Углублять донора только под незакрытый выбранный механизм | S-010 |
-| Final | После connected implementation построить и запустить full test suite; во время разработки только minimum relevant build/Clippy | R-049 |
+| Final | После connected implementation построить и запустить full test suite; во время разработки only minimum relevant build/Clippy | R-049 |
 
 ## 6. Последние изменения
 
@@ -194,8 +203,9 @@
 |---|---|
 | 2026-10-23 / `2ee24de2` | Первый конкретный `episode_learning` recipe и typed result. |
 | 2026-10-23 / `2ab45985` | Прослежен controller TaskPrompt/result path; подтверждены R-027/R-046. |
-| 2026-10-24 / `d97b9bfb` | Установлено, что controller Task lifecycle избыточен для one-shot learning; временно выбран direct client. |
+| 2026-10-24 / `d97b9bfb` | Controller Task lifecycle признан избыточным для one-shot learning. |
 | 2026-10-24 / `10f864d7` | Provider stack оставлен у controller; переписаны normative docs. |
-| 2026-10-24 / `d4657682` | Добавлены minimal inference profile, disclosure и controlled-result lifecycle; создан Inference Contract 0.1. |
+| 2026-10-24 / `d4657682` | Добавлены minimal inference profile, disclosure и controlled-result lifecycle; создан Contract 0.1. |
 | 2026-10-24 / `e81c0503` | Implementation draft.18 и Cognition draft.8 синхронизированы с Contract 0.1. |
-| 2026-10-24 / `27eda54c` | Contract 0.2 после source-trace controller: raw input вынесен из Operation JSON, release охватывает input+result, добавлены narrow caller, closed artifact provenance, Operation-only runner и ScriptRun anti-donor. |
+| 2026-10-24 / `27eda54c` | Contract 0.2: controlled input, narrow caller, Operation-only runner, input+result release and ScriptRun anti-donor. |
+| 2026-10-24 / `0da78d29` | Contract 0.3: direct swarm-client IPC, connection/profile split, actual destination and versioned loopback text/embedding adapters; direct HTTPS separated by explicit TLS dependency. |
