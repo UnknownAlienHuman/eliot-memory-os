@@ -17,10 +17,40 @@ Preserve existing access controls, required CI, and independent integration.
 The unchanged V2 ACTIVE registry still encodes its former programmes as active;
 this is a human-directed documentation freeze, not a migration of that registry.
 
+## V3 execution discipline
+
+The V2 failure was not a shortage of contracts, registries or work descriptions.
+It was failure to convert them into one integrated product path. Apply these
+constraints to V3 documentation and later implementation:
+
+- The unit of progress is a connected product edge: shipped caller → owning
+  operation → durable result or typed unknown → actual consumer → restart/readback.
+  A type, port, fixture, receipt, checklist, report, issue, branch or PR is not
+  completion by itself.
+- Use [the active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) as the only
+  live audit ledger. Do not create another task catalogue, gate, branch manager,
+  mission database, report database or agent scheduler. Extend an existing owner
+  only when a real product field cannot be represented there.
+- Prefer deletion, replacement and direct correction over append-only
+  clarification. A new normative document must retire or narrow an existing
+  authority; it must not create another equally current source of truth.
+- Run cheap deterministic admission and configuration checks before expensive
+  setup. Do not download, build, dispatch agents or generate broad evidence when
+  a missing credential, stale base, duplicate owner or unsupported route can be
+  rejected first.
+- Do not start overlapping sibling work while an earlier branch/PR for the same
+  semantic owner lacks a terminal disposition. Use `MERGE_READY`, `BLOCKED` with
+  an exact owner, `NO_CHANGE`, `SUPERSEDED`, or `RETURNED` with one concrete defect.
+- Optimize for merged product behavior and closed blockers, not generated prose,
+  LOC, commit count, agent count, issue count or PR count.
+- Keep the first implementation vertical and small. Add process machinery only
+  after the connected slice demonstrates a missing owner that ordinary code and
+  the existing issue/PR path cannot express.
+
 ## Working scope
 
 - Follow the requested scope. Explicit user instructions take priority over repository defaults.
-- Use current `main` as the source and documentation authority. Check `git status --short --branch` and `git rev-parse HEAD` before editing.
+- Base work on current `main`. While issue #5324/PR #5325 is open, the files under `docs/v3/` on its branch are the current V3 working authority; retained V2 documents on `main` remain donors.
 - Preserve unrelated changes. For parallel work, use isolated worktrees and one writer per file; the root agent handles synchronization and integration.
 - Read the nearest `AGENTS.md`, the owning issue/PR when present, and documentation relevant to the change.
 - Project navigation: [workflow](WORKFLOW.md), [V3 work](docs/v3/README.md), [architecture contract](docs/ARCHITECTURE_CONTRACT.md). [V2 workstream records](workstreams/ACTIVE.toml) and their validators remain unchanged donor infrastructure.
