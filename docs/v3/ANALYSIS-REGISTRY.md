@@ -97,6 +97,8 @@
 | R-059 | Append-only authority and context accretion | Large historical issue bodies, root `T*.md`, work-unit inventories and current V3 authority split | `PARTIAL` | Corrections were appended beside superseded plans, leaving several plausible authorities and increasing agent context cost. V3 documents plus this registry are current; Git/issues preserve history, not live requirements. | During V3 cutover retire or label superseded V2 authorities; do not add another coequal V3 report. |
 | R-060 | Cheap preflight and WIP backpressure | Issue #5305 root causes; AGENTS/README discipline | `DECIDED` | Deterministic admission/configuration/duplicate-owner failures run before expensive setup. New overlapping work waits for merge-ready, blocked, no-change, superseded or returned disposition. | Apply first through ordinary issue/PR ownership; add no new gate unless existing GitHub process cannot express a proven need. |
 | R-061 | Vertical completion criterion | Issue #3014; Architecture product path; Implementation §14 | `CHECKED` design | Completion requires shipped caller → owner admission → durable result or typed unknown → actual consumer/readback → restart/recovery. Types, ports, fixtures, receipts, plans and leaf compilation are intermediate evidence only. | Use this chain as the denominator for every implementation slice and later review. |
+| R-062 | Физическое дробление и manifest inversion | Root `Cargo.toml`; sampled `crates/smart/eliot-dreamer-bundle`, `eliot-cue-index` and `crates/meta/eliot-self-quality` manifests/source on `main` | `CHECKED` representative / `PARTIAL` corpus | Workspace содержит около 188 packages, а повторяющиеся 12–13 KiB per-module lifecycle/proof/promotion manifests превращают обычные helper-функции в отдельно управляемые продукты. V3 начинается одним Rust package и внутренними модулями; split разрешён только по реальной dependency, deployment или independently-changing boundary. | На implementation review оставлять обычный `mod`, пока не появится измеримая вторая граница. |
+| R-063 | Committed derived inventories as work | `.github/work-units/context-measurement-inventory.toml` and `long-lived-collection-inventory.toml` on `main` | `CHECKED` exact files | Generated repository scans with 126 and 408 candidates объявлены обязательными work-unit denominators и создают постоянную работу по синхронизации. Derived analysis является ephemeral; в Git попадает только реальный product input либо finite migration snapshot с owner и условием удаления. | Не переносить в V3; при cutover retire/archive после поиска реальных consumers. |
 
 ## 3. Source coverage
 
@@ -119,6 +121,7 @@
 | S-015 | Controller taskless execution and Store primitives | `CHECKED` для taskless fixture, production ScriptRun, generic mutate/dedup, Role dispatch, operation/object scope, ArtifactFiles, core schema and cancel on `e42c464d` | Установлены reusable primitives и anti-donor boundaries. Worker/provider execution не запускались. |
 | S-016 | Direct IPC and provider transport donors | `CHECKED` для `swarm-client`, OpenCode HTTP/config, controller Cargo and reqwest 0.13.5 feature table; Hy-Memory provider path already partial | Установлены no-replay IPC, loopback HTTP hardening, private-file pattern and missing current TLS feature. Provider/model quality/live compatibility не проверены. |
 | S-017 | Repository delivery-collapse evidence | `CHECKED` для owner-authored issues #5305, #3014, #327 и current retained process surfaces | Подтверждены failure mechanisms и explicit anti-duplication decisions; полный текущий census всех branches/PRs/issues не обновлялся. |
+| S-018 | Workspace/manifests/generated-inventory sample | `CHECKED` для root `Cargo.toml`, exact sampled crate paths and exact two inventory files | Подтверждён повторяющийся механизм, но не заявлен полный semantic audit всех ~188 crates или каждого work-unit файла. |
 
 ### Источники прохода 2026-10-24 — controller implementation boundary
 
@@ -188,7 +191,10 @@
 - не считать issue body, historical appendix, T-file или legacy receipt равноправным текущим V3 authority;
 - не начинать expensive setup до дешёвых admission/configuration/duplicate-owner checks;
 - не открывать overlapping sibling work без terminal disposition предыдущего владельца;
-- не считать prose, LOC, commits, agents, issues или PRs заменой merged product behavior.
+- не считать prose, LOC, commits, agents, issues или PRs заменой merged product behavior;
+- не создавать crate/process на каждый concept или helper до реальной dependency/deployment/change boundary;
+- не переносить per-helper proof/promotion/lifecycle manifests в V3 по умолчанию;
+- не считать generated repository inventory живым authority или обязательным denominator после завершения конечной миграционной работы.
 
 ## 5. Очередь
 
@@ -198,12 +204,14 @@
 | P1 | В controller реализовать first production slice: caller role/allowlist, profile/connection parser, custom input staging, exact dedup, one Operation runner, loopback text adapter, pending-result recovery, public receipt/grant and release — без Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-057 |
 | P1 | Параллельно продолжать Memory Base Slices 1–2 независимо от model routes | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
 | P1 | До начала каждого implementation slice зафиксировать одного integrator, product-edge denominator, дешёвые preflight checks и terminal disposition для overlap; не добавлять process infrastructure | R-058–R-061 |
+| P1 | Начать V3 одним Rust package и внутренними модулями; второй crate/process допускается только после измеримой границы и должен упростить существующий путь | R-033, R-062 |
 | P1 | После Base подключить learning через pinned direct IPC client and exact result lifecycle | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057 |
 | P2 | Добавить loopback embeddings through the same lifecycle, затем vector handler/query | R-015, R-034, R-048, R-050–R-057 |
 | P2 | Добавить direct HTTPS adapter только после explicit TLS feature/qualification | R-050, R-057 |
 | P2 | Исправить optional agent-result projection/source retention только для real agent consumer | R-014, R-027, R-046 |
 | P2 | Исправить Research parser/citation reader и подключить один профиль | R-016, R-031, R-032 |
 | P2 | Реализовать Docling/project-view/grounds paths как независимые increments | R-008, R-017, R-018, R-038, R-040 |
+| P2 | При V3 cutover retire generated V2 inventories и per-helper manifests; не поддерживать их синхронно с новым кодом | R-059, R-063 |
 | P3 | Получить недоступные ZIP/report | S-008, S-009 |
 | P3 | Углублять донора только под незакрытый выбранный механизм | S-010 |
 | Final | После connected implementation построить и запустить full test suite; во время разработки only minimum relevant build/Clippy | R-049 |
@@ -221,3 +229,4 @@
 | 2026-10-24 / `27eda54c` | Contract 0.2: controlled input, narrow caller, Operation-only runner, input+result release and ScriptRun anti-donor. |
 | 2026-10-24 / `0da78d29` | Contract 0.3: direct swarm-client IPC, connection/profile split, actual destination and versioned loopback text/embedding adapters; direct HTTPS separated by explicit TLS dependency. |
 | 2026-10-24 / `c1401bb2` | AGENTS/README закрепили delivery-collapse causes, one-ledger/product-edge discipline и Contract 0.3 terminology; добавлены R-058–R-061/S-017. |
+| 2026-10-24 / `4fcee2f6` | Representative physical/process pass: ~188-member workspace, per-helper module manifests and committed generated inventories recorded as V3 anti-patterns. |
