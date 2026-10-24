@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-24 · нормативная база Architecture draft.5 / Implementation draft.18 / Cognition draft.8 / Inference Contract 0.1; controller `38db378c`; активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-24 · нормативная база Architecture draft.5 / Implementation draft.18 / Cognition draft.8 / Inference Contract 0.2; controller `e42c464d`; активный рабочий реестр, не runtime gate.**
 
 Этот файл отвечает на четыре вопроса:
 
@@ -49,20 +49,20 @@
 | R-011 | Cross-project reuse и disclosure | Architecture §4.4; Implementation §§4.3,5.5,9.2; Cognition §9.3 | `DECIDED` | Origin отдельно от reuse scope; shared method не расширяет disclosure sources или instance facts. | Реализовать local/selected/owner queries и deterministic disclosure reduction. |
 | R-012 | Native hook → observation | Implementation §6.1; Claude hook docs; claude-mem selected path | `PARTIAL` | IDs, representations и final-message distinction определены; donor теряет `last_assistant_message` в выбранном path. | Проверить installed payload/version и один реальный relay. |
 | R-013 | Native context delivery | Implementation §6.2; Claude hook contracts | `PARTIAL` | Next-model boundaries и bounded JSON output выбраны; write != acceptance/use. | Проверить installed serialization, overflow, resume/child и duplicate boundary. |
-| R-014 | Controller Task/agent result route | Controller `38db378c`: TaskSpec/claim/dispatch/Claude result | `PARTIAL` | Годится для agent work, но требует Task/requirement/Attempt/binding и не выбран для one-shot Memory inference. R-027/R-046 остаются его gaps. | Сохранить optional richer route; не использовать как baseline `episode_learning`. |
-| R-015 | Batch embeddings contract | Implementation §§9.1,9.4; Inference Contract §5 | `GAP` | `EmbeddingClient` и `inference.embed` определены; метода нет в inspected controller catalog. | Реализовать controller route и per-input result; затем Memory handler/query arm. |
+| R-014 | Controller Task/agent result route | Controller `e42c464d`: TaskSpec/claim/dispatch/Claude result | `PARTIAL` | Годится для agent work, но требует Task/requirement/Attempt/binding и не выбран для one-shot Memory inference. R-027/R-046 остаются его gaps. | Сохранить optional richer route; не использовать как baseline `episode_learning`. |
+| R-015 | Batch embeddings contract | Implementation §§9.1,9.4; Inference Contract §7 | `GAP` | `EmbeddingClient` и `inference.embed` определены; метода нет в inspected controller catalog. | Реализовать controller route и per-input result; затем Memory handler/query arm. |
 | R-016 | Research request→report→source | Research `7c034569` selected callers; Implementation §9.5 | `PARTIAL` | Реальные run/status/report/section/citation operations найдены; R-031/R-032 не исправлены. | Исправить Research owners и квалифицировать один профиль. |
 | R-017 | Project structure и Eliot self-view | Implementation §8.1; old structure adapter scope | `PARTIAL` | Scoped versioned views выбраны; structural tool/deployment не квалифицирован. | Проверить два checkouts, late result и affected-view refresh. |
 | R-018 | Document→representation→open | Docling/Core selected paths; Implementation §8.2 | `PARTIAL` | Original bytes, retained representation, excerpts и exact open определены; decode/asset path не выполнен. | Реальная conversion/readback с partial pages/images и cost bounds. |
 | R-019 | Backup/restore | Implementation §12; Surreal/V2 restore reads прежних проходов | `PARTIAL` | Native logical export + blobs + fresh candidate restore выбраны. | Выполнить Base round-trip и Windows cutover. |
-| R-020 | Erasure и reappearance | Architecture §4.7; Implementation §12.1; Cognition §13 | `PARTIAL` | Withdrawal, exposure, refutation и physical erase разделены. Controller inference duplicate является controlled copy до release. | Реализовать traversal, backups/spool/late-result cleanup и inference duplicate release. |
-| R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Исправляется конкретный failed edge; нет global intelligence score или mandatory grader. | Выполнить connected request→revision→next context после R-048/R-050/R-051. |
+| R-020 | Erasure и reappearance | Architecture §4.7; Implementation §12.1; Cognition §13; R-051 | `PARTIAL` | Withdrawal, exposure, refutation и physical erase разделены. Controller inference input/result являются controlled copies до release. | Реализовать traversal, backups/spool/late-result cleanup и полный inference payload release. |
+| R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Исправляется конкретный failed edge; нет global intelligence score или mandatory grader. | Выполнить connected request→revision→next context после R-048/R-050/R-051/R-053–R-055. |
 | R-022 | Disagreement/anticipation | Architecture §8; Cognition §11 | `CHECKED` | Alternatives + grounds + cheapest discriminating observation; no voting; expiry != outcome. | Реализовать ordinary records after core path. |
 | R-023 | Direct control/status/inbox | Implementation §13 | `DECIDED` | Status выводится из actual process/jobs/results/profile facts; no separate readiness or attention store. | Реализовать configure/off/pause/cancel/status/inbox и inference profile visibility. |
-| R-024 | Normative-document consistency | Architecture draft.5; Implementation draft.18; Cognition draft.8; Inference Contract 0.1; README 24.10 | `CHECKED` | Task lifecycle удалён; Memory job, minimal profile, disclosure reduction, result copy/release and implementation order согласованы. | Поддерживать при следующих source/donor решениях; code всё ещё отсутствует. |
+| R-024 | Normative-document consistency | Architecture draft.5; Implementation draft.18; Cognition draft.8; Inference Contract 0.2; README | `PARTIAL` | Task lifecycle и policy platform удалены. Contract 0.2 исправил raw-input copy, caller authority, artifact provenance и release method, но Implementation/Cognition ещё используют старый result-only lifecycle/name. | Синхронизировать Implementation/Cognition/Architecture references без добавления новой платформы. |
 | R-025 | Что запускает интерпретацию | Implementation §§5.1,10.5 | `DECIDED` | New relevant input, correction or explicit question; accounting/read/release/embedding completion не self-trigger. | Проверить enqueue callers и absence of loops. |
 | R-026 | Active/pending job и eligibility | Implementation §§4.6,5.2,10.5 | `DECIDED` | Один active + coalesced pending target; first queued time сохраняется; waiting не retry. | Проверить continuous arrivals, two projects, off/idle/background и shutdown. |
-| R-027 | Controller agent result→public artifact handle | Controller result writers/projection on `5b6b5bee/38db378c` | `GAP` | `agent.result`/assembly сохраняют nested artifact refs, public projection их теряет. | Исправить optional agent-route projection; new inference methods must expose usable closed result receipt from first implementation. |
+| R-027 | Controller agent result→public artifact handle | Controller result writers/projection on `5b6b5bee/e42c464d` | `GAP` | `agent.result`/assembly сохраняют nested artifact refs, public projection их теряет. | Исправить optional agent-route projection; inference methods получают отдельный закрытый receipt с первого implementation. |
 | R-028 | Первый recipe bootstrap | Implementation §10.3; Cognition §7.2 | `DECIDED` | Bundled recipe сохраняется при enable purpose; restart/upgrade не затирает изменённый method. | Реализовать unique purpose address и first enable. |
 | R-029 | Outcome→next decision | Implementation §10.4; Cognition §9.2 | `DECIDED` | Один current contribution на method revision/attempt/criterion; context и learning — consumers. | Реализовать reducer и correction/contradiction cases. |
 | R-030 | Multi-stream/late events/coverage | Implementation §10.1; Cognition §4 | `DECIDED` | Per-stream bounds and supplied-vs-covered distinction; no global high-water mark. | Проверить late child, partial body, omitted handle и successor. |
@@ -76,17 +76,21 @@
 | R-038 | Resource/version/representation continuity | Architecture §4.2; Implementation §4.7; Cognition §4 | `DECIDED` | Dirty bytes retained; rename/copy links do not rewrite old IDs; equal bytes != same source. | Проверить partial read after edit/move and conversions. |
 | R-039 | Decision frame→lexical query | Implementation §7.3 | `DECIDED` | Focused question + exact cues; native OR candidate arm; no LLM query planner. | Выполнить actual query/tokens/noise/empty input. |
 | R-040 | Bounded source reading | Implementation §§5.6,7.2,8.2 | `DECIDED` | Metadata/excerpt first, selected ranges next; row limit != byte/decode limit. | Реальные file/Store readers, UTF-8 range and long JSON/line. |
-| R-041 | Automatic work and drain | Implementation §§1.3,10.5 | `DECIDED` | off/idle/background; finite drain; automatic model work additionally needs profile `allow_automatic`. | Реализовать one automatic episode path after manual path. |
+| R-041 | Automatic work and drain | Implementation §§1.3,10.5; R-055 | `DECIDED` | off/idle/background; finite drain; automatic model work additionally needs profile `allow_automatic`. Controller uses one bounded Operation runner, not another scheduler. | Реализовать one automatic episode path after manual path. |
 | R-042 | Curation result consumer | Cognition §§8–10 | `DECIDED` | Output must change normal context/open/method request; unread report not completion. | Проверить same relevant request before/after revision. |
 | R-043 | Consolidation/split without ID merge | Cognition §8 | `DECIDED` | Replay, grouping, revision, synthesis and split distinct; sources and old handles survive. | Реализовать ordinary curation publication and historical handles. |
 | R-044 | Forgetting changes reader | Cognition §13; Mem0 selected mutation/reader trace | `DECIDED` | Current reader uses current revision links; rare/unused not false. | Проверить correction after restart and scoped negative memory. |
-| R-045 | First episode recipe/result | Cognition §7; old I9.4/I9.5/I9.7/I9.10; Hy-Memory extractor path | `DECIDED` | Concrete instruction, zero-or-more changes, typed result, valid no-change and explicit partial/error. | Run after R-048/R-050/R-051; then useful/no-change/partial/malformed/conflict cases. |
+| R-045 | First episode recipe/result | Cognition §7; old I9.4/I9.5/I9.7/I9.10; Hy-Memory extractor path | `DECIDED` | Concrete instruction, zero-or-more changes, typed result, valid no-change and explicit partial/error. | Run after R-048/R-050/R-051/R-053–R-055; then useful/no-change/partial/malformed/conflict cases. |
 | R-046 | Claude terminal body durability | Controller Claude stream/result path | `GAP` | Current optional agent route keeps body in boot-local bounded LRU before page capture. | Fix in controller adapter if agent route is used; unrelated to direct inference artifact path. |
 | R-047 | One inference without second task manager | Old I9.1/I9.3/T12; controller Task path; V3 docs | `CHECKED` design / `NOT IMPLEMENTED` runtime | One Memory job owns input, coverage, decoding and publication; controller one-shot inference owns provider execution/readback only. | Implement R-048; do not create Task/Attempt or direct provider stack in Memory. |
-| R-048 | Controller `inference.text` / `inference.embed` | Controller method catalog/source `38db378c`; Inference Contract | `GAP` | Narrow methods are absent. Existing routes are agent/task-oriented. | Implement closed contracts, dedup, frozen profile, one attempt, durable artifacts and unknown outcome without Task/Attempt. |
+| R-048 | Controller `inference.text` / `inference.embed` | Controller method catalog/source `e42c464d`; Inference Contract 0.2 | `GAP` | Narrow methods are absent. Existing routes are agent/task/script-oriented. | Implement custom content-staging admission, exact dedup, frozen profile, Operation runner, result artifact and unknown outcome without Task/Attempt. |
 | R-049 | Code-first and test timing | User direction; Implementation §14; README | `DECIDED` | Production path first, minimum build/Clippy per coherent increment; no speculative test platform. Full suite after connected product implementation. | During coding record minimum Clippy; later build tests around observable paths. |
-| R-050 | Minimal inference profile, privacy and budget | Old I9.4/I9.10/I3.6/I10.11/I10.4; Architecture §2.3; Implementation §§9.1–9.3; Inference Contract §§2–7 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Small static profile, two-state disclosure, finite limits, requested/observed facts, no implicit fallback. No route classifier, capability registry or per-call approval platform. | Implement controller profile parser/admission and Memory disclosure reducer; qualify one local and one external profile only when actually configured. |
-| R-051 | Inference result copy lifecycle and erasure | Controller public artifact surface; Architecture §2.4; Implementation §§5.4,9.3,12.1; Cognition §§7.5,13; Inference Contract §§7–9 | `GAP` | Memory must verify and copy exact result, then idempotently release controller-owned duplicate. Current inspected controller surface has no reviewed operation-owned inference release because inference route itself is absent. | Implement `inference.result.release`, bounded text-free receipt, cleanup retry/status and erasure integration. |
+| R-050 | Minimal inference profile, privacy and budget | Old I9.4/I9.10/I3.6/I10.11/I10.4; Architecture §2.3; Contract §§3–4 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Small static profile with automatic canonical digest, two-state disclosure, finite limits, requested/observed facts and no implicit fallback. No classifier, registry or approval platform. | Implement controller profile parser/admission and Memory disclosure reducer; qualify actual local/external profiles only when configured. |
+| R-051 | Inference input/result copy lifecycle and erasure | Controller artifacts/operations `e42c464d`; Architecture §2.4; Contract §§5,12 | `GAP` | Controller must stage exact input before I/O and result after I/O, then idempotently release both after Memory verifies its copy. Result-only release leaves protected prompt/input indefinitely. | Implement `inference.release`, `remove_exact`, cleanup_pending recovery, bounded text-free receipt and erasure integration. |
+| R-052 | Taskless ScriptRun as inference donor | Controller taskless fixture and production `store/scripts.rs` on `e42c464d` | `CHECKED` / `NOT SELECTED` | Fixture qualifies Store admission but explicitly does not execute worker. Production path owns script registry, bundles, interpreter/process custody, start gates, automation authority, effects and three artifact classes. | Reuse only Operation/recovery ideas; do not route inference through `script.run`, ScriptEffect or automation cause. |
+| R-053 | Narrow inference caller authority | Controller Role/Store-call/object-scope path `e42c464d`; Contract §2 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing Manager/Operator are overbroad; Module requires binding; Observer is read-only. Add `inference_client` with exact method allowlist, no MCP discovery and no generic writer fallback. | Implement role serialization/registration, allowlist, self-owned queued cancel and exact-caller reads. |
+| R-054 | Closed inference artifact provenance | Controller `ArtifactFiles`, `object_scope` and artifacts schema `e42c464d`; Contract §§5,10,12 | `GAP` | Current artifact decoder accepts Task, Script and NativeResult domains only; supported file kinds omit inference; no verified deletion primitive exists. | Add `inference_input`/`inference_result`, exact Operation provenance, result-only public grant and private `remove_exact`. |
+| R-055 | Operation-only runner, recovery and cancellation | Generic mutation/dedup, Operation states, exact caller read and `operation.cancel` on `e42c464d`; Contract §§8–11 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing `(caller,request_id)` replay, Operation states, wake signal and queued cancellation are sufficient. Generic mutate cannot be called unchanged because it stores raw payload. No `inference_runs` table or second scheduler is selected initially. | Implement custom admission plus one bounded runner; queued cancel races CAS, sent/unknown work reconciles without automatic replay. |
 
 ## 3. Source coverage
 
@@ -104,42 +108,48 @@
 | S-010 | Donors D01–D47, Hy-Memory, Mem0, Docling, Research, controller | `PARTIAL` | Findings относятся к exact paths/revisions; ни один продукт не квалифицирован целиком. |
 | S-011 | Independent subagent review | `OPEN` | В этом проходе независимого subagent review не было. |
 | S-012 | Consolidated failure audit 2026-08-05 | `PARTIAL` | Проверен named curation preview path; historical counts/runtime not reproduced. |
-| S-013 | Controller inference boundary | `CHECKED` для Task/claim/dispatch, method catalog, config/Route and artifact surface on `38db378c` | Установлена цена Task lifecycle, отсутствие narrow inference methods и отсутствие готового inference-specific release. Provider/live routes не запускались. |
+| S-013 | Controller inference boundary | `CHECKED` для Task/claim/dispatch, method catalog, config/Route and artifact surface through `e42c464d` | Установлена цена Task lifecycle, отсутствие narrow inference methods и отсутствие готового inference-specific release. Provider/live routes не запускались. |
 | S-014 | Old inference privacy/routing corpus | `CHECKED` для I9.4, I9.10, I3.6, I10.11, I10.4 and old `RuntimeRoute` selected source | Сохранены finite limits, locality, requested/observed route and no silent fallback; rejected broader Governor/portfolio/fingerprint machinery. |
+| S-015 | Controller taskless execution and Store primitives | `CHECKED` для `o6_taskless_path_fixture`, production ScriptRun reconcile/finish, generic mutate/dedup, Role dispatch, operation/object scope, ArtifactFiles, core schema and operation.cancel on `e42c464d` | Установлены reusable primitives и конкретные anti-donor boundaries. Worker/provider execution не запускались. |
 
-### Источники прохода 2026-10-24
+### Источники прохода 2026-10-24 — controller implementation boundary
 
-Проверены и согласованы:
+Проверены:
 
-- V3 Architecture draft.5, Implementation draft.18, Cognition draft.8, Inference Contract 0.1 и README;
-- старые I9.4, I9.10, I3.6, I10.11, I10.4;
-- old `RuntimeRoute` selected implementation;
-- controller `38db378c` configuration, agent `Route`, method catalog and artifact read surface;
-- прежние exact Task/Attempt/Claude result findings.
+- controller main `e42c464d58db770cc5490f46f391843f9fec8df2`;
+- `store/o6_taskless_path_fixture.rs`;
+- production `store/scripts.rs` admission/reconcile/finish/cancel paths;
+- `store/mod.rs` generic mutation, request replay, Role dispatch, apply and reads;
+- `store/operations.rs` public projection and cancellation;
+- `store/object_scope.rs` exact-caller Operation and artifact grants;
+- `artifacts.rs` immutable file kinds/publish/read verification;
+- `migrations/001_core.sql` Operation/artifact schema;
+- controller Cargo dependencies and existing HTTP transport usage.
 
 Установлено:
 
-1. input/output/deadline, privacy locality, requested/observed route and no silent fallback are real requirements;
-2. old role-cardinality bundle, Governor admission, capability evidence, route classifier and portfolio planner are not required for one-shot Memory inference;
-3. controller agent `Route` is workspace/session/module-oriented and cannot be reused as untyped inference profile;
-4. minimal profile and two-state disclosure are sufficient for first route;
-5. result durability creates a controlled duplicate that needs explicit release and erasure accounting;
-6. Architecture, Implementation, Cognition, README and the shared contract now agree;
-7. controller methods, Memory adapter and runtime qualification remain absent.
+1. generic Operation dedup already rejects another method/payload under the same caller/request ID;
+2. exact caller can read its bounded Operation receipt without Task linkage;
+3. queued cancellation exists, but sent/unknown work cannot be declared cancelled locally;
+4. generic mutation stores the complete canonical public request and therefore is unsuitable unchanged for protected prompt/input bytes;
+5. current artifacts have closed provenance domains and no inference kind or verified delete primitive;
+6. result-only cleanup is insufficient because controller must retain the input before external I/O;
+7. taskless ScriptRun is a different product lifecycle and its fixture is admission-only;
+8. existing Operation table/states, artifacts table, wake signal, immutable file primitives and `reqwest` dependency are sufficient building blocks; no new scheduler/table is currently justified.
 
 Проектные контрпримеры, не прогоны:
 
-- protected source + external-only profile → explicit disclosure gap, no silent omission;
-- automatic job + profile with `allow_automatic=false` → waiting, not failure or implicit enable;
-- provider/model profile reconfigured after admission → running Operation keeps frozen profile identity;
-- usage absent → unknown, not zero;
-- admission reply lost → exact replay recovers same Operation;
-- provider timeout after possible send → unknown, no new request ID;
-- controller restart after durable result → same artifact remains readable;
-- Memory copy verified, release reply lost → exact idempotent release replay;
-- Memory erased while controller copy remains → erasure incomplete;
-- malformed/truncated body → not no-change;
-- Store conflict after result → publication replay, not inference replay.
+- conflicting request ID with another prompt digest → `REQUEST_ID_CONFLICT` before provider I/O;
+- protected prompt sent through generic mutate → raw duplicate remains in SQLite even after result release;
+- controller crash after input file before Operation commit → unregistered orphan, never executable;
+- crash after pending result metadata before file → result unavailable/unknown, not complete;
+- crash after result file before settle → verify deterministic file and finish settlement;
+- `operation.cancel` wins before runner CAS → no provider call;
+- runner CAS wins → local cancel cannot claim non-execution;
+- Memory verifies result but release reply is lost → exact release replay;
+- input deleted but result remains → cleanup incomplete;
+- artifact metadata claims inference result without matching settled Operation → read denied;
+- inference client attempts unrelated mutation → forbidden before generic writer path.
 
 ## 4. Решения, которые не открываются без нового основания
 
@@ -147,8 +157,12 @@
 - не создавать второй task manager, swarm, research engine или semantic DB;
 - не создавать provider/credential/router stack внутри Memory при выбранном controller owner;
 - не использовать controller Task/Attempt для обычного one-shot memory inference;
+- не использовать ScriptRun/Module binding как обход Task lifecycle;
+- не сохранять raw inference payload через generic mutation JSON;
 - не создавать permanent Dreamer process or model loop;
 - не возвращать Governor route/capability/fingerprint/portfolio platform ради первого inference route;
+- не создавать отдельный inference scheduler/table до реальной необходимости;
+- не добавлять public generic artifact deletion;
 - не блокировать capture/read из-за inference, vectors, graph, map или telemetry;
 - не использовать similarity как authority, truth или applicability proof;
 - не считать fixture, receipt, stored ID или shape-valid object работающей функцией;
@@ -162,11 +176,12 @@
 
 | Priority | Работа | Закрывает |
 |---|---|---|
-| P1 | В controller реализовать `InferenceProfile`, `inference.text`, `inference.embed`, exact dedup, frozen profile, durable closed result receipt, unknown outcome и `inference.result.release` без Task/Attempt | R-015, R-027, R-048, R-050, R-051 |
-| P1 | Затем реализовывать Base Slices 1–2: lifecycle, capture, revisions, exact/lexical context/open, maintenance | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
-| P1 | После Base реализовать connected learning: recipe→disclosure→retained request/result→digest verification→decode→revision→next context→controller release | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-051 |
+| P1 | Синхронизировать Implementation/Cognition с Contract 0.2: `inference_client`, controlled input/result, custom admission, `inference.release`, closed provenance and Operation-only runner | R-024, R-051–R-055 |
+| P1 | В controller реализовать первый production slice: caller role/allowlist, profile digest, custom input staging, exact dedup, one text runner, pending-result recovery, public receipt/grant and `inference.release` — без Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-055 |
+| P1 | Параллельно продолжать Memory Base Slices 1–2 независимо от model routes: lifecycle, capture, revisions, exact/lexical context/open, maintenance | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
+| P1 | После Base подключить learning: recipe→disclosure→saved request→controller result→digest verification→decode→revision→next context→release input/result | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-055 |
+| P2 | Добавить `inference.embed` через тот же Operation/artifact lifecycle, затем vector handler/query | R-015, R-034, R-048, R-050–R-055 |
 | P2 | Исправить optional controller agent-result projection/source retention только для реального agent-route consumer | R-014, R-027, R-046 |
-| P2 | Реализовать vector handler/query после `inference.embed` | R-015, R-034 |
 | P2 | Исправить Research parser/citation reader и подключить один профиль | R-016, R-031, R-032 |
 | P2 | Реализовать Docling/project-view/grounds paths как независимые increments | R-008, R-017, R-018, R-038, R-040 |
 | P3 | Получить недоступные ZIP/report | S-008, S-009 |
@@ -180,6 +195,7 @@
 | 2026-10-23 / `2ee24de2` | Первый конкретный `episode_learning` recipe и typed result. |
 | 2026-10-23 / `2ab45985` | Прослежен controller TaskPrompt/result path; подтверждены R-027/R-046. |
 | 2026-10-24 / `d97b9bfb` | Установлено, что controller Task lifecycle избыточен для one-shot learning; временно выбран direct client. |
-| 2026-10-24 / `10f864d7` | Исправлена вторая крайность: provider stack не переносится в Memory. Выбран narrow controller inference owner; переписаны normative docs. |
-| 2026-10-24 / `d4657682` | Добавлены minimal inference profile, disclosure и controlled-result lifecycle; создан shared Inference Contract. |
-| 2026-10-24 / current sync | Implementation draft.18 и Cognition draft.8 согласованы с Architecture draft.5 и Inference Contract; R-024 возвращён в `CHECKED`, R-050/R-051 включены во все lifecycle/erasure paths. |
+| 2026-10-24 / `10f864d7` | Provider stack оставлен у controller; переписаны normative docs. |
+| 2026-10-24 / `d4657682` | Добавлены minimal inference profile, disclosure и controlled-result lifecycle; создан Inference Contract 0.1. |
+| 2026-10-24 / `e81c0503` | Implementation draft.18 и Cognition draft.8 синхронизированы с Contract 0.1. |
+| 2026-10-24 / `27eda54c` | Contract 0.2 после source-trace controller: raw input вынесен из Operation JSON, release охватывает input+result, добавлены narrow caller, closed artifact provenance, Operation-only runner и ScriptRun anti-donor. |
