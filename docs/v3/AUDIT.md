@@ -313,7 +313,7 @@ A15 сохраняется как полнота пользовательско�
 
 1. Native Store: настоящее событие, restart, точный и lexical read той же записи; первичный путь работает без модели.
 2. Один реальный host: tool/result capture и контекст перед следующим решением, без синтетических результатов и модельной блокировки hook.
-3. Настоящий controller route: конечный episode job, фактический response, create/amend/keep, обычная выдача урока следующей работе. Missing embedding endpoint реализуется в controller отдельно, не подменяется генерацией чисел.
+3. Узкий controller inference route без Task/Attempt: Memory сохраняет конечный episode job и exact recipe/input, controller выполняет один `inference.text`, возвращает durable result artifact, а Memory применяет create/revise/no-change и выдаёт урок следующей работе. `inference.embed` реализуется отдельно как per-input batch-vector operation; ни одна из этих функций не подменяется agent task или генерацией чисел.
 4. Current continuation, cross-project methods, источники и project understanding; полноценные vectors/relations дополняют тот же read path.
 5. Подключённое изменение методов, исследование, разногласия, прогнозы, retention и восстановление завершают полный scope. Нужное независимое наблюдение входит в поставку реально работающего фонового сервиса, а не откладывается ради удобного подсчёта процессов.
 
@@ -418,3 +418,96 @@ A15 сохраняется как полнота пользовательско�
 ## 37. Original purpose and connected learning 0.24
 
 Прежде локальное дополнение включено в разделы 6–9 и карту: current branch до similarity; method revision в actual prompt; origin отдельно от reuse; scope результата и реальные source adapters. [MemP](https://github.com/zjunlp/MemP/tree/3066a1b280a39c7433ae37d9a745861903a5d3c4/ProcedureMem) изучался по `memory.py`, `run_memp_online.py`, `memory_adjust.py`, `llm_api.py`. [MentisDB skills.rs](https://github.com/CloudLLM-ai/mentisdb/blob/4c9b95041da68c5a26dece9f8776ff54b05b910c/src/skills.rs) — выбранные versioned write/read functions, не доказательство полного автономного consumer. Прежние открытые вопросы здесь получили проектные решения; runtime ещё предстоит написать.
+
+## 38. One-shot inference without a second task manager or a second provider stack — 1.0
+
+**24 октября 2026. Проверенная база:** Memory OS branch `d97b9bfb`; controller `38db378c559dd0d95cd60db26702ffa73a954258`; Hy-Memory `6b0bd866798049940c752c402512bb0e16c98a2b`. Это архитектурное решение и source trace, не реализованный route и не model run.
+
+### 38.1 Найденная ошибка проекта V3
+
+Предыдущая редакция правильно убрала отдельный `eliot-dreamer.exe`, но для первого `episode_learning` привязала один text request к controller `task.dispatch`. Настоящий caller показал, что это не «вызвать модель», а полный жизненный цикл разработки:
+
+```text
+TaskSpec(objective + phase + >=1 requirement)
+→ registered Manager/Operator
+→ controller-owned Attempt
+→ ready native binding
+→ immutable first task.dispatch
+→ agent.result/artifact read
+→ Attempt disposition
+```
+
+Claude route дополнительно требует подготовленный executor, первый native input именно через `task.dispatch` и текущую initial-dispatch identity. Эти механизмы нужны для агентной работы с ownership, tools, continuation, review и acceptance. Для операции «проанализировать замороженный эпизод и вернуть typed proposal» они дублируют уже существующий Memory `job` и создают второй task manager.
+
+Временный ответ `d97b9bfb` ушёл в другую крайность: direct OpenAI-compatible client внутри Memory. Это убирало Task/Attempt, но дублировало бы model credentials, provider/model routing, harness/local-model integration, usage accounting и retry/readback рядом с уже выбранным владельцем `eliot-swarm-controller`. Такой дубликат снова породил бы расходящиеся route profiles и два места исправления provider quirks.
+
+### 38.2 Сохранённое требование старой архитектуры
+
+Перечитаны старые I9.1, I9.3 и T12. Их полезный смысл:
+
+- один конечный Dreamer job для конкретного вопроса;
+- один допущенный model attempt;
+- ограниченный input и структурированный результат;
+- отсутствие постоянного LLM-loop;
+- model/provider independence;
+- реальный последующий consumer.
+
+Не сохраняются старые средства:
+
+- отдельный Dreamer process;
+- Dreamer ledger поверх обычной работы;
+- Governor bundle/admission/lease chain для внутренней обратимой интерпретации;
+- отдельный provider stack;
+- обязательная candidate/promotion ceremony.
+
+### 38.3 Выбранная граница
+
+Memory сохраняет узкий интерфейс `TextInferenceClient`, но initial adapter направлен в новый controller one-shot route, а не прямо к provider:
+
+```text
+Memory job + exact recipe/source revisions
+→ saved TextRequest(request key, route profile, exact prompt, limits)
+→ controller inference.text
+→ durable controller result artifact
+→ retained TextResult in Memory job
+→ purpose-specific decoder
+→ publish_revision
+→ next context
+```
+
+Memory владеет job, frozen input, recipe revision, source coverage, decoder и publication. Controller владеет credentials, route/provider/model/harness execution, request deduplication и transport/result readback. Ни один не копирует state другого.
+
+`inference.text` обязан использовать существующие controller Operation/request-replay/artifact primitives, но **не** создавать Task, Requirement, Attempt, workspace, review, submission или acceptance. Параметры — stable `client_request_id`, configured route profile, exact prompt, finite output limit и response format. Public result различает complete, partial, failed и unknown, возвращает effective model/finish/usage/limits и usable artifact handle.
+
+Embeddings получают отдельный `EmbeddingClient`/`inference.embed` с per-input result mapping. Они не становятся Dreamer agent tasks.
+
+### 38.4 Retry и unknown outcome
+
+Hy-Memory полезен как простой configurable OpenAI-compatible request/result adapter: content, model, finish reason, usage и response ID. Его retry-loop — антидонор: timeout/connection/408/429/5xx могут автоматически повторить уже принятый inference без native idempotency/readback.
+
+Для Eliot:
+
+1. exact request сохраняется в Memory job до I/O;
+2. controller deduplicates exact caller/request ID/params;
+3. потерянный admission reply восстанавливается тем же request;
+4. после Operation ID читается Operation/result, а не выполняется новый inference;
+5. exact response bytes сохраняются до parse/publication;
+6. Store conflict повторяет publication сохранённого ответа;
+7. ambiguous transport/provider outcome остаётся `unknown`;
+8. новый attempt создаётся только явным решением владельца либо после доказанного non-admission/native idempotent retry.
+
+Empty, malformed, truncated, failed и unknown не превращаются в `changes=[]`/no-change.
+
+### 38.5 Что установлено и что остаётся
+
+В текущем controller method catalog `inference.text` и `inference.embed` отсутствуют. Existing `task.dispatch`/Claude path и его result gaps R-027/R-046 не считаются реализацией нового one-shot route. Нужна adjacent-repository функция у владельца controller.
+
+Нормативные Architecture draft.4, Implementation draft.17, Cognition draft.7 и README теперь согласованы:
+
+- Base не зависит от controller/model;
+- first learning требует один narrow controller inference route;
+- agent Tasks остаются для настоящей agent work;
+- provider stack не дублируется в Memory;
+- tests не становятся ранней платформой: сначала connected production code и minimum Clippy, полный suite — после реализации продукта.
+
+**Не выполнено:** controller route, Memory adapter, schema/migrations, model call, Windows/runtime qualification, tests или benchmark. Реестр R-047/R-048/R-049 хранит активное состояние и следующую работу.

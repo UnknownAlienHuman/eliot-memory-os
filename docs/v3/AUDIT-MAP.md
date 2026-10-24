@@ -222,8 +222,20 @@
 | Составные основания | Roles и необязательные группы существующих links; unknown не угадывается | Targeted dependency lookup/recompute, не общий ATMS |
 | Не-кодовые источники | Native text + внешний Docling и реальные source locators | Конкретные converters/open сегментов, preserve raw |
 | Первое включение | Local config, один instance, малый standalone supervisor + daemon + DB | Windows launch, IPC, lifecycle и файловые primitives |
-| Модели и embeddings | Существующий controller text path; новая batch-vector функция у controller | Реальное request/result/readback и correct usage |
+| Модели и embeddings | Новый узкий `inference.text`/`inference.embed` у controller; Memory не копирует Task/Attempt или provider stack | Durable request/result/readback, unknown outcome и per-input vector mapping |
 | Research | Один domain adapter через реальную configured task/tool surface | Request/result/source mapping, не второй research engine |
 | Итоговая документация | Один смысловой baseline аудита; drafts переписать согласованно | Architecture — цель; Implementation — connected paths; Cognition — алгоритмы |
 
 Оставшиеся пункты — реализация выбранной конструкции, а не разрешение снова плодить каталоги. Не заявляются работающий V3, успешный model/DB/Windows run, независимые субагенты или повтор всех прошлых тестов. Форматирование/ссылки документов проверяются отдельно от продуктового поведения. Существующие CI и main не меняются этим аудитом.
+
+## 6. Inference boundary update — 2026-10-24
+
+| Источник требования / находка | Сохранённый смысл | Отброшенное средство | Нормативное решение V3 | Статус |
+|---|---|---|---|---|
+| V1/V2 Dreamer, I9.1/I9.3/T12 | Конечная model-assisted интерпретация, bounded input, structured result, no permanent loop, model independence | Отдельный Dreamer process/ledger, Governor admission/lease chain и candidate ceremony для каждой обратимой правки памяти | Один Memory `job` выбирает exact recipe/input; controller `inference.text` выполняет one-shot model call; Memory decode/publication/context остаются у Memory | `DECIDED`, route не реализован |
+| Controller `38db378c` Task/Attempt/Claude path | Exact prompt delivery, route/provider ownership, request identity и durable artifacts полезны | TaskSpec/requirement/Attempt/binding/review/acceptance для одного extraction request | Переиспользовать Operation/dedup/route/artifact owners в новом method без Task/Attempt semantics | `GAP` R-048 |
+| Hy-Memory `6b0bd866` provider client | Простой configurable prompt→content/model/finish/usage shape | Blind retry after timeout/connection/408/429/5xх без idempotency/readback | Exact request сохраняется до I/O; ambiguous outcome остаётся unknown; retry только после proven non-admission/native readback | `DECIDED` |
+| Embedding requirement | Query/document role, compatible space, independent result per input | Text-agent task или aggregate/zero-vector fallback | Отдельный controller `inference.embed` + Memory `EmbeddingClient`; derived fields only | `GAP` R-015/R-048 |
+| User implementation direction | Реальная разработка прежде тестового онанизма | Speculative test platform и production shims ради placeholder tests | Connected production code; minimum build/Clippy per coherent increment; full suite after product implementation | `DECIDED` R-049 |
+
+Полный разбор находится в [AUDIT §38](AUDIT.md#38-one-shot-inference-without-a-second-task-manager-or-a-second-provider-stack--10), активные implementation gaps — в [ANALYSIS-REGISTRY R-047–R-049](ANALYSIS-REGISTRY.md). Эта карта фиксирует происхождение решения; она не объявляет controller routes или V3 runtime реализованными.
