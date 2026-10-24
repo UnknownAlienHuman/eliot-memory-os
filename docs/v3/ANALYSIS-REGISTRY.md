@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-24 · нормативная база Architecture draft.6 / Implementation draft.19 / Cognition draft.9 / Inference Contract 0.3; controller `e42c464d`; активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-24 · нормативная база Architecture draft.7 / Implementation draft.20 / Cognition draft.10 / Inference Contract 0.4; controller `e42c464d`; активный рабочий реестр, не runtime gate.**
 
 Этот файл отвечает на четыре вопроса:
 
@@ -55,12 +55,12 @@
 | R-017 | Project structure и Eliot self-view | Implementation §8.1; old structure adapter scope | `PARTIAL` | Scoped versioned views выбраны; structural tool/deployment не квалифицирован. | Проверить два checkouts, late result и affected-view refresh. |
 | R-018 | Document→representation→open | Docling/Core selected paths; Implementation §8.2 | `PARTIAL` | Original bytes, retained representation, excerpts и exact open определены; decode/asset path не выполнен. | Реальная conversion/readback с partial pages/images и cost bounds. |
 | R-019 | Backup/restore | Implementation §12; Surreal/V2 restore reads прежних проходов | `PARTIAL` | Native logical export + blobs + fresh candidate restore выбраны. | Выполнить Base round-trip и Windows cutover. |
-| R-020 | Erasure и reappearance | Architecture §4.8; Implementation §12.1; Cognition §13; R-051 | `PARTIAL` | Withdrawal, exposure, refutation и physical erase разделены. Controller inference input/result являются controlled copies до release. | Реализовать traversal, backups/spool/late-result cleanup и полный inference payload release. |
-| R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Исправляется конкретный failed edge; нет global intelligence score или mandatory grader. | Выполнить connected request→revision→next context после R-048/R-050/R-051/R-053–R-057/R-068–R-069. |
+| R-020 | Erasure и reappearance | Architecture §4.8; Implementation §12.1; Cognition §13; R-051/R-070 | `PARTIAL` | Withdrawal, exposure, refutation и physical erase разделены. Controller input/result — controlled copies; unresolved Operation is fenced before erasure cleanup. | Реализовать traversal, backups/spool/late-result prevention и полный per-copy inference cleanup. |
+| R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Исправляется конкретный failed edge; нет global intelligence score или mandatory grader. | Выполнить connected request→revision→next context после R-048/R-050/R-051/R-053–R-057/R-068–R-070. |
 | R-022 | Disagreement/anticipation | Architecture §8; Cognition §11 | `CHECKED` | Alternatives + grounds + cheapest discriminating observation; no voting; expiry != outcome. | Реализовать ordinary records after core path. |
-| R-023 | Direct control/status/inbox | Implementation §13 | `DECIDED` | Status выводится из actual process/jobs/results/profile facts; no separate readiness or attention store. | Реализовать configure/off/pause/cancel/status/inbox и inference connection/profile visibility. |
-| R-024 | Normative-document consistency | Architecture draft.6; Implementation draft.19; Cognition draft.9; Inference Contract 0.3; README current | `CHECKED` | Все normative документы используют direct authenticated IPC, `InferenceConnection`/`InferenceProfile`, `actual_destination`, controlled `inference_input`/`inference_result`, `inference.release` и closed adapter IDs. Contract 0.3 является единственным cross-repository API authority; stale `locality`, result-only release name и split client boundary удалены. | Не создавать errata layer; при реальном изменении API синхронно обновить Contract, три книги и эту строку. |
-| R-025 | Что запускает интерпретацию | Implementation §§5.1,10.5 | `DECIDED` | New relevant input, correction or explicit question; accounting/read/release/embedding completion не self-trigger. | Проверить enqueue callers и absence of loops. |
+| R-023 | Direct control/status/inbox | Implementation §13 | `DECIDED` | Status выводится из actual process/jobs/results/profile facts and per-copy cleanup; no readiness/attention store. | Реализовать configure/off/pause/cancel/status/inbox и connection/profile/cleanup visibility. |
+| R-024 | Normative-document consistency | Architecture draft.7; Implementation draft.20; Cognition draft.10; Inference Contract 0.4; README current | `CHECKED` | Все normative документы используют direct authenticated IPC, `InferenceConnection`/`InferenceProfile`, `actual_destination`, controlled input/result, one controller client and three validated `inference.release` dispositions. Contract 0.4 — единственный cross-repository API authority. | Не создавать errata layer; при API change синхронно обновить Contract, три книги, README и эту строку. |
+| R-025 | Что запускает интерпретацию | Implementation §§5.1,10.5; Cognition §10 | `DECIDED` | New relevant input, correction or explicit question; accounting/read/release/embedding completion and terminal-no-result cleanup do not self-trigger. | Проверить enqueue callers и absence of loops. |
 | R-026 | Active/pending job и eligibility | Implementation §§4.6,5.2,10.5 | `DECIDED` | Один active + coalesced pending target; first queued time сохраняется; waiting не retry. | Проверить continuous arrivals, two projects, off/idle/background и shutdown. |
 | R-027 | Controller agent result→public artifact handle | Controller result writers/projection on `5b6b5bee/e42c464d` | `GAP` | `agent.result`/assembly сохраняют nested artifact refs, public projection их теряет. | Исправить optional agent-route projection только при реальном agent consumer; inference получает отдельный closed receipt. |
 | R-028 | Первый recipe bootstrap | Implementation §10.3; Cognition §7.2 | `DECIDED` | Bundled recipe сохраняется при enable purpose; restart/upgrade не затирает изменённый method. | Реализовать unique purpose address и first enable. |
@@ -70,66 +70,67 @@
 | R-032 | Research citation depends on active index | Research `7c034569` citation reader | `GAP` | Known retained citation can fail before source bytes if search projection changed. | Read saved representation/range directly under existing access. |
 | R-033 | Useful Base/layers/light extensions | Old A2.3/I2.19/I6.4; Architecture §3; Implementation §2 | `DECIDED` | One-package start, acyclic internal modules, Base and independent vertical increments; no module platform. | При коде контролировать imports, features, startup and Base without extensions. |
 | R-034 | Encoder→derived vector→context | Implementation §§4.3,7,9.4 | `DECIDED` | Query/document role, effective space and partial batch; semantic revision unchanged. | После R-015 выполнить one connected semantic query. |
-| R-035 | Architecture overconstraints | Full normative rereads; old route/privacy pass | `DECIDED` | Unknown attribution/grounds no longer global blockers. Privacy and cost retain narrow deterministic checks at external-send boundary; no Governor platform. | Не превращать missing metadata в permission gate outside actual send. |
+| R-035 | Architecture overconstraints | Full normative rereads; old route/privacy pass | `DECIDED` | Unknown attribution/grounds no longer global blockers. Privacy/cost retain narrow deterministic send-boundary checks; no Governor platform. | Не превращать missing metadata в permission gate outside actual send. |
 | R-036 | Commitment lifecycle | Architecture §8; Implementation §11.3; Cognition §12; old A7.5/A11.5 | `DECIDED` | Ordinary memory item; context/inbox readers; ACK/due/expiry do not resolve. | Реализовать explicit create/update/read; notifications later. |
 | R-037 | Stable work identity and scoped facts | Architecture §4.1; Implementation §3.1; Cognition §§2–3 | `DECIDED` | Project/workspace/task identity separated from branch/location/version/time. | Реальный attach/capture/query/late-result path. |
 | R-038 | Resource/version/representation continuity | Architecture §4.3; Implementation §4.7; Cognition §4 | `DECIDED` | Dirty bytes retained; rename/copy links do not rewrite old IDs; equal bytes != same source. | Проверить partial read after edit/move and conversions. |
 | R-039 | Decision frame→lexical query | Implementation §§7.1–7.3 | `DECIDED` | Focused question + exact cues; independent candidate arms; no LLM query planner. | Выполнить actual query/tokens/noise/empty input. |
 | R-040 | Bounded source reading | Implementation §§5.6,7.5,8.2 | `DECIDED` | Metadata/excerpt first, selected ranges next; row limit != byte/decode limit. | Реальные file/Store readers, UTF-8 range and long JSON/line. |
-| R-041 | Automatic work and drain | Implementation §§1.3,10.5; R-055 | `DECIDED` | off/idle/background; finite drain; automatic model work additionally needs profile `allow_automatic`. Controller uses one bounded Operation runner, not another scheduler. | Реализовать one automatic episode path after manual path. |
+| R-041 | Automatic work and drain | Implementation §§1.3,10.5; R-055 | `DECIDED` | off/idle/background; finite drain; automatic work additionally needs profile permission. Controller uses one bounded Operation runner. | Реализовать one automatic episode path after manual path. |
 | R-042 | Curation result consumer | Cognition §§8–10 | `DECIDED` | Output must change normal context/open/method request; unread report not completion. | Проверить same relevant request before/after revision. |
 | R-043 | Consolidation/split without ID merge | Cognition §8 | `DECIDED` | Replay, grouping, revision, synthesis and split distinct; sources and old handles survive. | Реализовать ordinary curation publication and historical handles. |
 | R-044 | Forgetting changes reader | Cognition §13; Mem0 selected mutation/reader trace | `DECIDED` | Current reader uses current revision links; rare/unused not false. | Проверить correction after restart and scoped negative memory. |
-| R-045 | First episode recipe/result | Cognition §7; old I9.4/I9.5/I9.7/I9.10; Hy-Memory extractor path | `DECIDED` | Concrete instruction, zero-or-more changes, typed result, valid no-change and explicit partial/error. Operational failure/unknown never becomes no-change. | Run after R-048/R-050/R-051/R-053–R-057/R-068–R-069; then useful/no-change/partial/malformed/conflict cases. |
-| R-046 | Claude terminal body durability | Controller Claude stream/result path | `GAP` | Current optional agent route keeps body in boot-local bounded LRU before page capture. | Fix in controller adapter only if agent route is used; unrelated to direct inference artifact path. |
-| R-047 | One inference without second task manager | Old I9.1/I9.3/T12; controller Task path; V3 docs | `CHECKED` design / `NOT IMPLEMENTED` runtime | One Memory job owns input, coverage, decoding and publication; controller one-shot inference owns provider execution/readback only. | Implement R-048; do not create Task/Attempt or direct provider stack in Memory. |
-| R-048 | Controller `inference.text` / `inference.embed` | Controller method catalog/source `e42c464d`; Inference Contract 0.3 | `GAP` | Narrow methods are absent. Existing routes are agent/task/script-oriented. | Implement custom content-staging admission, exact dedup, frozen profile/connection, Operation runner, result artifact and unknown outcome without Task/Attempt. |
-| R-049 | Code-first and test timing | User direction; Implementation §14; README | `DECIDED` | Production path first, minimum build/Clippy per coherent increment; no speculative test platform. Full suite after connected product implementation. | During coding record minimum Clippy; later build tests around observable paths. |
-| R-050 | Minimal inference connection/profile, privacy and budget | Old I9.4/I9.10/I3.6/I10.11/I10.4; Architecture §§2.3–2.4; Contract §§3–4,9 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Static connection + versioned adapter profile, actual destination, automatic canonical digest, two-state disclosure, finite limits, requested/observed facts and no implicit fallback. No classifier, registry or approval platform. | Implement config parser/admission and Memory disclosure reducer; qualify actual profiles only when configured. |
-| R-051 | Inference input/result copy lifecycle and erasure | Controller artifacts/operations `e42c464d`; Architecture §2.5; Contract §§5,13 | `GAP` | Controller stages exact input before I/O and result after I/O, then releases both after Memory verifies its copy. Result-only release would leave protected input indefinitely. | Implement `inference.release`, `remove_exact`, cleanup_pending recovery, bounded text-free receipt and erasure integration. |
-| R-052 | Taskless ScriptRun as inference donor | Controller taskless fixture and production `store/scripts.rs` on `e42c464d` | `CHECKED` / `NOT SELECTED` | Fixture qualifies Store admission but explicitly does not execute worker. Production path owns script registry, bundles, interpreter/process custody, start gates, automation authority, effects and three artifact classes. | Reuse only Operation/recovery ideas; do not route inference through `script.run`, ScriptEffect или automation cause. |
-| R-053 | Narrow inference caller authority | Controller Role/Store-call/object-scope path `e42c464d`; Contract §2 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing Manager/Operator are overbroad; Module requires binding; Observer is read-only. Add `inference_client` with exact method allowlist, no MCP discovery and no generic writer fallback. | Implement role serialization/registration, allowlist, self-owned queued cancel and exact-caller reads. |
-| R-054 | Closed inference artifact provenance | Controller `ArtifactFiles`, `object_scope` and artifacts schema `e42c464d`; Contract §§5,11,13 | `GAP` | Current artifact decoder accepts Task, Script and NativeResult domains only; supported file kinds omit inference; no verified deletion primitive exists. | Add `inference_input`/`inference_result`, exact Operation provenance, result-only public grant and private `remove_exact`. |
-| R-055 | Operation-only runner, recovery and cancellation | Generic mutation/dedup, Operation states, exact caller read and `operation.cancel` on `e42c464d`; Contract §§8,10,12 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing replay, states, wake signal and queued cancellation are sufficient. Generic mutate cannot be called unchanged because it stores raw payload. No `inference_runs` table or second scheduler is selected initially. | Implement custom admission plus one bounded runner; queued cancel races CAS, sent/unknown work reconciles without automatic replay. |
-| R-056 | Direct Memory→controller IPC dependency | `swarm-client` lib/client/config/Cargo on `e42c464d`; Contract §2.1 | `CHECKED` design / `NOT IMPLEMENTED` Memory adapter | Generic authenticated call already has no task policy or application replay; after-write cancel/disconnect/partial reply becomes unknown. Crate is `publish=false` but can remain exact-revision source dependency; no MCP/CLI/protocol copy is selected. | Pin exact controller revision, load private credential, verify frame bounds and exercise exact replay after reconnect during implementation. |
-| R-057 | First provider adapter and transport boundary | Controller OpenCode HTTP donor, Cargo reqwest features, reqwest 0.13.5 features, Hy-Memory provider donor; Contract §9 | `DECIDED` design / `NOT IMPLEMENTED` runtime | First adapters are versioned loopback Chat Completions/Embeddings with closed wire shape, no arbitrary extras/tools/stream/temperature/fallback/retry. Loopback hop does not imply local destination. Current controller reqwest build lacks TLS; direct HTTPS is later explicit adapter. | Implement/Clippy loopback text adapter first; qualify destination declarations and add HTTPS only with explicit TLS feature and its own qualification. |
-| R-058 | Delivery throughput and artifact incentives | Issues #5305, #3014 and #327; current V3 AGENTS/README | `CHECKED` | Repository postmortems identify the same collapse mechanism as code audit: branches, PRs, receipts and documentation were treated as progress while integrated product edges remained open; overlapping work lacked one current disposition. | Measure closed product edges/blockers; require one owner and terminal disposition before overlapping sibling work. |
-| R-059 | Append-only authority and context accretion | Large historical issue bodies, root `T*.md`, work-unit inventories and current V3 authority split | `PARTIAL` | Corrections were appended beside superseded plans, leaving several plausible authorities and increasing agent context cost. V3 documents plus this registry are current; Git/issues preserve history, not live requirements. | During V3 cutover retire or label superseded V2 authorities; do not add another coequal V3 report. |
-| R-060 | Cheap preflight and WIP backpressure | Issue #5305 root causes; AGENTS/README discipline | `DECIDED` | Deterministic admission/configuration/duplicate-owner failures run before expensive setup. New overlapping work waits for merge-ready, blocked, no-change, superseded or returned disposition. | Apply first through ordinary issue/PR ownership; add no new gate unless existing GitHub process cannot express a proven need. |
-| R-061 | Vertical completion criterion | Issues #3014/#5305; Architecture §§1,11; Implementation §14 | `CHECKED` design | Completion requires shipped caller → owning operation → durable result or typed unknown → actual consumer/readback → restart/recovery. Types, ports, fixtures, receipts, plans and leaf compilation are intermediate evidence only. | Use this chain as denominator for every implementation slice and later review. |
-| R-062 | Физическое дробление и manifest inversion | Root `Cargo.toml`; sampled `crates/smart/eliot-dreamer-bundle`, `eliot-cue-index` and `crates/meta/eliot-self-quality` manifests/source on `main` | `CHECKED` representative / `PARTIAL` corpus | Workspace содержит около 188 packages, а повторяющиеся 12–13 KiB per-module lifecycle/proof/promotion manifests превращают обычные helper-функции в отдельно управляемые продукты. V3 начинается одним Rust package и внутренними модулями; split разрешён только по реальной dependency, deployment или independently-changing boundary. | На implementation review оставлять обычный `mod`, пока не появится измеримая вторая граница. |
-| R-063 | Committed derived inventories as work | `.github/work-units/context-measurement-inventory.toml` and `long-lived-collection-inventory.toml` on `main` | `CHECKED` exact files | Generated repository scans with 126 and 408 candidates объявлены обязательными work-unit denominators и создают постоянную работу по синхронизации. Derived analysis является ephemeral; в Git попадает только реальный product input либо finite migration snapshot с owner и условием удаления. | Не переносить в V3; при cutover retire/archive после поиска реальных consumers. |
-| R-064 | Intent–mechanism inversion | Old Architecture A0.3–A0.6/A2.3/A10.6; old Implementation I0.4–I0.5/I6/I17–I18; current samples | `CHECKED` | Architecture прямо ставила intent выше literal compliance, требовала simplest reversible mechanism и запрещала append-only precedence. Implementation одновременно сделала content-addressed document identity, global Product Identity, module manifests, proof ladders and work schemas нормативным default. Антицеремониальный текст не ограничил производство церемоний. | V3 принимает механизм только после named caller/owner/result/consumer; replace/delete beats another corrective layer. |
-| R-065 | Crate-first decomposition as capacity target | Old Implementation document status/I17.17–I17.18; current ~188-member workspace | `CHECKED` design-to-structure correlation / `PARTIAL` causal attribution | Draft explicitly adopted crate-first micro-modularity, tens/low hundreds crates, three execution contours, `eliot-testd`, ModuleTestCapsules and generation promotion while saying crate count was not progress. The permitted capacity became the default architecture agents could satisfy locally. | One package/internal modules first; no contour, test daemon or generation lifecycle until one measured external/failure boundary needs it. |
-| R-066 | Identity/proof object multiplication | Old Implementation `NormativeDocumentIdentity`, conformance projection, Product Identity, CausalChangeUnit, ModuleTestCapsule, proof levels and receipts | `CHECKED` exact design constructs | Each object solved a local ambiguity, but together they formed a synchronization graph whose maintenance could outgrow the product edge. Generated projections did not remove underlying owners, identities and invalidation work. | Use Git commit/schema migration/operation ID at actual boundaries; ordinary issue/PR text for development; product-edge evidence instead of proof-object families. |
-| R-067 | Anti-proxy rules lacked admission backpressure | Old Architecture/Implementation anti-ceremony clauses; issues #5305/#3014; current artifacts | `CHECKED` | Docs already said reports, tests, commits and forms were not progress and prose instead of a discriminating artifact was failure. They did not make new artifact families wait for Product Proof or terminal overlap disposition, so agents could obey local contracts while product remained disconnected. | Enforce one active ledger, one integrator, WIP stop, cheap preflight and no new mechanism before a connected need. |
-| R-068 | Authoritative profile/destination admission | Contract §§3–4,6; Architecture §§2.3–2.4; Implementation §9.2; Cognition §7.1 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Memory reduces disclosure and selects profile name. Controller resolves connection/profile, inherits `actual_destination`, freezes digest and authoritatively checks disclosure, automatic use, limits and supported format. Memory не pre-approves по loopback URL или stale duplicate config. | Реализовать specific waiting/rejection mapping and ensure configuration gaps do not enter retry loops. |
-| R-069 | Один Memory-side controller client | Implementation §§2.1,9.1; Cognition §14; Contract §§1–2.1 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Один authenticated IPC adapter owns text/embed/Operation/artifact/cancel/release calls. Learning/vectors own semantic construction and mapping. Нет duplicated IPC stacks, MCP или CLI process per call. | Pin exact `swarm-client` revision and implement one adapter before separate feature handlers. |
+| R-045 | First episode recipe/result | Cognition §7; old I9.4/I9.5/I9.7/I9.10; Hy-Memory extractor path | `DECIDED` | Concrete instruction, zero-or-more changes, typed result, valid no-change and explicit partial/error. Operational failure/no-result/unknown never becomes no-change. | Run after R-048/R-050/R-051/R-053–R-057/R-068–R-070; then useful/no-change/partial/malformed/conflict cases. |
+| R-046 | Claude terminal body durability | Controller Claude stream/result path | `GAP` | Current optional agent route keeps body in boot-local bounded LRU before page capture. | Fix only if agent route is used; unrelated to direct inference artifact path. |
+| R-047 | One inference without second task manager | Old I9.1/I9.3/T12; controller Task path; V3 docs | `CHECKED` design / `NOT IMPLEMENTED` runtime | One Memory job owns input/coverage/decoding/publication; controller one-shot inference owns provider execution/readback/temporary copies. | Implement R-048; do not create Task/Attempt or direct provider stack in Memory. |
+| R-048 | Controller `inference.text` / `inference.embed` | Controller method catalog/source `e42c464d`; Inference Contract 0.4 | `GAP` | Narrow methods are absent. Existing routes are agent/task/script-oriented. | Implement custom staging admission, exact dedup, frozen profile/connection, runner, result artifact and unknown outcome. |
+| R-049 | Code-first and test timing | User direction; Implementation §14; README | `DECIDED` | Production path first, minimum build/Clippy per coherent increment; no speculative test platform. Full suite after connected implementation. | During coding record minimum Clippy; later build tests around observable paths. |
+| R-050 | Minimal connection/profile, privacy and budget | Old I9.4/I9.10/I3.6/I10.11/I10.4; Architecture §§2.3–2.4; Contract §§3–4,9 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Static connection + versioned profile, connection/profile digests, actual destination, two-state disclosure, finite limits and no fallback. No classifier/registry/approval platform. | Implement config parser/admission and Memory disclosure reducer; qualify actual profiles only when configured. |
+| R-051 | Inference controlled-copy lifecycle and erasure | Controller artifacts/operations `e42c464d`; Architecture §2.5; Contract §§5,13 | `GAP` | Controller stages exact input; result is optional. Cleanup tracks each copy independently and uses `memory_copy_verified`, `terminal_without_result` or `abandon_for_erasure`. | Implement per-copy states, `remove_exact`, fencing, cleanup recovery, bounded text-free receipt and erasure integration. |
+| R-052 | Taskless ScriptRun as inference donor | Controller taskless fixture and production `store/scripts.rs` on `e42c464d` | `CHECKED` / `NOT SELECTED` | Fixture qualifies Store admission but does not execute worker. Production path owns script registry, interpreter/process custody, authority/effects and multiple artifacts. | Reuse only Operation/recovery ideas; do not route inference through ScriptRun. |
+| R-053 | Narrow inference caller authority | Controller Role/Store-call/object-scope path `e42c464d`; Contract §2 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing roles are overbroad or incompatible. Add `inference_client` exact allowlist, no MCP discovery and no generic writer fallback. | Implement role serialization/registration, allowlist, own queued cancel and exact-caller reads. |
+| R-054 | Closed inference artifact provenance | Controller `ArtifactFiles`, `object_scope` and schema `e42c464d`; Contract §§5,11,13 | `GAP` | Current decoder omits inference kinds and verified deletion. Result has closed read grant; input remains private; both require exact provenance/removal. | Add kinds, Operation provenance, result-only public grant and private `remove_exact`. |
+| R-055 | Operation-only runner, recovery and cancellation | Generic mutation/dedup, Operation states/read/cancel `e42c464d`; Contract §§8,10,12 | `DECIDED` design / `NOT IMPLEMENTED` runtime | Existing replay/states/wake/queued cancel are sufficient. Generic mutate stores raw payload. No `inference_runs` or second scheduler selected. | Implement custom admission + bounded runner; queued cancel races CAS; sent/unknown reconciles without replay. |
+| R-056 | Direct Memory→controller IPC dependency | `swarm-client` source `e42c464d`; Contract §2.1 | `CHECKED` design / `NOT IMPLEMENTED` Memory adapter | Authenticated call has no task policy/application replay; after-write disconnect becomes unknown. Exact Git dependency selected; no MCP/CLI/protocol copy. | Pin revision, load private credential, verify frame bounds and exact replay after reconnect. |
+| R-057 | First provider adapter and transport boundary | Controller OpenCode donor, Cargo/reqwest features, Hy-Memory donor; Contract §9 | `DECIDED` design / `NOT IMPLEMENTED` runtime | First adapters are closed loopback Chat Completions/Embeddings without arbitrary extras/tools/stream/temperature/fallback/retry. Loopback != local destination. Direct HTTPS later with explicit TLS. | Implement/Clippy loopback text first; qualify destination; add HTTPS only as separate adapter. |
+| R-058 | Delivery throughput and artifact incentives | Issues #5305, #3014, #327; V3 AGENTS/README | `CHECKED` | Branches, PRs, receipts/docs were treated as progress while product edges remained open; overlapping work lacked current disposition. | Measure closed product edges/blockers; require owner + terminal disposition. |
+| R-059 | Append-only authority and context accretion | Historical issue bodies, root T files, inventories, V3 authority split | `PARTIAL` | Corrections accumulated beside superseded plans. V3 books + registry are current; Git/issues are history. | During cutover retire/label V2 authorities; no coequal V3 report. |
+| R-060 | Cheap preflight and WIP backpressure | Issue #5305; AGENTS/README | `DECIDED` | Admission/config/duplicate-owner failures run before expensive setup. Overlap waits for terminal disposition. | Use ordinary issue/PR ownership; add no gate absent proven need. |
+| R-061 | Vertical completion criterion | Issues #3014/#5305; Architecture §§1,11; Implementation §14 | `CHECKED` design | Completion = caller→operation→durable result/unknown→consumer/readback→restart/recovery. Local artifacts are intermediate. | Use as denominator for every slice/review. |
+| R-062 | Физическое дробление и manifest inversion | Root Cargo; sampled helper manifests/source | `CHECKED` representative / `PARTIAL` corpus | ~188 packages and large per-helper manifests turn helpers into governed products. V3 begins one package/internal modules. | Keep `mod` until measured dependency/deployment/change boundary. |
+| R-063 | Committed derived inventories as work | Two exact `.github/work-units` inventories | `CHECKED` exact files | Generated scans became mandatory denominators and permanent synchronization work. | Do not port; retire/archive after consumer search. |
+| R-064 | Intent–mechanism inversion | Old Architecture/Implementation targeted sections; current samples | `CHECKED` | Intent-first/simplest-mechanism prose coexisted with mandatory identity/manifest/proof/work schemas. | Admit mechanisms only after named caller/owner/result/consumer; replace/delete over corrective layer. |
+| R-065 | Crate-first decomposition as capacity target | Old Implementation status/I17; current workspace | `CHECKED` correlation / `PARTIAL` causality | Tens/hundreds crates, contours/testd/promotion became locally satisfiable default despite anti-metric prose. | One package/modules; no contour/test daemon/generation lifecycle before measured boundary. |
+| R-066 | Identity/proof object multiplication | Old normative identity/conformance/Product Identity/CCU/capsules/proof levels | `CHECKED` exact constructs | Locally useful objects formed synchronization graph exceeding product edge cost. | Use Git/schema/operation IDs at real boundaries and product-edge evidence. |
+| R-067 | Anti-proxy rules lacked admission backpressure | Old anti-ceremony clauses; issues #5305/#3014; artifacts | `CHECKED` | Rules condemned proxy work but did not prevent new artifact families before product proof or overlap disposition. | One ledger/integrator, WIP stop, cheap preflight, no mechanism before need. |
+| R-068 | Authoritative profile/destination admission | Contract §§3–4,6; Architecture §§2.3–2.4; Implementation §9.2; Cognition §7.1 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Memory reduces disclosure/selects profile. Controller resolves connection/destination, freezes digests and checks disclosure/origin/limits/format. | Implement specific waiting/rejection mapping without retry loops. |
+| R-069 | Один Memory-side controller client | Implementation §§2.1,9.1; Cognition §14; Contract §§1–2.1 | `DECIDED` design / `NOT IMPLEMENTED` runtime | One IPC adapter owns text/embed/Operation/artifact/cancel/release. Learning/vectors own semantics. | Pin `swarm-client` and implement one adapter before feature handlers. |
+| R-070 | No-result, partial cleanup and erasure abandonment | Contract §§5.3,12–13; Architecture §§2.5,7.1,9; Implementation §§4.6,5.4,9.3,12.1; Cognition §§7.4–7.5,13 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Result is optional. Terminal no-result releases input; unresolved erasure explicitly abandons/fences; input/result cleanup states remain separate; aggregate `released` cannot hide partial failure. | Implement dispositions, per-copy receipt/recovery and late-result fence; exercise cancel/fail/unknown/partial-cleanup cases. |
 
 ## 3. Source coverage
 
 | ID | Источник | Статус | Граница вывода |
 |---|---|---|---|
-| S-001 | V1 Canonical Master | `CHECKED` для ранее прочитанного полного документа до §40 | Requirements read; не полный code audit V1. |
-| S-002 | V2 Architecture/Implementation selected sections | `PARTIAL` | Много разделов перечитано по конкретным вопросам; весь корпус не объявлен свежо проверенным. |
-| S-003 | Claude audit revision 4 | `CHECKED` как предоставленный полный текст | Использован как source of ideas, не автоматический норматив. |
-| S-004 | ELIOT audit v9 | `CHECKED` как предоставленный текст | Historical findings не перезапускались на каждом SHA. |
-| S-005 | Swarm audit 2026-10-06 | `CHECKED` как предоставленный текст | Controller ownership отделён от Memory. |
-| S-006 | August architecture audit | `CHECKED` как предоставленный текст | Proof/policy machinery не перенесена автоматически. |
-| S-007 | LLM problems report | `CHECKED` как предоставленный текст | Failure classes mapped; incidents not reproduced. |
-| S-008 | Release ZIP `audit-2026-10-16-incomplete` | `BLOCKED` | Metadata известно; полный 968-file semantic review не заявлен. |
-| S-009 | `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` | `BLOCKED` | Полный текст отсутствует. |
-| S-010 | Donors D01–D47, Hy-Memory, Mem0, Docling, Research, controller | `PARTIAL` | Findings относятся к exact paths/revisions; ни один продукт не квалифицирован целиком. |
-| S-011 | Independent subagent review | `OPEN` | В этом проходе независимого subagent review не было. |
-| S-012 | Consolidated failure audit 2026-08-05 | `PARTIAL` | Проверен named curation preview path; historical counts/runtime not reproduced. |
-| S-013 | Controller inference boundary | `CHECKED` для Task/claim/dispatch, method catalog, config/Route and artifact surface through `e42c464d` | Установлена цена Task lifecycle, отсутствие narrow inference methods и отсутствие ready release. Provider/live routes не запускались. |
-| S-014 | Old inference privacy/routing corpus | `CHECKED` для I9.4, I9.10, I3.6, I10.11, I10.4 and old `RuntimeRoute` selected source | Сохранены finite limits, requested/observed facts and no silent fallback; rejected broader Governor/portfolio/fingerprint machinery. |
-| S-015 | Controller taskless execution and Store primitives | `CHECKED` для taskless fixture, production ScriptRun, generic mutate/dedup, Role dispatch, operation/object scope, ArtifactFiles, core schema and cancel on `e42c464d` | Установлены reusable primitives и anti-donor boundaries. Worker/provider execution не запускались. |
-| S-016 | Direct IPC and provider transport donors | `CHECKED` для `swarm-client`, OpenCode HTTP/config, controller Cargo and reqwest 0.13.5 feature table; Hy-Memory provider path already partial | Установлены no-replay IPC, loopback HTTP hardening, private-file pattern and missing current TLS feature. Provider/model quality/live compatibility не проверены. |
-| S-017 | Repository delivery-collapse evidence | `CHECKED` для owner-authored issues #5305, #3014, #327 и current retained process surfaces | Подтверждены failure mechanisms и explicit anti-duplication decisions; полный текущий census всех branches/PRs/issues не обновлялся. |
-| S-018 | Workspace/manifests/generated-inventory sample | `CHECKED` для root `Cargo.toml`, exact sampled crate paths and exact two inventory files | Подтверждён повторяющийся механизм, но не заявлен полный semantic audit всех ~188 crates или каждого work-unit файла. |
-| S-019 | `ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md` and `ELIOT_IMPLEMENTATION(10)(1).md` retained library copies | `CHECKED` targeted sections named by R-064–R-067 | Exact intent/mechanism clauses inspected; not a fresh line-by-line audit of both complete books. |
-| S-020 | Current normative synchronization pass | `CHECKED` для branch revisions Architecture draft.6 / Implementation draft.19 / Cognition draft.9 / Contract 0.3 | Полные текущие design texts проверены на owner/terms/lifecycle consistency. Runtime, build, provider и Windows behavior не запускались. |
+| S-001 | V1 Canonical Master | `CHECKED` ранее прочитанного документа до §40 | Requirements read; не полный V1 code audit. |
+| S-002 | V2 Architecture/Implementation selected sections | `PARTIAL` | Много разделов перечитано по вопросам; весь корпус не объявлен свежо проверенным. |
+| S-003 | Claude audit revision 4 | `CHECKED` provided text | Source of ideas, not automatic norm. |
+| S-004 | ELIOT audit v9 | `CHECKED` provided text | Findings not rerun on every SHA. |
+| S-005 | Swarm audit 2026-10-06 | `CHECKED` provided text | Controller ownership separated. |
+| S-006 | August architecture audit | `CHECKED` provided text | Proof/policy machinery not auto-carried. |
+| S-007 | LLM problems report | `CHECKED` provided text | Failure classes mapped; incidents not reproduced. |
+| S-008 | Release ZIP `audit-2026-10-16-incomplete` | `BLOCKED` | Metadata only; no full 968-file semantic review claim. |
+| S-009 | `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` | `BLOCKED` | Full text absent. |
+| S-010 | Donors D01–D47, Hy-Memory, Mem0, Docling, Research, controller | `PARTIAL` | Findings apply to exact paths/revisions; no whole donor qualification. |
+| S-011 | Independent subagent review | `OPEN` | No independent subagent review available this pass. |
+| S-012 | Consolidated failure audit 2026-08-05 | `PARTIAL` | Named curation preview path checked; counts/runtime not reproduced. |
+| S-013 | Controller inference boundary | `CHECKED` Task/claim/dispatch/catalog/config/artifacts through `e42c464d` | Established Task cost and missing narrow inference/release; no live provider run. |
+| S-014 | Old inference privacy/routing corpus | `CHECKED` selected old sections | Kept finite limits/requested-observed/no fallback; rejected platform. |
+| S-015 | Controller taskless execution/Store primitives | `CHECKED` exact selected paths `e42c464d` | Reusable primitives and anti-donors; no worker/provider execution. |
+| S-016 | Direct IPC/provider transport donors | `CHECKED` swarm-client/OpenCode/Cargo/reqwest; Hy-Memory partial | No-replay IPC, bounded loopback HTTP, private files, missing TLS feature. |
+| S-017 | Repository delivery-collapse evidence | `CHECKED` issues #5305/#3014/#327 and retained surfaces | Mechanisms confirmed; no full current census. |
+| S-018 | Workspace/manifests/generated inventories sample | `CHECKED` exact sampled paths | Repeated mechanism confirmed; not full semantic audit of all crates/work-units. |
+| S-019 | Retained old Architecture/Implementation library copies | `CHECKED` targeted R-064–R-067 sections | Exact clauses inspected; not complete fresh line-by-line audit. |
+| S-020 | Current normative synchronization pass | `CHECKED` Architecture draft.7 / Implementation draft.20 / Cognition draft.10 / Contract 0.4 | Current design texts checked for owner/terms/result/no-result/cleanup consistency. No runtime/build/provider/Windows execution. |
 
 ### Источники прохода 2026-10-24 — controller implementation boundary
 
@@ -147,103 +148,109 @@
 Установлено:
 
 1. exact Operation replay and direct authenticated IPC already exist;
-2. Memory needs no MCP surface, CLI process or copied transport;
+2. Memory needs no MCP/CLI/copied transport;
 3. generic mutation stores raw payload and cannot admit protected inference unchanged;
-4. current artifacts need explicit inference provenance and deletion owner;
-5. ScriptRun is not a lightweight provider executor;
-6. first working provider adapter can be a closed loopback Chat-Completions path over the existing HTTP dependency;
-7. loopback transport does not prove local data destination;
-8. current controller build does not include reqwest TLS features, so direct external HTTPS is not yet present;
-9. arbitrary provider extras and blind retry are rejected anti-donors;
-10. Contract 0.3 defines the minimal connection/profile/adapter/IPC boundary; code remains absent.
+4. artifacts need inference provenance and exact deletion owner;
+5. ScriptRun is not lightweight provider executor;
+6. first adapter can be closed loopback Chat Completions;
+7. loopback does not prove local destination;
+8. current controller build lacks reqwest TLS for direct HTTPS;
+9. arbitrary extras/blind retry are anti-donors;
+10. Contract 0.4 defines minimal connection/profile/adapter/IPC and complete cleanup boundary; code remains absent.
 
 Проектные контрпримеры, не прогоны:
 
-- conflicting request ID with another prompt digest → conflict before provider I/O;
-- protected prompt through generic mutate → raw SQLite duplicate survives release;
-- crash after input file before Operation commit → unregistered orphan, never executable;
-- crash after result file before settle → verify deterministic file and finish settlement;
-- queued cancel wins before runner CAS → no provider call;
+- same request ID + another digest → conflict before provider I/O;
+- protected prompt through generic mutate → raw SQLite duplicate survives cleanup;
+- crash after input file before Operation commit → orphan, never executable;
+- crash after result file before settle → verify deterministic file then settle;
+- queued cancel wins before runner CAS → no provider call, input still released;
 - runner CAS wins → local cancel cannot claim non-execution;
-- IPC reply lost after write → reconnect and exact replay, not new request ID;
-- loopback gateway forwards to cloud but profile says local → configuration defect; disclosure must not be inferred from host address;
-- provider returns tool call/no visible content → unsupported output, not no-change;
-- finish reason indicates length limit → partial, not complete;
-- current reqwest build attempts HTTPS direct adapter → unsupported until explicit TLS feature;
-- Memory verifies result but release reply is lost → exact release replay;
+- IPC reply lost after write → exact replay, not new request ID;
+- loopback forwards to cloud but says local → config defect;
+- tool-call/no visible content → unsupported output, not no-change;
+- length finish → partial, not complete;
+- current build uses direct HTTPS adapter → unsupported until TLS feature;
+- release reply lost → exact release replay;
+- one copy removed and another mismatches → cleanup_incomplete, never released;
+- unknown Operation erased → abandon fence before cleanup, external effect remains unknown;
 - inference client attempts unrelated mutation → forbidden before generic writer path.
 
 ## 4. Решения, которые не открываются без нового основания
 
-- не переносить V1/V2 runtime и compatibility facades;
-- не создавать второй task manager, swarm, research engine или semantic DB;
-- не создавать provider/credential/router stack внутри Memory при выбранном controller owner;
-- не использовать controller Task/Attempt или ScriptRun для обычного one-shot memory inference;
+- не переносить V1/V2 runtime/compatibility facades;
+- не создавать второй task manager/swarm/research engine/semantic DB;
+- не создавать provider/credential/router stack внутри Memory;
+- не использовать Task/Attempt/ScriptRun для one-shot inference;
 - не сохранять raw inference payload через generic mutation JSON;
-- не копировать controller IPC protocol в Memory и не запускать CLI на каждый call;
-- не создавать permanent Dreamer process or model loop;
+- не копировать IPC и не запускать CLI per call;
+- не создавать permanent Dreamer/model loop;
 - не возвращать Governor route/capability/fingerprint/portfolio platform;
-- не создавать отдельный inference scheduler/table до реальной необходимости;
-- не добавлять public generic artifact deletion;
-- не использовать unversioned “OpenAI-compatible” arbitrary extras as production contract;
-- не считать loopback доказательством local-only destination;
-- не дублировать controller connection/profile config в Memory для authoritative admission;
-- не создавать отдельные IPC clients/stacks для text, embeddings, readback и release;
-- не блокировать capture/read из-за inference, vectors, graph, map или telemetry;
-- не использовать similarity как authority, truth или applicability proof;
-- не считать fixture, receipt, stored ID или shape-valid object работающей функцией;
-- не создавать SkillRegistry, OutcomeStore, TruthRegistry или PacketStore;
-- не требовать promotion, experiment или approval для каждой provisional lesson;
-- не строить universal plugin/query/workflow framework до второго реального consumer;
-- не менять production behavior ради ложного тестового ожидания;
-- не объявлять source, donor или runtime coverage шире фактически прочитанного/наблюдаемого;
-- не создавать новый task catalogue, gate, branch manager, mission/report database или agent scheduler вместо существующего GitHub owner path;
-- не считать issue body, historical appendix, T-file или legacy receipt равноправным текущим V3 authority;
-- не начинать expensive setup до дешёвых admission/configuration/duplicate-owner checks;
-- не открывать overlapping sibling work без terminal disposition предыдущего владельца;
-- не считать prose, LOC, commits, agents, issues или PRs заменой merged product behavior;
-- не создавать crate/process на каждый concept или helper до реальной dependency/deployment/change boundary;
-- не переносить per-helper proof/promotion/lifecycle manifests в V3 по умолчанию;
-- не считать generated repository inventory живым authority или обязательным denominator после завершения конечной migration work;
-- не вводить `NormativeDocumentIdentity`, global `Product Identity`, `CausalChangeUnit` или `ModuleTestCapsule` как обязательные V3 work objects;
-- не строить three-contour execution fabric, separate test daemon или generation-promotion path до доказанной runtime/failure boundary;
-- не исправлять антицеремониальный rule добавлением ещё одного rule/projection/receipt;
-- не создавать отдельный errata/compatibility document для расхождений внутри текущего V3 design: исправлять owners напрямую.
+- не создавать отдельный inference scheduler/table;
+- не добавлять generic artifact deletion;
+- не использовать unspecified OpenAI-compatible extras;
+- не считать loopback local destination;
+- не дублировать connection/profile config в Memory для admission;
+- не создавать отдельные IPC stacks для text/embed/read/release;
+- не считать aggregate cleanup sufficient без per-copy facts;
+- не удалять unresolved Operation content до abandon fence;
+- не превращать operational failure/no-result в cognitive no-change;
+- не блокировать Base из-за optional capabilities;
+- не использовать similarity как authority/truth/applicability proof;
+- не считать fixture/receipt/stored ID/shape object функцией;
+- не создавать SkillRegistry/OutcomeStore/TruthRegistry/PacketStore;
+- не требовать promotion/experiment/approval для каждого lesson;
+- не строить universal plugin/query/workflow framework до consumer;
+- не менять production behavior ради placeholder test;
+- не расширять coverage claims;
+- не создавать task catalogue/gate/branch manager/report DB/scheduler вместо GitHub owner path;
+- не считать issue/history/T-file/receipt текущим V3 authority;
+- не начинать expensive setup до cheap preflight;
+- не открывать overlap без disposition;
+- не считать prose/LOC/commits/agents/issues/PRs продуктовым прогрессом;
+- не создавать crate/process per concept;
+- не переносить per-helper manifests;
+- не считать generated inventory permanent authority;
+- не вводить old identity/proof work objects;
+- не строить contours/test daemon/generation promotion до measured boundary;
+- не исправлять церемонию новой церемонией;
+- не создавать errata/compatibility doc для текущего V3: исправлять owner documents.
 
 ## 5. Очередь
 
 | Priority | Работа | Закрывает |
 |---|---|---|
-| P1 | В controller реализовать first production slice: caller role/allowlist, connection/profile parser, custom input staging, exact dedup, one Operation runner, loopback text adapter, pending-result recovery, public receipt/grant and release — без Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-055, R-057, R-068 |
-| P1 | Параллельно продолжать Memory Base Slices 1–2 независимо от model routes | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
-| P1 | До начала каждого implementation slice зафиксировать одного integrator, product-edge denominator, дешёвые preflight checks и terminal disposition для overlap; не добавлять process infrastructure | R-058–R-061, R-067 |
-| P1 | Начать V3 одним Rust package и внутренними модулями; второй crate/process допускается только после измеримой границы и должен упростить существующий путь | R-033, R-062, R-065 |
-| P1 | Реализовать один Memory-side controller adapter на pinned `swarm-client`; не создавать separate text/embed/read/release transports | R-056, R-069 |
-| P1 | Применять README goal→minimal-mechanism table как admission filter: unnamed caller/owner/result/consumer остаётся требованием, а не новым object family | R-064, R-066, R-067 |
-| P1 | После Base подключить learning через direct IPC and exact result lifecycle | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057, R-068–R-069 |
-| P2 | Добавить loopback embeddings through the same Operation/release lifecycle, затем vector mapping/query | R-015, R-034, R-048, R-050–R-057, R-069 |
-| P2 | Добавить direct HTTPS adapter только после explicit TLS feature/qualification | R-050, R-057 |
-| P2 | Исправить optional agent-result projection/source retention только для real agent consumer | R-014, R-027, R-046 |
-| P2 | Исправить Research parser/citation reader и подключить один профиль | R-016, R-031, R-032 |
-| P2 | Реализовать document/project-view/grounds paths как независимые increments | R-008, R-017, R-018, R-038, R-040 |
-| P2 | При V3 cutover retire generated V2 inventories и per-helper manifests; не поддерживать их синхронно с новым кодом | R-059, R-063 |
-| P3 | Получить недоступные ZIP/report | S-008, S-009 |
-| P3 | Углублять донора только под незакрытый выбранный механизм | S-010 |
-| Final | После connected implementation построить и запустить full test suite; во время разработки only minimum relevant build/Clippy | R-049 |
+| P1 | Controller first slice: role/allowlist, connection/profile parser, staging, dedup, runner, loopback text, pending-result recovery, closed receipt, per-copy release with three dispositions — no Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-055, R-057, R-068, R-070 |
+| P1 | Memory Base Slices 1–2 независимо от model routes | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
+| P1 | One integrator/product edge/cheap preflight/terminal overlap disposition per slice | R-058–R-061, R-067 |
+| P1 | One Rust package/internal modules; second crate/process only after measured boundary | R-033, R-062, R-065 |
+| P1 | One Memory controller adapter on pinned `swarm-client`; no separate transports | R-056, R-069 |
+| P1 | README goal→minimal-mechanism admission filter | R-064, R-066, R-067 |
+| P1 | After Base connect learning with exact request/result/no-result/cleanup lifecycle | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057, R-068–R-070 |
+| P2 | Embeddings through same Operation/per-copy release lifecycle, then vector mapping/query | R-015, R-034, R-048, R-050–R-057, R-069–R-070 |
+| P2 | Direct HTTPS only after explicit TLS qualification | R-050, R-057 |
+| P2 | Optional agent-result projection only for real consumer | R-014, R-027, R-046 |
+| P2 | Research parser/citation fixes and one profile | R-016, R-031, R-032 |
+| P2 | Document/project-view/grounds as independent increments | R-008, R-017, R-018, R-038, R-040 |
+| P2 | Retire generated V2 inventories/per-helper manifests during cutover | R-059, R-063 |
+| P3 | Obtain unavailable ZIP/report | S-008, S-009 |
+| P3 | Deepen donor only for selected unresolved mechanism | S-010 |
+| Final | Full tests after connected implementation; minimum relevant build/Clippy during development | R-049 |
 
 ## 6. Последние изменения
 
 | Дата / baseline | Изменение |
 |---|---|
-| 2026-10-23 / `2ee24de2` | Первый конкретный `episode_learning` recipe и typed result. |
-| 2026-10-23 / `2ab45985` | Прослежен controller TaskPrompt/result path; подтверждены R-027/R-046. |
-| 2026-10-24 / `d97b9bfb` | Controller Task lifecycle признан избыточным для one-shot learning. |
-| 2026-10-24 / `10f864d7` | Provider stack оставлен у controller; переписаны normative docs. |
-| 2026-10-24 / `d4657682` | Добавлены minimal inference profile, disclosure и controlled-result lifecycle; создан Contract 0.1. |
-| 2026-10-24 / `e81c0503` | Implementation draft.18 и Cognition draft.8 синхронизированы с Contract 0.1. |
-| 2026-10-24 / `27eda54c` | Contract 0.2: controlled input, narrow caller, Operation-only runner, input+result release and ScriptRun anti-donor. |
-| 2026-10-24 / `0da78d29` | Contract 0.3: direct swarm-client IPC, connection/profile split, actual destination and versioned loopback text/embedding adapters; direct HTTPS separated by explicit TLS dependency. |
-| 2026-10-24 / `c1401bb2` | AGENTS/README закрепили delivery-collapse causes, one-ledger/product-edge discipline и Contract 0.3 terminology; добавлены R-058–R-061/S-017. |
-| 2026-10-24 / `4fcee2f6` | Representative physical/process pass: ~188-member workspace, per-helper module manifests and committed generated inventories recorded as V3 anti-patterns. |
-| 2026-10-24 / `561fe900` | Старые цели сведены к minimal mechanisms; intent–mechanism inversion, crate-first expansion and identity/proof multiplication added as R-064–R-067/S-019. |
-| 2026-10-24 / `5f32d764`–`a03114ae` | Architecture draft.6, Implementation draft.19 и Cognition draft.9 синхронизированы с Contract 0.3; R-024 закрыт; добавлены authoritative admission R-068 и one-client boundary R-069/S-020. |
+| 2026-10-23 / `2ee24de2` | First `episode_learning` recipe/result. |
+| 2026-10-23 / `2ab45985` | Controller TaskPrompt/result traced; R-027/R-046. |
+| 2026-10-24 / `d97b9bfb` | Task lifecycle rejected for one-shot learning. |
+| 2026-10-24 / `10f864d7` | Provider stack retained by controller. |
+| 2026-10-24 / `d4657682` | Minimal profile/disclosure/result lifecycle; Contract 0.1. |
+| 2026-10-24 / `e81c0503` | Implementation 18/Cognition 8 sync with 0.1. |
+| 2026-10-24 / `27eda54c` | Contract 0.2 controlled input/caller/runner/release. |
+| 2026-10-24 / `0da78d29` | Contract 0.3 direct IPC, connection/profile, destination, adapters. |
+| 2026-10-24 / `c1401bb2` | Delivery-collapse constraints R-058–R-061/S-017. |
+| 2026-10-24 / `4fcee2f6` | Workspace/manifests/inventory anti-patterns. |
+| 2026-10-24 / `561fe900` | Goals→minimal mechanisms; R-064–R-067/S-019. |
+| 2026-10-24 / `5f32d764`–`a03114ae` | Architecture 6 / Implementation 19 / Cognition 9 synced with Contract 0.3; R-068/R-069. |
+| 2026-10-24 / `4e203676`–`fdf53183` | Contract 0.4 plus Architecture 7 / Implementation 20 / Cognition 10: optional result, three release dispositions, per-copy cleanup and abandon fence; R-070/S-020. |
