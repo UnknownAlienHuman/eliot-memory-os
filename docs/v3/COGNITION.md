@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.9 · 2026-10-24 · normative algorithms used by V3.**
+**Revision 1.0-draft.10 · 2026-10-24 · normative algorithms used by V3.**
 
-This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves context, learns from outcomes and improves connected methods. It does not define extra services. State, execution and ownership are defined in [Implementation](IMPLEMENTATION.md). External model execution, connection/profile resolution, controlled artifacts and release are defined by [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md).
+This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves context, learns from outcomes and improves connected methods. It does not define extra services. State, execution and ownership are defined in [Implementation](IMPLEMENTATION.md). External model execution, connection/profile admission, controlled artifacts and all cleanup dispositions are defined by [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md).
 
 ## 1. Cognitive units
 
@@ -35,7 +35,7 @@ Reconstruct current work in this order:
 4. preserve completed work, abandoned alternatives, open commitments and unresolved effects;
 5. only then retrieve similar prior work.
 
-If no task identity exists, use the narrowest known session/workspace continuation. Do not attach interleaved events to the newest prompt merely because it is newest. Generated plans and summaries cannot silently revise sourced goals. A branch switch changes environmental applicability, not identity of a continuing task. Fork and transfer retain explicit relations.
+If no task identity exists, use narrowest known session/workspace continuation. Do not attach interleaved events to newest prompt merely because it is newest. Generated plans and summaries cannot silently revise sourced goals. Branch switch changes environmental applicability, not identity of continuing task. Fork and transfer retain explicit relations.
 
 A continuation revision contains:
 
@@ -48,11 +48,11 @@ A continuation revision contains:
 - represented streams/segments and gaps;
 - exact source handles.
 
-A continuation never replaces original observations. Reading a tail is not publishing a summary or proving all streams were processed. Late events retain the task/resource binding in which they arose.
+A continuation never replaces original observations. Reading a tail is not publishing a summary or proving all streams were processed. Late events retain task/resource binding in which they arose.
 
 ## 3. Claim identity and current-state resolution
 
-A comparison group uses the minimum material identity:
+A comparison group uses minimum material identity:
 
 - project and relevant workspace/task scope;
 - subject/resource;
@@ -75,11 +75,11 @@ Last write, highest similarity, retrieval frequency and model confidence are not
 
 ### 3.1 Replacement and withdrawal
 
-Prepare replacement outside the transaction. Publish new revision, revision-specific grounds, scoped retirement and job result atomically.
+Prepare replacement outside transaction. Publish new revision, revision-specific grounds, scoped retirement and job result atomically.
 
-A failed publication leaves prior committed state intact. Competing replacements revalidate current revision. A result for source version A does not become evidence about version B because it was published later.
+Failed publication leaves prior committed state intact. Competing replacements revalidate current revision. Result for source version A does not become evidence about version B because it was published later.
 
-After A→B, withdrawing B does not automatically restore A. Return another supported alternative or unknown. Restoring A requires new evidence or correction of the original replacement decision.
+After A→B, withdrawing B does not automatically restore A. Return another supported alternative or unknown. Restoring A requires new evidence or correction of original replacement decision.
 
 ### 3.2 Compound grounds
 
@@ -87,69 +87,50 @@ A grounds group belongs to one conclusion revision. Every declared member of a g
 
 | Recorded situation | Consequence for that basis |
 |---|---|
-| All required members remain usable for the stated scope | Basis remains available; conclusion is not thereby certified |
-| Required premise is refuted or a required live condition is inapplicable | That group cannot justify the conclusion here |
+| All required members remain usable for stated scope | Basis remains available; conclusion is not thereby certified |
+| Required premise is refuted or live condition is inapplicable | That group cannot justify conclusion here |
 | A member or its relevance is unresolved | Group is unresolved, not true or false |
-| No declared group/composition or a required member disappeared | Do not infer support from an empty set or remaining citation count |
+| No declared composition or required member disappeared | Do not infer support from empty set or remaining citation count |
 
-For `(A and B) or C`, loss of B breaks the first group but not an intact C group. If all groups fail, the old conclusion lacks its declared basis; that does not prove the opposite. A surviving basis does not erase direct counterevidence to the conclusion.
+For `(A and B) or C`, loss of B breaks first group but not intact C group. If all groups fail, old conclusion lacks declared basis; that does not prove opposite. Surviving basis does not erase direct counterevidence.
 
-A newer edition does not automatically refute an old observation. Temporary source unavailability limits verification but does not make retained knowledge false. A live requirement that no longer holds affects current applicability.
+Newer edition does not automatically refute old observation. Temporary source unavailability limits verification but does not make retained knowledge false. A live requirement that no longer holds affects current applicability.
 
-Reconsider affected conclusions by indexed reverse links and finite jobs. Do not validate the whole graph before each read. Cyclic citations supply no independent support. Erasing a required premise must not turn an AND group into a smaller satisfied group; retain permitted loss-of-ground qualification before removing the content-bearing link.
+Reconsider affected conclusions by indexed reverse links and finite jobs. Do not validate whole graph before each read. Cyclic citations supply no independent support. Erasing required premise must not turn AND group into smaller satisfied group; retain permitted loss-of-ground qualification before removing content-bearing link.
 
 ### 3.3 Time
 
-Keep separate:
+Keep separate occurrence time, stated validity/situation, receipt time and editorial revision time.
 
-- occurrence time;
-- stated validity or situation;
-- receipt time;
-- editorial revision time.
-
-Preserve unknown precision/timezone. A late import or new summary is not a fresh world observation. A real A→B→A sequence creates a new A occurrence rather than deduplicating into the first A.
+Preserve unknown precision/timezone. Late import or new summary is not fresh world observation. A real A→B→A sequence creates new A occurrence rather than deduplicating into first A.
 
 Historical questions may require historical source/editorial revisions. Do not answer “what was known then?” using only today's heads. No automatic full historical-world rebuild is required.
 
 ## 4. Episodes, sources and coverage
 
-Group observations through actual host-native task/session/call/result/parent relationships. Keep a tool call with its result and observed repair or check.
+Group observations through actual host-native task/session/call/result/parent relationships. Keep tool call with result and observed repair/check.
 
-An episode may be processed in finite portions while work continues. Freeze selected membership and actual segments/per-stream bounds. New observations enter a pending successor rather than changing running input. Late child material or newly learned parent association can add previously uncovered source without reopening every stream.
+Episode may be processed in finite portions while work continues. Freeze selected membership and actual segments/per-stream bounds. New observations enter pending successor rather than changing running input. Late child material or newly learned parent association can add uncovered source without reopening every stream.
 
 Distinguish:
 
-- material selected for a job;
+- material selected for job;
 - material actually supplied to controller inference;
 - successfully processed coverage.
 
-A trimmed body, unexpanded handle or omitted segment is not covered. No-change covers only completed supplied input and purpose. Rereading background does not add independent support. There is no global processed bit.
+Trimmed body, unexpanded handle or omitted segment is not covered. No-change covers only completed supplied input and purpose. Rereading background does not add independent support. There is no global processed bit.
 
-When a compact lesson is selected, optional expansion follows source links to useful episode neighborhood:
-
-- cause/action;
-- result/error;
-- repair/change;
-- later check/outcome.
+When compact lesson is selected, optional expansion follows source links to useful episode neighborhood: cause/action, result/error, repair/change and later check/outcome.
 
 Timestamp proximity across unrelated streams does not create one episode. Missing counterparts remain explicit; useful independent material does not wait for every agent to finish.
 
-A source object, version and transformed representation remain distinct. Observed rename/copy/export/crop links retain exact input/output; inferred continuity remains a hypothesis. Equal names, bytes or embeddings cannot merge logical sources.
+Source object, version and transformed representation remain distinct. Observed rename/copy/export/crop links retain exact input/output; inferred continuity remains hypothesis. Equal names, bytes or embeddings cannot merge logical sources.
 
 ## 5. Project understanding
 
-A project view is a versioned answer to one useful question over an examined scope.
+A project view is a versioned answer to one useful question over an examined scope: purpose/boundaries, subsystem responsibility, API consumers, rationale, failed approaches or intended-versus-observed discrepancy.
 
-Examples:
-
-- purpose and boundaries;
-- subsystem responsibilities;
-- consumers of an API;
-- why a decision was made;
-- failed approaches in an area;
-- discrepancy between intended and observed behavior.
-
-A view records question, examined workspace/resource revisions, answer, source handles and gaps. Old cited files do not prove no new consumer exists. Membership-affecting changes qualify or dirty the view.
+A view records question, examined workspace/resource revisions, answer, source handles and gaps. Old cited files do not prove no new consumer exists. Membership-affecting changes qualify or dirty view.
 
 Refresh affected views only. Until refresh completes, serve prior qualified view and direct source access. Checkout-specific views use distinct addresses; late synthesis cannot overwrite another checkout's view. Stable project intent may remain shared while implementation views differ.
 
@@ -169,19 +150,15 @@ Generate independently from:
 - project-local methods;
 - reusable methods eligible for current project.
 
-Union candidates before selection. A lexical candidate does not need a vector score. Workspace/task selectors apply before per-arm limits. Historical cases retain original scope instead of becoming current state.
+Union candidates before selection. Lexical candidate does not need vector score. Workspace/task selectors apply before per-arm limits. Historical cases retain original scope instead of becoming current state.
 
 ### 6.2 Applicability
 
-Evaluate a method's material conditions as:
+Evaluate material conditions as `applicable`, `inapplicable` or `unknown/conditional`.
 
-- applicable;
-- inapplicable;
-- unknown or conditional.
+Typed observed values may decide simple conditions. Natural-language uncertainty remains conditional. Token overlap is not proof: `not committed` does not satisfy `committed`; mentioning check is not evidence it ran.
 
-Typed observed values may decide simple conditions. Natural-language uncertainty remains conditional. Token overlap is not proof: `not committed` does not satisfy `committed`; mentioning a check is not evidence it ran.
-
-Unknown applicability can yield a conditional suggestion and missing check. It does not require silence or permission denial.
+Unknown applicability can yield conditional suggestion and missing check. It does not require silence or permission denial.
 
 ### 6.3 Ranking
 
@@ -191,7 +168,7 @@ Rank relevance separately from support. Useful signals include exact match, lexi
 
 Expand relations only when they supply missing decision information: order, consumer, cause, outcome, repair or exception. Intermediate nodes need not repeat query words.
 
-Bound traversal by scope, relation purpose, nodes/edges and work budget. A link for revision 2 does not automatically describe revision 3. Current expansion uses links of the revision actually read; historical expansion uses requested revision.
+Bound traversal by scope, purpose, nodes/edges and work budget. Link for revision 2 does not automatically describe revision 3. Current expansion uses links of revision actually read; historical expansion uses requested revision.
 
 ### 6.5 Packet packing
 
@@ -204,7 +181,7 @@ Pack semantic units:
 - dissent, unknowns and next checks;
 - source handles.
 
-Load material exceptions through recorded links before final packing; they need not rank independently. Keep exception with claim or method. If a unit cannot fit, return a concise faithful qualified form plus handle or omit the whole unit with a stated gap. Do not drop negation, version or contraindication.
+Load material exceptions through recorded links before final packing; they need not rank independently. Keep exception with claim/method. If unit cannot fit, return concise faithful qualified form plus handle or omit whole unit with stated gap. Do not drop negation, version or contraindication.
 
 Packet-local grouping can reduce repeated compatible guidance without merging stored IDs. Compare material scope, time, perspective and conditions, not text hash alone. Grouping is not new evidence or permanent alias.
 
@@ -220,27 +197,27 @@ The handler receives:
 |---|---|
 | `new_sources` | Selected new observations/segments with request-local refs, source kind, actor/role, call/result association, exact text, material scope/version, disclosure and capture limits |
 | `background` | Relevant older excerpts used for interpretation, explicitly not new occurrences |
-| `existing_items` | Small set of current editable local claim/advice items with refs, exact revisions, complete editable content, conditions, exceptions and contrary evidence |
+| `existing_items` | Small current editable claim/advice set with exact revisions, content, conditions, exceptions and contrary evidence |
 | `recipe` | Exact processing-method ID/revision and text |
 
-The job retains ref→exact handle/revision/range mapping. A ref is request-local, not another registry. Include failures and read-only findings as well as successes. Label derived summaries and replayed Eliot context so they do not become new evidence.
+The job retains ref→exact handle/revision/range mapping. Ref is request-local, not another registry. Include failures and read-only findings as well as successes. Label derived summaries and replayed Eliot context so they do not become new evidence.
 
 Before controller I/O:
 
 1. freeze exact members and ranges;
 2. reduce disclosure over material actually supplied;
 3. select configured controller profile name;
-4. build the exact prompt and response format;
-5. save prompt bytes/blob, length, digest, profile, disclosure, limits and source mapping on the job;
+4. build exact prompt and response format;
+5. save prompt bytes/blob, length, digest, profile, disclosure, limits and source mapping;
 6. assign one stable client request ID for this explicit attempt.
 
-Do not drop protected material to make an external destination pass. Controller admission authoritatively resolves the profile's connection and `actual_destination`, validates disclosure/automatic-use/limits and either admits the Operation or returns a specific operational state. A rejection or wait leaves input unprocessed.
+Do not drop protected material to make external destination pass. Controller admission authoritatively resolves profile/connection/`actual_destination`, validates disclosure, origin, limits and format, and either admits Operation or returns specific operational state. Rejection/wait leaves input unprocessed.
 
 Provider/controller execution occurs outside Store transactions. Memory retains exact returned bytes and operational metadata before cognitive decoding.
 
 ### 7.2 Initial instruction
 
-Save this as the first `episode_learning` processing method and append typed response shape and JSON input as data:
+Save this as first `episode_learning` processing method and append typed response shape and JSON input as data:
 
 ```text
 Extract useful knowledge from NEW_SOURCES for a future decision. Use BACKGROUND
@@ -280,8 +257,6 @@ number of claims or methods.
 
 ### 7.3 Response contract
 
-Purpose-specific result:
-
 ```json
 {
   "status": "complete | partial",
@@ -302,65 +277,75 @@ Purpose-specific result:
 
 Rules:
 
-- `target` is null or an editable `existing_items` ref;
-- a revision retains item kind;
+- `target` is null or editable `existing_items` ref;
+- revision retains item kind;
 - content is nonempty;
-- every change cites at least one actual supplied source ref;
+- every change cites actual supplied source ref;
 - omitted existing items stay unchanged;
-- an empty list never means delete everything;
-- the model does not choose database IDs, origin project, reuse scope, disclosure, permissions, controller profile or job completion.
+- empty list never means delete everything;
+- model does not choose DB IDs, origin project, reuse scope, disclosure, permissions, profile or job completion.
 
-### 7.4 Operational execution states
+### 7.4 Operational execution and cleanup states
 
 Controller operational state is distinct from cognitive result:
 
 | Operational state | Cognitive consequence |
 |---|---|
 | profile/connection missing, disabled or incompatible | No provider request; input remains pending or explicitly failed |
-| automatic use denied | No provider request; automatic job waits until configuration/operator action changes |
-| requested but admission reply lost | Replay exact caller/request/method/identity; do not invent another attempt |
+| automatic use denied | No provider request; automatic job waits for config/operator change |
+| admission reply lost | Replay exact caller/request/method/identity; do not invent attempt |
 | queued | Operation exists; cancellation may still win |
 | sending/native accepted | Provider I/O may have occurred; local cancellation cannot prove non-execution |
-| `unknown` | Preserve Operation/request identity and reconcile; do not issue another request ID automatically |
+| `unknown` | Preserve identity and reconcile; no new request ID automatically |
 | controller result retained | Continue exact readback, not inference replay |
-| result copied into Memory | Safe to decode/publish; controller input/result cleanup still pending |
-| cleanup pending/incomplete | Memory result remains usable; controlled duplicate gap stays visible |
-| released | Controller `inference_input` and `inference_result`, when present, are removed or verified already absent |
+| result copied into Memory | Safe to decode/publish; controller copies still need cleanup |
+| terminal without result | No cognitive body exists; release retained input with `terminal_without_result` |
+| cleanup partial/incomplete | Memory result may remain usable; identify exact retained/mismatched copy |
+| released | Every created controller input/result copy is removed or verified absent |
+| abandoned for erasure | No cognitive result may later publish; provider effect/copy remains external unknown |
 
-A controller `complete` or `partial` status requires exact result artifact readback before it can affect cognition. Controller `failed`, missing result, digest mismatch, unsupported provider output or operational limit is not cognitive no-change.
+Controller `complete`/`partial` requires exact result artifact readback before it can affect cognition. Controller `failed`, missing result, digest mismatch, unsupported output or operational limit is not cognitive no-change.
 
-Lost admission reply is recovered by repeating the exact stable request ID and canonical parameters as the same authenticated client. Once Operation ID is known, read the Operation. Ambiguous provider timeout is not no-change and not permission to buy a second call.
+Lost admission reply is recovered by repeating exact stable request ID and canonical params as same client. Once Operation ID is known, read Operation. Ambiguous provider timeout is not no-change and not permission to buy second call.
 
 ### 7.5 Decode, validate, publish and release
 
-Read controller result artifact in bounded ranges, verify length and digest, and durably save the exact bytes in the Memory job/blob **before** decoding or release.
+For result-bearing Operation, read artifact in bounded ranges, verify length/digest, and durably save exact bytes in Memory **before** decoding or release.
 
-Parse one complete JSON object, optionally removing one enclosing code fence without changing the body.
+Parse one complete JSON object, optionally removing one enclosing code fence without changing body.
 
-Do **not** treat these as `changes=[]`:
+Do **not** treat as `changes=[]`:
 
 - empty body;
 - `{}` or missing `changes`;
 - malformed change;
 - provider/controller operational error;
 - profile/connection/destination/disclosure rejection;
-- missing or damaged result artifact;
-- truncated or unfinished result;
+- missing/damaged result artifact;
+- truncated/unfinished result;
 - unresolved external outcome.
 
-`partial` remains partial. Applying a separately usable partial proposal requires explicit retained coverage; it never marks whole input processed.
+`partial` remains partial. Applying separately usable partial proposal requires explicit retained coverage; it never marks whole input processed.
 
-Resolve refs through the saved input map. Derive expected target revisions there. Allocate create IDs once with decoded job result. Attach scope from actual inputs; mixed-scope inference remains attributed or conditional rather than silently widened. Updates preserve configured target scope and disclosure.
+Resolve refs through saved input map. Derive expected target revisions there. Allocate create IDs once with decoded job result. Attach scope from actual inputs; mixed-scope inference remains attributed/conditional rather than silently widened. Updates preserve target scope and disclosure.
 
 Application checks parseability, ref membership, editable target, expected revision and job claim. These checks do not prove semantic truth.
 
-Publish dependent proposal through the existing caller-owned transaction. Store conflict reuses retained proposal. Genuine revision conflict creates explicit reconciliation or successor work; it does not overwrite or call the model again.
+Publish proposal through existing caller-owned transaction. Store conflict reuses retained proposal. Genuine revision conflict creates explicit reconciliation/successor work; it does not overwrite or call model again.
 
 Valid complete no-change records only supplied input and purpose. Background and omitted bodies do not become processed. Failure leaves raw capture and existing memory available.
 
-After Memory has the verified durable result bytes, call idempotent `inference.release`. It removes both controller content artifacts for the Operation. Release does not depend on semantic success: malformed or unusable cognitive output is still copied and then eligible for controller cleanup. Release failure leaves a cleanup gap but does not revoke the Memory copy. Physical erasure remains incomplete while either controlled controller copy persists.
+Cleanup selection is operational, not cognitive:
 
-`kind=method` becomes ordinary advice and is available to exact/lexical context with conditions and limitations. The next relevant context opens the published revision and cited sources, not raw JSON as an unread report.
+- result copied and verified → `inference.release(memory_copy_verified)`;
+- terminal Operation with no result → `inference.release(terminal_without_result)`;
+- unresolved Operation selected for physical erase → `inference.release(abandon_for_erasure)`.
+
+Malformed cognitive output still uses `memory_copy_verified` after exact bytes are durably copied; semantic failure is not a reason to retain controller content indefinitely.
+
+Release reports input/result independently. One removed file does not imply complete cleanup. Release failure does not revoke verified Memory bytes. Physical erasure remains incomplete while either controlled controller copy persists or mismatches.
+
+`kind=method` becomes ordinary advice available to exact/lexical context with conditions/limitations. Next relevant context opens published revision and cited sources, not raw JSON as unread report.
 
 ## 8. Consolidation and correction
 
@@ -368,87 +353,84 @@ After Memory has the verified durable result bytes, call idempotent `inference.r
 
 | Situation | Operation |
 |---|---|
-| Same source event replayed | Return prior capture result; no inference or new evidence |
+| Same source event replayed | Return prior capture result; no inference/new evidence |
 | Repeated compatible wording in packet | Packet-local grouping with source handles |
 | New detail about same addressed item | Revise item and conditions |
 | Several episodes suggest broader pattern | Create separate provisional claim/method/view linked to exact sources |
-| Existing synthesis conflates cases | Narrow or split derived account; keep original episodes |
+| Existing synthesis conflates cases | Narrow/split derived account; keep original episodes |
 
-First curation implementation does not union source IDs, rewrite all inbound links, build permanent equivalence classes or create universal undo stack. A hash can shortlist equal text, not prove same event, object or proposition.
+First curation implementation does not union source IDs, rewrite all inbound links, build permanent equivalence classes or universal undo stack. Hash can shortlist equal text, not prove same event/object/proposition.
 
 ### 8.2 Select from actual content
 
-Start from changed episode or item and finite neighborhood selected by exact subject/cues, claim group, known links and lexical candidates. Load actual current content, conditions, limitations, contrary evidence and relevant historical revision when correction depends on it.
+Start from changed episode/item and finite neighborhood selected by exact subject/cues, claim group, known links and lexical candidates. Load current content, conditions, limitations, contrary evidence and relevant history when correction depends on it.
 
-Do not require records to arrive already labelled `duplicate_of` or `false_merge`; that would make curation a formatter of a prior answer. Conversely, model similarity does not authorize destructive merge.
+Do not require records to arrive already labelled `duplicate_of` or `false_merge`; that makes curation formatter of prior answer. Conversely, model similarity does not authorize destructive merge.
 
 ### 8.3 Additive synthesis
 
-When A and B support broader pattern C:
+When A and B support broader C:
 
 1. retain A and B;
 2. create C as separate provisional claim/method/view;
 3. link C to exact source revisions;
-4. state conditions and counterexamples;
-5. let normal retrieval decide where C is useful.
+4. state conditions/counterexamples;
+5. let normal retrieval decide usefulness.
 
-C does not inherit every link, outcome or disclosure class by default. Disclosure derives from actual content and sources C still reveals.
+C does not inherit every link, outcome or disclosure by default. Disclosure derives from actual content and sources C still reveals.
 
-### 8.4 Correct a false merge
+### 8.4 Correct false merge
 
-If derived C conflates different versions or cases:
+If C conflates versions/cases:
 
-1. preserve source episodes and old C revision;
+1. preserve sources and old C revision;
 2. narrow C or create scoped successors;
-3. assign only supported conditions, sources and counterevidence to each;
+3. assign only supported conditions, sources and counterevidence;
 4. revise affected dependants of C;
-5. leave dependants grounded directly in unchanged A or B untouched.
+5. leave dependants grounded directly in unchanged A/B untouched.
 
-Old exact handles continue to open historical C. No global redirect is required.
+Old exact handles continue to open historical C. No global redirect required.
 
 ## 9. Methods, outcomes and transfer
 
 ### 9.1 Method consumption
 
-A processing method changes behavior only when a real request builder reads its exact revision. An advice method changes behavior only when context selects it. A stored proposal with no consumer is not implemented improvement.
+Processing method changes behavior only when real request builder reads exact revision. Advice method changes behavior only when context selects it. Stored proposal with no consumer is not implemented improvement.
 
-A new processing revision applies to later jobs. Running job keeps frozen recipe. Software upgrade does not overwrite user-edited or learned revision.
+New processing revision applies to later jobs. Running job keeps frozen recipe. Software upgrade does not overwrite user-edited/learned revision.
 
 ### 9.2 Outcome reduction
 
-An outcome contribution is addressed by:
+Outcome contribution is addressed by exact method revision when known, actual attempt/execution, criterion/target and source evidence.
 
-- exact method revision when known;
-- actual attempt or external execution;
-- criterion and checked target;
-- source evidence.
+Tool result and agent summary of same attempt are not two successes. Correction replaces current contribution for attempt/criterion while retaining history. Contradictory attempts remain separate.
 
-A tool result and agent summary of the same attempt are not two successes. Correction replaces current contribution for that attempt/criterion while retaining history. Contradictory attempts remain separate.
-
-Context reads relevant limitation or counterexample even before method text is rewritten. Learning may then revise method conditions or produce an alternative.
+Context reads relevant limitation/counterexample even before method text is rewritten. Learning may revise conditions or produce alternative.
 
 ### 9.3 Cross-project transfer
 
 Origin, reuse scope and disclosure are independent.
 
-A reusable method may be considered in another permitted project while retaining source origin, conditions and counterexamples. Current applicability still depends on target situation. Source disclosure does not widen because method is reusable.
+Reusable method may be considered in permitted project while retaining source origin, conditions/counterexamples. Current applicability depends on target situation. Disclosure does not widen because method is reusable.
 
-A generalized method can become `external_allowed` while a supporting episode remains `local_only` only if generalized content no longer contains or reveals protected material. Otherwise strict disclosure remains. This is source-based reduction, not model judgement.
+Generalized method can become `external_allowed` while supporting episode remains `local_only` only if generalized content no longer contains/reveals protected material. Otherwise strict disclosure remains. This is source-based reduction, not model judgement.
 
 ## 10. Automatic curation and self-diagnosis
 
-Automatic mode is `off | idle | background`. New relevant input coalesces one pending target and preserves first queued time. A quiet delay batches nearby events; maximum age makes target due but does not override disabled capability, disclosure incompatibility, controller profile automatic-use restriction or capacity.
+Automatic mode is `off | idle | background`. New relevant input coalesces one pending target and preserves first queued time. Quiet delay batches nearby events; maximum age makes due but does not override disabled capability, disclosure incompatibility, profile automatic-use restriction or capacity.
 
-Claim a finite slice. New events remain pending successor. Foreground return stops new idle dispatch; already admitted work finishes or remains unknown. Shutdown allows one finite drain interval and does not start a final model call.
+Claim finite slice. New events remain pending successor. Foreground return stops new idle dispatch; admitted work finishes or remains unknown. Shutdown allows one finite drain and does not start final model call.
 
-A controller `AUTOMATIC_USE_DISABLED` or destination mismatch is recorded as waiting/configuration state and is not retried continuously. Explicit operator/configuration change or a new explicit attempt may make work eligible again.
+`AUTOMATIC_USE_DISABLED`, missing connection or destination mismatch is waiting/configuration state, not continuous retry. Explicit config/operator change or new explicit attempt may make work eligible.
 
-A curation result must reach ordinary `context`, `open` or processing-method consumer. Unread report is not completion.
+Terminal no-result cleanup is not new learning input and must not enqueue another cognitive job. Release completion is accounting, not experience.
+
+Curation result must reach ordinary `context`, `open` or processing-method consumer. Unread report is not completion.
 
 Self-diagnosis asks which connected edge failed:
 
 1. capture;
-2. source selection or disclosure reduction;
+2. source selection/disclosure reduction;
 3. profile/connection/destination admission;
 4. controller/provider execution;
 5. result retention/readback/release;
@@ -459,50 +441,51 @@ Self-diagnosis asks which connected edge failed:
 10. use/correlation;
 11. method quality.
 
-Correct the supported failing edge. Do not create recursive diagnosis from routine accounting, missing telemetry or every no-change.
+Correct supported failing edge. Do not create recursive diagnosis from accounting, missing telemetry or every no-change.
 
 ## 11. Disagreement, prediction and research
 
-Disagreement belongs to a question, scope and time. Preserve rival explanations and grounds, then identify the cheapest useful observation that can distinguish them. One source lookup, one agent or human decision may be enough. A panel or vote is not required.
+Disagreement belongs to question, scope and time. Preserve rival explanations/grounds, then identify cheapest useful distinguishing observation. One source lookup, agent or human decision may be enough. Panel/vote is not required.
 
-Unresolved disagreement does not block unrelated work. A provisional choice records why it was selected and what would cause reconsideration.
+Unresolved disagreement does not block unrelated work. Provisional choice records rationale and reconsideration trigger.
 
-A prediction states expected observation before action, conditions and available check. Static dependency, co-change and causal explanation are not interchangeable.
+Prediction states expected observation before action, conditions and available check. Static dependency, co-change and causal explanation are not interchangeable.
 
-Research begins with available memory and exact local sources. External acquisition is used for a concrete remaining gap. Eliot Research owns research execution and large corpora; Memory stores compact findings, alternatives, coverage and source handles needed later.
+Research begins with available memory and exact local sources. External acquisition is for concrete remaining gap. Eliot Research owns execution/corpora; Memory stores compact findings, alternatives, coverage and source handles.
 
-A failed source request, completed but uninformative research and useful partial answer are different outcomes. Repeating the same uncertainty does not justify endless research. Ask for clarification only when the answer can materially change the task or owner decision.
+Failed source request, completed but uninformative research and useful partial answer are different outcomes. Repeating uncertainty does not justify endless research. Ask clarification only when answer can materially change task/owner decision.
 
 ## 12. Commitments and attention
 
-A commitment is an ordinary versioned memory item with:
+Commitment is ordinary versioned memory item with scope/subject, owner/recipient, state, optional due time, source and resolution evidence/owner decision.
 
-- scope and subject;
-- owner or recipient;
-- state;
-- optional due time;
-- source;
-- resolution evidence or explicit owner decision.
+Context/inbox read commitments by address/scope, not similarity. Showing, acknowledging or passing due date does not resolve them. Notification failure does not hide inspectable state.
 
-Context and inbox read commitments by address/scope, not similarity. Showing, acknowledging or passing due date does not resolve them. Notification failure does not hide commitment from inspectable state.
-
-Automatic extraction and notifications are later optional producers using the same item and operations. They do not create another task manager or attention database.
+Automatic extraction and notifications are later optional producers using same items/operations. They do not create another task manager or attention database.
 
 ## 13. Forgetting, withdrawal and erasure
 
 Do not use one decay score as truth, relevance and deletion.
 
-Choose an explicit operation:
+Choose explicit operation:
 
 - reduce exposure;
-- withdraw advisory influence in a stated situation;
-- publish supersession or refutation;
+- withdraw advisory influence in stated situation;
+- publish supersession/refutation;
 - archive history;
 - physically erase controlled scope.
 
-Rare or unused knowledge is not thereby false. Popular knowledge is not thereby supported. A warning can narrow after relevant new outcome or changed condition; time alone does not prove it obsolete.
+Rare/unused knowledge is not thereby false. Popular knowledge is not thereby supported. Warning can narrow after relevant outcome/condition change; time alone does not prove obsolete.
 
-Physical erasure traverses controlled sources, derivatives, packets, job inputs/results, staged files, backups and both controller inference content artifacts. A late controller/provider result cannot reintroduce erased data. If a provider-held copy cannot be controlled, report the external boundary. If controller `inference_input` or `inference_result` cannot be confirmed removed, report incomplete erasure.
+Physical erasure traverses controlled sources, derivatives, packets, job inputs/results, staged files, backups and both controller content artifacts.
+
+For each inference Operation:
+
+- verified Memory result → release with `memory_copy_verified`;
+- terminal no-result → release with `terminal_without_result`;
+- queued/sending/unknown selected for erase → `abandon_for_erasure` fences late controller publication before cleanup.
+
+A late provider result cannot reintroduce erased data through controller. Provider-held copy/effect may remain external unknown. If either controller input/result copy cannot be confirmed removed, report exact per-copy gap and incomplete erasure.
 
 ## 14. Algorithm ownership
 
@@ -514,11 +497,11 @@ Physical erasure traverses controlled sources, derivatives, packets, job inputs/
 | Episode membership/coverage | `learning` |
 | Disclosure reduction | `learning` pure reducer |
 | Text request construction/decoding | Purpose handler in `learning` |
-| Controller IPC, Operation/result readback and release | `adapters::controller` |
+| Controller IPC, Operation/result readback and all release dispositions | `adapters::controller` |
 | Job timing/reconciliation | `jobs` |
 | Atomic revisions and history | `memory` + `store` |
 | Vector-space identity and result mapping | `vectors` + `jobs` |
 | Document/Research translation | `adapters::source` |
 | Control/status | `control` |
 
-No algorithm in this table requires its own process, registry or database. A new component appears only when a real dependency, lifecycle or owner boundary demands it.
+No algorithm in this table requires its own process, registry or database. New component appears only when real dependency, lifecycle or owner boundary demands it.
