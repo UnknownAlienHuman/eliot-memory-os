@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.4 · 2026-10-24 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.5 · 2026-10-24 · normative design for the greenfield rewrite.**
 
-V1 and V2 are donors. V3 is a new implementation, not a compatibility migration. This document defines the product purpose, ownership and invariants. [Implementation](IMPLEMENTATION.md) defines the concrete runtime, data and integration design. [Cognition](COGNITION.md) defines the algorithms. [AUDIT](AUDIT.md) explains the rejected machinery and source limits. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) tracks what has and has not been checked.
+V1 and V2 are donors. V3 is a new implementation, not a compatibility migration. This document defines product purpose, ownership and invariants. [Implementation](IMPLEMENTATION.md) defines runtime, data and integration paths. [Cognition](COGNITION.md) defines algorithms. [AUDIT](AUDIT.md) explains rejected machinery and source limits. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) tracks checked, decided and open work.
 
 ## 1. Product purpose
 
@@ -24,11 +24,11 @@ A searchable archive is necessary but insufficient. A stored object, graph, summ
 - restores work after interruption without inventing state;
 - prevents repeated mistakes and abandoned approaches from silently returning;
 - exposes relevant constraints, counterexamples and unknowns before a decision;
-- turns observed outcomes into a later change in guidance;
+- turns observed outcomes into later changes in guidance;
 - keeps original sources openable and corrections reversible;
 - remains useful when optional models, vectors or specialist tools are unavailable.
 
-A mechanism must serve one of those outcomes. More metadata, stages, checks, processes or interfaces are not benefits by themselves. When a default repeatedly blocks useful work, correct that default at its owner instead of building another exception layer around it.
+A mechanism must serve one of those outcomes. More metadata, stages, checks, processes or interfaces are not benefits by themselves. When a default repeatedly blocks useful work, correct that default at its owner instead of adding an exception layer.
 
 ## 2. Ownership and boundaries
 
@@ -37,8 +37,8 @@ A mechanism must serve one of those outcomes. More metadata, stages, checks, pro
 | User goal, permissions and acceptance of external work | Human and host/controller |
 | Agent sessions, tools, task execution and swarm orchestration | Host/controller |
 | Observations, revisions, retrieval, context, source links, outcomes and finite memory jobs | Eliot Memory OS |
-| Interpretation, consolidation and method improvement | Eliot learning handlers; the model call is supplied through a narrow inference adapter |
-| Provider/model selection, credentials and model execution | `eliot-swarm-controller` through a one-shot inference route in the initial integrated profile |
+| Interpretation, consolidation and method improvement | Eliot learning handlers |
+| Provider/model credentials, one-shot model execution and provider readback | `eliot-swarm-controller` through a narrow inference route in the initial integrated profile |
 | Persistence, native indexes and transactions | SurrealDB through one private Store |
 | Code/document/source translation | Narrow adapters and configured specialist tools |
 | External research execution and large research corpora | Eliot Research or another configured research system |
@@ -46,29 +46,58 @@ A mechanism must serve one of those outcomes. More metadata, stages, checks, pro
 
 Eliot may link an external task, attempt, action and result, but it does **not** become another task manager, acceptance authority, permission engine, swarm controller or research platform.
 
-The controller may execute a model request for Eliot, but it does **not** own Eliot's memory job, episode coverage, recipe revision, publication or retry decision. Conversely, Eliot does not copy controller Tasks, Attempts, workspaces, review state or provider internals merely to obtain one completion.
+The controller may execute one model request for Eliot, but it does **not** own Eliot's memory job, episode coverage, processing recipe, publication or retry decision. Eliot does not copy controller Tasks, Attempts, workspaces, reviews or provider internals merely to obtain one completion.
 
 ### 2.1 Dreamer is a role, not a mandatory process
 
-**Dreamer** means model-assisted interpretation performed for a concrete Eliot job. It is not a permanent daemon, model vendor, special database, separate scheduler or second canonical writer.
+**Dreamer** means model-assisted interpretation for a concrete Eliot job. It is not a permanent daemon, model vendor, special database, separate scheduler or second canonical writer.
 
-A learning handler prepares one finite request, invokes the configured inference adapter outside the Store transaction, retains the exact result, decodes a purpose-specific response and publishes ordinary memory revisions. Different models can perform that role. Deterministic work and embeddings do not become Dreamer jobs merely because they use computation.
+A learning handler freezes finite input and one exact recipe revision, invokes a configured inference adapter outside the Store transaction, retains the exact result, decodes a purpose-specific response and publishes ordinary memory revisions. Different models can perform that role. Deterministic work and embeddings do not become Dreamer jobs merely because they use computation.
 
 ### 2.2 One-shot inference is not agent orchestration
 
 The first learning extension needs this semantic operation:
 
 ```text
-exact prompt + route profile + output limits + stable request key
+exact prompt + selected inference profile + finite limits + stable request key
 → complete | partial | unknown | failed
-→ exact returned body and observed model metadata
+→ exact returned body + requested/observed route facts
 ```
 
-The initial integrated adapter calls a narrow `inference.text` operation in `eliot-swarm-controller`. That operation reuses controller credentials, route selection, request deduplication and durable result artifacts, but it does not require a controller Task, requirement list, Attempt, native workspace, review or acceptance lifecycle.
+The initial adapter calls narrow `inference.text` / `inference.embed` operations in `eliot-swarm-controller`. They reuse controller credentials, provider adapters, request deduplication and durable result readback. They do **not** require a controller Task, Requirement, Attempt, native workspace, review, submission or acceptance lifecycle.
 
-Richer agent work can still use controller Tasks and native sessions when the work actually needs tools, continuation or orchestration. The one-shot inference boundary must not be widened into a generic workflow engine inside Memory OS.
+Richer agent work continues to use controller Tasks and native sessions when it genuinely needs tools, continuation or orchestration. The one-shot boundary must not expand into a generic workflow engine inside Memory OS.
 
-### 2.3 User intent and factual reports remain distinct
+### 2.3 Minimal inference profile, not another Governor
+
+The first integrated route uses a small static `InferenceProfile`, not the old `RuntimeRoute`/capability-evidence platform and not the agent-route `native_options` bag.
+
+A profile identifies only behavior needed for one-shot inference:
+
+- adapter/connection reference and requested model;
+- locality: `local` or `external`;
+- whether automatic work may use it;
+- finite input, output, timeout and concurrency limits;
+- response-format capabilities;
+- no implicit fallback to another provider, model, account, locality or billing path.
+
+The controller freezes the resolved non-secret profile snapshot/revision on admission and reports requested and observed provider/model facts. Missing usage or cost remains unknown, never zero. Reconfiguration affects a new explicit attempt; it cannot silently mutate an admitted one.
+
+Memory classifies inference material as `local_only` or `external_allowed`. Project configuration supplies the default; a source may be stricter. Derived knowledge cannot widen the strictest contributing source. Mixed input uses the strictest class.
+
+A `local_only` request cannot use an external profile. The request builder does not silently omit protected material merely to make the route pass; it returns a specific route/disclosure gap or selects an explicitly configured local profile. Automatic execution additionally requires `allow_automatic = true`.
+
+These are deterministic checks at the actual external-send boundary. They do not justify a general policy engine, route classifier, approval ceremony, capability registry, portfolio planner or per-call proof package.
+
+### 2.4 Durable result and finite duplicate lifetime
+
+The controller retains exact result bytes long enough for readback after disconnect/restart. Memory copies the exact body and digest into its existing job/blob before decoding.
+
+Once Memory durably confirms the copy, the controller-owned transport/result copy must become releasable and eventually removed under the narrow inference owner. Until then it is a second controlled content copy.
+
+Erasure is incomplete while a controlled controller copy remains. Acknowledgement/release does not require a general artifact-retention graph inside Memory, and it must not delete the only readable copy before Memory confirms persistence.
+
+### 2.5 User intent and factual reports remain distinct
 
 The user owns goals and preferences, not infallibility about external facts. Preserve an explicit change of intent as such. Preserve a factual assertion with its source, conditions and possible counterevidence. A generated continuation, learned method or retrieved suggestion cannot silently replace the user's goal, relax its criteria or grant execution authority.
 
@@ -85,11 +114,11 @@ The initial product is:
 - one small supervisor mode of the same executable;
 - transient host relays/adapters;
 - ordinary internal modules;
-- optional outbound clients constructed only when their capability is enabled.
+- optional outbound clients constructed only when enabled.
 
 A new process is justified only by a real external runtime or failure boundary. A new crate is justified only by an actual dependency, deployment or change boundary. A noun in the design is not an instruction to create a registry, protocol, actor, state machine or service.
 
-One stored mutable state has one application mutation owner. This does not mean one permitted author, one interpretation or one source. Dashboards, packets, scores, maps and status reports are views unless they genuinely own independent state.
+One stored mutable state has one application mutation owner. This does not mean one permitted author, one interpretation or one source. Dashboards, packets, scores, maps and status reports are views unless they own independent state.
 
 ### 3.1 Layers remain; pass-through machinery does not
 
@@ -102,18 +131,18 @@ Keep four responsibility layers:
 
 These are dependency boundaries, not four processes or a compulsory `interface → facade → service → repository` chain. Internal calls use typed Rust values. Serialization belongs at actual storage, process or network boundaries. Add a trait only where a real interchangeable I/O boundary exists.
 
-An extension is a vertical capability across the layers it actually uses. It adds a real writer/handler and a real consumer to existing operations; it does not build a miniature platform with its own scheduler, database, context compiler and supervisor.
+An extension is a vertical capability across the layers it actually uses. It adds a real writer/handler and real consumer to existing operations; it does not build a miniature platform with its own scheduler, database, context compiler and supervisor.
 
 ### 3.2 A useful Base, then additive capabilities
 
-**Base** works without model, vector encoder, document converter, project graph or Research credentials. It provides:
+**Base** works without a model, vector encoder, document converter, project graph or Research credentials. It provides:
 
 - capture from one real host;
 - explicit notes, corrections and commitments with history;
 - exact and lexical retrieval;
 - addressed current-work reconstruction from saved state and available events;
 - bounded context delivery and exact source opening;
-- restart, spool, backup/restore and erase for the data it stores;
+- restart, spool, backup/restore and erase for retained Base data;
 - direct status and control.
 
 Base is a useful limited product, not a claim of automatic learning.
@@ -123,8 +152,8 @@ The first learning extension closes one connected loop:
 ```text
 retained episode
 → exact processing recipe
-→ one inference request
-→ typed create/revise/no-change result
+→ one admitted inference request
+→ retained typed create/revise/no-change result
 → ordinary memory revision
 → changed later context
 ```
@@ -169,7 +198,7 @@ Corrections create revisions. Historical evidence remains openable after current
 
 Occurrence time, stated validity, receipt time and editorial revision time answer different questions. A late import or newly written summary does not become a fresh observation of the world.
 
-### 4.4 Origin and reuse scope are different
+### 4.4 Origin, reuse scope and disclosure are different
 
 Every item retains where it came from. Reusable methods separately state where they may be considered:
 
@@ -177,7 +206,9 @@ Every item retains where it came from. Reusable methods separately state where t
 - selected projects;
 - the local owner's projects.
 
-Reuse never erases origin, material conditions, counterexamples or disclosure limits. Permission to consider a method in a project does not prove its workspace-, task- or version-specific conditions hold there.
+Reuse never erases origin, material conditions, counterexamples or disclosure limits. Permission to consider a method in another project does not prove its workspace-, task- or version-specific conditions and does not authorize sending its sources to a model profile.
+
+A generalized method can be `external_allowed` while one of its original episodes remains `local_only` only when the derived content no longer contains or reveals the protected source. Otherwise the stricter disclosure remains. This is ordinary source propagation, not a privacy ontology.
 
 ### 4.5 Grounds are explicit enough to revise
 
@@ -203,9 +234,9 @@ These distinctions live on ordinary records and links. They do not require a uni
 | Reduce exposure | Show less often while permitted history remains |
 | Withdraw influence | Stop guidance in the stated situation |
 | Supersede/refute | Publish a scoped replacement or contradiction |
-| Erase scope | Remove controlled source and derivatives, including staged data and controlled backups |
+| Erase scope | Remove controlled source and derivatives, including staged data, controlled backups and controlled inference copies |
 
-Already delivered host/provider copies are an external boundary. Restore cannot silently revive a known current deletion.
+Already delivered provider copies are an external boundary. Controller-owned local result copies are controlled integration data and must be cleaned or reported as an incomplete erase. Restore cannot silently revive a known current deletion.
 
 ## 5. Current work and decision context
 
@@ -255,14 +286,14 @@ Understanding is not a compulsory pyramid, onboarding ceremony or placeholder ca
 
 Initial learning changes external memory, methods, context construction and selected configurable strategies. It does not require model-weight training.
 
-Once a learning purpose and route are configured, Eliot may automatically interpret selected episodes, publish provisional lessons and revise connected methods through its ordinary write path. Ordinary reversible improvements do not require a human vote, promotion ceremony or experiment before every useful suggestion. They preserve sources, qualifications and history; they cannot change permissions, user goals or external task acceptance.
+Once a learning purpose and permitted profile are configured, Eliot may automatically interpret selected episodes, publish provisional lessons and revise connected methods through its ordinary write path. Ordinary reversible improvements do not require a human vote, promotion ceremony or experiment before every useful suggestion. They preserve sources, qualifications and history; they cannot change permissions, user goals or external task acceptance.
 
 ### 7.1 One Memory job owns the loop
 
 The semantic owner is one Eliot job:
 
 ```text
-frozen sources + exact recipe revision
+frozen sources + exact recipe revision + disclosure
 → saved inference request
 → configured inference adapter
 → retained raw result
@@ -275,7 +306,7 @@ The inference adapter owns only external execution and readback. It does not cla
 
 ### 7.2 Model-independent Dreamer
 
-The processing recipe and result contract define the cognitive operation. The configured route may use a cloud model, local model or harness-backed provider. Interface compatibility does not guarantee equal quality; route/model identity and observed limits are retained with the result.
+The processing recipe and result contract define the cognitive operation. The configured profile may use a cloud model, local model or harness-backed provider. Interface compatibility does not guarantee equal quality; profile revision, requested/observed model, locality and observed limits remain with the result.
 
 A text-interpretation job consumes its exact recipe revision. Embeddings consume an encoder profile. Deterministic reducers need neither. A stored proposal changes behavior only when a real consumer reads it.
 
@@ -296,11 +327,11 @@ One attributable attempt/criterion contributes once. Replayed hooks and summarie
 
 No-change is valid only for work actually completed on the supplied input. It is not a mandatory explanation after every event.
 
-Provider failure, malformed output, missing fields, truncation, unresolved external execution and partial processing are not successful no-change. Useful partial output may be retained as partial with exact coverage; it cannot mark omitted input processed.
+Provider failure, unavailable/disallowed route, malformed output, missing fields, truncation, unresolved external execution and partial processing are not successful no-change. Useful partial output may be retained as partial with exact coverage; it cannot mark omitted input processed.
 
 ### 7.5 Recursive improvement
 
-Self-improvement diagnoses the failed step: capture, interpretation, retrieval, delivery, use, applicability or method quality. Correct that step instead of multiplying duplicate lessons or adding a global intelligence score.
+Self-improvement diagnoses the failed step: capture, route/disclosure admission, external inference, decoding, publication, retrieval, delivery, use, applicability or method quality. Correct that step instead of multiplying duplicate lessons or adding a global intelligence score.
 
 Within repeatable work, Eliot may use Propose–Probe–Compose. Across tasks, it retains lessons about how to improve. Baseline/no-change remains valid. A selected candidate is not automatically better. Irreversible external effects are not repeated merely to obtain a comparison.
 
@@ -323,31 +354,41 @@ A failed source request, completed but uninformative research and a useful parti
 Persist enough information to distinguish:
 
 - not requested;
+- waiting for an allowed/configured profile;
 - requested but not admitted;
 - admitted/running;
 - completed with retained result;
 - partial;
 - failed;
 - unknown outcome;
+- copied into Memory;
+- decoded;
 - applied to memory;
+- controller copy released or cleanup pending;
 - cancelled or erased.
 
 Acknowledgement is not completion. Heartbeat is not progress. Prepared context is not handoff. A model response is not a published lesson. A published lesson is not proof of external success.
 
-Primary capture and reads stay available when optional routes fail. External I/O never runs inside a Store transaction. Unknown external outcomes are reconciled through saved request identity and native readback where supported; they are not repaired by issuing a new request ID and hoping the first call did nothing.
+Primary capture and reads remain available when optional routes fail. External I/O never runs inside a Store transaction. Unknown external outcomes are reconciled through saved request identity and native readback where supported; they are not repaired by issuing a new request ID.
 
-Secrets remain in the owning credential system. Stored prompts/results obey configured privacy and disclosure. A source handle identifies content; it does not grant access. Direct control provides status/inbox, inspect/open, configure, pause/resume/cancel, correct/withdraw/erase, backup/restore and graceful shutdown.
+Secrets remain in the owning credential system. Profile names, non-secret revisions, requested/observed model facts and result references may be stored. Missing usage/cost remains unknown. No fallback may silently change provider, model, account, locality, retention or billing semantics.
+
+Direct control provides status/inbox, inspect/open, configure, pause/resume/cancel, correct/withdraw/erase, backup/restore and graceful shutdown. It reports profile unavailable/disallowed/over-limit and controller-copy cleanup gaps directly.
 
 ## 10. Explicit non-goals
 
-V3 does not add these without a demonstrated second consumer and owner decision:
+V3 does not add these without a demonstrated consumer and owner decision:
 
 - a second task manager or workflow engine inside Memory OS;
-- a provider stack duplicated inside Memory OS when controller owns the configured routes;
+- a provider/credential/router stack duplicated inside Memory OS;
+- controller Task/Attempt for ordinary one-shot memory inference;
+- reuse of agent workspace/session route types as an untyped inference profile;
+- the old Governor route/capability/fingerprint/portfolio platform;
 - a permanent Dreamer process or model loop;
 - a second semantic/vector database;
 - a truth registry, skill registry, outcome store or packet database;
 - a universal policy/approval/proof platform;
+- a route-classifier model or silent fallback ladder for the first inference profile;
 - a broker or event bus for internal function calls;
 - one actor, crate, contract package or service per concept;
 - runtime Rust plugins, WASM packaging or hot-generation machinery;
@@ -368,6 +409,8 @@ real input
 → observable product effect
 ```
 
-For Base, the minimum product observation is: source knowledge captured in session A, service restart, relevant retrieval/delivery in session B, and exact source opening.
+For Base, the minimum observation is: source knowledge captured in session A, service restart, relevant retrieval/delivery in session B, and exact source opening.
 
-For first learning, the minimum observation is: one retained episode, one exact recipe and inference request, one retained/decoded result, one published lesson or valid no-change, and a later context that reads the resulting revision. A stored type, fixture, receipt, generated report or passing serializer alone is not that evidence.
+For first learning, the minimum observation is: one retained episode, exact recipe and disclosure, one allowed frozen inference profile, one retained/decoded result, one published lesson or valid no-change, and a later context that reads the resulting revision. The controller result copy is either released after confirmed Memory persistence or explicitly remains a cleanup gap.
+
+A stored type, fixture, receipt, generated report or passing serializer alone is not that evidence.
