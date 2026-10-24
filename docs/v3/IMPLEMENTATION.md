@@ -1,10 +1,10 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.18 · 2026-10-24 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.19 · 2026-10-24 · concrete design for the greenfield rewrite.**
 
-This document turns [Architecture](ARCHITECTURE.md) into runtime, modules, data and connected operations. [Cognition](COGNITION.md) defines the algorithms. [One-shot inference contract](INFERENCE-CONTRACT.md) defines the narrow Memory↔controller model boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) records checked evidence, decisions and open gaps.
+This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, data and connected operations. [Cognition](COGNITION.md) defines algorithms. [One-shot inference contract](INFERENCE-CONTRACT.md) is the sole normative Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) records checked evidence, decisions and open gaps.
 
-Nothing here is implemented merely because it is specified. The complete target is not a prerequisite for useful Base. Build connected production slices in §14; do not construct scaffolding for later capabilities before their first real writer and consumer exist.
+Nothing here is implemented merely because it is specified. The complete target is not a prerequisite for useful Base. Build the connected production slices in §14. Do not construct scaffolding for a later capability before its first real writer and consumer exist.
 
 ## 1. Runtime and first use
 
@@ -14,7 +14,7 @@ The initial Windows profile uses one executable with modes:
 
 ```text
 eliot supervisor     owns the local process family
-eliot daemon         serves memory operations
+eliot daemon         serves Memory operations
 eliot relay ...      transient host/CLI adapter
 ```
 
@@ -25,9 +25,9 @@ The supervisor owns:
 - their Windows Job Object;
 - restart intensity and planned shutdown.
 
-The daemon does not supervise itself. Hosts and `eliot-swarm-controller` do not own this process family. Model/provider processes remain controller/provider concerns.
+The daemon does not supervise itself. Hosts and `eliot-swarm-controller` do not own this process family. Provider/model processes remain controller/provider concerns.
 
-### 1.2 Data root
+### 1.2 Data root and configuration
 
 Use one stable installation root, for example:
 
@@ -49,13 +49,16 @@ Use one stable installation root, for example:
 - configured projects/workspaces;
 - capture exclusions and retention;
 - host adapters;
-- controller endpoint and inference/embedding profile names;
+- controller IPC/data root and private inference-client credential path;
+- selected text/embedding profile names;
 - project/source disclosure defaults;
 - idle timeout and automatic-work mode;
 - optional document/Research tools;
 - explicitly allowed cross-project reuse scopes.
 
-It is not a generated policy database, route registry or module catalogue. Provider credentials and secret connection material stay with their owner, initially `eliot-swarm-controller`. Memory stores profile names, frozen non-secret profile identity returned by controller and external operation/result references.
+It is not a generated policy database, route registry or module catalogue.
+
+Provider connections, provider credentials, adapter IDs and `actual_destination` declarations stay with `eliot-swarm-controller`. Memory stores only selected profile names and frozen non-secret execution identity returned by controller.
 
 ### 1.3 Demand start and shutdown
 
@@ -73,42 +76,42 @@ Before normal idle shutdown:
 4. stop daemon and database;
 5. wait for exit and release the mutex.
 
-Pending data, a completed background job or an internal poll cannot renew the interval indefinitely. Explicit shutdown does not start a final DreamCycle. Unknown external attempts remain reconcilable after restart; shutdown does not authorize a second model call.
+Pending data, a completed background job or an internal poll cannot renew the interval indefinitely. Explicit shutdown does not start a final Dreamer cycle. Unknown controller/provider outcomes remain reconcilable after restart; shutdown does not authorize another request ID.
 
-Primary capture and exact/lexical reads become available as soon as Store is ready. They do not wait for inference, embeddings, project orientation or a graph.
+Primary capture and exact/lexical reads become available as soon as Store is ready. They do not wait for controller inference, embeddings, project orientation or a graph.
 
 ## 2. Code structure
 
 ### 2.1 Start with one Rust package
 
-Use one library package plus a thin executable selecting supervisor/daemon/relay modes. Ordinary modules provide boundaries. Split a crate only when an actual dependency, deployment or change boundary requires it.
+Use one library package plus a thin executable selecting supervisor/daemon/relay modes. Ordinary modules provide boundaries. Split a crate only when an actual dependency, deployment or independently changing boundary requires it.
 
 | Module | Owns | Does not own |
 |---|---|---|
-| `model` | Small values crossing real module boundaries | Vendor SDKs, runtime, a universal contract catalogue |
+| `model` | Small values crossing real internal boundaries | Vendor SDKs, runtime, universal contract catalogue |
 | `store` | Schema/migrations, fixed queries, atomic writes, exact reads and blobs | Interpretation, host protocol, model selection |
-| `memory` | Semantic item operations, revisions and source links | Raw provider or host I/O |
-| `context` | Decision-frame retrieval, applicability, relation expansion and packing | A second Store or model scheduler |
-| `learning` | Purpose-specific request builders, disclosure reduction, decoders, reducers and publication proposals | Job claims, provider retries or direct external I/O |
+| `memory` | Semantic item operations, revisions, history, grounds and source links | Raw host/provider I/O |
+| `context` | Decision-frame retrieval, applicability, relation expansion and packing | Second Store or model scheduler |
+| `learning` | Purpose-specific input selection, request builders, disclosure reduction, decoders, reducers and publication proposals | Job claims, provider retries or credentials |
+| `vectors` | Vector-space identity, result mapping and vector candidate arm | Provider transport or second vector database |
 | `jobs` | Due selection, claim/reclaim, finite handler dispatch, reconciliation and result application | Semantic algorithms duplicated from handlers |
 | `adapters::host` | Native host event normalization and context delivery | Task ownership or memory policy |
-| `adapters::inference` | `TextInferenceClient` over controller `inference.text` and result release/readback | Memory job state, publication, provider credentials or route planning |
-| `adapters::embedding` | `EmbeddingClient` over controller `inference.embed` | Semantic revisions or a second vector database |
+| `adapters::controller` | Authenticated controller IPC, `inference.text`, `inference.embed`, Operation/artifact readback, queued cancel and `inference.release` | Memory job state, publication, provider credentials or route planning |
 | `adapters::source` | Document, structure and Research translation | Another memory service |
-| `control` | Status/inbox, configuration, maintenance and owner commands | A general policy engine |
-| `runtime` | Composition, process/task lifetime and shutdown | Cognitive algorithms or a global mutable service locator |
+| `control` | Status/inbox, configuration, maintenance and owner commands | General policy engine |
+| `runtime` | Composition, process/task lifetime and shutdown | Cognitive algorithms or global mutable service locator |
 
 Dependency direction:
 
 ```text
 model + pure transformations          -> no I/O imports
-store + outbound adapters             -> model and their external dependencies
-application operations                -> model, Store API and required narrow clients
+store + outbound adapters             -> model and external dependencies
+application operations                -> model, Store API and narrow clients
 host / CLI / MCP surfaces             -> application operations
 runtime composition                   -> concrete constructors and startup/shutdown
 ```
 
-Keep SDK connections, SQL helpers and module internals private. Internal calls share typed Rust values; serialize only at storage, process or network boundaries. Add a trait at a real interchangeable I/O boundary, not for every table or function.
+Keep IPC, HTTP, SQL and module internals private. Internal calls share typed Rust values; serialize only at storage, process or network boundaries. Add a trait at a real interchangeable I/O boundary, not for every table or function.
 
 ### 2.2 Base and additive capabilities
 
@@ -116,9 +119,9 @@ Keep SDK connections, SQL helpers and module internals private. Internal calls s
 
 | Capability | Additional dependency | Existing consumer |
 |---|---|---|
-| First learning | Base observations, one `TextInferenceClient`, one recipe | Ordinary `memory`, `context` and `open` |
-| Vector retrieval | Base text revisions and one `EmbeddingClient` | Additional candidate arm in `context` |
-| Project understanding | Base source access and configured structure tool; inference only for explanations | Versioned project views |
+| First learning | Base observations, one controller inference client, one processing recipe | Ordinary `memory`, `context` and `open` |
+| Vector retrieval | Base text revisions and controller embedding profile | Additional candidate arm in `context` |
+| Project understanding | Base source access and configured structure tool; inference only for explanation | Versioned project views |
 | Documents | Base blobs/jobs and configured converter | Search excerpts and exact source `open` |
 | Research | Configured Research client | Findings/report/source handles in ordinary memory |
 | Richer cognition | Relevant claims/methods/outcomes and text inference where needed | Same jobs, revisions and context |
@@ -136,7 +139,7 @@ A new capability adds only what its connected path needs:
 4. its real reader/consumer;
 5. maintenance for the retained data it adds.
 
-It does not automatically add a process, manifest family, event bus, scheduler, database, context compiler or plugin platform.
+It does not automatically add a process, manifest family, event bus, scheduler, database, context compiler, plugin platform or generated inventory.
 
 Finite expensive work uses the existing `job` runner. A long-lived task exists only when it must retain an actual resource or continuously receive input. Runtime plugin discovery, dynamic Rust ABI, WASM packaging and hot-generation machinery are not selected.
 
@@ -144,9 +147,9 @@ Finite expensive work uses the existing `job` runner. A long-lived task exists o
 
 Construct an optional client only when configured. Do not probe every remote service on daemon startup. A capability failure stays inside that capability; Base remains available.
 
-Disabling a capability stops new dispatch for its purposes. Pending work waits rather than being repeatedly claimed and failed. Already dispatched work retains exact request/result identity until reconciled, cancelled or erased. Re-enabling can continue selected pending work or a finite backfill; ordinary reads do not wait for it.
+Disabling a capability stops new dispatch for its purposes. Pending work waits rather than being repeatedly claimed and failed. Already admitted controller Operations retain exact request/result identity until reconciled, cancelled where still queued, released or erased. Re-enabling may continue selected pending work or a finite backfill; ordinary reads do not wait for it.
 
-A runtime switch does not remove compiled dependencies. Use Cargo features only when omitting a heavy optional dependency materially reduces the build or package. Do not add a negative `lite` feature that changes record meaning.
+Use Cargo features only when omitting a heavy optional dependency materially reduces the build or package. Do not add a negative `lite` feature that changes record meaning.
 
 ## 3. Application surface and work binding
 
@@ -154,7 +157,7 @@ All host surfaces call the same application operations:
 
 | Operation | Result |
 |---|---|
-| `attach(workspace, session)` | Project/workspace binding, continuation key, gaps and actual capabilities |
+| `attach(workspace, session)` | Project/workspace binding, continuation address, gaps and actual capabilities |
 | `capture(event)` | `committed`, `staged`, `unknown` or `rejected` |
 | `context(frame, budget, retrieval=local)` | Packet ID, rendered text, exact revisions, handles and gaps |
 | `open(handle, read_context, range?)` | Exact item/source or bounded page and continuation |
@@ -209,7 +212,7 @@ Key fields:
 
 Unique identity: `(project, stream, event_key)`.
 
-A tool result, an agent report about it, a prepared packet and an observed handoff are distinct observations. Replays compare source content, not receipt time.
+A tool result, agent report about it, prepared packet and observed handoff are distinct observations. Replays compare source content, not receipt time.
 
 ### 4.3 `memory`
 
@@ -221,16 +224,16 @@ Key fields:
 - for methods: `method_role = advice | processing` and implemented `processing_purpose`;
 - optional exact `address_kind` and `address_key`;
 - `content`, `search_text`, exact cues and advisory aliases;
-- disclosure class and source-derived disclosure limitations;
+- disclosure class and source-derived limitations;
 - subject/aspect/perspective;
 - material applicability conditions/exceptions and optional typed selectors;
 - validity interval;
 - support limitations separately from retrieval exposure and advisory influence;
 - optional commitment state;
-- optional embedding vector, effective space and encoded representation identity;
+- optional vector, effective space and encoded representation identity;
 - created/updated times.
 
-One complete exact address has at most one current item. An unaddressed note needs no address. A source project is not a reuse audience, and reuse scope does not widen disclosure.
+One complete exact address has at most one current item. An unaddressed note needs no address. Source project is not reuse audience, and reuse scope does not widen disclosure.
 
 ### 4.4 `memory_history`
 
@@ -264,23 +267,24 @@ Key fields:
 
 - `id`, `project`, `purpose`, `target_key`, `state`;
 - explicit/automatic origin and source cause;
-- first queued/due time, retry and waiting/error reason;
+- first queued/due time, attempt number, retry or waiting reason;
 - frozen observation IDs/segments or per-stream ranges;
 - input memory IDs/revisions;
 - selected processing method ID/revision;
-- claim and expiry;
+- claim owner and expiry;
 - configured execution limits;
 - reduced disclosure class;
-- selected inference/embedding profile name;
-- exact saved external request or blob reference and digest;
-- external operation/request/result references;
-- frozen non-secret profile identity returned by controller;
-- retained raw result/status/body blob and observed metadata;
-- controller result-release state;
-- applied result handles, covered input, remaining/unavailable portions;
-- explicit no-change, partial, unknown or failure disposition.
+- selected controller profile name;
+- exact saved request or blob reference, byte length and digest;
+- controller Operation ID and stable client request ID;
+- frozen profile digest, adapter ID, non-secret connection identity and `actual_destination`;
+- controller result artifact reference, length and digest;
+- retained Memory raw result/blob and requested/observed metadata;
+- `controller_copy_state = not_created | retained | cleanup_pending | cleanup_incomplete | released`;
+- decoded proposal/no-change/partial/failure state;
+- applied result handles, covered input and remaining/unavailable portions.
 
-One `(project, purpose, target_key)` has at most one active job and one coalesced pending successor. Active includes waiting for or reconciling a dispatched external request. Completed history does not occupy the slot.
+One `(project, purpose, target_key)` has at most one active job and one coalesced pending successor. Active includes waiting for or reconciling an admitted external request. Completed history does not occupy the slot.
 
 ### 4.7 Blobs and locators
 
@@ -300,7 +304,7 @@ Dirty/untracked code is cited by retained bytes or retained range, not by HEAD a
 
 ## 5. Store operations and transaction rules
 
-Store is private application code using the official SurrealDB SDK and fixed parameterized queries. Network, model, document and Research calls never run inside a database transaction.
+Store is private application code using the official SurrealDB SDK and fixed parameterized queries. Network, controller, document and Research calls never run inside a database transaction.
 
 Use native keys/indexes for identity. A preceding existence query alone does not prevent concurrent duplicates. Dependent writes use one explicit transaction; zero-row conditional updates abort rather than return an error-shaped success.
 
@@ -318,13 +322,13 @@ In one short transaction:
 6. coalesce only implemented, enabled and necessary follow-up work;
 7. commit.
 
-Capture does not call a model. Packet/status/read/claim-renewal/result-release/embedding-completion events do not automatically become new experience. A structured correction uses the atomic path in §5.3.
+Capture does not call a model. Packet/status/read/claim-renewal/release/embedding-completion events do not automatically become new experience. A structured correction uses §5.3.
 
 If Store is unavailable, durably publish a complete spool command under the same source identity. Report `staged` only after bytes are saved. Replay uses the same operation and deletes the spool entry only after primary readback.
 
 ### 5.2 `claim_due_job`
 
-Select only work whose handler is present, enabled and eligible for configured automatic mode. Waiting for idle time, a permitted inference profile, disclosure-compatible route or resume is not a failed attempt.
+Select only work whose handler is present, enabled and eligible for configured automatic mode. Waiting for idle time, a configured profile, disclosure-compatible destination or resume is not a failed attempt.
 
 In one short transaction:
 
@@ -332,169 +336,152 @@ In one short transaction:
 2. move its pending row into the active slot;
 3. freeze finite inputs;
 4. set claim/expiry;
-5. resolve and freeze exact processing method revision when required;
+5. resolve and freeze exact processing-method revision when required;
 6. reduce actual selected input to one disclosure class;
-7. select the configured profile name, without resolving provider secrets;
+7. select the configured profile name without resolving connection secrets;
 8. commit.
 
-The worker reads inputs and invokes external clients outside the transaction. Reclaiming an expired worker claim keeps the same job, frozen input, saved request and external references. It first reads saved/local/remote result state; expiry is not permission to buy another model call.
+The handler builds and saves exact request bytes/digest before controller I/O. Reclaim never rebuilds a different request for an already admitted Operation.
 
-Automatic work additionally requires both Memory automatic mode and `allow_automatic` in the selected controller profile. Neither setting silently enables the other.
+### 5.3 `publish_memory_revision`
 
-### 5.3 `publish_revision`
+For explicit correction or accepted proposal, one transaction:
 
-All semantic mutation uses one internal function within the caller-owned transaction. Inputs are create/update target, expected revision, complete new semantic fields, actual source handles and revision-aware links/grounds.
+1. re-read expected current revision;
+2. reject stale expected revision;
+3. copy old current row into `memory_history`;
+4. write new current revision;
+5. insert revision-specific source/grounds/replacement links;
+6. settle the owning command/job result;
+7. coalesce only affected follow-up work;
+8. commit.
 
-The function:
+IDs for proposal-created items are allocated once and retained with decoded job result so a Store retry cannot create another item.
 
-1. checks addressed expected revision;
-2. archives the prior current revision;
-3. creates or updates the item;
-4. replaces current-revision links with the explicitly supplied set;
-5. records scoped replacement/withdrawal when requested;
-6. returns the exact new version handle.
+### 5.4 `retain_external_result` and `apply_job_result`
 
-A direct structured correction saves its observation, applies the edit and saves the mutation result in the same transaction. Replay returns the original result even if later edits exist. A stale first application is retained as an unapplied correction; it does not overwrite newer work.
+Controller polling/artifact reading occurs outside Store transactions.
 
-### 5.4 `apply_job_result`
+After exact result bytes are read and verified, one short transaction stores:
 
-Persist exact external result bytes/status/limits on the job before parsing or publication releases temporary output. Verify result digest/length against controller receipt before decode. An erasure-cancelled job cannot reintroduce deleted data.
+- controller Operation/result identity;
+- exact Memory blob reference, length and digest;
+- requested/observed execution metadata;
+- external status and limits;
+- current controller-copy state.
 
-For one dependent semantic publication, one transaction:
+Decoding occurs from the retained Memory blob. Applying a valid proposal uses one transaction with expected revisions, new history/current rows, links, coverage and job disposition. A Store conflict reuses the saved decoded proposal and never repeats inference.
 
-1. return existing applied result on replay;
-2. verify current claim and expected target revisions;
-3. publish changes through `publish_revision`;
-4. save exact handles/no-change and actual input coverage;
-5. finish the job and release its active slot;
-6. retain or create any necessary successor;
-7. commit.
+Controller release occurs outside the publication transaction after Memory has a verified durable copy. Its success/failure updates only cleanup state; it does not roll back a valid Memory publication.
 
-A database conflict reuses the retained proposal. A genuine target change records the proposal as not applied and coalesces explicit reconciliation; it does not silently call the model again.
+### 5.5 Exact reads and coherent hydration
 
-Independent embedding results may be applied in bounded groups. One stale item does not discard valid vectors for other inputs. Embedding completion changes derived fields only and creates no semantic revision.
+Read current item, exact revision, grounds, source handles, conditions, exceptions and controller/job status through bounded Store operations. A packet records the exact revisions actually rendered.
 
-Controller result release is a separate idempotent cleanup step after Memory has durably stored and verified the exact body. Cleanup failure does not undo a published lesson, but remains visible and blocks a claim of complete erasure for that controlled duplicate.
+Do not mix a current item with links from another revision. If the required coherent set cannot be read under one transaction/snapshot, use revision checks and retry the read rather than silently combining states.
 
-### 5.5 `find_context`
+### 5.6 Bounded reads
 
-Run available candidate arms independently:
+All large reads page by real byte/row limits. A row limit is not a byte limit. Preserve UTF-8 boundaries and continuation handles. Long JSON, one-line logs and converted documents must not force unbounded allocation.
 
-- direct handles and exact IDs;
-- exact continuation address;
-- exact cues;
-- full-text search;
-- compatible vector search when enabled and available;
-- scoped alternatives and typed relations;
-- local and eligible reusable advice methods.
+## 6. Host capture and context delivery
 
-Apply project/workspace/task eligibility before each arm's limit. Do not retrieve global top-k and discard other projects afterward. Internal processing recipes are selected by job purpose, not injected as task advice.
+### 6.1 Capture
 
-Union version handles, then load bounded metadata/previews, applicability, material exceptions and only selected bodies/ranges. `LIMIT` on rows does not limit body bytes. Do not hold a Store transaction across query embedding or host handoff.
+A host adapter normalizes native events but retains native identity, event ordering, task/session/call/result relations, occurrence time, body limits and source locator. It does not invent missing task identity or semantic success.
 
-Return packet ID, rendered content, exact item/method revisions, source handles and gaps. Recording attribution failure does not suppress useful context.
+Capture path:
 
-### 5.6 `open_handle`
+```text
+native event
+→ bounded normalization
+→ capture_event
+→ committed or durable spool
+→ optional finite follow-up job
+```
 
-Open current/historical memory, observation, source segment/blob, bounded stream/episode page, project view, job/result status or recorded context packet.
+Final assistant text, tool result and host lifecycle events remain distinct. Capture exclusions apply before durable publication.
 
-The requested immutable version remains constant across pages. Missing content is missing; do not substitute a newer URL, file or revision. Default reads are bounded. Return actual range, retained total when known, next continuation and capture completeness. Byte, character, line, page and cell coordinates are not interchangeable.
+### 6.2 Context delivery
 
-Exact source opening does not depend on search-index readiness and never buys another OCR, model or source execution.
+At a real supported host boundary:
 
-## 6. Host capture and delivery
+1. resolve exact continuation address;
+2. load current work and explicit constraints;
+3. generate independent retrieval candidates;
+4. resolve current revisions/applicability and material exceptions;
+5. pack within actual budget;
+6. persist packet identity and exact included revisions;
+7. render through the host boundary.
 
-### 6.1 First adapter: Claude Code
+Distinguish:
 
-Use a command hook calling `eliot relay`, not a model-based hook.
+- packet prepared;
+- packet handed off to host;
+- packet associated with a later action;
+- content actually used, when observable.
 
-| Native event | Eliot action |
-|---|---|
-| `SessionStart`, `UserPromptSubmit` | Attach and request current orientation |
-| `SubagentStart` | Address child by actual session/agent ID and offer initial child context |
-| `PostToolUse`, `PostToolUseFailure` | Capture exact call input and structured result/error under `tool_use_id` |
-| `PostToolBatch` when available | Relate model-visible representations to the same calls and request one packet at the next model boundary |
-| `Stop`, `SubagentStop`, `StopFailure` | Capture supplied closing text/error and make relevant background work due; do not wake the agent for bookkeeping |
-| `PostCompact` when available | Record the host-produced view, not independent evidence of every underlying event |
+Absence of host correlation does not block retrieval or capture. Do not claim delivery merely because packet text was written to a local file.
 
-Preserve native session, agent, prompt, tool and transcript identities when supplied. Role names are not instance IDs. Keep structured tool result and model-visible batch representation distinct. Missing or empty final text is not replaced with an older transcript tail.
-
-The relay synchronously commits or durably stages the event, then exits. It does not wait for learning, transcript synthesis or whole-service readiness. Ordinary memory hooks do not block tools or emit permission decisions.
-
-### 6.2 Delivery
-
-Build context before optional diagnostics. Distinguish packet preparation, local write/handoff, observed host acceptance and later use.
-
-For Claude, output only valid event-specific JSON on stdout; diagnostics stay elsewhere. Fit essential claims and exceptions within the host's actual string limit and expose detail through `open`. A host-generated overflow file preview is not proof the complete packet reached the model.
-
-Use one selected boundary for a full packet, not duplicate full packets at every hook. Initial child orientation may use `SubagentStart`; later advice waits for a real supported boundary. Background learning remains stored if no next boundary occurs.
-
-Record exact rendered revisions and recipient. Without native evidence, offered context is not confirmed adherence. Do not demand an extra agent acknowledgement form to manufacture correlation.
-
-## 7. Current work, retrieval and packing
+## 7. Retrieval, context and source opening
 
 ### 7.1 Decision frame
 
-A decision frame contains available:
+A decision frame contains project/workspace/task or actor/session address, observed resource versions, focused question, exact cues, known constraints and requested budget.
 
-- project/workspace and exact continuation key;
-- native task/session identity;
-- branch/HEAD/resource conditions separately;
-- current user request, goal and criteria;
-- explicit retrieval question and typed cues;
-- relevant decision/historical time;
-- tool/model profile;
-- context incarnation;
-- output and input/read/work budgets.
+Address current work before search. A branch/path alone does not select among interleaved tasks.
 
-Unknown fields remain unknown. Generated summaries cannot replace sourced goals.
+### 7.2 Candidate arms
 
-### 7.2 Continuation before similarity
+Generate bounded candidates independently from:
 
-Context construction order:
+- direct IDs/handles;
+- exact current-work address;
+- exact cues;
+- full-text/lexical search;
+- compatible vector space when enabled;
+- current alternatives/grounds;
+- typed relations;
+- project-local and eligible reusable methods.
 
-1. open addressed continuation;
-2. read bounded relevant observations outside its recorded per-stream coverage;
-3. apply explicit constraints, corrections and open commitments;
-4. retrieve applicable methods and episodes;
-5. resolve alternatives and material dissent;
-6. add optional project view/relation expansion;
-7. pack the decision.
+Union before final selection. A lexical candidate does not require a vector score. Workspace/task selectors apply before per-arm limits.
 
-A continuation is an ordinary versioned memory item recording goal, plan, completed work, abandoned approaches, open commitments, last results, next step, represented streams/segments and gaps. It never replaces original observations.
+### 7.3 Ranking and applicability
 
-For a large unsummarized tail, freeze an upper sequence per relevant stream, read a finite metadata/excerpt page across streams, union exact linked call/results and indexed hits, then open selected ranges within aggregate budget. Old exact corrections/commitments use addressed reads rather than newest-N arrival. Read cursors are not learning coverage.
+Rank relevance separately from evidential support. Scores are relative ordering, not calibrated truth probability.
 
-### 7.3 Search
+Applicability is `applicable | inapplicable | conditional/unknown`. Exact typed conditions may decide simple cases. Natural-language uncertainty remains conditional. Token overlap does not prove a condition.
 
-Base uses native exact/full-text search. Preserve typed exact cues for paths, symbols, commands, versions and error codes.
-
-Use one focused natural-language query from explicit question, current request, goal or error, not the entire transcript. A broad OR candidate arm improves recall; applicability and packing remove noise. Exact technical identity does not depend on token conjunction.
-
-The full-text index covers the indexed field, not the entire blob behind it. Long text may produce addressable source segments through finite deterministic processing. Until then, empty excerpt search does not prove absence from unindexed bytes.
-
-The vector arm adds candidates to the same pipeline. Automatic host context never waits for cold encoder/network work. Explicit semantic retrieval may obtain one query vector within its request budget; failure returns useful local results plus a missing-arm gap.
+Material exception/counterevidence is loaded with its claim or method even if it would not rank independently.
 
 ### 7.4 Packing
 
-Build whole decision units:
+Pack semantic units, not arbitrary chunks:
 
-1. addressed current work and explicit corrections outside semantic ranking;
-2. selected claim/method plus material conditions, counterexamples and replacement links;
-3. relevant episode action/result/repair/check;
-4. source handles and specific gaps.
+- current work;
+- exact constraints/corrections;
+- applicable or conditional methods;
+- relevant prior episode;
+- dissent, unknowns and next checks;
+- source handles.
 
-Pack within actual rendered budget. Prefer current corrections and decision-changing limitations over optional background. Do not drop negation, version or exception to make a recommendation fit. If a unit cannot fit faithfully, return a qualified short form plus handle or omit the whole unit with a stated gap.
+If a unit cannot fit, return a faithful qualified reduction plus expansion handle or omit the whole unit with a stated gap. Never drop negation, version or contraindication.
 
-Candidate examination, bytes read and rendered packet size are separate budgets.
+Packet-local grouping reduces repetition but does not merge stored identities or create evidence.
 
-## 8. Sources and project understanding
+### 7.5 `open`
+
+`open` resolves an exact item/revision, observation, blob, converted representation, report section or source range. It does not rerun search, conversion, research or inference merely to satisfy a historical handle.
+
+Return metadata/excerpt first and selected bounded ranges next. A missing retained representation is a specific durability gap, not permission to substitute a newer source.
+
+## 8. Project views, documents and affected grounds
 
 ### 8.1 Project views
 
-Use configured structure tools and direct source reads, not an embedded parser platform. Views retain question, examined scope/revisions, answer, source handles and gaps. Refresh only affected views; serve the prior qualified view while refresh fails or is pending.
+A project view is a versioned answer to one useful question over an examined scope. First contact returns available exact facts immediately. A finite job may add semantic explanation.
 
-The same mechanism reads Eliot's Architecture, implementation and observed runtime as distinct sources. No self-model service or conformance database is added.
+A view records examined workspace/resource revisions, answer, source handles and gaps. Membership-affecting changes qualify or dirty the view. Refresh affected views only; retain prior qualified view and direct source access while refresh is unavailable.
 
 ### 8.2 Documents
 
@@ -512,54 +499,52 @@ Do not reconvert on read or silently substitute a newer file. Preserve available
 
 ### 8.3 Reconsider affected grounds
 
-A correction, refutation, relevant live-condition change or erasure records its actual scope and coalesces a follow-up job in the primary mutation. Use reverse grounding indexes to page affected conclusion revisions. Load each conclusion's own complete groups; do not walk navigation links as evidence or rebuild every project view.
+A correction, refutation, relevant live-condition change or erasure records its actual scope and coalesces a follow-up job in the primary mutation. Use reverse grounding indexes to page affected conclusion revisions. Load each conclusion's complete groups; do not walk navigation links as evidence or rebuild every project view.
 
-Known qualification reaches context before a replacement explanation is ready. Model work may help interpret an unresolved relation, but no model call is needed to find declared affected links or a broken required group. Cycles supply no independent support. Keep traversal finite and resumable in the existing job.
+Known qualification reaches context before replacement explanation is ready. Model work may help interpret an unresolved relation, but no model call is needed to find declared affected links or a broken required group. Cycles supply no independent support. Keep traversal finite and resumable in the existing job.
 
-## 9. External inference, embeddings and Research
+## 9. Controller inference, embeddings and Research
 
-### 9.1 Normative inference boundary
+### 9.1 One Memory-side controller client
 
-The shared cross-repository contract is [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md). Memory exposes these narrow internal client traits:
+[INFERENCE-CONTRACT](INFERENCE-CONTRACT.md) owns the cross-repository method, authority, artifact, replay, provider-adapter and release details. Memory uses one narrow authenticated client over the pinned controller IPC implementation:
 
 ```rust
-trait TextInferenceClient {
-    async fn infer(&self, request: TextRequest) -> TextResult;
-    async fn release_result(&self, operation: ExternalOperationRef) -> ReleaseResult;
-}
-
-trait EmbeddingClient {
-    async fn embed(&self, request: EmbeddingRequest) -> EmbeddingResult;
+trait ControllerInferenceClient {
+    async fn text(&self, request: TextRequest) -> OperationRef;
+    async fn embed(&self, request: EmbeddingRequest) -> OperationRef;
+    async fn get(&self, operation: OperationRef) -> OperationReceipt;
+    async fn read_result(&self, artifact: ArtifactRef, range: ByteRange) -> Bytes;
+    async fn cancel_queued(&self, operation: OperationRef) -> CancelResult;
+    async fn release(&self, request: ReleaseRequest) -> ReleaseResult;
 }
 ```
 
-The initial adapters call controller:
+The concrete adapter reuses the exact-revision `swarm-client` dependency. It does not copy IPC framing/authentication, use MCP or spawn one CLI process per request.
+
+The public controller methods are:
 
 ```text
 inference.text
 inference.embed
-inference.result.release
+inference.release
 operation.get
+operation.cancel
 artifact.get
 artifact.read
 ```
 
 The controller route is not a controller Task/Attempt and does not own Memory job state, recipe, source coverage, decoding or publication.
 
-### 9.2 Inference profile and disclosure
+### 9.2 Connection, profile and disclosure
 
-Controller configuration owns a small static `InferenceProfile`. Memory references it by name; controller freezes the non-secret snapshot identity at admission.
+Controller owns static `InferenceConnection` and `InferenceProfile` configuration.
 
-The profile contains only:
+A connection owns transport, private credential reference, non-secret identity and `actual_destination = local | external`. A loopback endpoint may still have an external destination.
 
-- adapter/connection reference and requested model;
-- locality: `local | external`;
-- `allow_automatic`;
-- finite input/output/time/concurrency limits;
-- supported response formats;
-- explicit fallback policy, initially none.
+A profile selects one closed versioned adapter ID, one connection, requested model, `allow_automatic`, finite input/output/time/concurrency limits and supported response formats. The resolved profile inherits destination from the connection. Controller freezes a canonical non-secret digest on admission.
 
-Memory reduces the actual supplied content to:
+Memory selects a profile name and reduces actual supplied content to:
 
 ```text
 local_only | external_allowed
@@ -572,64 +557,71 @@ Reduction is deterministic:
 - a derived item remains as strict as content it still contains or reveals;
 - mixed input uses the strictest contributing class;
 - reuse scope does not widen disclosure;
-- `local_only` requires a local profile.
+- `local_only` requires `actual_destination=local`.
 
-Do not silently omit protected material to make an external profile pass. If required material and selected profile are incompatible, the job waits or fails with a disclosure/profile gap. It is not no-change and does not mark input processed.
+Do not omit protected material to make an external destination pass. If required material and selected profile are incompatible, the job waits or fails with a disclosure/profile gap. It is not no-change and does not mark input processed.
 
-Automatic execution requires both Memory automatic mode and profile `allow_automatic = true`. Missing usage or cost remains unknown, never zero. No silent switch of provider, model, account, locality, retention or billing path is allowed.
+Automatic execution requires both Memory automatic mode and profile `allow_automatic=true`. Missing usage, cost or account identity remains unknown. No silent fallback is allowed.
 
-### 9.3 Request, result and release lifecycle
+### 9.3 Exact request, readback and release lifecycle
 
-Before external I/O, save on the existing job:
+Before controller I/O, save on the existing Memory job:
 
-- stable request key/client request ID;
+- stable client request ID;
 - selected profile name;
 - reduced disclosure and explicit/automatic origin;
-- exact prompt/input bytes or immutable blob reference and digest;
+- exact prompt/input bytes or immutable blob reference, length and digest;
 - finite requested limits/format;
 - selected recipe/source revisions.
 
 Call controller outside the Store transaction.
 
-Deduplication key is:
+Connected lifecycle:
 
 ```text
-authenticated caller + client_request_id + canonical method parameters
+saved Memory request
+→ authenticated inference.text/embed
+→ controller validates and stages private inference_input
+→ controller Operation with frozen connection/profile behavior
+→ provider attempt or typed rejection/unknown
+→ immutable inference_result when a body exists
+→ Memory operation.get + bounded artifact.read
+→ Memory verifies length/digest and stores exact result bytes
+→ decode/map and apply through ordinary Store operations
+→ inference.release removes controller inference_input and inference_result
+→ Memory records released or cleanup gap
 ```
 
-An exact replay returns the original Operation/admission state. Different parameters under the same ID are rejected.
+Controller deduplicates by exact caller, stable request ID, method and canonical bounded request identity. Input digest/length participates; raw content is not stored in generic Operation JSON.
 
-If admission reply is lost, repeat the identical request to the same controller as the same client. Once Operation ID exists, use `operation.get` and artifact readback. A connection or timeout after bytes may have been sent remains `unknown` unless native idempotency/readback resolves it. A new request ID is not recovery.
+If the admission reply is lost, repeat the identical request to the same controller as the same client. Once Operation ID exists, use `operation.get` and artifact readback. Connection loss after possible send remains `unknown` unless native readback resolves it. A new request ID is not recovery.
 
-For `complete` or usable `partial`:
+`complete` or usable `partial` requires exact artifact readback. Memory verifies length/digest and stores its own copy before decoding or release. Malformed cognitive output is still retained as exact transport output and is not successful no-change.
 
-1. read exact artifact ranges;
-2. verify byte length and digest from public receipt;
-3. save exact body in Memory blob/job;
-4. decode and publish through §5.4;
-5. call idempotent `inference.result.release`;
-6. retain cleanup status.
+`inference.release` is idempotent and covers both controller-owned content artifacts. Cleanup failure is visible but does not invalidate a verified Memory copy. Release is independent of cognitive success: after Memory has durable exact bytes, malformed/failed decoding does not justify indefinite controller retention.
 
-Controller release removes operation-owned content/staging only after Memory durable-copy acknowledgement and retains a bounded text-free receipt. Release failure is visible but does not invalidate already verified Memory bytes.
-
-Cancellation stops waiting or a not-yet-admitted attempt when possible. It does not prove a provider call did not occur and does not erase a completed result. Erasure must include Memory copies and any still-controlled controller duplicate.
+Cancellation applies only while controller Operation is still queued. Once provider I/O may have begun, local cancellation cannot prove non-execution and content needed for reconciliation is retained until release is permitted.
 
 ### 9.4 Embeddings
 
-`inference.embed` returns:
+`inference.embed` uses the same Operation, controlled-copy, exact-readback and release lifecycle.
+
+Canonical result contains:
 
 ```text
 effective vector space
 + role: query | document
 + one vector or error per input_key
-+ observed usage/limits
++ observed model/usage/limits when supplied
 ```
 
-Controller owns provider-specific splitting, credentials and model invocation. Memory maps each result to exact item/revision/representation. Missing, duplicate or unresolvable positions are errors, not zero vectors or shifted assignment.
+Controller owns provider-specific serialization, credentials and model invocation. Memory maps each result to exact item/revision/representation. Missing, duplicate or unresolvable positions are errors, not zero vectors or shifted assignment.
 
-Coalesce compatible inputs, respect actual token/byte/count limits, preserve successful sub-batches and retry only unresolved items under the same unknown-outcome rules. Applying a vector updates derived fields only. A content revision invalidates old vector in the primary mutation; text remains lexically usable.
+Coalesce compatible inputs within actual bounds. Preserve successful items and leave unresolved items explicit. Applying vectors updates derived fields only. Content revision invalidates the old vector in the primary mutation; text remains lexically usable.
 
 One initial vector space is enough. Changing to an incompatible space pauses only vector dispatch/query, rebuilds derived vectors in finite pages and leaves Base reads available.
+
+After the canonical embedding result is durably copied and mapped, call `inference.release` for that Operation as well.
 
 ### 9.5 Research
 
@@ -656,22 +648,22 @@ Group events through actual session/task/call/result/parent relations. An episod
 A job freezes membership and exact observation segments/per-stream bounds. Distinguish:
 
 - selected source material;
-- text actually supplied to inference;
+- text actually supplied to controller inference;
 - successfully processed coverage.
 
-An unexpanded handle, trimmed body or omitted segment is not covered. Complete no-change covers only the supplied input and purpose. Deferred material goes to pending successor. There is no global processed bit.
+An unexpanded handle, trimmed body or omitted segment is not covered. Complete no-change covers only supplied input and purpose. Deferred material goes to pending successor. There is no global processed bit.
 
 ### 10.2 Interpret, correct or keep
 
-A normal learning job receives relevant episode input, explicit feedback, a small set of related items and the exact processing recipe. It may create a provisional claim/method, revise a named item/view, identify conflict/unknown or keep/no-change.
+A normal learning job receives relevant episode input, explicit feedback, a small set of related items and exact processing-method revision. It may create a provisional claim/method, revise a named item/view, identify conflict/unknown or keep/no-change.
 
 A direct structured correction uses §5.3 without inference.
 
-### 10.3 Processing method consumer
+### 10.3 Processing-method consumer
 
-Ship real default recipe text for each implemented text purpose as application assets. First enablement for a project saves the needed default as an ordinary processing method at a stable purpose address. Do not seed future or unimplemented purposes.
+Ship real default recipe text only for implemented text purposes. First enablement for a project saves the needed default as an ordinary processing method at a stable purpose address. Do not seed future purposes.
 
-When claiming a text job, freeze selected method ID/revision with inputs. The request builder opens that exact body. Reclaimed work retains the same method and saved request. Software update does not overwrite a learned or user-edited method with bundled default.
+When claiming a text job, freeze method ID/revision with inputs. Request builder opens that exact body. Reclaimed work retains the same method and saved request. Software update does not overwrite a learned or user-edited method with bundled default.
 
 Textual improvement changes the addressed processing method through ordinary revision. Later jobs consume the new revision; running work keeps frozen input. A method with no real consumer is stored knowledge, not implemented self-improvement.
 
@@ -679,12 +671,12 @@ Textual improvement changes the addressed processing method through ordinary rev
 
 Retain source events in observations. Reduce attributable feedback into ordinary versioned outcome items addressed by exact method revision, actual attempt/execution and criterion/checked target.
 
-A tool result and agent report about it may both be saved but are one attempt. A packet proves offered context, not adherence. Unknown method/attempt association remains unknown rather than crediting every method shown.
+A tool result and agent report about it may both be saved but are one attempt. A packet proves offered context, not adherence. Unknown method/attempt association remains unknown rather than crediting every shown method.
 
-Two consumers:
+Consumers:
 
 - `context` loads relevant limitations/counterexamples with selected advice;
-- `learning` may revise the addressed method when new feedback can change the next decision.
+- `learning` may revise addressed method when new feedback can change a later decision.
 
 ### 10.5 Automatic timing without another scheduler
 
@@ -692,16 +684,16 @@ Keep capability enablement separate from `automatic = off | idle | background`.
 
 | Setting | Behavior |
 |---|---|
-| Module disabled | No new explicit/automatic work from that producer; retained content remains readable; existing external attempts remain reconcilable |
+| Capability disabled | No new explicit/automatic work from producer; retained content remains readable; admitted controller Operations remain reconcilable |
 | Enabled, automatic off | Explicit `dream` works; no automatic inference or reminders to re-enable it |
-| Enabled, automatic idle | Coalesced work may run after observed foreground quiet and during finite drain |
+| Enabled, automatic idle | Coalesced work may run after foreground quiet and during finite drain |
 | Enabled, automatic background | Same runner progresses under configured capacity while capture/control/context retain priority |
 
-A selected inference profile may independently refuse automatic use. In that case explicit work remains available if otherwise permitted; automatic jobs wait with a specific reason.
+A selected profile may independently refuse automatic use. Explicit work remains available if otherwise permitted; automatic jobs wait with a specific reason.
 
-New relevant input coalesces one pending target and preserves first queued time. A quiet delay batches nearby events; maximum age makes it due but does not override disabled, disclosure-incompatible or idle-only policy. Claim one finite slice; leave remainder pending.
+New relevant input coalesces one pending target and preserves first queued time. A quiet delay batches nearby events; maximum age makes it due but does not override disabled, destination/disclosure incompatibility or idle-only mode. Claim one finite slice; leave remainder pending.
 
-During foreground return, stop starting new idle work. Already admitted work may finish or retain uncertainty; do not cancel and repurchase on every keystroke. A stopped process resumes pending jobs at next use. Optional unattended windows are an external OS/host invocation of the same finite maintenance operation, not another scheduler inside Eliot.
+During foreground return, stop starting new idle work. Already admitted work may finish or remain unknown; do not cancel and repurchase on every keystroke. A stopped process resumes pending jobs at next use. Optional unattended windows are external OS/host invocations of the same finite maintenance operation, not another scheduler inside Eliot.
 
 Curation output must reach ordinary context/open/method consumers. An unread maintenance report is not product result.
 
@@ -715,15 +707,15 @@ Distinguish:
 - packet-local grouping;
 - same-item revision;
 - new synthesis from several episodes;
-- correction or split of an erroneous synthesis.
+- correction or split of erroneous synthesis.
 
-A broader pattern normally creates a separate provisional claim or method linked to exact sources. It does not delete or union source identities. A false merge narrows or splits the derived item while original episodes and historical handles remain.
+A broader pattern normally creates a separate provisional claim or method linked to exact sources. It does not delete or union source identities. A false merge narrows or splits derived item while original episodes and historical handles remain.
 
 ### 11.2 Disagreement and anticipation
 
 Represent rival explanations as ordinary claims with grounds and counterevidence. Select the cheapest useful discriminating observation; voting is not evidence.
 
-A prediction records trigger, expected observation, material conditions, useful check/action and reconsideration/expiry condition. Expiry does not fabricate outcome or close a commitment.
+A prediction records trigger, expected observation, material conditions, useful check/action and reconsideration/expiry condition. Expiry does not fabricate outcome or close commitment.
 
 ### 11.3 Commitments
 
@@ -736,8 +728,10 @@ Showing, acknowledging or passing a due date does not resolve a commitment. Reso
 Ask which connected step failed:
 
 - capture;
-- inference/profile/disclosure;
-- result readback or cleanup;
+- source selection or disclosure reduction;
+- profile/destination admission;
+- controller execution;
+- result retention/readback/release;
 - decoding;
 - publication;
 - retrieval/applicability;
@@ -753,24 +747,24 @@ Correct the supported failing step. Do not create recursive diagnosis jobs from 
 
 Withdrawal stops guidance; it does not claim physical deletion.
 
-For erasure, record exact selected scope/command ID as a small text-free durable notice before removal. Cancel affected pending/active jobs, settle local writers and prevent late external results or spool replay from reintroducing erased content.
+For erasure, record exact selected scope/command ID as a small text-free durable notice before removal. Cancel affected pending work, request queued controller cancellation where applicable, settle local writers and prevent late controller/Research results or spool replay from reintroducing erased content.
 
 Page through actual references and remove controlled observations, memory/current/history, conversion assets, source excerpts, packet copies, job input/output blobs, staged files and content-bearing links in scope. Remove or replace controlled backups containing the data.
 
-For inference jobs, erasure also:
+For each affected inference Operation:
 
-1. cancels or marks the external Operation abandoned where possible;
-2. invokes `inference.result.release` for retained controller result copies;
-3. records cleanup gap when controller copy cannot be confirmed removed;
-4. prevents late result ingestion after erasure.
+1. preserve enough identity to prevent replay/reintroduction;
+2. call `inference.release` when terminal or owner-authorized abandonment permits cleanup;
+3. verify release covers controller `inference_input` and `inference_result` when present;
+4. retain cleanup gap when either controlled copy cannot be confirmed removed.
 
-Already delivered provider copies are an external boundary. A controlled controller artifact is not external merely because it is in another local service. Do not report complete erase while it remains.
+Already delivered provider copies are an external boundary. A controller artifact is controlled integration data, not external merely because it is in another local service. Do not report complete erase while it remains.
 
 ### 12.2 Backup
 
 Use native logical database export plus referenced immutable blobs and finite selected spool entries. Include schema, all six tables, explicit history/links, methods/continuations/outcomes, retained model/Research results and non-secret configuration metadata.
 
-Remote handles alone do not back up remote bytes. Search indexes are rebuildable; exact sources and paid model output are not.
+Remote/controller handles alone do not back up their bytes. Search indexes are rebuildable; exact sources and paid model output are not.
 
 Pause new mutations/dispatch, drain short transactions, freeze backup set, export through Store-owned maintenance transport, copy referenced blobs, write manifest/checksums/counts and publish completion only after all bytes succeed. Failure leaves live data intact.
 
@@ -787,8 +781,8 @@ Direct controls:
 - status and scoped inbox;
 - inspect/open;
 - pause/resume jobs;
-- cancel owned work;
-- configure projects, host adapters, disclosure defaults and profile names;
+- cancel owned queued work;
+- configure projects, host adapters, disclosure defaults and selected profile names;
 - correct/withdraw/erase;
 - backup/restore;
 - graceful shutdown.
@@ -797,16 +791,18 @@ Status is derived from actual process, configuration, jobs and retained external
 
 - disabled;
 - waiting for automatic mode;
-- waiting for compatible inference profile;
-- disclosure blocked;
-- admitted/running;
-- result retained remotely;
-- result copied locally;
-- cleanup pending or released;
-- partial;
-- unknown;
-- failed;
-- applied.
+- profile or connection unavailable;
+- destination/disclosure mismatch;
+- automatic use denied;
+- requested but not admitted;
+- queued/sending;
+- outcome unknown;
+- controller result retained;
+- result copied into Memory;
+- decoded;
+- applied;
+- cleanup pending, incomplete or released;
+- partial, failed, cancelled or erased.
 
 Do not equate:
 
@@ -816,13 +812,20 @@ Do not equate:
 - retained bytes with decoded proposal;
 - decoded proposal with published memory;
 - published memory with external task success;
-- local copy with cleanup of the controller duplicate.
+- Memory copy with release of controller input/result copies.
 
-Missing usage/cost is unknown, not zero. Optional notification failure does not block status or control.
+Missing usage/cost/account identity is unknown, not zero. Optional notification failure does not block status or control.
 
 ## 14. Implementation sequence
 
-Write connected production code first. Run minimum relevant build/Clippy after a coherent code increment. Do not construct a large test framework or force production behavior around speculative tests. Full automated testing follows the completed product implementation; the scenarios below define what that later suite must exercise.
+Write connected production code first. Run minimum relevant build/Clippy after a coherent code increment. Do not construct a large speculative test framework or force production behavior around placeholder tests. Full automated testing follows connected product implementation; the scenarios below define what the later suite must exercise.
+
+Before each slice:
+
+- name one integrator and exact product edge;
+- reject missing configuration, stale base and duplicate owner before expensive setup;
+- do not open overlapping sibling work without a terminal disposition;
+- count merged product behavior and closed blockers, not generated artifacts.
 
 ### Slice 1 — Store and local lifecycle
 
@@ -838,9 +841,9 @@ real event → committed observation → restart → exact open
 
 Connect first host capture, continuation lookup/raw bounded tail, exact/full-text retrieval, explicit notes/corrections/commitments, context delivery, source open, pause/stop and Base backup/restore/erase.
 
-Base runs with model/vector/document/Research capabilities disabled.
+Base runs with controller/model/vector/document/Research capabilities disabled.
 
-Observable product path:
+Observable path:
 
 ```text
 session A captures result or explicit lesson
@@ -849,33 +852,37 @@ session A captures result or explicit lesson
 → exact source opens
 ```
 
-### Slice 3 — Controller inference owner
+### Slice 3 — Controller one-shot inference owner
 
 In `eliot-swarm-controller`, implement [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md):
 
-- static `InferenceProfile`;
-- `inference.text`;
-- `inference.embed`;
-- exact dedup and unknown-outcome behavior;
-- durable public result artifact;
-- `inference.result.release`;
-- no Task/Attempt/workspace/review semantics.
+- narrow `inference_client` authority and exact allowlist;
+- static `InferenceConnection` and `InferenceProfile` configuration;
+- canonical non-secret profile digest and `actual_destination`;
+- `inference.text`, `inference.embed` and `inference.release`;
+- controlled `inference_input` and `inference_result` artifacts;
+- exact dedup, queued cancellation and unknown-outcome behavior;
+- one Operation-backed runner;
+- closed loopback text adapter first, embeddings second;
+- durable public result readback;
+- idempotent cleanup of both controller content copies;
+- no Task/Attempt/workspace/review/ScriptRun semantics.
 
 This is adjacent-repository production work, not a Memory-side provider stack.
 
 ### Slice 4 — First connected learning
 
-In Memory, add `ControllerTextInferenceClient`, one `episode_learning` handler, disclosure reduction, retained request/result, digest verification, decoder, publication and release acknowledgement.
+In Memory, pin/reuse controller `swarm-client`; add one controller client, one `episode_learning` handler, disclosure reduction, exact retained request/result, digest verification, decoder, publication and release tracking.
 
 Observable path:
 
 ```text
 episode + exact recipe + disclosure
-→ one controller inference operation
-→ retained and verified body
+→ one controller inference Operation
+→ retained and verified Memory copy
 → create/revise/no-change
-→ next context consumes revision
-→ controller duplicate released
+→ later context consumes revision
+→ controller inference_input/result released or exact cleanup gap reported
 ```
 
 Exercise unknown outcome, malformed/partial output and controller restart without calling inference twice. Keep Base working with learning disabled.
@@ -886,10 +893,10 @@ Add vector retrieval, project views, documents, Research and additional hosts ac
 
 ### Slice 6 — Advanced improvement
 
-Add cross-episode curation, recursive improvement, targeted diagnosis, richer disagreement/anticipation and broader integrations only after base paths work. Reuse same jobs, revisions and context; do not create a second cognitive runtime.
+Add cross-episode curation, recursive improvement, targeted diagnosis, richer disagreement/anticipation and broader integrations only after base paths work. Reuse the same jobs, revisions and context; do not create a second cognitive runtime.
 
 ### Final verification phase
 
-After product implementation is connected, build the automated suite around real production operations. Start with observable paths above, then concurrency, restart, erasure and optional-module failure. Use real Store/application boundaries; substituted provider responses verify local mapping only and do not qualify a live provider.
+After product implementation is connected, build the automated suite around the real operations above, then add concurrency, restart, erasure and optional-capability failure. Substituted provider responses verify local mapping only and do not qualify a live provider route.
 
 Inspect actual latency, I/O, calls, retained bytes, dependencies and code size before claiming optimization. Line count is a diagnostic, not a quota or permission to compress responsibilities into an unreadable monolith.
