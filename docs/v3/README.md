@@ -100,6 +100,49 @@ If context construction or the hook fails, Base capture and explicit retrieval r
 
 The first implementation must qualify the installed Claude Code version and actual payloads. The current public hook reference is a design input, not proof that a user's installed build emits every current field.
 
+## Exact open and bounded reads
+
+`open` is not a broad query with an empty selector. It requires one nonempty exact handle or source locator and an optional bounded range. Search and context generation may suggest handles; only `open` resolves one of them.
+
+Exact handles identify what the caller asked to read:
+
+- current semantic handle — resolve the current revision or return explicit absent/withdrawn/erased state;
+- version handle `(item_id, revision)` — return that exact historical revision or explicit missing/damaged state, never silently substitute current;
+- observation/source handle — return the retained source body/blob representation and locator actually captured;
+- transformed representation handle — return that representation and its relation to the original, never silently reconvert or replace it with a newer source.
+
+A content digest verifies bytes. It is not a public logical handle unless the object is explicitly content-addressed.
+
+### Exact result envelope
+
+Every exact read reports actual disposition rather than an empty list with implied success:
+
+```text
+requested handle and revision/range
+resolved identity and representation
+returned byte/item range and digest
+current/history state
+material conditions, limitations and capture gaps
+relation descriptors needed to interpret the item
+expansion handles
+next cursor when more retained bytes or relation descriptors exist
+missing | forbidden | erased | damaged | unsupported representation
+```
+
+`requested`, `returned`, `missing` and `forbidden` are populated from the real read. `truncated=true` requires a valid continuation for the omitted readable portion or an explicit non-pageable gap. A fixed relation cap without continuation is incomplete coverage, not a complete exact read.
+
+Opening one claim or method does not require loading every source body, but it must not hide the existence of its material grounds, contradictions, replacements, exceptions or outcome links merely because the caller did not already know both relation endpoints. Return bounded relation descriptors and expansion handles from the revision actually opened. Expanding a neighbor body is a subsequent exact read.
+
+Current and historical relations are revision-aware. A link supporting revision 2 does not silently describe revision 3. Relation discovery and body expansion are separate, but neither may depend on semantic top-k.
+
+### Bounded byte and item pagination
+
+Ranges and cursors bind to the exact object/revision/representation and read options. A cursor cannot be replayed against another source or a changed current revision. The result states whether limits apply to rows, bytes, decoded elements or rendered text; one does not masquerade as another.
+
+Large text/blob reading is metadata/excerpt first, then exact byte or representation ranges. UTF-8 boundaries are handled explicitly. Long JSON, one very long line, PDFs, images and spreadsheets retain format-specific coordinates where available.
+
+An empty exact-handle list returns a validation error or empty exact result by the owning operation; it never means “read the project broadly.” Broad navigation uses a separate bounded query with its own scope, denominator and cursor.
+
 ## Why V2 stalled and what V3 forbids
 
 The preserved goals were not the main problem. Continuity, correction, provenance, negative memory, project understanding, Dreamer, privacy, recovery and operator control remain useful. The failure came from turning each principle into its own owner, registry, receipt, lifecycle and proof ceremony, then rewarding production of those artifacts instead of integration.
