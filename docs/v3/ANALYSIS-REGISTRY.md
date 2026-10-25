@@ -62,12 +62,12 @@
 | R-016 | Research request→report→source | Research `7c034569`; Implementation §9.3 | `PARTIAL` | Run/status/report/section/citation operations найдены; R-031/R-032 открыты. | Исправить parser/citation owner. |
 | R-017 | Project views/self-view | Implementation §8.1 | `PARTIAL` | Scoped versioned views выбраны; deployment/tool не qualified. | Проверить two checkouts, late result, affected refresh. |
 | R-018 | Document→representation→open | Docling/Core selected paths; Implementation §8.2 | `PARTIAL` | Original bytes, retained representation, excerpts, exact open определены. | Реальный partial page/image conversion and cost bounds. |
-| R-019 | Backup/restore | Implementation §12; SurrealDB docs; V2 reads | `PARTIAL` | Logical export + immutable blobs + selected pending spool + fresh candidate; live engine copy rejected. | Exact 3.3.4 Windows RocksDB export/import round-trip. |
+| R-019 | Backup/restore | Implementation §12; exact 3.3.4 export/import source; V2 reads | `CHECKED` design / `NOT QUALIFIED` runtime | Logical export over authenticated HTTP route, V3-owned dump/blob/manifest publication and import into a fresh candidate. Import is statement-by-statement, may continue after failures and return partial state; any failed candidate is discarded whole. | Execute exact Windows RocksDB export/import and candidate-discard round-trip. |
 | R-020 | Erasure/reappearance | Architecture §4.10; Implementation §12.1; Cognition §13 | `PARTIAL` | Deletion notice, replay check and controller late-result fence selected. | Реализовать traversal, backups/spool and all controlled copies. |
 | R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Диагностируется конкретный failed edge; нет global intelligence score. | Connected source→context→result→revision path after Base/controller. |
 | R-022 | Disagreement/anticipation | Architecture §8; Cognition §11 | `CHECKED` | Alternatives+grounds+cheapest distinguishing observation; no voting. | Ordinary records after core path. |
 | R-023 | Control/status/inbox | Architecture §9; Implementation §13 | `DECIDED` | Status derives from binary/engine/schema/process/spool/jobs/packets/reads/profile/copy facts. | Реализовать actual status and commands. |
-| R-024 | Normative consistency | Architecture 8 / Implementation 22 / Cognition 11 / Contract 0.4 / README | `CHECKED` | Inference, Base capture/spool/packet/open and Store/durability live in owner docs; no new contract/errata layer. | Synchronize only when mechanism changes. |
+| R-024 | Normative consistency | Architecture 8 / Implementation 22 / Cognition 11 / Contract 0.4 / README | `PARTIAL` | Existing books agree through Store baseline, but exact capability trap, maintenance route set and credential-role split from R-089–R-091 are not yet mirrored in Implementation/README. | Update owner docs after the selected Slice 0 target is frozen; do not create another contract. |
 | R-025 | Interpretation triggers | Implementation §§5.3,10; Cognition §10 | `DECIDED` | New committed input/correction/explicit question; replay/read/packet/release/cleanup do not self-trigger duplicate learning. | Проверить enqueue callers/loops. |
 | R-026 | Active/pending jobs | Implementation §§4.6,5.7,10 | `DECIDED` | Optional unique slot: one active + one pending successor; waiting not retry. | Continuous arrivals, two projects, modes, shutdown. |
 | R-027 | Agent result public artifact | Controller projection | `GAP` | Agent route loses nested artifact refs in public projection. | Fix only with real agent consumer. |
@@ -136,12 +136,15 @@
 | R-080 | Legacy read coverage/cursor | `fetch_atoms_l2.surql` and filters | `CHECKED` exact path | Fixed caps have no honest cursor/coverage. | Typed exact envelope/cursor. |
 | R-081 | Exact-open consistency | Current README/books | `CHECKED` design / `NOT IMPLEMENTED` runtime | Exact current/history/source/representation handles, dispositions, ranges and identity cursor. | Implement readers and edge cases. |
 | R-082 | SurrealDB Rust SDK fit | Root Cargo/toolchain/deny; SDK 3.3.4 metadata; V2 adapter | `CHECKED` / `NOT SELECTED` baseline | SDK requires Rust 1.95 while workspace declares 1.94; published license metadata conflicts with current allowlist on paper; no SDK dependency exists. | Reconsider only after exact cargo check/deny/size proof. |
-| R-083 | Exact SurrealDB Windows release identity | Official release/tag API and build workflow; Implementation §§1.2–1.3 | `CHECKED` release identity / `NOT QUALIFIED` runtime | Tag `v3.3.4` resolves to commit `1ac2b1dba7cd177621a4cf5d507caebeb2414395`. Asset `surreal-v3.3.4.windows-amd64.exe`, asset ID `655787929`, size `321555968`, SHA-256 `1255a3b2e771b8853e9ee0aca0ddde09dbe4532248502a5d900eb3997955f0cc`. GitHub release is mutable, so installer verifies digest and retains approved bytes; tag/name alone are insufficient. | Download/hash approved asset, retain local installation copy, run Slice 0. |
-| R-084 | Store RPC/mutation replay | V2 session donor; current RPC docs | `CHECKED` design / `NOT IMPLEMENTED` runtime | Bounded JSON WS, `json` subprotocol, fixed methods/queries, one in-flight/socket, exact IDs, no blind replay. | Implement parser/bounds/errors/readback. |
+| R-083 | Exact SurrealDB Windows release identity | Official release/tag API and build workflow; Implementation §§1.2–1.3 | `CHECKED` release identity / `NOT QUALIFIED` runtime | Tag `v3.3.4` resolves to commit `1ac2b1dba7cd177621a4cf5d507caebeb2414395`. Asset `surreal-v3.3.4.windows-amd64.exe`, asset ID `655787929`, size `321555968`, SHA-256 `1255a3b2e771b8853e9ee0aca0ddde09dbe4532248502a5d900eb3997955f0cc`. Installer verifies digest and retains approved bytes. | Download/hash approved asset and run Slice 0. |
+| R-084 | Store RPC/mutation replay | V2 session donor; exact tag RPC source | `CHECKED` design / `NOT IMPLEMENTED` runtime | Bounded JSON WS on `/rpc`, `json` subprotocol, fixed methods/queries, one in-flight/socket, exact IDs, no blind replay. Route and method capability gates are independent. | Implement parser/bounds/errors/readback. |
 | R-085 | Schema/migration/transactions | Current SurrealDB docs; Implementation §§4–5.2 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Checksummed `.surql`, DB generation param/INFO, strict schemafull, derived unique keys, snapshot transactions, FOR UPDATE/sentinel. | Write migration 0001 and run conflict/rollback cases. |
 | R-086 | Windows immutable publication | Microsoft API docs; current donors; Implementation §§5.4–5.5 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Local NTFS/ReFS; create-new temp; file flush; no-replace WRITE_THROUGH rename; parent flush; exact readback; post-rename sync failure unknown. | Implement and force file/rename/dir-sync/restart outcomes. |
-| R-087 | SurrealDB RocksDB build/runtime qualification | Tag `v3.3.4` server Cargo + rolling Windows build; storage docs | `CHECKED` build provenance / `OPEN` runtime | Server default features include `storage-rocksdb`; release Windows job builds `surreal.exe` with default features and publishes a generated SHA-256, so the official Windows asset is built with RocksDB support. Actual Windows RocksDB start/restart/conflict/export/import/durability remains unrun. | Run standalone asset against disposable `rocksdb:` root; no SurrealKV fallback. |
-| R-088 | Standalone CLI, secrets and capability posture | Tag `v3.3.4` `cli/start.rs`, `dbs/mod.rs`; official CLI/env docs | `CHECKED` source design / `NOT QUALIFIED` runtime | Downloaded asset is standalone DB binary and must be launched as `surreal start <storage-url>`, not launcher `surreal db start`. Non-secret path/bind/timeouts/capability settings are explicit arguments and verified at admission. Initial root username/password come from a private installer-owned source into child-only environment, never command line/logs. Unauthenticated/guest/network/scripting/eval remain disabled; exact minimal RPC/function allowlist is qualified by Slice 0 before pinning. | Run `version`/help/start on Windows, qualify path syntax, credentials, minimal capabilities, query/transaction/startup timeouts and restart behavior. |
+| R-087 | SurrealDB RocksDB build/runtime qualification | Tag `v3.3.4` server Cargo + rolling Windows build; storage docs | `CHECKED` build provenance / `OPEN` runtime | Server default features include `storage-rocksdb`; official Windows asset is built with RocksDB support. Actual Windows RocksDB start/restart/conflict/export/import/durability remains unrun. | Run standalone asset against disposable `rocksdb:` root; no SurrealKV fallback. |
+| R-088 | Standalone CLI, secrets and capability posture | Exact tag `cli/start.rs`, `dbs/mod.rs`, validator, auth arguments | `CHECKED` source design / `NOT QUALIFIED` runtime | Launch is `surreal start <storage-url>`. Non-secret path/bind/timeouts/capabilities are explicit. Secrets use child-only environment. `--deny-all` is necessary but not sufficient because arbitrary-query defaults to all unless separately denied. | Qualify exact argument vector, environment, path syntax and admissions on Windows. |
+| R-089 | Exact Store capability surface | Exact tag `dbs/mod.rs`, RPC capabilities/method/protocol and `/rpc` route | `CHECKED` source design / `NOT QUALIFIED` runtime | Qualification target: `--deny-all`; explicit `--deny-arbitrary-query` plus `--allow-arbitrary-query system`; HTTP routes `rpc,signin,export,import`; RPC methods `signin,use,version,query,ping`; no guest/net/script/eval/experimental. Function allowlist starts empty and grows only from checked-in query corpus. Capability flags do not inspect SQL body, so fixed-query private client remains the real statement boundary. | Run allowed and denied route/method/subject/function matrix against exact asset; then mirror final profile in Implementation. |
+| R-090 | Exact export/import and partial-restore semantics | Exact tag CLI `export.rs`/`import.rs`, network routes and auth arguments | `CHECKED` source design / `NOT QUALIFIED` runtime | Export/import are authenticated HTTP routes. CLI secrets can arrive through `SURREAL_USER/PASS` and DB selection env. Export must use an exact schema-generation-owned subset rather than broad defaults. Record versions are not exported; V3 history is ordinary rows. Import commits statement-by-statement, continues past failures and can return 422 with partial state. | Export to V3-owned temp, hash/publish manifest, import once into empty candidate, discard entire candidate on any failure, then verify schema/counts/handles/conflicts. |
+| R-091 | Store credential roles | Prior user constraint; exact tag auth levels, IAM roles/policy and import permission | `DECIDED` design / `NOT QUALIFIED` runtime | Windows Credential Manager remains sole secret authority. Root bootstrap credential is supervisor/installer-only. Normal daemon uses a database-scoped Editor through the private Store bridge. Schema/backup/restore use a separate database-scoped Owner because import requires `Edit Any`; root does not enter daemon, backup manifest or CLI argv. | Slice 0 must create/sign in both DB users, prove the fixed runtime corpus under Editor and maintenance/export/import under Owner, then synchronize owner docs. |
 
 ## 3. Source coverage
 
@@ -176,8 +179,11 @@
 | S-027 | SurrealDB 3.3.4 docs/package metadata | `CHECKED` SDK/RPC/schema/index/transaction/storage docs | Public contract, not live binary proof. |
 | S-028 | Microsoft Win32 file API docs | `CHECKED` CreateFile/FlushFileBuffers/MoveFile semantics | API contract, no crash/power-loss run. |
 | S-029 | Store/durability normative synchronization | `CHECKED` Implementation 22 + README + R-082–R-087 | Design only. |
-| S-030 | SurrealDB `v3.3.4` release/tag/build provenance | `CHECKED` release API, tag commit, server Cargo, rolling channel and Windows build action | Proves exact published identity and compile feature provenance; release is mutable and asset was not executed here. |
-| S-031 | SurrealDB standalone start/capability source | `CHECKED` tag `v3.3.4` `cli/start.rs`, `dbs/mod.rs` and official CLI/env reference | Establishes available arguments/defaults; exact Windows invocation/capability set still requires Slice 0. |
+| S-030 | SurrealDB `v3.3.4` release/tag/build provenance | `CHECKED` release API, tag commit, server Cargo, rolling channel and Windows build action | Exact identity/build features; no execution. |
+| S-031 | SurrealDB standalone start source | `CHECKED` exact tag `cli/start.rs`, `dbs/mod.rs` | Exact arguments/defaults; Windows invocation still unrun. |
+| S-032 | SurrealDB exact capability/RPC source | `CHECKED` tag `v3.3.4` `dbs/mod.rs`, validator, RPC capabilities/method/protocol and `/rpc` route | Establishes parser/default/route/method/subject gates. Does not prove exact command line on Windows. |
+| S-033 | SurrealDB exact export/import source | `CHECKED` tag `v3.3.4` CLI export/import, HTTP routes and auth arguments | Establishes route permissions, env credentials, export selection and partial import; no round-trip. |
+| S-034 | SurrealDB exact IAM roles/policy | `CHECKED` tag `v3.3.4` IAM roles/policy plus import permission check | Establishes Editor/Owner distinction and why import needs Owner; user creation/sign-in not run. |
 
 ## 4. Findings from current focused passes
 
@@ -187,41 +193,56 @@ Legacy `forwarded` was shape-only; spool lacked a durable replayer; occurrence u
 
 Counterexamples retained: two identical prompts are two occurrences; lost commit reply replays the same command; temp-before-rename is not staged; deletion notice blocks old replay; prepared packet is not emitted; exact empty selector is not broad; relation descriptor does not require neighbor body; capped page needs cursor; historical handle never falls forward.
 
-### 2026-10-25 — Store, schema and Windows durability
+### 2026-10-25 — Store, schema, capability and Windows durability
 
 Established:
 
 1. no official SurrealDB SDK dependency exists; V2 uses custom WebSocket RPC;
-2. current SDK requires Rust 1.95 while workspace declares 1.94;
-3. SDK license metadata does not fit the current allowlist without explicit admission proof;
-4. V2 major-only pin and SurrealKV default are insufficient;
-5. bounded JSON RPC covers the required remote surface without engine/SDK linkage;
-6. snapshot isolation needs unique values or locked sentinel records for set invariants;
-7. strict/schemafull definitions, params and INFO support a small migration owner;
-8. Windows immutable publication requires file flush, no-replace write-through rename, parent-directory flush and exact readback;
-9. post-rename sync failure is a possible committed filesystem effect and must reconcile;
-10. logical export/import, not live engine-directory copy, owns application backup.
+2. current SDK requires Rust 1.95 while workspace declares 1.94 and its package metadata needs explicit license admission;
+3. V2 major-only pin and SurrealKV default are insufficient;
+4. bounded JSON RPC covers the required remote surface without engine/SDK linkage;
+5. snapshot isolation needs unique values or locked sentinel records for set invariants;
+6. strict/schemafull definitions, params and INFO support a small migration owner;
+7. Windows immutable publication requires file flush, no-replace write-through rename, parent-directory flush and exact readback;
+8. post-rename sync failure is a possible committed filesystem effect and must reconcile;
+9. logical export/import, not live engine-directory copy, owns application backup;
+10. `v3.3.4` resolves to commit `1ac2b1dba7cd177621a4cf5d507caebeb2414395` and R-083 records the exact asset/digest;
+11. official Windows build uses default server features including RocksDB, but runtime qualification remains open;
+12. standalone launch is `surreal start`, not launcher syntax;
+13. HTTP route and RPC method allowlists are separate gates;
+14. `--deny-all` does not by itself reduce arbitrary-query: explicit deny-all for arbitrary query plus `system` allow is required;
+15. root/namespace/database authenticated sessions map to `system`, while guest and record actors remain separate targets;
+16. exposing only RPC `query` still grants arbitrary SurrealQL to that authenticated system actor, so the private fixed-query client is the statement-level boundary;
+17. export/import are separate HTTP routes; credentials/selection support environment variables;
+18. import is non-transactional, continues after statement failures and can leave a partial database;
+19. database Owner can edit any resource at its level, while Editor lacks `Any`, so maintenance import cannot use the runtime Editor identity;
+20. release/build/source proof is not runtime qualification.
 
-Exact release/build follow-up established:
+Qualification target, not a claimed working command:
 
-11. `v3.3.4` resolves to commit `1ac2b1dba7cd177621a4cf5d507caebeb2414395`;
-12. the official Windows asset identity is recorded in R-083, including SHA-256;
-13. release promotion reuses a prior rolling build; the Windows action builds `surreal.exe` with default features and generates a checksum;
-14. default server features include RocksDB, so build provenance is closed even though runtime qualification remains open;
-15. the asset is the standalone database executable; supervisor uses `surreal start`, not launcher syntax;
-16. CLI exposes bind, exact data path, root credentials, query/transaction/startup timeouts and fine-grained capabilities;
-17. release metadata is mutable, so installer must verify/retain exact approved bytes rather than trust tag/name indefinitely.
+```text
+--deny-all
+--deny-arbitrary-query
+--allow-arbitrary-query system
+--allow-http rpc,signin,export,import
+--allow-rpc signin,use,version,query,ping
+```
+
+The function allowlist is empty until the checked-in migration/query corpus proves a specific built-in function necessary.
 
 Counterexamples, not runtime runs:
 
-- tag/name unchanged but release asset replaced → digest mismatch blocks Store;
-- official asset has RocksDB feature but `rocksdb:` startup fails on target Windows/filesystem → R-087 remains open and Slice 0 blocks;
-- supervisor invokes standalone asset with `db start` → wrong product surface;
-- password placed in process command line → secret leakage, rejected;
-- invalid/non-secret environment value silently falls back → admission must verify actual endpoint/version/engine behavior;
-- `--deny-all` without the exact required allowlist blocks own Store operations → capability set is qualified by the fixed migration/query corpus, not guessed;
-- broader default capabilities permit network/script/eval that Base does not need → not selected;
-- same asset runs with another storage engine → installation identity mismatch, not automatic fallback.
+- `--deny-all` without explicit arbitrary-query denial → query surface remains broader than intended;
+- allow RPC `query` but omit HTTP route `rpc` → WebSocket never reaches method dispatch;
+- allow route `rpc` but omit method `signin` → connection exists but cannot authenticate;
+- allow `query` to `guest` or `record` → accidental broader SQL principals;
+- raw SurrealQL exposed behind a “private” caller wrapper → capability flags do not restrict statement family;
+- export default used unfiltered → users/configs/modules or other unowned resources can enter backup;
+- `versions=true` assumed to preserve application history → unsupported; V3 history must be rows;
+- retry failed import into same candidate → compounds unknown partial state;
+- use runtime Editor for import → permission check on `Edit Any` refuses or tempts privilege widening;
+- root secret handed to daemon/CLI argv → credential boundary violation;
+- exact asset has RocksDB feature but `rocksdb:` startup fails on target Windows/filesystem → R-087 stays open, no fallback.
 
 ## 5. Решения, которые не открываются без нового основания
 
@@ -254,16 +275,22 @@ Counterexamples, not runtime runs:
 - не копировать live engine directory как Base backup;
 - не fall back from RocksDB to beta SurrealKV;
 - не запускать standalone release asset через launcher-only `surreal db start`;
-- не передавать root password в command line/logs;
-- не оставлять unauthenticated/guest/network/scripting/eval capabilities включёнными по умолчанию;
+- не передавать root password в daemon, backup manifest, argv или logs;
+- не считать `--deny-all` достаточным arbitrary-query gate;
+- не разрешать HTTP/RPC/subject/function surface шире exact checked-in corpus;
+- не использовать embedded/local export/import path, bypassing owned server admission;
+- не принимать broad default export as V3 backup;
+- не продолжать restore в partially imported candidate;
+- не использовать runtime Editor credential для maintenance import;
 - не объявлять release/build provenance runtime qualification.
 
 ## 6. Очередь
 
 | Priority | Работа | Закрывает |
 |---|---|---|
-| P0 | Slice 0: obtain exact asset from R-083, verify retained SHA, run `version/help/start`, qualify `rocksdb:` Windows path, credentials/capabilities/timeouts, minimal RPC, strict migrations, unique/FOR UPDATE/conflict/unknown readback, no-replace file publication/reconciliation and logical export/import | R-002, R-006, R-019, R-072–R-073, R-081–R-088 |
-| P1 | Base Slice 1: one package, supervisor/daemon/Store RPC, migrations, CaptureCommand, indexes, blobs, durable pending spool/replay, status and restart open | R-001–R-007, R-019–R-020, R-033, R-037–R-040, R-071–R-073, R-079–R-088 |
+| P0 | Slice 0: exact asset/hash/version/help/start; `rocksdb:` Windows path; bootstrap root + DB Owner/Editor creation; exact HTTP/RPC/arbitrary-query/function allow/deny matrix; minimal fixed-query client; strict migrations; unique/FOR UPDATE/conflict/unknown readback; no-replace file publication; exact-subset export; failed-import candidate discard; logical restore verification | R-002, R-006, R-019, R-072–R-073, R-081–R-091 |
+| P0 | After Slice 0 freezes the working argument/credential/backup profile, update Implementation/README and return R-024 to `CHECKED`; no new contract file | R-024, R-089–R-091 |
+| P1 | Base Slice 1: one package, supervisor/daemon/Store RPC, migrations, CaptureCommand, indexes, blobs, durable pending spool/replay, status and restart open | R-001–R-007, R-019–R-020, R-033, R-037–R-040, R-071–R-073, R-079–R-091 |
 | P1 | Base Slice 2: qualified Claude relay, continuation, SessionStart/UserPromptSubmit packet emission, packet retention, lexical retrieval, exact open, notes/corrections/commitments and maintenance | R-003–R-013, R-023, R-036, R-039–R-044, R-074–R-081 |
 | P1 | Controller inference slice: role/config/staging/dedup/runner/loopback text/readback/per-copy release; no Task/ScriptRun/new table | R-027, R-048, R-050–R-057, R-068–R-070 |
 | P1 | One integrator/product edge/cheap preflight/terminal disposition per slice | R-058–R-061, R-067 |
@@ -292,4 +319,5 @@ Counterexamples, not runtime runs:
 | 2026-10-24 / `036377ed`–`864ad1a2` | Base host/capture/spool/packet; R-071–R-076. |
 | 2026-10-24 / `bfb23738`–`63120469` | Exact-open contract; R-077–R-081. |
 | 2026-10-25 / `2bc53a9a`–`33666eea` | Store/schema/transaction and Windows durability baseline; R-082–R-087. |
-| 2026-10-25 / release-provenance follow-up | Exact v3.3.4 asset/tag/build/standalone launch/capability evidence; R-083/R-087/R-088 and S-030/S-031. |
+| 2026-10-25 / `0a162fee` | Exact v3.3.4 asset/tag/build/standalone launch evidence; R-083/R-087/R-088 and S-030/S-031. |
+| 2026-10-25 / capability/export audit | Exact HTTP/RPC/query gates, partial import and credential roles; R-089–R-091 and S-032–S-034. |
