@@ -26,6 +26,80 @@ Base captures real host/source events, preserves explicit knowledge/corrections/
 
 Learning, vectors, project understanding, documents, Research and additional hosts are independent vertical extensions. They reuse the same records, finite jobs, revision publication, context assembly and maintenance path. A missing extension does not disable Base; disabling a producer does not erase retained readable knowledge. There is no second Lite database or Full memory engine.
 
+## First Base host and durable capture
+
+The first integrated host profile is one Claude Code hook relay because it supplies real lifecycle, prompt, tool-result and final-response boundaries. Claude-specific JSON is an adapter input, not the Memory domain model. Other hosts arrive later through the same `capture`, `context` and `open` operations.
+
+The initial event profile is deliberately small:
+
+| Event | Base purpose |
+|---|---|
+| `SessionStart` | Reopen the exact continuation and return real bounded context on `startup`, `resume`, `clear`, `compact` or `fork` |
+| `UserPromptSubmit` | Capture the submitted user input and return decision-time context before the model request |
+| `PostToolUse` | Preserve a successful tool call, its native `tool_use_id`, input and returned result |
+| `PostToolUseFailure` | Preserve a started tool call that failed, including its error and interruption facts |
+| `Stop` | Preserve the main agent's final `last_assistant_message` without waiting for transcript freshness |
+| `SubagentStop` | Preserve the final subagent response and native agent identity; handback tool results remain tool events |
+| `PostCompact` | Preserve the generated compact summary as a derived representation, never as replacement source truth |
+| `SessionEnd` | Preserve the session lifecycle boundary and reason |
+
+`PreToolUse`, permission and stop enforcement are not Base memory requirements. Negative memory is advisory by default. A later host guard is explicit and opt-in; V3 does not carry forward a general lease, finish or compaction gate merely because the old plugin had one.
+
+### One capture command, one occurrence identity
+
+The relay builds one complete bounded `CaptureCommand` before any daemon call. It contains a relay-generated command ID, native host/session/task/resource coordinates, event kind, native event key when available, occurrence time, exact accepted body or blob, body digest, disclosure, locator and explicit capture limits.
+
+Occurrence identity is separate from content equality:
+
+- native IDs such as `session_id`, `tool_use_id`, prompt/message/agent IDs are retained when supplied;
+- the relay command ID is the fallback occurrence key and the idempotency key for direct delivery and spool replay;
+- the content digest verifies bytes but never merges two real occurrences merely because their payloads match;
+- an identical replay of the same command returns the original Store result; another occurrence with identical bytes remains another observation.
+
+Capture exclusions run before durable publication. Accepted source bytes remain exact within the declared bound. Extracted index fields are separate projections. A generic key-name sanitizer must not silently remove URLs, endpoints, paths, final messages or other source locators; any omitted or host-truncated material is recorded as an explicit capture limitation.
+
+### Direct delivery and spool are the same operation
+
+There is no successful `forwarded` state without Store readback.
+
+```text
+build exact CaptureCommand once
+→ call daemon `capture`
+→ committed only after Store identity/digest readback
+
+lost/unavailable daemon result
+→ atomically publish the same command to `spool/pending`
+→ staged only after durable file publication
+→ daemon replays the same `capture` operation
+→ delete pending file only after Store readback
+```
+
+A spool file is written to a same-directory temporary regular file, flushed and synchronized, atomically renamed, then followed by parent-directory synchronization. The daemon is the sole replayer. Corrupt or permanently rejected entries move to `spool/failed` with a bounded non-content reason; they do not loop forever. Successful replay removes the pending body instead of maintaining a second `committed` content archive.
+
+The public capture outcomes mean exactly:
+
+- `committed` — the Store owns the observation and exact readback matched;
+- `staged` — the exact command is durably present in the pending spool;
+- `unknown` — neither Store commit nor durable spool publication can be established;
+- `rejected` — deterministic validation, exclusion or bound failure before ownership transfer.
+
+### Context is content, not a service-status phrase
+
+`SessionStart` and `UserPromptSubmit` return the actual rendered context packet through the host's supported context channel. A message such as “event spooled” is status, not context.
+
+A packet is retained through ordinary V3 data rather than a `PacketStore`: one Eliot application observation/blob records packet ID, rendered digest, budget, gaps and exact included revisions; ordinary links record inclusion and an observed host handoff. Keep these states distinct:
+
+```text
+prepared
+→ emitted through the host contract
+→ associated with a later action when observable
+→ actually used or influential: usually unknown unless separately observed
+```
+
+If context construction or the hook fails, Base capture and explicit retrieval remain available. The host receives a specific context gap rather than fabricated empty success, and no local output file is counted as delivery.
+
+The first implementation must qualify the installed Claude Code version and actual payloads. The current public hook reference is a design input, not proof that a user's installed build emits every current field.
+
 ## Why V2 stalled and what V3 forbids
 
 The preserved goals were not the main problem. Continuity, correction, provenance, negative memory, project understanding, Dreamer, privacy, recovery and operator control remain useful. The failure came from turning each principle into its own owner, registry, receipt, lifecycle and proof ceremony, then rewarding production of those artifacts instead of integration.
