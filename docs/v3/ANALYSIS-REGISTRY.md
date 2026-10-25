@@ -39,7 +39,7 @@
 | R-001 | Граница продукта и владельцы | Architecture §§1–3; Implementation §§1–3; старые I9.1/I9.3/T12 | `CHECKED` | Host/controller владеет внешними задачами и инструментами; Eliot — памятью и собственными finite jobs. Controller владеет provider execution/readback, но не Memory job, recipe, coverage или publication. | Не возвращать Task/Attempt или provider stack внутрь Memory без нового реального consumer. |
 | R-002 | Локальная process family и idle drain | Implementation §1; V2 I1.5/I14.22; Windows primitives прежних проходов | `DECIDED` | Один supervisor, daemon и SurrealDB child; конечный drain; explicit shutdown не запускает Dreamer cycle и не разрешает повтор unknown model call. | Реализовать и проверить Windows mutex, Job Object, restart и cutover. |
 | R-003 | Точный continuation address | Architecture §4.1; Implementation §3.1; Cognition §2 | `DECIDED` | Project/workspace + реальный task либо actor/session; branch/path/HEAD — состояние. | Проверить два workspaces, branch switch, fork, transfer и late result. |
-| R-004 | Context packet identity | Implementation §§5.5,6.2; Cognition §6 | `DECIDED` | Packet хранит фактически отрисованные revisions; offered/handoff/use различены; отсутствие correlation не блокирует память. | Реализовать coherent hydration и host correlation без agent ACK-формы. |
+| R-004 | Context packet identity | Implementation §§5.5,6.2; Cognition §6; README Base host contract | `DECIDED` | Packet хранит фактически отрисованные revisions; prepared/emitted/action-associated/use различены. Packet — ordinary Eliot observation/blob + links, не PacketStore. | Провести выбранный packet/handoff contract в Implementation/Cognition и реализовать coherent hydration/readback. |
 | R-005 | Прямая структурированная поправка | Implementation §§5.1,5.3–5.4 | `DECIDED` | Correction observation + revision/history + saved result в одной caller-owned transaction; replay не применяет правку повторно. | Реализовать один command path и conflict/readback. |
 | R-006 | Шесть таблиц и Store operations | Implementation §§4–5 | `PARTIAL` | Общая схема и операции определены; SQL/indexes не выполнены. | Реализовать migrations/query files и проверить plans, uniqueness и объём чтения. |
 | R-007 | Revision/history/current state | Architecture §4.4; Implementation §§4.3–4.5,5.3; Cognition §§3,8 | `DECIDED` | Exact version handle; current/history не подменяют друг друга; split не перенаправляет старые handles. | Реализовать atomic publication, historical reads и restart readback. |
@@ -47,8 +47,8 @@
 | R-009 | Retrieval arms и packet grouping | Implementation §7; Cognition §6 | `PARTIAL` | Exact/lexical/vector/relation arms независимы; grouping не merge IDs или evidence. | Проверить реальные tokens/plans/bytes, OR noise и exception outside top-k. |
 | R-010 | Реальный consumer processing method | Implementation §§5.2,10.3; Cognition §§7,9.1 | `DECIDED` | Job freezes exact recipe revision; request builder читает её и вставляет в один inference request. | Реализовать и показать изменившийся следующий request/context после revision. |
 | R-011 | Cross-project reuse и disclosure | Architecture §4.5; Implementation §§4.3,9.2; Cognition §9.3 | `DECIDED` | Origin отдельно от reuse scope; shared method не расширяет disclosure sources или instance facts. | Реализовать local/selected/owner queries и deterministic disclosure reduction. |
-| R-012 | Native hook → observation | Implementation §6.1; Claude hook docs; claude-mem selected path | `PARTIAL` | IDs, representations и final-message distinction определены; donor теряет `last_assistant_message` в выбранном path. | Проверить installed payload/version и один реальный relay. |
-| R-013 | Native context delivery | Implementation §6.2; Claude hook contracts | `PARTIAL` | Next-model boundaries и bounded output выбраны; write != acceptance/use. | Проверить installed serialization, overflow, resume/child и duplicate boundary. |
+| R-012 | Native hook → observation | Main hook paths `5aac094`; current Claude hook reference; README Base host contract | `PARTIAL` | Выбран first-host profile: UserPromptSubmit, PostToolUse, PostToolUseFailure, Stop, SubagentStop, PostCompact, SessionEnd; SessionStart delivers context. Current V2 path не сохраняет точный event и теряет final/source material. | Синхронизировать Architecture/Implementation/Cognition, затем квалифицировать installed Claude version/payload и реализовать один real relay. |
+| R-013 | Native context delivery | Main plugin hook output; current Claude SessionStart/UserPromptSubmit contracts; README | `PARTIAL` | Context должен быть actual packet through supported host channel. Старый SessionStart возвращает service-status phrase; local file/write не delivery. | Провести packet output/error/handoff states в books; проверить serialization, timeout, resume/clear/compact/fork и subagent boundary на installed host. |
 | R-014 | Controller Task/agent result route | Controller `e42c464d`: TaskSpec/claim/dispatch/Claude result | `PARTIAL` | Годится для agent work, но требует Task/Requirement/Attempt/binding и не выбран для one-shot Memory inference. R-027/R-046 остаются его gaps. | Сохранить optional richer route; не использовать как baseline `episode_learning`. |
 | R-015 | Batch embeddings contract | Implementation §§9.1,9.4; Inference Contract §7 | `GAP` | Controller `inference.embed` и canonical per-input result определены; метода нет в inspected controller catalog. | Реализовать controller route, затем vector mapping/query arm через один controller client. |
 | R-016 | Research request→report→source | Research `7c034569` selected callers; Implementation §9.5 | `PARTIAL` | Реальные run/status/report/section/citation operations найдены; R-031/R-032 не исправлены. | Исправить Research owners и квалифицировать один профиль. |
@@ -59,7 +59,7 @@
 | R-021 | Recursive improvement | Architecture §7; Cognition §10 | `PARTIAL` | Исправляется конкретный failed edge; нет global intelligence score или mandatory grader. | Выполнить connected request→revision→next context после R-048/R-050/R-051/R-053–R-057/R-068–R-070. |
 | R-022 | Disagreement/anticipation | Architecture §8; Cognition §11 | `CHECKED` | Alternatives + grounds + cheapest discriminating observation; no voting; expiry != outcome. | Реализовать ordinary records after core path. |
 | R-023 | Direct control/status/inbox | Implementation §13 | `DECIDED` | Status выводится из actual process/jobs/results/profile facts and per-copy cleanup; no readiness/attention store. | Реализовать configure/off/pause/cancel/status/inbox и connection/profile/cleanup visibility. |
-| R-024 | Normative-document consistency | Architecture draft.7; Implementation draft.20; Cognition draft.10; Inference Contract 0.4; README current | `CHECKED` | Все normative документы используют direct authenticated IPC, `InferenceConnection`/`InferenceProfile`, `actual_destination`, controlled input/result, one controller client and three validated `inference.release` dispositions. Contract 0.4 — единственный cross-repository API authority. | Не создавать errata layer; при API change синхронно обновить Contract, три книги, README и эту строку. |
+| R-024 | Normative-document consistency | Architecture draft.7; Implementation draft.20; Cognition draft.10; Inference Contract 0.4; README current | `CHECKED` for inference boundary | Все normative документы используют current controller inference boundary. Новый Base host/capture contract tracked отдельно в R-076. | Не создавать errata layer; API change синхронно обновляет owner docs. |
 | R-025 | Что запускает интерпретацию | Implementation §§5.1,10.5; Cognition §10 | `DECIDED` | New relevant input, correction or explicit question; accounting/read/release/embedding completion and terminal-no-result cleanup do not self-trigger. | Проверить enqueue callers и absence of loops. |
 | R-026 | Active/pending job и eligibility | Implementation §§4.6,5.2,10.5 | `DECIDED` | Один active + coalesced pending target; first queued time сохраняется; waiting не retry. | Проверить continuous arrivals, two projects, off/idle/background и shutdown. |
 | R-027 | Controller agent result→public artifact handle | Controller result writers/projection on `5b6b5bee/e42c464d` | `GAP` | `agent.result`/assembly сохраняют nested artifact refs, public projection их теряет. | Исправить optional agent-route projection только при реальном agent consumer; inference получает отдельный closed receipt. |
@@ -73,7 +73,7 @@
 | R-035 | Architecture overconstraints | Full normative rereads; old route/privacy pass | `DECIDED` | Unknown attribution/grounds no longer global blockers. Privacy/cost retain narrow deterministic send-boundary checks; no Governor platform. | Не превращать missing metadata в permission gate outside actual send. |
 | R-036 | Commitment lifecycle | Architecture §8; Implementation §11.3; Cognition §12; old A7.5/A11.5 | `DECIDED` | Ordinary memory item; context/inbox readers; ACK/due/expiry do not resolve. | Реализовать explicit create/update/read; notifications later. |
 | R-037 | Stable work identity and scoped facts | Architecture §4.1; Implementation §3.1; Cognition §§2–3 | `DECIDED` | Project/workspace/task identity separated from branch/location/version/time. | Реальный attach/capture/query/late-result path. |
-| R-038 | Resource/version/representation continuity | Architecture §4.3; Implementation §4.7; Cognition §4 | `DECIDED` | Dirty bytes retained; rename/copy links do not rewrite old IDs; equal bytes != same source. | Проверить partial read after edit/move and conversions. |
+| R-038 | Resource/version/representation continuity | Architecture §4.3; Implementation §4.7; Cognition §4 | `DECIDED` | Dirty bytes retained; rename/copy links не переписывают old IDs; equal bytes != same source. | Проверить partial read after edit/move and conversions. |
 | R-039 | Decision frame→lexical query | Implementation §§7.1–7.3 | `DECIDED` | Focused question + exact cues; independent candidate arms; no LLM query planner. | Выполнить actual query/tokens/noise/empty input. |
 | R-040 | Bounded source reading | Implementation §§5.6,7.5,8.2 | `DECIDED` | Metadata/excerpt first, selected ranges next; row limit != byte/decode limit. | Реальные file/Store readers, UTF-8 range and long JSON/line. |
 | R-041 | Automatic work and drain | Implementation §§1.3,10.5; R-055 | `DECIDED` | off/idle/background; finite drain; automatic work additionally needs profile permission. Controller uses one bounded Operation runner. | Реализовать one automatic episode path after manual path. |
@@ -106,6 +106,12 @@
 | R-068 | Authoritative profile/destination admission | Contract §§3–4,6; Architecture §§2.3–2.4; Implementation §9.2; Cognition §7.1 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Memory reduces disclosure/selects profile. Controller resolves connection/destination, freezes digests and checks disclosure/origin/limits/format. | Implement specific waiting/rejection mapping without retry loops. |
 | R-069 | Один Memory-side controller client | Implementation §§2.1,9.1; Cognition §14; Contract §§1–2.1 | `DECIDED` design / `NOT IMPLEMENTED` runtime | One IPC adapter owns text/embed/Operation/artifact/cancel/release. Learning/vectors own semantics. | Pin `swarm-client` and implement one adapter before feature handlers. |
 | R-070 | No-result, partial cleanup and erasure abandonment | Contract §§5.3,12–13; Architecture §§2.5,7.1,9; Implementation §§4.6,5.4,9.3,12.1; Cognition §§7.4–7.5,13 | `CHECKED` design / `NOT IMPLEMENTED` runtime | Result is optional. Terminal no-result releases input; unresolved erasure explicitly abandons/fences; input/result cleanup states remain separate; aggregate `released` cannot hide partial failure. | Implement dispositions, per-copy receipt/recovery and late-result fence; exercise cancel/fail/unknown/partial-cleanup cases. |
+| R-071 | Legacy hook forwarder is shape-only | `crates/eliot-engine/src/service.rs`; `tests/windows_service.rs`; code search on main `5aac094` | `CHECKED` exact code | `daemon_reachable=true` returns `forwarded` without sending; fallback writes a JSON file and path hash. Only test caller was found; test checks response shape, not Store/replay/consumer. | Do not port. Replace with one exact CaptureCommand and Store-or-durable-spool ownership result. |
+| R-072 | Base relay/spool ownership | README current; legacy writers in `plugin.rs`/`service.rs` | `DECIDED` design / `NOT IMPLEMENTED` runtime | One command is created before IPC, reused by direct call/replay; committed requires Store readback, staged requires atomic durable spool; daemon is sole replayer; pending body removed after readback. | Conduct design into Implementation/Cognition, then implement temp+sync+rename+dir-sync, failed quarantine and finite fair replay. |
+| R-073 | Occurrence identity and exact accepted source | `plugin.rs` main `5aac094`; README current | `DECIDED` design / `NOT IMPLEMENTED` runtime | Content hash is verification, not occurrence ID. Native IDs or relay command identify occurrence. Generic sanitizer/truncation cannot silently replace accepted source or erase URL/path/final message; limitations are explicit. | Add exact command/body/blob fields and replay conflict rules to Implementation/schema before code. |
+| R-074 | First Claude host surface and schema drift | Actual `hooks.json`, Claude integration doc, current official Claude Code Hooks reference | `PARTIAL` | Actual plugin has 7 events; internal doc claims a different set of 8. Current public API exposes UserPromptSubmit, success/failure tool events, Stop/SubagentStop final messages, PostCompact and SessionEnd. README selects minimal V3 profile. | Verify installed Claude version and emitted payloads; then update V3 host adapter/config. Do not treat public docs as installed-runtime proof. |
+| R-075 | Real context packet handoff | Legacy `stdout_for_decision`; official SessionStart/UserPromptSubmit outputs; README current | `DECIDED` design / `NOT IMPLEMENTED` runtime | Old SessionStart injects “event spooled” service prose. V3 emits actual bounded packet, records ordinary observation/blob + revision links, and distinguishes prepared/emitted/associated/use. | Sync books and implement actual hook output/readback; test timeout/resume/clear/compact/fork and explicit gap. |
+| R-076 | Base capture normative consistency | README current versus Architecture draft.7 / Implementation draft.20 / Cognition draft.10 | `PARTIAL` | High-level first-host/capture/spool/packet decisions are selected in README; detailed books still contain only generic capture/spool language and do not yet define exact event profile or durability protocol. | Update Architecture/Implementation/Cognition in one pass; then change this row to CHECKED without creating another contract document. |
 
 ## 3. Source coverage
 
@@ -130,7 +136,9 @@
 | S-017 | Repository delivery-collapse evidence | `CHECKED` issues #5305/#3014/#327 and retained surfaces | Mechanisms confirmed; no full current census. |
 | S-018 | Workspace/manifests/generated inventories sample | `CHECKED` exact sampled paths | Repeated mechanism confirmed; not full semantic audit of all crates/work-units. |
 | S-019 | Retained old Architecture/Implementation library copies | `CHECKED` targeted R-064–R-067 sections | Exact clauses inspected; not complete fresh line-by-line audit. |
-| S-020 | Current normative synchronization pass | `CHECKED` Architecture draft.7 / Implementation draft.20 / Cognition draft.10 / Contract 0.4 | Current design texts checked for owner/terms/result/no-result/cleanup consistency. No runtime/build/provider/Windows execution. |
+| S-020 | Current normative inference synchronization pass | `CHECKED` Architecture draft.7 / Implementation draft.20 / Cognition draft.10 / Contract 0.4 | Inference owner/terms/result/no-result/cleanup consistent. No runtime/build/provider/Windows execution. |
+| S-021 | Legacy Base hook/spool path on main `5aac094` | `CHECKED` exact `plugin.rs`, `service.rs`, hook intake, hook config, shape test and integration doc | Static code/config audit only. No live installed plugin, daemon delivery, Store replay or Windows durability execution. |
+| S-022 | Official Claude Code Hooks reference, crawled 2026-10-24 | `CHECKED` current public schemas/lifecycle | Current docs establish available events/fields/context channels; they do not prove the user's installed Claude version or actual payload behavior. |
 
 ### Источники прохода 2026-10-24 — controller implementation boundary
 
@@ -176,6 +184,31 @@
 - unknown Operation erased → abandon fence before cleanup, external effect remains unknown;
 - inference client attempts unrelated mutation → forbidden before generic writer path.
 
+### Источники прохода 2026-10-24 — Base host/capture boundary
+
+Проверены:
+
+- `crates/eliot-engine/src/service.rs::HookIpcForwarder`;
+- `crates/eliot-engine/tests/windows_service.rs::h1_hook_forwarder_spools_without_canonical_write`;
+- `crates/eliot-engine/src/plugin.rs::EliotHookService`, `spool`, `stdout_for_decision` and sanitization/identity helpers;
+- `bins/eliot-agent-bridge/src/hook_intake.rs`;
+- actual `integrations/claude/eliot/hooks/hooks.json`;
+- retained `docs/integrations/claude/CLAUDE_CODE_PLUGIN.md`;
+- current official Claude Code Hooks reference for lifecycle, context injection and event fields.
+
+Установлено:
+
+1. legacy `forwarded` is a return shape, not delivery;
+2. no production caller of `HookIpcForwarder` and no consumer/replayer of its spool were found;
+3. shape test proves only JSON flags and reference prefix;
+4. hook spool writes directly to final path without atomic durable publish;
+5. event ID uses a short content-hash prefix, conflating occurrence and equality;
+6. accepted payload is silently sanitized/truncated before durable memory, including generic URL/endpoint removal;
+7. SessionStart returns service-status prose, not restored Memory context;
+8. actual hook config, internal integration document and current official event surface disagree;
+9. current official Stop/SubagentStop expose final messages directly; PostCompact exposes summary; UserPromptSubmit and SessionStart support context injection;
+10. README now selects one exact Base relay/spool/packet design; detailed books remain to be synchronized.
+
 ## 4. Решения, которые не открываются без нового основания
 
 - не переносить V1/V2 runtime/compatibility facades;
@@ -214,19 +247,28 @@
 - не вводить old identity/proof work objects;
 - не строить contours/test daemon/generation promotion до measured boundary;
 - не исправлять церемонию новой церемонией;
-- не создавать errata/compatibility doc для текущего V3: исправлять owner documents.
+- не создавать errata/compatibility doc для текущего V3: исправлять owner documents;
+- не считать content digest occurrence identity;
+- не возвращать `forwarded` без Store ownership/readback;
+- не объявлять `staged` до atomic durable spool publication;
+- не писать spool прямо в final path без sync/rename/dir sync;
+- не сохранять silently sanitized projection вместо accepted source bytes;
+- не считать service-status phrase контекстом;
+- не переносить V2 PreToolUse/Stop/PreCompact governance gates в Base по умолчанию.
 
 ## 5. Очередь
 
 | Priority | Работа | Закрывает |
 |---|---|---|
+| P1 | Синхронизировать README Base host/capture/spool/packet contract с Architecture/Implementation/Cognition; не создавать новый contract file | R-004, R-012, R-013, R-071–R-076 |
+| P1 | Memory Base Slices 1–2: one real Claude relay, exact CaptureCommand, Store readback, atomic pending spool, daemon replay, exact open, actual context packet and restart path | R-001–R-013, R-019–R-026, R-033, R-036–R-040, R-071–R-075 |
 | P1 | Controller first slice: role/allowlist, connection/profile parser, staging, dedup, runner, loopback text, pending-result recovery, closed receipt, per-copy release with three dispositions — no Task/Attempt/ScriptRun/new table | R-027, R-048, R-050–R-055, R-057, R-068, R-070 |
-| P1 | Memory Base Slices 1–2 независимо от model routes | R-001–R-013, R-019–R-026, R-033, R-036–R-040 |
 | P1 | One integrator/product edge/cheap preflight/terminal overlap disposition per slice | R-058–R-061, R-067 |
 | P1 | One Rust package/internal modules; second crate/process only after measured boundary | R-033, R-062, R-065 |
 | P1 | One Memory controller adapter on pinned `swarm-client`; no separate transports | R-056, R-069 |
 | P1 | README goal→minimal-mechanism admission filter | R-064, R-066, R-067 |
 | P1 | After Base connect learning with exact request/result/no-result/cleanup lifecycle | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057, R-068–R-070 |
+| P2 | Qualify actual installed Claude Code version/payloads and update first-host config; public docs alone are not runtime proof | R-012, R-013, R-074, S-022 |
 | P2 | Embeddings through same Operation/per-copy release lifecycle, then vector mapping/query | R-015, R-034, R-048, R-050–R-057, R-069–R-070 |
 | P2 | Direct HTTPS only after explicit TLS qualification | R-050, R-057 |
 | P2 | Optional agent-result projection only for real consumer | R-014, R-027, R-046 |
@@ -254,3 +296,4 @@
 | 2026-10-24 / `561fe900` | Goals→minimal mechanisms; R-064–R-067/S-019. |
 | 2026-10-24 / `5f32d764`–`a03114ae` | Architecture 6 / Implementation 19 / Cognition 9 synced with Contract 0.3; R-068/R-069. |
 | 2026-10-24 / `4e203676`–`fdf53183` | Contract 0.4 plus Architecture 7 / Implementation 20 / Cognition 10: optional result, three release dispositions, per-copy cleanup and abandon fence; R-070/S-020. |
+| 2026-10-24 / `036377ed` | README selected first Claude Base event profile, exact occurrence identity, one CaptureCommand, atomic spool/replay and real packet handoff; R-071–R-076/S-021–S-022 registered. |
