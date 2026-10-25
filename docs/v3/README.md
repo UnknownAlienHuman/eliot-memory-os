@@ -1,13 +1,13 @@
 # Eliot Memory OS V3
 
-**Layered Base and additive extensions · 2026-10-24 · normative design, not implemented code.**
+**Layered Base and additive extensions · 2026-10-25 · normative design, not implemented code.**
 
 V1 and V2 are donors. V3 is a greenfield implementation.
 
 ## Reading order
 
 1. [Architecture](ARCHITECTURE.md) — purpose, ownership, Base, extensions and non-goals.
-2. [Implementation](IMPLEMENTATION.md) — runtime, modules, data, narrow external contracts and implementation order.
+2. [Implementation](IMPLEMENTATION.md) — runtime, modules, data, Store/RPC/durability contracts and implementation order.
 3. [Cognition](COGNITION.md) — current-work reconstruction, retrieval, learning, consolidation and self-improvement algorithms.
 4. [One-shot inference contract](INFERENCE-CONTRACT.md) — sole Memory↔controller boundary for connections, profiles, disclosure, controlled payloads, readback and all cleanup dispositions.
 5. [Active analysis registry](ANALYSIS-REGISTRY.md) — what was checked, exact gaps and the next work queue.
@@ -20,11 +20,40 @@ Architecture, Implementation and Cognition describe one product at increasing de
 
 ## Selected construction
 
-One local Rust package/codebase, one demand-start supervisor/daemon family, one SurrealDB child and one private Store. Domain/pure logic, application operations, external adapters and host surfaces keep explicit dependency direction without requiring a process, actor, contract crate or pass-through service per concept.
+One local Rust package/codebase, one demand-start supervisor/daemon family, one external SurrealDB child and one private Store. Domain/pure logic, application operations, external adapters and host surfaces keep explicit dependency direction without requiring a process, actor, contract crate or pass-through service per concept.
 
 Base captures real host/source events, preserves explicit knowledge/corrections/commitments, supplies exact/lexical context and reopens exact sources after restart. Its maintenance covers the data it actually retains. Base starts without controller, model, encoder, converter or Research credentials.
 
 Learning, vectors, project understanding, documents, Research and additional hosts are independent vertical extensions. They reuse the same records, finite jobs, revision publication, context assembly and maintenance path. A missing extension does not disable Base; disabling a producer does not erase retained readable knowledge. There is no second Lite database or Full memory engine.
+
+## Store and local durability baseline
+
+V3 does not assume that naming an SDK or database makes persistence correct. The Store baseline is now explicit:
+
+- exact SurrealDB server binary/version/digest and storage engine are installation-owned inputs;
+- the first qualification target is SurrealDB 3.3.4 with external RocksDB; no silent fallback to SurrealKV or another version;
+- Memory uses a small bounded JSON WebSocket RPC client over the owned loopback child, not the current Rust SDK or the V2 Store adapter;
+- only fixed application queries with bound variables are exposed;
+- the database is `STRICT`, the six application tables are `SCHEMAFULL`, and schema generation/definitions are verified before mutation;
+- composite unique indexes own occurrence/idempotency/cardinality where possible;
+- snapshot-isolation conflicts retry the whole immutable transaction only after exact classification/readback;
+- logical backup/export is the application contract; copying a live engine directory is not.
+
+The official Rust SDK may be reconsidered later, but the current 3.3.4 dependency requires Rust 1.95 while this repository declares MSRV 1.94, and its published license metadata does not fit the current `cargo-deny` allowlist without an explicit preflight. A dependency is not admitted because its API looks convenient.
+
+The first Windows durability profile is a local fixed NTFS/ReFS volume. Immutable blob/spool/deletion publication uses:
+
+```text
+create-new same-directory temporary file
+→ write + file FlushFileBuffers
+→ no-replace same-volume MoveFileExW with WRITE_THROUGH
+→ parent-directory FlushFileBuffers
+→ reopen and verify exact bytes
+```
+
+`MOVEFILE_REPLACE_EXISTING` is forbidden for pending-command publication. Rename success followed by failed parent sync/readback is post-commit unknown, not `staged`; reconciliation must verify the final file and complete directory sync. The same rule applies when replay deletes/moves a pending entry.
+
+These mechanisms remain unimplemented until Slice 0 proves the exact Windows binary, storage engine, transaction behavior, file publication and logical export/import round-trip.
 
 ## First Base host and durable capture
 
@@ -74,7 +103,7 @@ lost/unavailable daemon result
 → delete pending file only after Store readback
 ```
 
-A spool file is written to a same-directory temporary regular file, flushed and synchronized, atomically renamed, then followed by parent-directory synchronization. The daemon is the sole replayer. Corrupt or permanently rejected entries move to `spool/failed` with a bounded non-content reason; they do not loop forever. Successful replay removes the pending body instead of maintaining a second `committed` content archive.
+The daemon is the sole replayer. Corrupt or permanently rejected entries move to `spool/failed` with a bounded non-content reason; they do not loop forever. Successful replay removes the pending body instead of maintaining a second `committed` content archive.
 
 The public capture outcomes mean exactly:
 
@@ -241,6 +270,7 @@ Base implements capture, explicit updates and reuse. The first learning extensio
 
 [Implementation §14](IMPLEMENTATION.md#14-implementation-sequence) defines connected slices:
 
+0. Exact SurrealDB/Windows durability preflight: pin the server, qualify RocksDB, strict schema/index/transaction semantics, immutable publication and logical export/import.
 1. Store/lifecycle and exact persistence.
 2. Useful Base with one host, retrieval/context/source open and maintenance.
 3. Controller one-shot inference owner: connection/profile admission, direct IPC, controlled input/optional result, exact readback and per-copy `inference.release` without Task/Attempt.
@@ -248,7 +278,7 @@ Base implements capture, explicit updates and reuse. The first learning extensio
 5. Independent vector, project-view, document, Research and host increments.
 6. Advanced curation and diagnosis after base paths work.
 
-Write production code first. Run minimum relevant build/Clippy after coherent code increments. Do not build speculative test platform or distort production code to satisfy placeholder tests. Full automated suite is built and run after connected product implementation.
+Write production code first. Run minimum relevant build/Clippy after coherent code increments. Do not build a speculative test platform or distort production code to satisfy placeholder tests. Full automated suite is built and run after connected product implementation.
 
 For every slice, resolve cheap blockers first, keep one integrator and give overlapping work terminal disposition before opening sibling branch. Leaf compilation, generated documentation or stored receipt does not close a slice.
 
