@@ -1,116 +1,107 @@
 # Eliot V3 — One-shot inference contract
 
-**Revision 0.7-draft · 2026-10-26 · shared boundary for Memory OS and `eliot-swarm-controller`; not implemented.**
+**Revision 0.8-draft · 2026-10-26 · shared Memory OS ↔ `eliot-swarm-controller` boundary; not implemented.**
 
-This is the sole normative Memory↔controller contract for one-shot model execution. It prevents these wrong implementations:
+This is the sole normative contract for one-shot text and embedding execution. It keeps Memory semantics in Memory and physical model execution in controller. It deliberately does **not** create Task/Attempt/review machinery, another scheduler, another receipt store, generic provider fields, implicit retries or caller migration.
 
-1. wrapping one memory extraction in controller Task/Attempt/review/acceptance;
-2. copying provider credentials, routing and retry logic into Memory OS;
-3. restoring the old Governor platform around a reversible request;
-4. routing inference through ScriptRun/module-binding machinery because it is taskless;
-5. retaining controller prompt/result copies indefinitely;
-6. calling an unspecified “OpenAI-compatible” service through arbitrary fields;
-7. losing input cleanup when an Operation has no result;
-8. changing caller identity during credential rotation and thereby orphaning retained Operations/artifacts;
-9. restoring a Memory job under a new principal and redispatching inference because exact-caller readback is no longer available;
-10. treating a successful `client.hello` as sufficient while discarding the authenticated principal, role, credential generation or protocol returned by controller;
-11. turning local-Operator erasure authority into normal result-byte disclosure or ownership transfer;
-12. reusing generic `client.register` for inference setup/rotation even though it permits current-GM authority, refuses an existing client and stores the supplied token verifier in generic Operation JSON;
-13. claiming credential revocation from a token-hash update while an already authenticated Principal has no generation fence.
+The contract prevents these failures:
 
-Memory owns its finite job, frozen sources, exact recipe, disclosure reduction, stable request identity, decoding and publication. Controller owns caller authentication, configured connection/profile, provider invocation, Operation deduplication/readback and temporary controlled copies.
+1. copying provider credentials/routing into Memory;
+2. wrapping one reversible inference request in the agent-task lifecycle;
+3. persisting prompts, embedding inputs or token verifiers in generic Operation JSON;
+4. orphaning old Operations by changing `client_id` during token rotation or restore;
+5. trusting the credential file supplied by Memory instead of the authenticated hello result;
+6. treating a verifier update as revocation while an already authenticated Principal remains usable;
+7. disclosing inference result bytes through Operator cleanup authority;
+8. duplicating provider work after a lost reply or restored backup;
+9. creating a durable “possibly submitted/proven unsent” state machine that duplicates controller idempotency.
 
-## 1. Application methods
+Memory owns the finite job, frozen sources, prompt/embedding recipe, disclosure reduction, exact request identity, decoding and publication. Controller owns caller authentication, profiles/connections, provider invocation, Operation deduplication/readback and temporary controlled copies.
 
-Initial inference-client surface:
+## 1. Exact application surface
+
+Controller adds one role:
+
+```text
+inference_client
+```
+
+It is not Manager, Operator, Observer, Participant or Module. `Principal::require_writer` continues to reject it. It has no MCP discovery surface and no generic mutation fallback.
+
+Allowed methods are exactly:
 
 ```text
 mutations:
   inference.text
   inference.embed
   inference.release
-  operation.cancel       # only own still-queued inference Operation
+  operation.cancel       # own queued inference Operation only
 
 reads:
-  operation.get          # only own retained Operation receipt
-  artifact.get           # only own retained inference result
-  artifact.read          # only own retained inference result
+  operation.get          # own retained inference Operation only
+  artifact.get           # own retained inference_result only
+  artifact.read          # own retained inference_result only
 ```
 
-`inference.text` and `inference.embed` may spend quota and create an external effect. `inference.release` is idempotent over one exact inference Operation and releases every controller-owned content copy permitted by the validated disposition, including input-only Operations.
+Store dispatches this allowlist only after current registration and credential-generation validation. No Task, Requirement, Attempt, binding, workspace, native agent session, review, submission, acceptance or ScriptRun is created.
 
-None of these methods creates or requires Task, Requirement, Attempt, binding, workspace, native agent session, review, submission, acceptance, ScriptRun or Memory-side provider credentials.
+## 2. Caller and credential identity
 
-## 2. Narrow caller authority
-
-Controller adds one authenticated role:
-
-```text
-inference_client
-```
-
-It is not Manager, Operator, Observer, Participant or bound Module. It has no MCP discovery surface and no generic writer authority. `Principal::require_writer` must continue to reject it; the Store dispatches only the exact allowlist in §1 after current registration/generation validation.
-
-### 2.1 Stable logical caller identity
-
-Controller credentials contain different objects:
+Controller authentication has four distinct values:
 
 ```text
 client_id               stable retained principal
 credential_id           non-secret identity of one secret generation
-credential_generation   monotonic authorization generation
+credential_generation   positive monotonic authorization generation
 secret/token             replaceable authentication material
 ```
 
-For Memory OS, `client_id` is installation-scoped and stable across daemon restart, Store rollback and token rotation. Conceptually:
+For one Memory installation, `client_id` is generated once and retained conceptually as:
 
 ```text
 eliot-memory:<stable-installation-id>
 ```
 
-The exact string format is implementation-owned, but it is generated once, bounded, non-secret and retained in Memory installation identity and controller registration. It is not derived from PID, executable path, data-root generation, backup generation, token digest or wall clock.
+It survives daemon restart, Store-root cutover, rollback, backup restore and token rotation. It is not derived from PID, executable path, data-root generation, backup generation, token digest or time.
 
-Every Memory inference job retains:
+Operation/artifact ownership is the stable `client_id`, never `credential_id`, generation or token. Same-client rotation must not rewrite `caller_id`, request identity, Operation ID or artifact provenance.
+
+Changing `client_id` is principal migration. Initial V3 provides no migration or ownership-transfer path. A new principal cannot adopt old work through Operator access, a new request ID or metadata rewriting.
+
+Every Memory controller-backed job retains, without secrets:
 
 ```text
 controller_client_id
 client_request_id
+method + canonical bounded request identity
 controller_operation_id when known
-result artifact identity/digest when known
-authenticated credential_generation as diagnostics
-non-secret credential_id/reference as diagnostics
+result artifact identity/digest/length when known
+profile/adapter/connection/destination snapshot
+credential_id + credential_generation used for the physical connection
+release Operation/disposition and per-copy cleanup state
+controller_reconciliation state
 ```
 
-The Operation owner is `controller_client_id`, not a token or credential generation. A new credential generation under the same authenticated `client_id` may read/cancel/release retained Operations according to their state. Rotation must not rewrite `caller_id`, request identity, Operation ID or artifact provenance.
+Credential identity is diagnostic/admission evidence. It does not own the Operation.
 
-Changing `client_id` is **principal migration**, not credential rotation. Initial V3 selects no migration. Without an explicit controller-side transfer protocol that atomically rewrites or aliases every retained Operation, artifact grant and cleanup owner, a new `client_id` cannot adopt old work. Memory must not use local Operator access or a new request ID as normal recovery.
+## 3. Generation-aware hello protocol
 
-### 2.2 Direct IPC client and verified hello receipt
+Memory uses the exact pinned `swarm-client`, never MCP, a copied framing implementation or a spawned general-purpose controller CLI.
 
-Memory calls controller through exact-revision `swarm-client`, not MCP or a spawned CLI.
+The first generation-aware inference protocol is exactly:
 
-The inspected client:
+```text
+protocol_version = 2
+```
 
-- connects to the configured local IPC root;
-- sends one `client.hello` carrying `client_id + token` before any application request;
-- never automatically resends an application request;
-- reports cancellation/disconnect/partial reply after possible write as `OUTCOME_UNKNOWN` and retires the connection.
+Version 1 is not generation-aware and cannot authorize V3 inference. Support is never inferred from unknown JSON fields.
 
-At controller revision `e42c464d`, the host returns:
+`swarm-client` must expose `connect_verified` or an equivalent closed constructor. The successful typed hello receipt is exactly:
 
 ```text
 client_id
 role
-protocol_version
-```
-
-but `swarm-client::Client::connect` discards that result and returns only the socket-backed client. That API is an incomplete donor for Memory identity continuity. The current Principal also carries no credential generation.
-
-Before the inference adapter exists, controller and `swarm-client` must expose a closed typed hello receipt containing at least:
-
-```text
-client_id
-role
+credential_id
 credential_generation
 protocol_version
 ```
@@ -119,41 +110,71 @@ No application-capable handle is returned unless:
 
 ```text
 receipt.client_id == installation.controller_client_id
-receipt.client_id == credential.client_id
+receipt.client_id == supplied credential.client_id
 receipt.role == inference_client
-receipt.credential_generation == installation expected generation
+receipt.credential_id == installation.selected_credential_id
+receipt.credential_generation == installation.selected_credential_generation
 receipt.credential_generation > 0
-receipt.protocol_version supports generation-fenced inference
-no unknown receipt fields or malformed values
+receipt.protocol_version == 2
+no missing, unknown or malformed receipt fields
 ```
 
-Any mismatch closes/poisons the connection before an application frame and becomes `CALLER_IDENTITY_UNAVAILABLE`, `CREDENTIAL_GENERATION_MISMATCH` or `HOST_HANDSHAKE_FAILED` as appropriate. Memory does not infer authenticated identity solely from the credential material it supplied, and it does not accept a Manager/Operator/Module session with a matching-looking ID.
+Mismatch closes/poisons the connection before any application frame and returns a typed failure such as:
 
-Memory does not copy framing/authentication code. Changing the Git pin is an explicit integration update.
+```text
+CALLER_IDENTITY_UNAVAILABLE
+CREDENTIAL_ID_MISMATCH
+CREDENTIAL_GENERATION_MISMATCH
+HOST_HANDSHAKE_FAILED
+```
 
-Memory user configuration stores only controller IPC/data root, bounded IPC settings and selected inference profile names. The supervisor/installer-owned installation identity stores expected stable `controller_client_id`, expected credential generation and non-secret current/pending/previous credential references. Raw token bytes never enter Memory Store rows, backups, logs or public status. The public inference payload must fit the configured IPC frame; the initial contract has no generic upload/session path.
+Memory does not infer authenticated identity from its own credential file and never substitutes Manager/Operator/Module authority.
 
-### 2.3 Setup and rotation are specialized local-Operator operations
+At inspected controller revision `e42c464d`, host hello returns `client_id`, role and protocol version, but `swarm-client::Client::connect` discards that result. The current Principal also has no credential ID/generation. That revision is a donor, not an implementation of this section.
 
-Generic controller `client.register` is **not** reused for inference credentials. At `e42c464d` it:
+## 4. Provisioning owner and secret path
 
-- accepts current GM or local Operator through `gm::require_authority`;
-- rejects an already registered `client_id` with no implicit rotation;
-- accepts `token_hash` in the public mutation payload;
-- passes that payload through the generic mutation ledger, which stores canonical full params in `operations.original_request_json`.
+Memory never receives controller `operator.json` or any controller Operator token.
 
-The current `client.list` projection is correctly limited to `client_id`, role and disabled state; this safe projection is retained. The problem is setup/rotation authority and secret-derived verifier retention in the generic Operation, not `client.list`.
+Provisioning is owned by a **controller-local maintenance command** running against the controller data root, conceptually:
 
-Initial V3 adds two closed controller-local maintenance operations, names shown normatively:
+```text
+swarm inference-client install \
+  --client-id <stable-memory-client-id> \
+  --credential-out <absolute-private-new-path>
+
+swarm inference-client rotate \
+  --client-id <stable-memory-client-id> \
+  --credential-out <absolute-private-pending-path>
+```
+
+The command:
+
+1. validates the controller data root and loads its own private `operator.json` internally;
+2. exclusively creates and durably flushes one pending private credential bundle containing `client_id`, a stable `client_request_id`, one high-entropy token, one independent non-secret new `credential_id`, and the expected current credential ID/generation (or install generation 0);
+3. on command retry, loads that exact pending bundle instead of generating replacement material;
+4. invokes the specialized Store operation over authenticated local IPC;
+5. returns a closed non-secret receipt containing client ID, credential ID and committed generation;
+6. never prints token/verifier bytes, places them on argv, logs them or gives controller Operator authority to Memory.
+
+The private bundle exists before a possible Store commit, so a process crash cannot commit an authentication verifier whose token is unrecoverable. After an unknown reply, the same command reloads the same pending bundle and classifies by authenticated hello/exact replay. It never overwrites an existing pending path.
+
+The Memory installer/supervisor coordinates only the bundle reference and non-secret receipt in `installation.toml`. The daemon receives the selected inference credential reference needed to connect; it never receives controller Operator credentials.
+
+A failed or unknown provisioning command retains one pending credential bundle/reference for reconciliation. It does not generate another token under the same retained mutation identity.
+
+## 5. Specialized install and rotation
+
+Generic `client.register` is not reused. At `e42c464d` it accepts current-GM authority, rejects an existing client and sends `token_hash` through generic mutation persistence. That is unsuitable for installation-scoped inference credentials.
+
+Controller adds two non-MCP, local-Operator-only Store operations:
 
 ```text
 inference.client.install
 inference.credential.rotate
 ```
 
-Only the verified local bootstrap Operator may invoke them. Current GM authority is insufficient. They are not available to `inference_client`, Manager, Module or MCP discovery.
-
-The installer creates one high-entropy token and one independent non-secret `credential_id` before calling controller. The token/verifier is secret-bearing. A specialized transaction may retain the verifier only in the private `client:<id>` authentication registration. It must never place token bytes, `token_hash`, another token-derived fingerprint or reusable verifier into:
+Their secret-bearing request is handled by a specialized transaction. Token bytes, `token_hash`, token-derived fingerprints and reusable verifiers may exist only in the private authentication registration and must never enter:
 
 ```text
 operations.original_request_json
@@ -162,98 +183,101 @@ operations.result_json
 observations
 client.list / status
 logs / telemetry / diagnostics
-Memory configuration, Store or backup
+Memory Store / backup / configuration
 ```
 
-The durable non-secret mutation identity is:
+The durable redacted mutation identity is:
 
 ```text
 (local Operator caller,
  client_request_id,
  method,
  target client_id,
- credential_id,
- expected credential generation)
+ new credential_id,
+ expected current credential_id/generation)
 ```
 
-The caller must retain exactly one pending token for one `credential_id`; it must not generate a second token under the same retained identity. Controller does not need to persist a token-derived request fingerprint to compensate for a caller that violates this rule.
+### 5.1 `inference.client.install`
 
-`inference.client.install`:
+It atomically:
 
-1. requires the expected installation-scoped client ID and absent registration;
-2. creates role `inference_client`, `credential_id`, `credential_generation=1`, verifier and `disabled=false` atomically with a redacted Operation receipt;
-3. exact replay returns the same generation/credential ID;
-4. any existing incompatible registration is conflict, never overwrite or migration.
+1. requires the expected stable client ID and absent registration;
+2. creates role `inference_client`, supplied independent `credential_id`, generation `1`, verifier and `disabled=false`;
+3. writes a redacted Operation receipt;
+4. returns exact replay of the same receipt;
+5. rejects any incompatible existing registration without overwrite or migration.
 
-`inference.credential.rotate`:
+### 5.2 `inference.credential.rotate`
 
-1. requires local Operator, exact target `client_id`, role `inference_client`, current `credential_id` and expected positive generation;
-2. atomically replaces only verifier/credential ID and increments generation once;
-3. preserves client ID, role and all Operation/artifact ownership;
-4. exact replay returns the retained new generation;
-5. stale expected generation or different credential ID is conflict;
-6. never temporarily creates a second principal or aliases ownership.
+It atomically:
 
-### 2.4 Generation fencing revokes old application authority
+1. requires local Operator, exact target client ID, role `inference_client`, current credential ID and expected positive generation;
+2. replaces only verifier/credential ID and increments generation exactly once;
+3. preserves caller identity and all Operation/artifact ownership;
+4. returns exact replay of the retained new credential ID/generation;
+5. rejects stale generation, wrong current credential ID or a different new credential ID as conflict;
+6. never creates a second principal or ownership alias.
 
-Authentication captures the current registration generation in the server-side Principal. Every inference-client application dispatch must reload the current registration and require:
+`client.list` remains a non-secret projection of client ID, role and disabled state. It never exposes verifier or credential material.
+
+## 6. Generation fencing and revocation
+
+Authentication captures `credential_id` and `credential_generation` in the server-side Principal. Before **every** inference-client read or mutation, Store reloads the registration and requires:
 
 ```text
 registration exists
 registration.role == inference_client
 registration.disabled == false
+principal.credential_id == registration.credential_id
 principal.credential_generation == registration.credential_generation
 ```
 
-This check occurs before every inference read or mutation, including specialized/readback paths, and before provider admission. No inference-client method may bypass it through a long-poll, module or generic-writer path.
+This check occurs before provider admission, artifact read, Operation read/cancel and release. No long-poll, module or generic-writer path bypasses it.
 
-Rotation is serialized with application admission by the existing single Store owner. A request that passed the generation check before rotation may remain an admitted Operation owned by the same stable caller. A request evaluated after rotation with the old Principal is rejected before application admission. The new credential reads any prior Operation because ownership did not change.
+The single Store owner serializes rotation with application admission:
 
-Generation mismatch returns a terminal authentication error such as `CREDENTIAL_STALE`. `swarm-client` treats it as connection-poisoning and closes its physical session. The server should also stop or reap a stale session after its terminal response so idle stale transports cannot accumulate. Application authority is revoked by the generation fence; a full controller restart is not required merely to invalidate the old token.
+- a request admitted before rotation remains an Operation owned by the same stable caller;
+- an old Principal evaluated after rotation receives terminal `CREDENTIAL_STALE` before application admission;
+- the new generation may read/release pre-rotation Operations because caller ownership is unchanged.
 
-If generation fencing is not implemented, changing the stored verifier does **not** revoke already authenticated Principals and rotation is unqualified. Host restart is only a fallback for an implementation that lacks the selected generation fence, not the V3 target.
+`swarm-client` treats `CREDENTIAL_STALE` as connection-poisoning and closes the transport. Controller reaps the stale session after its terminal response. A full host restart is not the selected revocation mechanism.
 
-### 2.5 Rotation reconciliation
+If generation fencing is absent, token replacement is not qualified revocation.
 
-The installer retains one pending secret/reference while current remains available. After a lost rotation reply:
+## 7. Rotation reconciliation
 
-1. authenticate pending token and require typed hello with expected new generation;
-2. if pending fails, authenticate current token and require the old generation;
-3. never create another pending token during classification;
-4. if pending succeeds, read the rotation receipt and one pre-rotation Operation under the same `client_id`;
-5. publish installation selection pending→current/current→previous with exact generation readback;
-6. retire previous secret only in a later explicit cleanup step after Memory reconnect/readback.
+Memory installation selection retains at most one current, one pending and one unretired previous inference credential reference, each bound to exact non-secret credential ID/generation. Another rotation is refused while pending/previous remains unresolved.
 
-If both observations contradict the one-verifier/generation transition, neither authenticates, hello identity/role/generation mismatches, or selection cannot be read back, rotation is incomplete. Keep both credential references and block another rotation. A retained old transport is not authorization once its generation is stale, but its failure/closure remains observable.
+After a lost rotate reply:
 
-The pinned controller revision `e42c464d` supplies authenticated IPC and exact-caller ownership donors, but it does **not** implement `inference_client`, specialized install/rotation, credential generation, typed hello exposure or stale-session fencing. Runtime status remains `NOT IMPLEMENTED`.
+1. probe the pending credential and require hello with the expected new credential ID/generation;
+2. if pending fails, probe current and require the old credential ID/generation;
+3. never generate another pending token during classification;
+4. when pending succeeds, read the redacted rotation receipt and one pre-rotation Operation under the same client ID;
+5. atomically publish pending→current and current→previous in Memory installation selection;
+6. reconnect the daemon and prove old Operation read/release;
+7. retire previous secret/reference only in a later explicit cleanup step.
 
-## 3. Connections and profiles
+Contradictory observations, neither credential authenticating, hello/receipt disagreement or unreadable selection leaves rotation incomplete with both references retained.
 
-Controller owns static `InferenceConnection` and `InferenceProfile` records. Neither is an agent Route, dynamic registry or admission-proof platform.
+## 8. Connections, profiles and disclosure
 
-### 3.1 `InferenceConnection`
+Controller owns static `InferenceConnection` and `InferenceProfile` records.
 
-A connection owns:
+A connection contains:
 
 ```text
 name
-versioned transport ID
+versioned adapter/transport ID
 canonical endpoint
 private provider-credential reference
 actual_destination = local | external
 explicit transport-security behavior
 ```
 
-`actual_destination` describes where supplied content ultimately goes. A loopback gateway forwarding to cloud is external.
+A loopback gateway forwarding to cloud is `external`. Provider secret bytes never enter Operation JSON, logs, digests or receipts. Initial adapters support no arbitrary headers, query parameters, extra body, environment proxy or redirects.
 
-Connection files are absolute, bounded private regular files with closed schema. Provider secrets never enter Operation JSON, logs, digests or receipts. Initial adapters support no arbitrary headers, query parameters, extra body, environment proxy or redirects.
-
-`connection_digest` covers non-secret behavior-changing fields, not credential bytes/path. Provider credential/account rotation under unchanged digest is not proof of identical provider account; unavailable account/billing identity remains unknown.
-
-### 3.2 `InferenceProfile`
-
-A profile selects:
+A profile contains:
 
 ```text
 name
@@ -266,34 +290,20 @@ finite input/output/time/concurrency limits
 supported response formats
 ```
 
-Controller validates positive finite bounds and a supported adapter/connection/model combination. `profile_digest` covers all non-secret behavior-changing fields. Reconfiguration affects new explicit requests and never mutates an admitted Operation snapshot.
+Digests cover non-secret behavior-changing fields. Reconfiguration affects new admissions only. Memory selects a profile name; it cannot construct provider headers, arbitrary extras or fallback ladders.
 
-Memory selects only a profile name. It does not construct provider headers, arbitrary extras or fallback ladders. There is no implicit provider/model/account/destination fallback.
-
-## 4. Disclosure and admission
-
-Memory reduces all supplied material to:
+Memory reduces supplied material to:
 
 ```text
 local_only
 external_allowed
 ```
 
-Project default may be narrowed by a source. Derived content cannot widen the strictest source it still contains or reveals. Mixed input uses the strictest class. Reuse scope does not widen disclosure.
+Derived content cannot widen the strictest source it still reveals. Controller authoritatively validates current caller/generation, profile/connection, actual destination, origin, exact input digest/length, format, limits and known capacity. Protected content is not silently omitted to pass external admission.
 
-Controller resolves the actual profile/connection and authoritatively checks:
+Admission failure is operational failure, not cognitive no-change, and does not mark input processed.
 
-- current caller role, stable client identity and credential generation;
-- profile/connection existence and enabled state;
-- `actual_destination` versus disclosure;
-- automatic-use permission;
-- exact input digest/length and IPC/profile limits;
-- output/format limits;
-- known capacity.
-
-Protected content is not silently omitted to make an external destination pass. Admission failure is not cognitive no-change and does not mark input processed.
-
-## 5. Controlled input and result artifacts
+## 9. Controlled input and result copies
 
 One inference Operation creates at most:
 
@@ -302,40 +312,33 @@ inference_input
 inference_result
 ```
 
-Before provider I/O, controller stages exact accepted input under deterministic Operation-owned identity, verifies bytes/digest and commits Operation metadata without raw input in generic JSON. An orphan file without committed Operation is never dispatchable and is cleanup material.
+Before provider I/O, controller stages exact accepted input under deterministic Operation-owned identity, verifies bytes/digest and commits bounded Operation metadata without raw prompt/input in generic JSON. An orphan file without a committed Operation is cleanup material and never dispatchable.
 
-When visible result exists, controller stages exact bounded bytes, verifies digest/length, publishes the file and settles the Operation with a closed receipt. Provider-safe failure metadata may exist without `inference_result`; raw provider errors are not automatically cognitive content.
+When a visible result exists, controller stages bounded bytes, verifies digest/length, publishes the exact file and settles with a closed receipt. Provider-safe failure metadata may exist without a result artifact. Raw provider errors are not automatically cognitive content.
 
-Crash states remain explicit:
-
-- metadata but no exact input/result file → unavailable/damaged, never complete;
-- exact file present but settlement missing → restart may verify and finish settlement;
-- settled receipt without exact file/digest → damaged result, not no-change.
-
-Per-copy cleanup state:
+Crash handling is explicit:
 
 ```text
-not_created
-retained
-cleanup_pending
-removed
-already_absent
-mismatch
-unknown
+metadata but missing/mismatched exact file -> unavailable/damaged
+exact pending file but settlement missing  -> verify and finish settlement
+settled receipt but missing/mismatched file -> damaged result
 ```
 
-Aggregate state is derived:
+Per-copy state is:
 
 ```text
-retained
-cleanup_pending
-cleanup_incomplete
-released
+not_created | retained | cleanup_pending | removed | already_absent | mismatch | unknown
 ```
 
-A single boolean cannot hide one remaining controlled copy.
+Aggregate cleanup is derived and cannot hide a remaining copy:
 
-## 6. `inference.text`
+```text
+retained | cleanup_pending | cleanup_incomplete | released
+```
+
+## 10. Text and embedding requests
+
+### 10.1 `inference.text`
 
 Conceptual request:
 
@@ -352,11 +355,9 @@ Conceptual request:
 }
 ```
 
-`origin` is `explicit | automatic`. Automatic requests are rejected before provider I/O unless profile permits them.
+`origin` is `explicit | automatic`. Automatic admission requires profile permission. Validation covers exact bytes/digest, caller/generation, frame/profile limits, destination/disclosure, format and capacity.
 
-Validation includes bounded request ID, exact bytes/digest, caller/generation continuity, frame/profile limits, profile/connection/destination, output/format, automatic permission and capacity. Memory recipe/source IDs remain inside Memory's exact retained request; controller does not own the cognitive schema.
-
-## 7. `inference.embed`
+### 10.2 `inference.embed`
 
 Conceptual request:
 
@@ -373,13 +374,11 @@ Conceptual request:
 }
 ```
 
-`role = query | document` maps through the adapter's actual task parameter/prefix.
+`role = query | document` maps through the selected adapter's actual task parameter/prefix. Canonical result contains one exact result/error per input key plus one effective space identity: profile digest, observed model, dimensions and role. Missing/duplicate/unresolvable positions, inconsistent dimensions or non-finite vectors fail. Never repair with zero vectors or shifted assignment.
 
-Canonical result contains one exact result or error per input key and one effective space identity: profile digest, observed model, dimensions and role. Missing/duplicate/unresolvable positions, inconsistent dimensions and non-finite vectors are errors. Never repair with zero vectors or shifted assignment.
+## 11. Operation identity and reconciliation
 
-## 8. Admission, replay and retained identity
-
-Operation identity is:
+Inference Operation identity is:
 
 ```text
 (controller_client_id,
@@ -388,39 +387,70 @@ Operation identity is:
  canonical bounded request identity)
 ```
 
-Canonical identity includes input digest/length rather than raw bytes. Exact replay by the same stable caller returns the original Operation/admission state regardless of later credential generation. Different method/profile/limits/format/role/input digest under the same request ID is `REQUEST_ID_CONFLICT`.
+Canonical identity contains input digest/length, not raw input. Same caller + exact identity returns the original Operation/admission state regardless of later credential generation. Different method/profile/limits/format/role/input digest under the same request ID is `REQUEST_ID_CONFLICT`.
 
-The existing Operation table is sufficient initially:
+The existing Operation table is sufficient:
 
-- `caller_id` — stable `controller_client_id`;
+- `caller_id` — stable controller client ID;
 - `client_request_id` — caller correlation key;
-- `original_request_json` — bounded inference identity, never raw prompt/input or caller-token verifier;
-- `effective_request_json` — frozen profile/connection, controlled input and execution facts;
-- `result_json` — closed public receipt and per-copy cleanup;
-- existing state — queued, sending, native accepted, settled, rejected, cancelled, abandoned or unknown.
+- `original_request_json` — bounded redacted identity;
+- `effective_request_json` — frozen profile/connection/input/execution facts;
+- `result_json` — closed receipt and cleanup state;
+- existing queued/sending/native-accepted/settled/rejected/cancelled/abandoned/unknown states.
 
-Do not add `inference_runs`, a second scheduler or generic external-job platform. Generic mutation is not called unchanged because it would persist raw payload and cannot stage private artifacts correctly. Credential install/rotation use their own redacted transaction for the same reason.
+Do not add `inference_runs`, another scheduler or a submission-phase ledger.
 
-## 9. Initial provider adapters
+`swarm-client` never automatically resends an application request. When Memory has no known Operation ID after disconnect/restore, it deliberately invokes the **same method with the exact retained identity once after verified hello**. Controller then performs one `reconcile-or-admit` decision:
+
+```text
+matching Operation exists   -> return original Operation/admission receipt
+no matching Operation exists -> create the first admission
+same request ID, other identity -> REQUEST_ID_CONFLICT
+caller unavailable          -> no call; hold job
+```
+
+Memory does not need a durable `possible_send` versus `proven_no_send` state. Provider-send uncertainty remains inside the admitted controller Operation and is never permission to call the provider again.
+
+## 12. Bounded runner and provider uncertainty
+
+One controller runner consumes queued `inference.text/embed` Operations using the existing Operation ledger/wake signal.
+
+1. select eligible queued Operation under frozen profile concurrency;
+2. verify exact input artifact, caller registration and frozen profile/connection;
+3. CAS `queued → sending` before provider I/O;
+4. perform one provider attempt outside Store transaction;
+5. retain native admission/response identity when supplied;
+6. persist exact result when present and terminal receipt;
+7. wake readers and continue finite work.
+
+Possible provider send followed by timeout/loss becomes `unknown` unless native idempotency/readback resolves it. It is never redispatched merely because Memory replays the admission identity.
+
+Restart behavior:
+
+```text
+verified queued input          -> eligible once
+sending/native accepted        -> native readback or unknown
+verified pending result        -> finish settlement
+abandoned                      -> never dispatch/publish late result
+```
+
+Credential rotation does not cancel an admitted Operation. Disabling/removing the stable principal is a separate authority transition that must disposition queued/unknown copies explicitly.
+
+## 13. Initial provider adapters
 
 Initial text adapter:
 
 ```text
 openai_chat_completions_loopback_v1
-```
-
-Closed wire:
-
-```text
 POST <base>/chat/completions
 Content-Type: application/json
 Accept: application/json
 optional Bearer from private connection file
 ```
 
-Body contains only model, one user message with exact prompt, admitted `max_tokens`, and typed `json_object` response format when supported. No tools, streaming, temperature, stop list, arbitrary headers/fields or fallback model.
+Body contains only model, one exact user message, admitted `max_tokens` and typed `json_object` format when supported. No tools, streaming, temperature, stop list, arbitrary fields, redirects, hidden retry or fallback model.
 
-Response requires bounded JSON and one usable `choices[0].message.content`. Record observed model/finish/response ID/usage only when supplied. Tool-only/content-free/unsupported multimodal output fails. Length finish is partial, never complete. No hidden retry; possible-send transport failure is unknown.
+Response requires bounded JSON and one usable `choices[0].message.content`. Length finish is partial, never complete. Tool-only, content-free or unsupported multimodal output fails. Usage/cost/account remain unknown when absent.
 
 Initial embedding adapter:
 
@@ -428,143 +458,113 @@ Initial embedding adapter:
 openai_embeddings_loopback_v1
 ```
 
-It posts bounded model/input array, verifies indices/count/finite vectors/consistent dimension and emits §7 canonical per-input output.
+It posts bounded model/input array and verifies count, indices, finite vectors and consistent dimensions.
 
-Loopback does not prove local destination. Current controller `reqwest` lacks qualified direct HTTPS/TLS in the inspected build; a future HTTPS adapter requires explicit TLS qualification, no redirects/proxies and identical no-replay/copy lifecycle.
+Loopback does not prove local destination. Direct HTTPS is a later separately qualified adapter with pinned TLS behavior, no proxies/redirects and the same no-replay/copy lifecycle.
 
-## 10. One bounded runner
+## 14. Read, cancel, release and erasure authority
 
-One controller runner consumes queued `inference.text/embed` Operations. It reuses Operation ledger/wake signal and is not another process or scheduler.
-
-1. select eligible queued Operation under frozen profile concurrency;
-2. verify exact input artifact and frozen profile/connection/caller state;
-3. verify the caller registration still exists with role `inference_client`; credential generation need not remain the original dispatch generation because Operation ownership is the stable caller, but new application admission uses the current generation;
-4. CAS `queued → sending` before provider I/O;
-5. perform one provider attempt outside Store transaction;
-6. retain native admission/response identity when supplied;
-7. persist exact result when present and terminal receipt;
-8. wake readers and continue finite work.
-
-Possible-send timeout/loss becomes unknown unless native idempotency/readback resolves it. A new request ID is not recovery.
-
-Restart behavior:
-
-- verified queued input remains eligible under the still-registered stable caller and frozen profile;
-- sending/native-accepted uses native readback when supported, otherwise unknown;
-- verified pending result may finish settlement;
-- abandoned never redispatches/publishes late result;
-- no restart automatically issues another provider call.
-
-Credential rotation does not cancel an already admitted Operation. Disabling/removing the principal is a separate authority change and must define what happens to its queued/unknown controlled copies before execution resumes.
-
-## 11. Public receipt and artifact authorization
-
-`operation.get` grants a bounded receipt to the exact currently authenticated `controller_client_id` without Task linkage. Only that principal receives its `client_request_id`. A verified local Operator may receive a separately defined bounded non-content diagnostic/erasure status; that path is not the normal receipt and never transfers caller ownership. Projection never exposes arbitrary provider JSON or credentials.
-
-Receipt contains status, optional result artifact/digest/length/encoding, requested profile/adapter/connection/model/destination, observed provider/model/response/finish/usage/cost when known, limits and independent input/result cleanup state.
-
-Missing usage/cost/account remains unknown, never zero/inferred.
+`operation.get` returns a bounded receipt only to the exact currently authenticated stable caller. Only that caller receives its `client_request_id` and result artifact identity. Missing usage/cost/account is unknown, never zero or inferred.
 
 `inference_result` byte authorization requires:
 
-- artifact kind `inference_result`;
-- settled target Operation names same artifact/digest/length;
-- requesting principal's current authenticated `client_id` equals retained `caller_id`;
-- its credential generation is current for the physical request;
-- released content is unreadable.
+```text
+artifact kind == inference_result
+settled Operation names exact artifact/digest/length
+requesting current principal.client_id == retained caller_id
+requesting credential ID/generation is current for this physical request
+content is not released
+```
 
-A verified local Operator erasure branch may validate provenance and delete exact controlled copies without receiving result bytes. It does not satisfy `artifact.get/read`, create a Memory result or adopt cleanup ownership. `inference_input` has no public read grant. Do not relabel artifacts as script/native result or trust metadata alone.
+`inference_input` has no public read grant.
 
-## 12. Cancellation, restore and caller loss
+`operation.cancel` handles only the exact caller's queued inference Operation. After provider I/O may have begun, cancellation cannot prove non-execution.
 
-`operation.cancel` handles only exact caller's still-queued inference Operation. Cancellation races runner CAS; one wins. Once provider I/O may have begun, local cancellation cannot prove non-execution.
+`inference.release` is idempotent over one exact inference Operation and supports:
 
-A Memory backup retains non-secret `controller_client_id`, request ID, Operation ID, artifact/release identity and cleanup state, but never token/verifier. Restore validates a typed hello receipt proving the configured current credential authenticates as the same `controller_client_id`, expected current generation, `inference_client` role and supported protocol **before** reconciling restored inference jobs.
+```text
+memory_copy_verified    exact result durably copied by Memory
+terminal_without_result terminal state with no possible future result
+abandon_for_erasure     fence queued/sending/unknown publication, then erase
+```
 
-Restored jobs:
+For every expected file controller verifies Operation provenance, canonical path, regular-file/no-reparse identity, length/digest when present, exact deletion and parent-directory durability. Missing exact file becomes `already_absent`; mismatch blocks deletion. Partial cleanup remains visible and retryable.
 
-- known Operation ID → `operation.get`/artifact/release readback under same caller; never redispatch;
-- stable request ID but unknown Operation ID after possible send → exact replay under same caller only, returning original Operation or conflict;
-- no admitted Operation and proven no-send → request may proceed under retained exact request identity;
-- credential/hello authenticates as another `client_id`, stale/unexpected generation, role or unsupported protocol → `caller_identity_unavailable`; no read/cancel/release or redispatch claim is made;
-- out-of-target current Operations during Store rollback block cutover until terminal/released or explicitly abandoned by an authorized erasure owner.
+A verified local Operator may invoke a separate bounded erasure/abandonment branch that validates exact provenance, fences late publication and deletes controlled copies. It returns only non-content disposition/cleanup facts. It cannot satisfy `artifact.get/read`, disclose result bytes, adopt caller ownership or fabricate a Memory result. Provider non-execution/deletion/no-charge is never claimed.
 
-Loss of the old logical caller prevents complete controlled-copy cleanup. Recovery requires restoring a current credential for the same registered `client_id` or an explicit verified local-Operator abandonment/erasure action. Operator access does not transfer ownership, disclose result bytes, fabricate cognitive result or authorize duplicate inference.
+## 15. Memory backup and restore
 
-## 13. `inference.release`
+A Memory backup retains stable caller/request/method/canonical request identity, known Operation/artifact/release identity, cleanup state and selected non-secret credential ID/generation. It never contains token/verifier bytes.
 
-Request names target Operation, disposition and expected artifact/digest/length when required.
+Before reconciling restored inference jobs, Memory authenticates the selected current credential and validates the exact protocol-v2 hello receipt.
 
-Controller independently validates current authenticated caller/generation, target owner/state, artifact identities and disposition.
+Restored job handling is only:
 
-### 13.1 `memory_copy_verified`
+```text
+known controller_operation_id
+  -> operation/artifact/release readback; never redispatch
 
-Only when exact result is retained and Memory acknowledges durable matching copy. Input/result become cleanup targets.
+unknown controller_operation_id
+  -> exact same-caller reconcile-or-admit call using retained method/request identity
 
-### 13.2 `terminal_without_result`
+caller/credential/role/protocol unavailable
+  -> caller_identity_unavailable; hold job and cleanup debt; no call
+```
 
-Only when rejected, failed without retained result or cancelled before send, and no future result can publish. Input is cleanup target; result is `not_created`.
+A new caller or request ID is not recovery. Local Operator erasure can end controlled-copy reconciliation but cannot transfer ownership or produce a cognitive result. Out-of-target current Operations may block Store-root rollback cutover until terminal/released or explicitly abandoned.
 
-### 13.3 `abandon_for_erasure`
+## 16. Implementation increments
 
-Allowed for exact caller or verified local Operator when erasure explicitly ends reconciliation of queued/sending/unknown work. Controller atomically marks Operation abandoned and fences future dispatch, settlement and publication before deleting controlled copies. The Operator branch receives only bounded disposition/cleanup facts, not result bytes or caller ownership. Late provider content is discarded by exact file owner; only bounded non-content facts remain.
+Do not make full rotation a prerequisite for first useful inference.
 
-This cannot prove provider non-execution, deletion or no charge.
+### P1a — connected inference
 
-### 13.4 Physical cleanup
+1. add `inference_client` and deny generic writer authority;
+2. add credential ID/generation to registration and Principal;
+3. implement protocol-v2 typed hello and verified client constructor;
+4. implement controller-local one-time install at generation 1;
+5. enforce generation check on every allowed method;
+6. add profile/connection parsing and disclosure admission;
+7. add controlled input/result domains;
+8. implement `inference.text`, runner, exact result readback and release;
+9. connect one Memory episode-learning job and restore reconciliation path.
 
-For each expected file controller verifies Operation provenance, canonical path, regular-file/no-reparse identity, length/digest when present, exact deletion and parent-directory durability. Missing exact file becomes `already_absent`; mismatch blocks deletion. Partial input/result cleanup remains visible and retryable under the same stable caller/Operation identity.
+### P1b — credential rotation
 
-Release is idempotent. Memory records release Operation ID, disposition and each copy state. Release failure never rolls back a verified Memory publication.
+1. implement rotate with current/pending/previous identity;
+2. classify lost reply using retained pending/current credentials;
+3. reject/reap stale sessions through generation fencing;
+4. prove pre-rotation Operation read/release with the new generation;
+5. retire old secret/reference in a later cleanup step.
 
-## 14. Reuse and explicit non-donors
+### P2
 
-Reuse from exact controller source:
+Add embeddings through the same lifecycle, then qualify direct HTTPS only when required.
 
-- authenticated bounded IPC framing and no application replay;
-- host-side hello identity fields, after adding typed generation-aware exposure;
-- stable `client_id` Principal and token-verifier authentication;
-- Store-side reloading of current client registration before generic dispatch;
-- safe `client.list` projection that omits the verifier;
-- Operation exact caller/request identity and conflict behavior;
-- exact-caller operation/artifact authorization;
-- existing Operation states/failure observations;
+## 17. Reuse and current gaps
+
+Reuse from inspected controller source:
+
+- authenticated bounded IPC framing and no automatic application replay;
+- stable caller/request Operation conflict behavior;
+- exact-caller Operation/artifact authorization;
 - immutable artifact publish/read/digest verification;
-- wake signal and bounded worker pattern;
+- existing Operation states, wake signal and bounded worker pattern;
+- safe non-secret `client.list` projection;
 - bounded no-redirect/no-hidden-retry HTTP patterns.
 
 Do not reuse unchanged:
 
-- current `swarm-client::connect`, which discards authenticated hello identity;
-- generic `client.register` for inference setup or rotation;
-- generic mutation storage of secret-bearing credential params;
-- current Principal/current-registration check without credential generation;
-- current-GM authority for installation-scoped inference credentials;
-- Task/Attempt/workspace/review/acceptance lifecycle;
-- ScriptRun/interpreter/effect lifecycle;
+- `swarm-client::Client::connect` that discards hello result;
+- generic `client.register` or generic mutation storage for inference credentials;
+- current-GM authority for installation credentials;
+- Principal validation without credential ID/generation;
 - Manager/Operator as ordinary inference caller;
-- local Operator as result-byte reader or ownership-transfer mechanism;
-- module binding or agent route types;
-- generic writer fallback;
+- Task/Attempt/ScriptRun/module binding;
+- Operator result-byte reads or ownership transfer;
 - hidden provider retry/fallback;
-- credential rotation that changes `client_id`;
-- normal recovery through Operator/admin read or a new request ID;
+- caller migration as token rotation;
+- a new request ID after uncertainty;
 - another task/profile/capability/receipt registry.
 
-## 15. Implementation order and open runtime gaps
-
-1. add `inference_client` role and make generic writer deny it;
-2. add generation-bearing Principal/registration and validate current generation before every inference method;
-3. expose/validate typed `client.hello` receipt before returning an application-capable client;
-4. implement local-Operator-only redacted `inference.client.install` and `inference.credential.rotate`; never persist token verifier in generic Operation JSON;
-5. make stale-generation response poison/close the client and reap stale server sessions;
-6. prove same-client rotation by reading/releasing a pre-rotation Operation with the new generation;
-7. add inference artifact domains, exact-caller byte grants and non-disclosing Operator erasure branch;
-8. add connection/profile parser/digests/admission;
-9. implement staged-input mutation identity and `inference.text` runner;
-10. add result readback, cancellation and all release dispositions;
-11. connect one Memory job/restore reconciliation path;
-12. add embeddings through the same lifecycle;
-13. qualify direct HTTPS only when explicitly needed.
-
-At inspected controller revision `e42c464d` and the searched current repository, the following remain absent: `inference_client`, inference methods, inference artifact kinds, runner, release cleanup, credential generation/fencing, typed hello exposure/verification, specialized redacted install/rotation, non-disclosing Operator erasure and Memory restore continuity. This document is design, not runtime proof.
+At controller revision `e42c464d`, these remain absent: `inference_client`; protocol-v2 verified hello; credential ID/generation and stale-session fence; controller-local redacted install/rotation; inference methods/artifacts/runner/release; non-disclosing Operator erasure; and Memory restore continuity. This contract is design, not runtime proof.
