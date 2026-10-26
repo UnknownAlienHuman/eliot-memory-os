@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.26 · 2026-10-26 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.27 · 2026-10-26 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, data and connected operations. [Cognition](COGNITION.md) defines algorithms. [One-shot inference contract](INFERENCE-CONTRACT.md) is the sole normative Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) records checked evidence, decisions and open gaps.
 
@@ -13,20 +13,22 @@ Nothing here is implemented merely because it is specified. The complete target 
 The initial Windows profile uses one executable with modes:
 
 ```text
-eliot supervisor     owns the local process family
-eliot daemon         serves Memory operations
+eliot supervisor     owns the local process family and privileged maintenance
+eliot daemon         serves Memory application operations
 eliot relay ...      transient host/CLI adapter
 ```
 
 The supervisor owns:
 
-- `eliot daemon`;
-- one external SurrealDB server child;
+- one active `eliot daemon` generation;
+- one active external SurrealDB server child;
+- at most one isolated disposable SurrealDB candidate while qualifying a restore;
 - their Windows Job Object;
-- exact child executable/configuration identity;
-- restart intensity and planned shutdown.
+- retained executable/process identity;
+- root/Owner credential use, schema migration and DB-user rotation;
+- the installation-selection generation and planned cutover/shutdown.
 
-The daemon does not supervise itself. Hosts and `eliot-swarm-controller` do not own this process family. Provider/model processes remain controller/provider concerns.
+The daemon owns application state and ordinary Editor-authenticated Store operations. It does not supervise itself, receive root/Owner credentials or mutate the active installation selection. Hosts and `eliot-swarm-controller` do not own this process family. Provider/model processes remain controller/provider concerns.
 
 ### 1.2 Data root and configuration
 
@@ -37,8 +39,10 @@ Use one stable installation root, for example:
   config.toml
   installation.toml
   data\
-    db\
-    blobs\
+    roots\
+      <root-id>\
+        db\
+        blobs\
   spool\
     pending\
     failed\
@@ -50,7 +54,7 @@ Use one stable installation root, for example:
 
 `config.toml` contains practical user configuration:
 
-- selected data directory;
+- the allowed/base local data directory, not the selected active root;
 - configured projects/workspaces and host binding rules;
 - capture exclusions, per-event bounds and retention;
 - enabled host adapters and their native executable/config paths;
@@ -61,28 +65,30 @@ Use one stable installation root, for example:
 - optional document/Research tools;
 - explicitly allowed cross-project reuse scopes.
 
-It is not a generated policy database, route registry, module catalogue or inventory denominator.
+It is not a generated policy database, route registry, module catalogue, runtime inventory or installation pointer.
 
-`installation.toml` is a small installer-owned input, not a second state store. It pins:
+`installation.toml` is a small supervisor/installer-owned selection record, not a second application state store. It contains only the information needed to select and admit the process family:
 
+- a monotonic installation-selection generation;
+- current and previous closed root IDs under `data/roots/`;
 - exact Eliot and SurrealDB executable paths, versions, sizes and SHA-256 digests;
-- exact canonical storage URL and storage engine;
-- the explicit RocksDB durability mode;
-- namespace/database names;
-- installation-scoped daemon pipe identity and loopback endpoint policy, not trusted pre-existing endpoints;
-- closed launch profile;
-- schema generation expected by this Eliot build;
-- the non-secret launch/environment identity last admitted by the supervisor.
+- exact canonical storage profile and explicit RocksDB durability mode;
+- namespace/database names and expected schema generation;
+- the installation-scoped daemon pipe identity and loopback endpoint policy, not trusted pre-existing endpoints;
+- non-secret Windows Credential Manager references for root, Owner and Editor, with current/pending/previous references only while a rotation is unresolved;
+- the closed launch/environment profile and last admitted non-secret identity.
 
-The first qualification target is SurrealDB **3.3.4**. The initial production storage candidate is the external server with RocksDB because SurrealDB 3.3 documents RocksDB as the recommended on-disk engine while SurrealKV remains beta. The installer generates one canonical Windows storage URL bound to the retained data root and appends explicit `sync=every`; callers do not supply alternate URL spellings or query parameters.
+A daemon may read the non-secret selected root/profile/Editor reference needed to admit ordinary Store access. Only the supervisor resolves root/Owner references or replaces `installation.toml`.
 
-This is a qualification target, not a completed proof. Store readiness is unavailable until the exact Windows binary and profile pass launch-identity, startup, restart, conflict, acknowledged-commit durability, owned-listener/peer admission, typed Store transport, application backup/restore and durable-file publication checks. Do not silently fall back to another server version or storage engine.
+The first qualification target is SurrealDB **3.3.4**. The initial production storage candidate is the external server with RocksDB because SurrealDB 3.3 documents RocksDB as the recommended on-disk engine while SurrealKV remains beta. The supervisor derives one canonical Windows storage URL from the selected closed root ID and appends explicit `sync=every`; callers do not supply alternate URL spellings, root paths or query parameters.
+
+This is a qualification target, not a completed proof. Store readiness is unavailable until the exact Windows binary and profile pass launch-identity, startup, restart, conflict, acknowledged-commit durability, owned-listener/peer admission, typed Store transport, application backup/restore and durable-file/selection checks. Do not silently fall back to another server version, root or storage engine.
 
 Provider connections, provider credentials, adapter IDs and `actual_destination` declarations stay with `eliot-swarm-controller`. Memory stores only selected profile names and frozen non-secret execution identity returned by controller.
 
-### 1.3 Demand start, local IPC, endpoint ownership, Store admission and shutdown
+### 1.3 Demand start, internal control, local IPC, Store admission and shutdown
 
-The supervisor holds a named mutex for the stable installation root throughout startup, operation and shutdown. A relay connects first; if no endpoint answers, it starts a supervisor candidate and waits. Only the candidate owning the mutex starts children. An existing owner with an unready daemon is not permission to launch another database.
+The supervisor holds a named mutex for the stable installation root throughout startup, operation and shutdown. A relay connects first; if no daemon endpoint answers, it starts a supervisor candidate and waits. Only the candidate owning the mutex starts children. An existing owner with an unready daemon is not permission to launch another process family or database.
 
 #### Retained executable launch identity
 
@@ -90,7 +96,35 @@ Before creating an owned child, the supervisor opens the approved executable wit
 
 The supervisor then creates the child suspended, keeps its process handle, re-observes the child image path and file identity against the retained executable, assigns it to the owned Job Object and only then resumes it. Any disagreement terminates the still-suspended child. The lease remains alive through this boundary. A path string, pre-launch digest or PID alone is not launch identity. Slice 0 must prove that the selected sharing modes and ancestor pins work with the exact Eliot and SurrealDB Windows binaries.
 
-Create SurrealDB and daemon children suspended, assign them to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resume them only after the retained-image check above. If validation or assignment fails, terminate the still-suspended child. Do not kill unrelated processes by name or port.
+#### Supervisor↔daemon inherited control boundary
+
+Before launching the daemon, the supervisor creates two bounded one-way anonymous pipes to form one duplex private control channel. It marks only the daemon ends inheritable and supplies exactly those handles through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` with `bInheritHandles=TRUE`; unrelated handles are not inherited. The child-only environment contains only the decimal handle values and protocol generation, never a secret. Both processes clear inheritance on their retained ends immediately after startup.
+
+This is not a named public endpoint. It needs no discovery, DACL-based peer selection or bearer token because the validated supervisor creates the pipes and the validated suspended daemon receives the exact handles. One owner task on each side performs all framing and handle I/O. Frames are versioned, length-prefixed, bounded, correlated by one exact operation ID and restricted to a closed enum such as:
+
+```text
+supervisor → daemon:
+  store_descriptor
+  quiesce
+  resume
+  maintenance_result
+  shutdown_complete
+
+daemon → supervisor:
+  daemon_ready
+  maintenance_request
+  quiesced
+  shutdown_ready
+  acknowledgement
+```
+
+`store_descriptor` carries only non-secret facts needed for independent admission: SurrealDB PID/start time/image and file identity, root/selection generation, endpoint, storage/profile digest and expected schema generation. The daemon opens and retains its own process handle to that child, repeats listener/peer/auth/schema admission and reports `daemon_ready`; a descriptor is not authority by itself.
+
+A maintenance request names only a closed operation kind, operation ID and already retained backup/configuration/credential generation ID. It never carries raw SQL, executable arguments, endpoint, arbitrary filesystem path, password, verifier or credential value. The supervisor independently resolves the named object beneath the installation root, verifies its identity and uses its own root/Owner Credential Manager references.
+
+Only one privileged maintenance operation is active per installation. Ordinary backup creation is daemon-owned; schema migration, DB-user rotation, candidate restore, SurrealDB lifecycle and installation cutover are supervisor-owned. The daemon owns mutation admission, replay/job drain, exact Store readback and quiesce evidence. The supervisor owns privileged execution, child handles, candidate roots and installation selection.
+
+Channel EOF is fail-closed. A daemon that loses the supervisor closes mutation admission, requests relay staging where possible, closes Store sockets and exits within a finite deadline. A supervisor that loses the daemon does not continue a pre-cutover restore/rotation from an unconfirmed request; a candidate is disposable unless durable installation-selection readback already proves cutover. After a possible selection replacement, startup reconciles the actual selection before any retry.
 
 #### Relay→daemon named-pipe boundary
 
@@ -106,12 +140,14 @@ The first Base protocol is one versioned, length-prefixed request and one correl
 
 Pipe name, liveness, DACL, a bearer token or a caller-supplied PID is not sufficient identity. This local boundary excludes other Windows users, stale generations, pipe squatting and unrelated local binaries; it does not claim to defeat arbitrary malicious code already executing as the same Windows account. That stronger threat requires a different OS/account boundary rather than more application ceremony.
 
+#### Closed SurrealDB process profile
+
 The supervisor creates a minimal child environment block rather than inheriting the caller environment. Preserve only required Windows process variables and explicitly selected SurrealDB settings. Arbitrary `SURREAL_*`, `RUST_LOG`, slow-query, import, Postgres, metrics and OpenTelemetry settings from the parent are not inherited.
 
 The first closed qualification profile is equivalent to:
 
 ```text
-surreal start <installer-owned-rocksdb-url>?sync=every
+surreal start <supervisor-derived-rocksdb-url>?sync=every
 --bind 127.0.0.1:<per-start-owned-port>
 --deny-all
 --allow-arbitrary-query system
@@ -124,7 +160,7 @@ surreal start <installer-owned-rocksdb-url>?sync=every
 --allow-origin <installer-owned-reserved-origin>
 ```
 
-The environment explicitly disables metrics and leaves slow-query logging, import, Postgres and telemetry unconfigured. `/ready`, `/health` and `/status` are loopback lifecycle probes supplied by the server; they are not substitutes for Store admission and are never exposed outside the owned listener. HTTP `signin`, `export` and `import` routes are not selected. The only RPC method is `query` behind the private fixed-query Store client.
+The environment explicitly sets `SURREAL_METRICS_ENABLED=false` and leaves slow-query logging, import, Postgres and telemetry unconfigured. `/ready`, `/health` and `/status` are loopback lifecycle probes supplied by the server; they are not substitutes for Store admission and are never exposed outside the owned listener. HTTP `signin`, `export` and `import` routes are not selected. The only RPC method is `query` behind the private fixed-query Store client.
 
 `--allow-origin` is browser response metadata, not WebSocket authorization. SurrealDB's CORS layer forwards ordinary requests and adds headers; `/rpc` does not reject a WebSocket upgrade by Origin. The security boundary is exact process/connection ownership plus Basic-authenticated handshake and system-only fixed query, not Origin. The reserved Origin remains defense in depth for readable browser HTTP responses and diagnostics only.
 
@@ -155,29 +191,41 @@ Root omits database-auth headers until the namespace/database exists. Database u
 
 SurrealDB still accepts an anonymous WebSocket upgrade when no Authorization header is supplied. Guest arbitrary query is denied, so it cannot read/write Store data through the selected method surface, but connection-exhaustion behavior must be measured in Slice 0. If random per-start port, bounded server settings and measured behavior are insufficient, pinned WSS or a narrow authenticated proxy is a separate evidence-driven hardening decision; Origin is never promoted as the fix.
 
-#### Root bootstrap and database users
+#### Root bootstrap, migrations and database users
 
-Windows Credential Manager is the only secret authority. Generate the root bootstrap credential once and retain the same secret through all reconciliation attempts. Root bootstrap is deliberately short-lived:
+For local Store credentials, Windows Credential Manager is the only secret authority. Generate the root bootstrap credential once and retain the same secret through all reconciliation attempts. Root bootstrap is deliberately short-lived:
 
-1. on an empty store, start one bootstrap child with that root username/password in its child-only environment;
+1. on an empty selected root, start one bootstrap child with that root username/password in its child-only environment;
 2. wait until upstream startup has persisted the root user and `/ready` succeeds;
 3. gracefully stop that child and restart the same root **without** root credentials in its environment;
 4. verify listener/peer ownership, then authenticate root in the WebSocket Basic handshake;
 5. create the configured namespace, `STRICT` database and two database-scoped users through fixed root queries;
-6. prove both database users can authenticate in pinned Basic handshakes, restart again without root environment material and repeat Editor/Owner admission.
+6. prove Owner and Editor can authenticate in pinned Basic handshakes;
+7. run ordered checked migrations through a separately authenticated Owner socket and verify schema generation/definitions;
+8. restart again without root environment material and repeat Owner admission before starting the daemon.
 
 A bootstrap child may persist root before a later bind/startup failure. That is `OUTCOME_UNKNOWN`, not permission to generate a new root password. Restart without root environment material and try the retained credential. If root authentication succeeds, bootstrap committed. If it fails and no other writer can exist under the installation mutex, stop the child and retry bootstrap with the **same** credential under a finite budget; persistent mismatch blocks rather than rotating or overwriting root.
 
-This prevents a long-running child from retaining the root password in its process environment. The persisted root account remains protected by its Credential Manager secret so an existing store cannot be re-bootstrapped merely because another process supplies new startup credentials.
-
 The two database-scoped users are:
 
-- **Editor** — ordinary daemon Store reads and mutations;
-- **Owner** — migrations, DB-user rotation and typed restore writes.
+- **Editor** — ordinary daemon Store reads and application mutations;
+- **Owner** — supervisor-owned migrations, DB-user rotation and typed restore writes.
 
-The installer derives a standard Argon2 PHC verifier locally and provisions users with fixed `PASSHASH` statements; plaintext database-user passwords are not placed in SurrealQL, argv or logs. Slow-query logging remains disabled because `PASSWORD`, `PASSHASH` and `PASSSCRAM` are literal-bearing DDL. SCRAM material is not created while Postgres/SCRAM transports are disabled. Credential headers, DDL buffers, handshake failures and RPC errors are secret-bearing: logs retain only bounded error class and operation identity, never the header, request, statement, password or verifier.
+The supervisor derives a standard Argon2 PHC verifier locally and provisions users with fixed `PASSHASH` statements; plaintext database-user passwords are not placed in SurrealQL, argv or logs. Slow-query logging remains disabled because `PASSWORD`, `PASSHASH` and `PASSSCRAM` are literal-bearing DDL. SCRAM material is not created while Postgres/SCRAM transports are disabled. Credential headers, DDL buffers, handshake failures and RPC errors are secret-bearing: logs retain only bounded error class and operation identity, never the header, request, statement, password or verifier.
 
-#### Store admission and shutdown
+The daemon receives only the non-secret Editor reference and reads only that Credential Manager entry. The supervisor code path resolves root/Owner. Because both processes initially run under one Windows account, this is an application authority boundary against accidental misuse, not a claim that arbitrary malicious same-account code cannot read the user's credentials. A stronger threat model requires a separate OS identity/service account.
+
+#### Startup admission
+
+A normal startup is ordered:
+
+1. read and verify `installation.toml`, selected root and executable identities under the installation mutex;
+2. start/admit the selected SurrealDB child;
+3. reconcile bootstrap/credential state and run pending checked migrations through root/Owner;
+4. create the inherited supervisor channel and launch the validated daemon;
+5. send one `store_descriptor`;
+6. require the daemon to repeat process/listener/peer/Editor/schema/typed-probe admission and report `daemon_ready`;
+7. only then expose the relay pipe and accept capture/read/control operations.
 
 Store readiness requires all of these observations:
 
@@ -190,30 +238,38 @@ Store readiness requires all of these observations:
 7. schema generation and `INFO FOR DB/TABLE` checks match §5.1;
 8. one bounded typed write/read/delete probe succeeds through the same Store client used by production.
 
-A listening port, process heartbeat, `/health`, `/status`, `/ready`, WebSocket 101 or successful TCP connection alone is not Store readiness. A binary, owner, peer, profile, credential, schema or typed-probe mismatch stops Store mutation before host relays can claim capture ownership.
+A listening port, process heartbeat, `/health`, `/status`, `/ready`, supervisor descriptor, WebSocket 101 or successful TCP connection alone is not Store readiness. A binary, owner, peer, profile, credential, schema or typed-probe mismatch stops Store mutation before host relays can claim capture ownership.
 
 After Store is ready, the daemon begins bounded fair replay of `spool/pending`. Replay does not block primary exact reads or new capture indefinitely. It pages entries in stable order, processes a finite batch, then yields to foreground work. Corrupt or permanently rejected entries move to `spool/failed`; transient Store failure leaves them pending. A replayed command uses the same application `capture` operation and command ID as direct delivery.
 
-Normal idle or explicit shutdown is not Job Object termination. It proceeds as follows:
+#### Normal and forced shutdown
 
-1. close mutation admission; direct capture that reached the daemon receives internal `stage_required` before any blob/Store ownership, so the relay publishes the same command to durable spool;
-2. stop claiming new background work and pause admission of new replay items;
-3. allow one finite drain interval for already eligible work and the replay item already in flight; reconcile any possible Store write before proceeding;
-4. persist collected results/progress and close daemon Store sockets;
-5. request the qualified graceful SurrealDB shutdown path;
-6. wait through a finite supervisor deadline and record the actual child exit;
-7. if the child does not exit, terminate the owned Job Object as crash containment;
-8. release the installation mutex only after process ownership is settled.
+Normal idle or explicit shutdown is not Job Object termination. The daemon validates the external control operation, then:
+
+1. closes mutation admission; direct capture receives internal `stage_required` before any blob/Store ownership, so the relay publishes the same command to durable spool;
+2. stops claiming new background work and pauses admission of new replay items;
+3. drains already eligible work and the replay item in flight; reconciles any possible Store write;
+4. persists collected results/progress, closes Store sockets and sends `shutdown_ready(operation_id)` to the supervisor;
+5. exits only after the supervisor acknowledges the operation or the inherited channel fails.
+
+The supervisor then:
+
+1. rejects a mismatched/stale operation ID;
+2. requests the qualified graceful SurrealDB shutdown path;
+3. waits through a finite deadline and records the actual child exit;
+4. sends `shutdown_complete` when the daemon is still present;
+5. if a child does not exit, terminates the owned Job Object as crash containment;
+6. releases the installation mutex only after process ownership is settled.
 
 `stage_required` is a private direct-delivery disposition, not a fifth public capture result and not `rejected`. The relay returns public `staged` only after its own immutable pending-file publication succeeds; otherwise it returns `unknown`.
 
-SurrealDB itself bounds its maintenance drain and may continue shutdown after logging cleanup failures. A clean exit is therefore not an application durability receipt. The next start always repeats Store admission and exact application readback. A mutation error delivered after RocksDB applied the transaction but before grouped WAL sync completed is `OUTCOME_UNKNOWN`; it is reconciled by application identity before retry.
+SurrealDB itself bounds its maintenance drain and may continue shutdown after logging cleanup failures. A clean exit is therefore not an application durability receipt. The next start always repeats full admission and exact application readback. A mutation error delivered after RocksDB applied the transaction but before grouped WAL sync completed is `OUTCOME_UNKNOWN`; it is reconciled by application identity before retry.
 
-If the supervisor dies, the Job Object terminates owned children. The next demand start treats this as crash recovery, opens the retained root and repeats full admission. Restarting a failed daemon does not restart a healthy database.
+If the supervisor dies, the Job Object terminates owned children. The next demand start treats this as crash recovery, reads the actual installation-selection generation, opens the selected retained root and repeats full admission. Restarting a failed daemon does not restart a healthy database unless the new daemon fails independent admission of that child.
 
 Pending spool data, a completed background job or an internal poll cannot renew the idle interval indefinitely. Explicit shutdown does not start a final Dreamer cycle. Unknown controller/provider outcomes remain reconcilable after restart; shutdown does not authorize another request ID.
 
-Primary capture and exact/lexical reads become available as soon as Store is admitted. They do not wait for controller inference, embeddings, project orientation, graph refresh or complete spool drain.
+Primary capture and exact/lexical reads become available as soon as daemon admission succeeds. They do not wait for controller inference, embeddings, project orientation, graph refresh or complete spool drain.
 
 ## 2. Code structure
 
@@ -224,19 +280,20 @@ Use one library package plus a thin executable selecting supervisor/daemon/relay
 | Module | Owns | Does not own |
 |---|---|---|
 | `model` | Small values crossing real internal boundaries | Vendor SDKs, runtime, universal contract catalogue |
-| `store` | Bounded authenticated SurrealDB query client, schema/migrations, fixed queries, typed DTOs, transactions, exact reads and blob references | Arbitrary SurrealQL or generic Surreal value surface, interpretation, host protocol, model selection |
+| `store` | Bounded authenticated SurrealDB query client, fixed queries, typed DTOs, transactions, exact reads and blob references | Arbitrary SurrealQL or generic Surreal value surface, host protocol, installation selection |
 | `memory` | Semantic item operations, revisions, history, grounds and source links | Raw host/provider I/O |
 | `context` | Continuation reconstruction, candidate selection, applicability, relation expansion and packing | Second Store or model scheduler |
 | `learning` | Purpose-specific input selection, request builders, disclosure reduction, decoders, reducers and publication proposals | Job claims, provider retries or credentials |
 | `vectors` | Vector-space identity, result mapping and vector candidate arm | Provider transport or second vector database |
 | `jobs` | Due selection, claim/reclaim, finite handler dispatch, reconciliation and result application | Semantic algorithms duplicated from handlers |
-| `adapters::host` | Native host event decoding, `CaptureCommand` construction, mutually attested daemon IPC and context emission | Task ownership, semantic publication or Store status invention |
+| `adapters::host` | Native host event decoding, `CaptureCommand`, mutually attested daemon IPC and context emission | Task ownership, semantic publication or Store status invention |
 | `adapters::controller` | Authenticated controller IPC, inference methods, Operation/artifact readback, queued cancel and release | Memory job state, publication, provider credentials or route planning |
 | `adapters::source` | Document, structure and Research translation | Another memory service |
-| `spool` | Atomic pending-command publication, bounded replay inventory, pause/drain ownership and failed quarantine | A second canonical event store |
-| `platform::windows` | Minimal named mutex, Job Object, retained executable/path leases, named-pipe peer admission, TCP owner observation and durable local-file primitives used by V3 | V2 platform framework, policy, manifests or generic capability registry |
-| `control` | Status/inbox, configuration, maintenance and owner commands | General policy engine |
-| `runtime` | Composition, process/task lifetime, bounded pipe/socket owner tasks and shutdown | Cognitive algorithms or global mutable service locator |
+| `spool` | Immutable pending publication, bounded replay inventory, pause/drain ownership and failed quarantine | A second canonical event store |
+| `platform::windows` | Named mutex, Job Object, retained executable/path leases, exact inherited-handle list, named-pipe peer admission, TCP owner observation, immutable publication and mutable selection replacement | V2 platform framework, policy, manifests or generic capability registry |
+| `control` | External status/inbox/configuration/maintenance commands, operation IDs and daemon-side quiesce | Root/Owner credentials, arbitrary supervisor commands or process handles |
+| `runtime::supervisor` | Installation selection, privileged control owner, root/Owner operations, migrations, Store candidates, child lifecycle and cutover | Memory semantics or public control surface |
+| `runtime::daemon` | Application composition, Editor Store owner, relay accept loop, jobs/replay and bounded shutdown | Privileged credential/process effects |
 
 Dependency direction:
 
@@ -245,10 +302,10 @@ model + pure transformations          -> no I/O imports
 store + outbound adapters + spool     -> model and external dependencies
 application operations                -> model, Store API and narrow clients
 host / CLI / MCP surfaces             -> application operations
-runtime composition                   -> concrete constructors and startup/shutdown
+runtime composition                   -> concrete constructors, privileged owner and startup/shutdown
 ```
 
-Keep RPC, HTTP, SQL, host JSON and filesystem helpers private. Internal calls share typed Rust values; serialize only at storage, process or network boundaries. Add a trait at a real interchangeable I/O boundary, not for every table or function.
+Keep RPC, HTTP, SQL, host JSON, pipe frames and filesystem helpers private. Internal calls share typed Rust values; serialize only at storage, process or network boundaries. Add a trait at a real interchangeable I/O boundary, not for every table or function.
 
 The current official SurrealDB Rust SDK is **not** the baseline dependency. The 3.3.4 SDK requires Rust 1.95 while this repository declares workspace MSRV 1.94, and its published package metadata points to a license file outside the current `deny.toml` allowlist. The pinned development toolchain can compile newer Rust, but that does not make the declared MSRV or dependency policy true. Reconsider the SDK only after an exact-version `cargo check`, `cargo deny` and dependency-size preflight passes and demonstrably simplifies the bounded remote client below.
 
@@ -281,7 +338,7 @@ A new capability adds only what its connected path needs:
 
 It does not automatically add a process, manifest family, event bus, scheduler, database, context compiler, plugin platform, proof family or generated inventory.
 
-Finite expensive work uses the existing `job` runner. A long-lived task exists only when it must retain an actual resource or continuously receive input. The named-pipe accept loop and Store WebSocket owner qualify because they own live OS handles; they are not generic actors. Runtime plugin discovery, dynamic Rust ABI, WASM packaging and hot-generation machinery are not selected.
+Finite expensive work uses the existing `job` runner. A long-lived task exists only when it must retain an actual resource or continuously receive input. The inherited supervisor channel owner, relay named-pipe accept loop and Store WebSocket owner qualify because they own live OS handles; they are not generic actors. Runtime plugin discovery, dynamic Rust ABI, WASM packaging and hot-generation machinery are not selected.
 
 ### 2.4 Optional means optional
 
@@ -303,9 +360,11 @@ All host surfaces call the same application operations:
 | `open(handle, read_context, range?)` | Exact item/source/representation page, relation descriptors and continuation |
 | `record_outcome(report)` | Captured observed result or explicitly sourced report |
 | `dream(request)` | Finite interpretation/research/improvement job when its handler is configured |
-| `control(command)` | Status/inbox, configure, pause/cancel, correct, withdraw/erase, backup/restore or shutdown |
+| `control(command)` | Operation ID plus status/inbox, configure, pause/cancel, correct, withdraw/erase, backup/restore/rotate or shutdown state |
 
 `record_outcome` reuses capture. An unavailable capability fails specifically; it does not return successful empty output.
+
+The daemon owns the external `control` operation. A command that requires root/Owner, process lifecycle or installation replacement is converted into one closed privileged maintenance intent on the inherited channel. Returning an operation ID or supervisor acknowledgement is not completion; `control` reads the actual process/credential/selection/Store state until terminal or unknown.
 
 ### 3.1 Bind work without a scope platform
 
@@ -479,9 +538,11 @@ Aggregate cleanup state is derived as `retained | cleanup_pending | cleanup_inco
 
 A unique optional slot key enforces at most one active job and one coalesced pending successor for `(project, purpose, target_key)`. Terminal history has no slot key.
 
+Privileged maintenance is not another primary table. The daemon may use an ordinary finite `job` row when the user needs durable status, but supervisor authority and cutover truth come from the inherited operation ID plus actual credential/process/installation readback. Before the daemon exists, startup migration/bootstrap truth is installation/Store state, not a fabricated job row.
+
 ### 4.7 Blobs, locators and packet records
 
-Large source bytes, prompts, packets and results live under `blobs/`; rows keep opaque references and digests. Publish immutable blob bytes durably before committing a row that refers to them. Cleanup may remove unreferenced temporary files later; a committed row must never point to bytes that were never saved.
+Large source bytes, prompts, packets and results live under the selected root's `blobs/`; rows keep opaque references and digests. Publish immutable blob bytes durably before committing a row that refers to them. Cleanup may remove unreferenced temporary files later; a committed row must never point to bytes that were never saved.
 
 A rendered context packet does not receive a seventh primary table. Record it as an Eliot application observation/blob with packet ID/digest, binding, budget, exact included revisions, omissions/gaps, prepared time and observed host emission result. Use `link` rows for inclusion and handoff/action association.
 
@@ -544,7 +605,7 @@ A transport, shutdown or WAL-sync failure after a mutation may have been applied
 
 ### 5.1 Schema, credentials and migration ownership
 
-The installer/bootstrap Owner applies ordered, checksummed `.surql` migrations before Store becomes ready. Do not add SurrealKit, a migration service or a migration database for the initial product.
+The supervisor/bootstrap Owner applies ordered, checksummed `.surql` migrations before daemon Store admission. Do not add SurrealKit, a migration service or a migration database for the initial product.
 
 Baseline schema rules:
 
@@ -560,9 +621,9 @@ Baseline schema rules:
 - use `CONCURRENTLY` only for a later online migration with explicit readiness polling;
 - never use the 2.x-only `DEFER` clause on the 3.x target.
 
-Store the expected migration number in database parameter `$eliot_schema_generation`. Startup reads `INFO FOR DB` and `INFO FOR TABLE` and compares the actual definitions/digest against checked-in migration metadata. `IF NOT EXISTS` is not enough for a changed definition: a mismatched existing table/field/index blocks mutation until the named migration resolves it.
+Store the expected migration number in database parameter `$eliot_schema_generation`. Startup reads `INFO FOR DB` and `INFO FOR TABLE` and compares actual definitions/digests against checked-in migration metadata. `IF NOT EXISTS` is not enough for a changed definition: a mismatched existing table/field/index blocks daemon admission until the named migration resolves it.
 
-The database-scoped Owner owns migrations and user rotation. The ordinary daemon receives only the Editor credential. Root and Owner run their fixed DDL/query corpora only through separately authenticated, peer-verified sockets. User creation/rotation uses one fixed DDL shape with a locally generated Argon2 PHC verifier in `PASSHASH`; it runs only while slow-query logging and telemetry are disabled and the verifier is never retained in application logs, backup manifests or Store result bodies. Successful DDL is reconciled by independent Basic handshake/sign-in and restart readback. Root is not a normal migration credential.
+The database-scoped Owner owns migrations and user rotation. The ordinary daemon receives only the Editor reference. Root and Owner run their fixed DDL/query corpora only through separately authenticated, peer-verified supervisor sockets. User creation/rotation uses one fixed DDL shape with a locally generated Argon2 PHC verifier in `PASSHASH`; it runs only while slow-query logging and telemetry are disabled and the verifier is never retained in application logs, backup manifests or Store result bodies. Successful DDL is reconciled by independent Basic handshake and restart readback. Root is not a normal migration credential.
 
 ### 5.2 Transaction and conflict rules
 
@@ -603,16 +664,18 @@ After commit, read observation identity, body length/digest and binding through 
 
 Capture does not call a model. Packet/status/read/claim-renewal/release/embedding-completion events do not automatically become new experience. A structured correction uses §5.6.
 
-### 5.4 Windows durable-file primitive and relay spool publication
+### 5.4 Windows durable-file primitives
 
-The initial durability profile is a local fixed Windows volume with a qualified NTFS or ReFS directory. UNC/network/removable roots and reparse traversal are rejected. Temporary and final files are always in the same directory/volume.
+The initial durability profile is one qualified local fixed NTFS/ReFS volume. UNC/network/removable roots and reparse traversal are rejected. Temporary and final files for one operation are always in the same directory/volume.
 
-One internal Windows primitive owns immutable publication:
+#### Immutable no-replace publication
+
+Immutable blobs, pending commands, deletion notices, backup pages/manifests and immutable candidate artifacts use one internal primitive:
 
 1. retain/validate the parent directory without following reparse points;
 2. create a unique same-directory temporary regular file with `CREATE_NEW` semantics;
-3. write the complete bytes;
-4. flush userspace buffers and call `sync_all`/`FlushFileBuffers` on the writable file handle;
+3. write complete bytes through a bounded buffer;
+4. flush userspace buffers and call `sync_all`/`FlushFileBuffers` on the writable file;
 5. close the file handle;
 6. rename to the absent final name with `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` **without** `MOVEFILE_REPLACE_EXISTING` or cross-volume copy;
 7. open the parent directory with write access, `FILE_FLAG_BACKUP_SEMANTICS` and `FILE_FLAG_OPEN_REPARSE_POINT` and call `FlushFileBuffers`;
@@ -620,9 +683,33 @@ One internal Windows primitive owns immutable publication:
 
 If the final path already exists, never overwrite it. Open/verify it and perform a successful parent-directory flush before returning prior `staged`; different bytes are conflict.
 
-If rename succeeds but parent sync or final readback fails, publication is **post-commit unknown**, not staged and not a pre-commit failure. Reconciliation reopens the exact final path, verifies bytes, retries directory sync and only then returns staged. The same rule applies to immutable blob publication, deletion notices, backup manifests and installation cutover files.
+If rename succeeds but parent sync or final readback fails, publication is **post-commit unknown**, not staged and not a pre-commit failure. Reconciliation reopens the exact final path, verifies bytes, retries directory sync and only then returns staged.
 
-The legacy `atomic_replace_file` donor uses `MOVEFILE_REPLACE_EXISTING` and is therefore not the V3 spool primitive. The existing directory-flush donor demonstrates the required Windows handle flags and error propagation, but V3 keeps only the minimal physical mechanism in its internal module.
+The legacy `atomic_replace_file` donor uses `MOVEFILE_REPLACE_EXISTING` and is therefore not this primitive.
+
+#### Mutable installation-selection replacement
+
+`installation.toml` is intentionally different: exactly one current selection must replace the previous generation. Only the supervisor may perform this under the installation mutex:
+
+1. read and retain the current file; require the expected generation;
+2. construct a complete next record with `generation = current + 1`, closed current/previous root IDs and explicit current/pending/previous credential references;
+3. create/write/flush/close a same-directory temporary file and retain its expected byte digest;
+4. call `MoveFileExW(temp, installation.toml, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`;
+5. flush the parent directory;
+6. reopen no-follow and verify exact bytes/digest, generation, root IDs and credential references;
+7. keep the previous root and previous credentials until a later explicit retirement operation.
+
+`ReplaceFileW` is not selected because its advertised write-through flag is not a supported durability mechanism. The mutable replacement is never reused for immutable spool/blob publication.
+
+If the replace call may have succeeded but directory sync/readback fails, the disposition is `SELECTION_UNKNOWN`. Do not write another generation blindly. Startup/reconciliation opens the actual file and classifies:
+
+- expected new generation and bytes → replacement committed;
+- exact old generation and bytes → replacement did not commit;
+- missing, malformed, unexpected generation or mismatched bytes → fail closed with both roots/credentials retained for owner inspection.
+
+No process resumes mutation after cutover until selection and selected Store readback agree.
+
+#### Relay publication outcome
 
 Direct daemon delivery has four private dispositions:
 
@@ -633,14 +720,14 @@ stage_required
 unknown
 ```
 
-`stage_required` is returned before blob/Store ownership whenever shutdown, backup or another explicit quiesce has closed mutation admission. It is transient and never maps to public `rejected`.
+`stage_required` is returned before blob/Store ownership whenever shutdown, backup, restore cutover or another explicit quiesce has closed mutation admission. It is transient and never maps to public `rejected`.
 
 Relay delivery:
 
-1. call daemon `capture` over the mutually attested pipe;
+1. call daemon `capture` over the mutually attested named pipe;
 2. accept `committed` only with matching Store readback;
 3. accept deterministic `rejected` only when no ownership transfer occurred and the command must not be retained;
-4. on `stage_required`, unavailable daemon, or disconnect/timeout/malformed reply after possible send, publish the exact same serialized command through the durable primitive;
+4. on `stage_required`, unavailable daemon, or disconnect/timeout/malformed reply after possible send, publish the exact same serialized command through the immutable primitive;
 5. return public `staged` only after successful final verification;
 6. if Store commit and durable pending publication both remain unestablished, return `unknown`.
 
@@ -648,7 +735,7 @@ Do not return `forwarded` as success and do not overload rejection to mean tempo
 
 ### 5.5 Daemon spool replay
 
-The daemon is the only automatic replayer. One replay owner exposes a pause/drain boundary used by backup, shutdown and erasure. Pausing first stops admission of another item; draining waits for the current item to reach matching Store readback, deterministic rejection, retained pending state or an explicitly reconciled unknown. An unresolved possible Store mutation blocks successful backup/erasure rather than allowing the same occurrence to fall between Store and spool inventories.
+The daemon is the only automatic replayer. One replay owner exposes a pause/drain boundary used by backup, shutdown, restore cutover and erasure. Pausing first stops admission of another item; draining waits for the current item to reach matching Store readback, deterministic rejection, retained pending state or an explicitly reconciled unknown. An unresolved possible Store mutation blocks successful backup/cutover/erasure rather than allowing the same occurrence to fall between Store and spool inventories.
 
 For each bounded fair batch:
 
@@ -732,7 +819,7 @@ The adapter retains unknown fields only inside a bounded raw source representati
 
 ### 6.2 Relay process behavior
 
-A hook invocation reads one bounded JSON object, validates adapter compatibility, constructs one immutable `CaptureCommand`, performs its daemon calls over the mutually attested one-request pipe boundary, attempts direct capture then spool, optionally requests context at a supported decision boundary, writes one bounded host-compatible stdout object, writes diagnostics separately and exits without claiming more than achieved.
+A hook invocation reads one bounded JSON object, validates adapter compatibility, constructs one immutable `CaptureCommand`, performs daemon calls over the mutually attested one-request pipe boundary, attempts direct capture then spool, optionally requests context at a supported decision boundary, writes one bounded host-compatible stdout object, writes diagnostics separately and exits without claiming more than achieved.
 
 Capture and context have separate timeout budgets. Capture may be staged while context times out. Context failure cannot erase committed/staged capture state. A failed/unknown direct connection is never retried with a new command ID; the relay publishes the same serialized command.
 
@@ -824,19 +911,19 @@ Commitment is an ordinary scoped memory item with owner/recipient, state, option
 
 Self-diagnosis identifies the failed connected edge—capture, Store/spool, source selection, controller admission/execution/readback/release, decoding, publication, retrieval, host delivery, use or method quality—and corrects that edge.
 
-## 12. Deletion, backup and restore
+## 12. Deletion, backup, restore and credential transitions
 
 ### 12.1 Withdrawal and erasure
 
 Withdrawal stops guidance, not physical deletion.
 
-For erasure, publish an exact text-free deletion notice through the same durable-file primitive, close affected mutation/replay admission, drain or reconcile any in-flight replay, cancel pending work, fence unresolved controller work and prevent late Store/Research/spool reintroduction. Page/remove controlled observations, memory/history, representations, packet/job blobs, staged commands, links and affected backups. Do not claim complete while any controlled copy or possible Store write remains unresolved.
+For erasure, publish an exact text-free deletion notice through the immutable primitive, close affected mutation/replay admission, drain or reconcile any in-flight replay, cancel pending work, fence unresolved controller work and prevent late Store/Research/spool reintroduction. Page/remove controlled observations, memory/history, representations, packet/job blobs, staged commands, links and affected backups. Do not claim complete while any controlled copy or possible Store write remains unresolved.
 
 ### 12.2 Application-owned backup cut
 
 SurrealDB logical export is not the application backup owner. Although the core exporter reads one database snapshot, the HTTP route can commit status before the export job ends and surface a later job failure only in server logs while the client sees an ordinary body EOF. Import is statement-by-statement and may leave partial state. The selected Store profile therefore keeps HTTP `export` and `import` disabled.
 
-Backup is a V3 operation over the six owned tables, immutable blobs, active deletion notices, retained failed quarantine and a finite pending-spool cut:
+Backup is daemon-owned and operates over the six tables, selected-root immutable blobs, active deletion notices, retained failed quarantine and a finite pending-spool cut:
 
 1. enter `backup_preparing`; close mutation admission, new replay admission, claims, cleanup and blob/deletion maintenance;
 2. finish or reconcile all admitted short Store mutations and drain the replay item already in flight; any unresolved possible write blocks successful backup;
@@ -844,10 +931,10 @@ Backup is a V3 operation over the six owned tables, immutable blobs, active dele
 4. release the publication mutex; keep replay paused and mutation admission closed; direct daemon capture receives `stage_required`, so new accepted commands stage after the cut rather than enter either inventory;
 5. page every table through checked-in read-only queries in stable canonical application-identity order with immutable cursor fences;
 6. encode each page as a versioned canonical application JSON Lines format: fixed DTO struct/field order, no unordered maps/sets, no Unicode/content normalization, finite numbers only, exact escaped UTF-8 bytes and a header carrying table/schema/page/cursor/count identity;
-7. hash the exact page bytes; copy and verify every referenced immutable blob, selected pending command, retained failed entry and active deletion notice;
+7. hash exact page bytes; copy and verify every referenced immutable blob, selected pending command, retained failed entry and active deletion notice;
 8. include a sanitized non-secret `config.toml` snapshot and digest for later comparison/rebinding, but never a secret or Credential Manager value;
-9. write a manifest containing backup-format version, supported schema generation, source installation/binary/storage identity, cut ID, table/page/row counts and digests, blob/spool/deletion/config inventories and explicit gaps;
-10. publish the complete backup through the same create-new/file-sync/no-replace/directory-sync/readback primitive;
+9. write a manifest containing backup-format version, source installation/selection generation, binary/storage/schema identity, cut ID, table/page/row counts and digests, blob/spool/deletion/config inventories and explicit gaps;
+10. publish the complete backup through the immutable primitive;
 11. record success, failure or post-publication unknown; only then reopen mutation admission and resume replay.
 
 Every table page is read while application mutation admission and replay are closed. Background SurrealDB metadata maintenance does not authorize changes to V3 application rows. The manifest—not EOF—owns completion. A failed backup leaves live data intact and no published successful manifest.
@@ -856,33 +943,97 @@ Credentials, root bootstrap material, controller/provider secrets and database-u
 
 The first implementation accepts only backup format/schema generations explicitly supported by the running build. Unsupported older/newer input is an exact refusal; do not invent a generic migration framework before a real compatible format exists.
 
-### 12.3 Typed restore and cutover
+### 12.3 Restore is exact rollback, not hidden merge
 
-Restore never imports a SurrealQL dump and never writes into the selected live root. The installation-scoped deletion ledger and live spool remain independent of the backup candidate until the cutover reconciliation below.
+The initial restore operation activates the exact application state of one selected backup cut, after applying newer monotonic deletion fences and external spool continuity. It does **not** claim to merge Store rows committed after that backup. Without a retained change log and conflict policy, such a merge cannot be proved.
 
-1. create a fresh candidate root under the same pinned SurrealDB version/engine and explicit `sync=every` profile;
-2. run the short root-bootstrap child, reconcile unknown bootstrap with the retained credential, stop after root persistence and restart without root environment material;
-3. verify owned listener/peer, authenticate root through the Basic handshake, create the configured namespace/`STRICT` database and database Owner/Editor with `PASSHASH`, prove both handshakes and restart again without root environment material;
-4. apply the ordered checked migrations and verify schema generation/definitions;
-5. verify backup-format/schema support, manifest and every table page/blob/spool/deletion/config digest before admitting content;
-6. read the current installation deletion ledger and union it with the backup notices. Current/newer notices are monotonic and dominate backup content; backup restore can add a fence but never remove or roll one back;
-7. restore only rows and immutable blobs not fenced by that union, through fixed Owner queries and explicit per-table DTOs, preserving application identities/revisions/links/job states without generic JSON `Value` conversion;
-8. stage verified backup pending/failed entries separately; discard every fenced command and retain each original disposition for cutover reconciliation;
-9. compare the sanitized configuration snapshot with current configuration and report/rebind differences explicitly; never overwrite current secrets, paths or profiles silently;
-10. verify counts/digests after declared fence exclusions, exact current/history/source reads, uniqueness/cardinality probes, deletion fences, job/controller identities and representative write/read/delete behavior;
-11. shut down and restart the candidate under the ordinary Editor profile, repeat full Store admission and exact verification;
-12. under the installation mutex and spool publication mutex, pause/drain the live replayer and merge staged backup spool entries with the current installation spool by command ID, exact bytes and disposition: preserve every current post-cut entry, reject same-ID/different-bytes conflict and never downgrade failed to pending;
-13. durably switch the selected data root, publish the union deletion ledger and merged spool inventories, then resume replay; keep the prior root until explicit retirement.
+Therefore:
 
-Any parse, DTO, schema, row, blob, spool, deletion, config, conflict, restart or verification failure discards the entire candidate. A retry starts with another empty candidate. A cutover-side publication with unknown outcome is reconciled from exact installation files before another attempt. Primary reads become available after successful cutover; optional embeddings/views/Research refresh later through ordinary jobs.
+- if the current Store is admitted, the daemon first creates and verifies a fresh safety backup of the current generation before accepting rollback cutover;
+- an owner may explicitly select disaster recovery without a fresh safety backup only when the current Store is unavailable/damaged, and status records that current committed data could not be inventoried;
+- the previous root is retained after cutover, so post-backup committed rows remain recoverable there or in the safety backup until explicit retirement;
+- only deletion notices and pending/failed spool entries are unioned/merged automatically, because they have monotonic fence or exact command/disposition semantics outside the backed-up Store cut;
+- completed Store rows, revisions, jobs and settings from the discarded timeline are not silently copied into the restored root;
+- once controller inference is enabled, unresolved external Operations not represented in the target backup block cutover until terminal/released, or require an explicit abandonment disposition; restore must not orphan a possible late result/controlled copy.
+
+Restore never imports a SurrealQL dump and never writes into the selected live root. The supervisor owns the candidate process, root/Owner credentials and installation replacement. The daemon owns user-facing validation, safety backup, current Store/spool/deletion facts and quiesce.
+
+#### Candidate preparation
+
+1. The daemon validates the requested retained backup ID, exact owner intent and safety-backup/disaster-recovery precondition, then sends `maintenance_request(restore, operation_id, backup_id, expected_selection_generation)`; no path or SQL crosses the channel.
+2. The supervisor resolves the backup beneath `backups/`, verifies its immutable identity and refuses a stale selection generation.
+3. It creates a fresh closed candidate root under `data/roots/` and starts at most one isolated candidate SurrealDB child on another owned dynamic loopback port.
+4. It runs the short root-bootstrap child, reconciles unknown bootstrap with the retained candidate credential, restarts without root environment material, creates namespace/`STRICT` DB and candidate Owner/Editor with `PASSHASH`, and applies checked migrations.
+5. It verifies backup-format/schema support, manifest and every table page/blob/spool/deletion/config digest before admitting content.
+6. It reads the current installation deletion ledger supplied through the closed cut facts and unions it with backup notices. Current/newer notices dominate backup content; a backup can add a fence but never remove or roll one back.
+7. It restores only rows/blobs not fenced by that union through fixed candidate Owner queries and explicit table DTOs.
+8. It stages verified backup pending/failed entries separately; every fenced command is discarded, and original pending/failed disposition is retained for cutover reconciliation.
+9. It compares the sanitized configuration snapshot with current configuration and reports/rebinds differences explicitly; it never overwrites current secrets, paths or profiles silently.
+10. It verifies counts/digests after declared fence exclusions, exact current/history/source reads, uniqueness/cardinality probes, deletion fences, job/controller identities and representative write/read/delete behavior.
+11. It restarts the candidate under its ordinary Editor profile and repeats full independent admission. Until cutover, the daemon cannot connect to or mutate the candidate.
+
+Any candidate parse, DTO, schema, row, blob, spool, deletion, config, conflict, restart or verification failure discards the entire candidate. A retry starts with another empty candidate.
+
+#### Cutover
+
+1. The supervisor sends `quiesce(operation_id, expected_selection_generation, candidate_root_id)`.
+2. The daemon closes mutation/new-replay/job admission; direct capture receives `stage_required`; it drains/reconciles the active replay and every admitted Store mutation, blocks on unresolved write outcome, freezes the current spool/deletion inventory and closes the active Store socket.
+3. The daemon sends `quiesced` with exact old root/selection generation, spool/deletion cut facts, unresolved external-operation disposition and safety-backup identity.
+4. The supervisor verifies the operation/cut facts, stops the old active SurrealDB child and merges staged backup spool entries with the current installation spool by command ID, exact bytes and disposition: preserve every current entry, reject same-ID/different-bytes and never downgrade failed to pending.
+5. It publishes the union deletion ledger and replaces `installation.toml` to select the candidate root and retain the old root as `previous_root_id` using §5.4. If replacement is `SELECTION_UNKNOWN`, it performs exact readback before any further action.
+6. When the selected new generation is proven, it treats the admitted candidate as the active Store and sends a fresh `store_descriptor` to the daemon.
+7. The daemon independently verifies process/listener/peer, resolves the selected Editor reference, repeats schema/typed-probe admission and sends `daemon_ready`.
+8. The supervisor sends `resume`; only then do mutation admission and replay reopen.
+
+If the daemon or inherited channel is lost before selection replacement, the supervisor abandons the candidate and leaves the old selection active. If loss occurs after a possible replacement, startup reads the actual selection and admits that root; it never assumes rollback or repeats the same generation blindly. The prior root remains until explicit retirement.
+
+Primary reads become available after successful cutover/admission; optional embeddings/views/Research refresh later through ordinary jobs. Status names the rollback source cut and previous-root/safety-backup divergence rather than claiming current-row merge.
+
+### 12.4 Credential rotation
+
+Store-user rotation is supervisor-owned and uses current/pending/previous Credential Manager references in `installation.toml`; the daemon never receives root/Owner material.
+
+For Editor rotation:
+
+1. the supervisor creates one pending credential secret and publishes a new selection generation naming `editor_pending` while retaining current/previous references;
+2. it uses an independently admitted Owner socket and a fixed `PASSHASH` statement to alter the Editor user;
+3. if the mutation outcome is unknown, it probes the pending credential first and the current credential second; it never generates another pending secret;
+4. once the pending credential authenticates, it replaces the selection so pending becomes current and old current becomes previous;
+5. it sends the new selection/Store descriptor to the daemon; the daemon opens a fresh peer-verified Editor socket and acknowledges admission;
+6. only after daemon admission plus restart readback may a later retirement operation delete the previous secret.
+
+If the old credential still works and the pending one does not, the mutation did not commit and may retry with the same pending secret under a finite budget. If neither or both violate the expected transition, rotation blocks with both references retained.
+
+Owner rotation follows the same pattern using root or the retained current Owner as the privileged actor; it does not require daemon reconnection. Root rotation is not part of first Base and cannot be improvised through startup credentials.
+
+### 12.5 Previous-root and credential retirement
+
+Retirement is a separate explicit control operation after a successful cutover/rotation has survived restart and exact readback. It never runs automatically at cutover. It rechecks that the root/credential is not current, pending, referenced by an unresolved operation or required by an unfinished cleanup/erasure obligation. Physical deletion uses bounded traversal and reports partial/unknown rather than changing the active selection to hide residue.
 
 ## 13. Control and observability
 
-Direct controls: status/inbox, inspect/open, pause/resume jobs, cancel queued work, configure projects/hosts/disclosure/profiles, correct/withdraw/erase, backup/restore or shutdown.
+Direct controls: status/inbox, inspect/open, pause/resume jobs, cancel queued work, configure projects/hosts/disclosure/profiles, correct/withdraw/erase, backup/restore, credential rotation, previous-generation retirement and shutdown.
 
-Status derives from real facts. Show Eliot/Surreal binary version/digest/signature and retained-launch disposition, daemon pipe generation/owner and bounded peer-rejection classes, canonical storage URL/engine/sync mode, per-start port and observed listener/peer owner, admitted launch/environment identity, bootstrap/reconciliation phase without secret material, Editor/Owner authenticated-handshake readiness, Store socket owner/poison/reconnect state, schema generation, Store readiness gap, graceful/forced last shutdown, capture committed/staged/unknown/rejected, internal stage-required count, spool pending/failed counts/age/publication-unknown/replay paused-or-in-flight, backup cut/disposition/format/manifest, restore candidate/deletion-union/spool-merge state, context prepared/emitted/gap, exact-open dispositions, job/profile/controller states, result/application and per-copy cleanup.
+The daemon owns the external control surface and exact operation IDs. It delegates only closed privileged effects to the inherited supervisor channel. A request/acknowledgement is never reported as completion; status is derived from actual facts.
 
-Do not equate adjacent lifecycle states. Origin/CORS is never displayed as Store authentication. Missing usage/cost/account is unknown. Notification failure does not block status/control.
+Status shows at least:
+
+- Eliot/Surreal binary version/digest/signature and retained-launch disposition;
+- supervisor/daemon generation, inherited-channel state and last correlated privileged operation;
+- installation-selection generation, current/previous/pending root and credential-reference states without secret material;
+- daemon named-pipe generation/owner and bounded peer-rejection classes;
+- canonical storage URL/engine/sync mode, per-start port and observed listener/peer owner;
+- bootstrap/migration/rotation/reconciliation phase;
+- Editor/Owner authenticated-handshake readiness and Store socket owner/poison/reconnect state;
+- schema generation and Store readiness gap;
+- graceful/forced last shutdown;
+- capture committed/staged/unknown/rejected and internal `stage_required` count;
+- spool pending/failed counts/age/publication-unknown/replay paused-or-in-flight;
+- backup cut/disposition/format/manifest and safety-backup identity;
+- restore candidate, exact rollback source, quiesce/cutover/selection-unknown state, deletion-union/spool-merge disposition and previous-root divergence;
+- context prepared/emitted/gap, exact-open dispositions, job/profile/controller states, result/application and per-copy cleanup.
+
+Do not equate adjacent lifecycle states. Origin/CORS is never displayed as Store authentication. A privileged request is not an effect; candidate verification is not cutover; selection replacement is not daemon admission; prior-root retention is not merged current data. Missing usage/cost/account is unknown. Notification failure does not block status/control.
 
 ## 14. Implementation sequence
 
@@ -890,31 +1041,33 @@ Write connected production code first. Run minimum relevant build/Clippy after e
 
 Before each slice: one integrator/edge; cheap preflight before setup; no overlap without disposition; measure merged behavior/blockers.
 
-### Slice 0 — dependency, wire and durability preflight
+### Slice 0 — dependency, authority, wire and durability preflight
 
 Before Base code:
 
-1. acquire/pin the exact Eliot and SurrealDB Windows binaries, sizes, SHA-256 digests, PE and observed signature dispositions;
-2. prove retained no-follow executable/ancestor leases, deny-write/delete sharing, streaming digest, suspended child image identity, Job assignment and resume; force executable swap, reparse, pre-existing writable handle and post-create mismatch;
-3. prove the selected SurrealDB binary starts and restarts the same canonical RocksDB root with explicit `sync=every`, `--no-defaults` and no SurrealKV fallback;
-4. prove the sanitized environment, dynamic numeric-loopback port, retained process handle, listener owner, established peer owner, disabled metrics/identification/slowlog/telemetry/Postgres/import and allowed/denied HTTP/query/function matrix;
-5. qualify relay→daemon named-pipe first-instance/DACL/remote rejection and mutual process attestation; force pipe squat, wrong SID/session/image, stale PID, missing daemon Job membership, oversize/partial frame, excess connection and timeout;
-6. prove CORS/Origin does not authorize WebSocket, anonymous upgrade cannot query, and connection-exhaustion behavior stays within the admitted local threat/resource profile;
-7. run the short root-bootstrap child, reconcile bind/startup unknown with the same retained root credential, restart without root environment material, authenticate root in a peer-verified Basic handshake, provision database Owner/Editor with `PASSHASH`, then restart and prove both database handshakes again;
-8. prove the RPC surface is query-only and the dedicated socket owner handles control frames/cancellation: deny RPC `signin`, `use`, `version`, `ping` and every other method; force timeout, caller cancellation, late/wrong response, close and reconnect so no poisoned socket is reused;
-9. run strict schema/index migration and full Store admission through the minimal client;
-10. freeze explicit JSON-safe DTOs and round-trip optional-state, ID/reference, integer-time, finite-vector and pagination boundaries without generic `Value` or `SELECT *`;
-11. exercise unique conflict, `FOR UPDATE`, whole-transaction retry, disconnect and applied-before-WAL-sync/shutdown unknown readback;
-12. exercise create-new temp, no-replace write-through rename, directory flush, post-rename sync failure reconciliation, delete/move directory flush and restart readback on the supported filesystem;
-13. prove `stage_required`, replay pause/drain and exact public `staged|unknown` mapping under backup/shutdown/erasure, including an in-flight replay whose Store outcome is unknown;
-14. complete one application-owned canonical backup cut and typed restore into a fresh candidate, including exact blobs/deletion notices/pending+failed spool, current-ledger late erasure, live post-cut spool merge, sanitized config comparison, forced page/blob mismatch, unsupported format, candidate discard, restart and cutover verification;
-15. exercise graceful shutdown with active maintenance/replay and forced Job Object containment, then prove consistent restart admission/readback.
+1. acquire/pin exact Eliot and SurrealDB Windows binaries, sizes, SHA-256 digests, PE and observed signature dispositions;
+2. prove retained no-follow executable/ancestor leases, deny-write/delete sharing, streaming digest, suspended child image identity, exact inherited handle list, Job assignment and resume; force executable swap, reparse, pre-existing writable handle, leaked unrelated handle and post-create mismatch;
+3. qualify the two inherited anonymous pipes: exact handle list/environment values, bounded frames/IDs, one privileged operation, EOF/crash behavior and no arbitrary path/SQL/secret payload;
+4. prove the selected SurrealDB binary starts and restarts the same canonical selected RocksDB root with explicit `sync=every`, `--no-defaults` and no SurrealKV fallback;
+5. prove sanitized environment, dynamic numeric-loopback port, retained process handle, listener owner, established peer owner, disabled metrics/identification/slowlog/telemetry/Postgres/import and allowed/denied HTTP/query/function matrix;
+6. qualify relay→daemon named-pipe first-instance/DACL/remote rejection and mutual process attestation; force pipe squat, wrong SID/session/image, stale PID, missing daemon Job membership, oversize/partial frame, excess connection and timeout;
+7. prove CORS/Origin does not authorize WebSocket, anonymous upgrade cannot query, and connection-exhaustion behavior stays within the admitted local threat/resource profile;
+8. run the short root-bootstrap child, reconcile bind/startup unknown with the same retained root credential, restart without root environment material, authenticate root in a peer-verified Basic handshake, provision database Owner/Editor with `PASSHASH`, then restart and prove both database handshakes again;
+9. run strict schema/index migration through supervisor Owner, then prove the query-only dedicated socket owner handles control frames/cancellation: deny RPC `signin`, `use`, `version`, `ping` and every other method; force timeout, caller cancellation, late/wrong response, close and reconnect so no poisoned socket is reused;
+10. complete full supervisor descriptor→daemon independent Store admission and relay exposure;
+11. freeze explicit JSON-safe DTOs and round-trip optional-state, ID/reference, integer-time, finite-vector and pagination boundaries without generic `Value` or `SELECT *`;
+12. exercise unique conflict, `FOR UPDATE`, whole-transaction retry, disconnect and applied-before-WAL-sync/shutdown unknown readback;
+13. exercise immutable create-new/no-replace publication and mutable installation replacement separately; force file/rename/parent-sync/readback failures and prove old/new/unknown generation reconciliation;
+14. prove `stage_required`, replay pause/drain and exact public `staged|unknown` mapping under backup/shutdown/erasure, including an in-flight replay whose Store outcome is unknown;
+15. complete canonical backup and exact-rollback restore into a fresh candidate, including safety backup/disaster mode, exact blobs/deletion notices/pending+failed spool, current-ledger late erasure, current post-cut spool merge, explicit non-merge of post-backup Store rows, unresolved controller-operation block, forced mismatches, unsupported format, candidate discard and previous-root retention;
+16. rotate Editor with one pending secret through unknown commit, pending/current probes, selection replacement, daemon reconnect, restart readback and delayed previous-secret retirement; qualify Owner rotation separately;
+17. exercise privileged channel loss before and after possible cutover, graceful shutdown with active maintenance/replay and forced Job Object containment, then prove consistent restart admission/readback.
 
-This preflight changes dependencies only when evidence requires it. It does not build a second storage framework or copy SurrealDB's CBOR protocol. The minimal Windows executable-lease, named-pipe peer and TCP-owner functions may be adapted from the exact V2 donors; the V2 platform/framework/session/lease machinery is not imported.
+This preflight changes dependencies only when evidence requires it. It does not build a second storage framework, public supervisor API or copied SurrealDB CBOR protocol. Minimal Windows executable-lease, explicit-handle-list, named-pipe peer and TCP-owner functions may be adapted from exact V2 donors; V2 platform/framework/session/lease machinery is not imported.
 
 ### Slice 1 — Store and local lifecycle
 
-Implement supervisor/daemon/owned SurrealDB, retained launch identity, mutually attested relay IPC, closed process profile, exact listener/peer and authenticated-handshake admission, one Store socket owner, schema/migrations, typed Store DTOs, `CaptureCommand`, immutable blob publication, exact read after restart, pending spool publication/replay with pause/drain, status/shutdown and revision/history.
+Implement supervisor/daemon/owned SurrealDB, retained launch identity, inherited privileged channel, mutually attested relay IPC, closed process profile, exact listener/peer and authenticated-handshake admission, supervisor-owned bootstrap/migrations/credentials, daemon-owned Editor socket, typed Store DTOs, `CaptureCommand`, immutable blob publication, exact read after restart, pending spool publication/replay with pause/drain, mutable installation selection, status/shutdown and revision/history.
 
 ```text
 real event → committed or staged → replay if staged → restart → exact open
@@ -922,7 +1075,7 @@ real event → committed or staged → replay if staged → restart → exact op
 
 ### Slice 2 — Useful Base and first host
 
-Connect Claude relay profile, continuation, exact/full-text retrieval, notes/corrections/commitments, actual SessionStart/UserPromptSubmit context emission, packet retention/handoff, source open and application-owned Base backup/restore/erase. Base runs with controller/model/vector/document/Research disabled.
+Connect Claude relay profile, continuation, exact/full-text retrieval, notes/corrections/commitments, actual SessionStart/UserPromptSubmit context emission, packet retention/handoff, source open and application-owned Base backup/exact-rollback restore/erase. Base runs with controller/model/vector/document/Research disabled.
 
 ### Slice 3 — Controller inference owner
 
@@ -930,7 +1083,7 @@ Implement Contract 0.4: role, connection/profile/digests, destination admission,
 
 ### Slice 4 — First learning
 
-Pin `swarm-client`; one controller adapter; one episode handler; exact request/result; verification; decode/publication; later context; correct cleanup. Exercise unknown/no-result/cancel/malformed/partial/cleanup/abandon/restart without duplicate inference.
+Pin `swarm-client`; one controller adapter; one episode handler; exact request/result; verification; decode/publication; later context; correct cleanup. Exercise unknown/no-result/cancel/malformed/partial/cleanup/abandon/restart without duplicate inference. Extend restore cutover to reject or explicitly abandon unresolved post-backup controller Operations before switching timelines.
 
 ### Slices 5–6 — independent increments and advanced improvement
 
@@ -938,6 +1091,6 @@ Add vectors, views, documents, Research and hosts only by real prerequisites, th
 
 ### Final verification
 
-After connected product, build the suite over production operations, concurrency, restart, process/pipe/peer ownership, Store conflict/unknown outcomes, authenticated handshake/socket cancellation, spool durability/replay quiesce, exact-open pagination, application backup/restore/deletion union, erasure and optional failure. Stub providers qualify local mapping only.
+After connected product, build the suite over production operations, concurrency, restart, executable/pipe/peer ownership, privileged channel and selection replacement, Store conflict/unknown outcomes, authenticated handshake/socket cancellation, spool durability/replay quiesce, exact-open pagination, canonical backup/exact rollback/deletion union/spool merge, credential rotation, erasure and optional failure. Stub providers qualify local mapping only.
 
 Measure actual latency, I/O, calls, retained bytes, dependencies and code size. Line count is diagnostic, not quota.
