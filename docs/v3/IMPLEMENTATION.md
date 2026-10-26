@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.28 · 2026-10-26 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.29 · 2026-10-26 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, data and connected operations. [Cognition](COGNITION.md) defines algorithms. [One-shot inference contract](INFERENCE-CONTRACT.md) is the sole normative Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) records checked evidence, decisions and open gaps.
 
@@ -62,18 +62,19 @@ Source bodies, spool files, databases and backups are plaintext application data
 - configured projects/workspaces and host binding rules;
 - capture exclusions, per-event bounds and retention;
 - enabled host adapters and their native executable/config paths;
-- controller IPC/data root and private inference-client credential path;
+- controller IPC/data root and private inference-client credential path/reference;
 - selected text/embedding profile names;
 - project/source disclosure defaults;
 - idle timeout and automatic-work mode;
 - optional document/Research tools;
 - explicitly allowed cross-project reuse scopes.
 
-It is not a generated policy database, route registry, module catalogue, runtime inventory or installation pointer.
+It is not a generated policy database, route registry, module catalogue, runtime inventory, logical-principal generator or installation pointer.
 
 `installation.toml` is a small supervisor/installer-owned selection record, not a second application state store. It contains only the information needed to select and admit the process family:
 
 - a monotonic installation-selection generation;
+- one stable non-secret Memory installation ID and expected `controller_client_id` that survive root cutover, rollback and inference-token rotation;
 - one current and at most one unretired previous closed root ID under `data/roots/`;
 - exact Eliot and SurrealDB executable paths, versions, sizes and SHA-256 digests;
 - exact canonical storage profile and explicit RocksDB durability mode;
@@ -84,13 +85,15 @@ It is not a generated policy database, route registry, module catalogue, runtime
 
 A second root cutover is refused while `previous_root_id` remains unretired. A second credential rotation for one role is refused while that role has a pending or unretired previous reference. This bounded backpressure prevents an older controlled root/secret from becoming unaddressable merely because another generation was selected.
 
-A daemon may read the non-secret selected root/profile/Editor reference needed to admit ordinary Store access. Only the supervisor resolves root/Owner references or replaces `installation.toml`.
+A daemon may read the non-secret selected root/profile/Editor reference and expected `controller_client_id` needed to admit ordinary Store and optional inference access. Only the supervisor resolves root/Owner references or replaces `installation.toml`. Neither daemon nor restore invents a new controller principal when the expected one is unavailable.
+
+Before any controller application request, `adapters::controller` authenticates with the configured private credential and requires a typed hello receipt whose `client_id`, role and protocol match the admitted installation identity and `inference_client` contract. A missing/mismatched receipt is `caller_identity_unavailable`; the connection closes before application I/O. Supplying a credential file is not itself authenticated-principal proof, and Operator/admin access is not a normal fallback.
 
 The first qualification target is SurrealDB **3.3.4**. The initial production storage candidate is the external server with RocksDB because SurrealDB 3.3 documents RocksDB as the recommended on-disk engine while SurrealKV remains beta. The supervisor derives one canonical Windows storage URL from the selected closed root ID and appends explicit `sync=every`; callers do not supply alternate URL spellings, root paths or query parameters.
 
 This is a qualification target, not a completed proof. Store readiness is unavailable until the exact Windows binary and profile pass launch/root-identity, startup, restart, conflict, acknowledged-commit durability, owned-listener/peer admission, typed Store transport, application backup/restore and durable-file/selection checks. Do not silently fall back to another server version, root or storage engine.
 
-Provider connections, provider credentials, adapter IDs and `actual_destination` declarations stay with `eliot-swarm-controller`. Memory stores only selected profile names and frozen non-secret execution identity returned by controller.
+Provider connections, provider credentials, adapter IDs and `actual_destination` declarations stay with `eliot-swarm-controller`. Memory stores only selected profile names, the stable non-secret controller caller identity, frozen non-secret execution identity returned by controller, and non-authoritative credential-reference generation/digest diagnostics. It never stores token bytes or a reusable token verifier.
 
 ### 1.3 Demand start, internal control, local IPC, Store admission and shutdown
 
@@ -286,7 +289,7 @@ Use one library package plus a thin executable selecting supervisor/daemon/relay
 | `vectors` | Vector-space identity, result mapping and vector candidate arm | Provider transport or second vector DB |
 | `jobs` | Due selection, claim/reclaim, finite handler dispatch, reconciliation and application | Semantic algorithms duplicated from handlers |
 | `adapters::host` | Native host decoding, `CaptureCommand`, mutually attested daemon IPC and context emission | Task ownership or semantic publication |
-| `adapters::controller` | Authenticated controller IPC, inference/readback/cancel/release | Memory job/publication/provider credentials |
+| `adapters::controller` | Authenticated controller IPC, typed hello verification, inference/readback/cancel/release | Memory job/publication/provider credentials or principal migration |
 | `adapters::source` | Document, structure and Research translation | Another memory service |
 | `spool` | Immutable pending publication, bounded replay, pause/drain and failed quarantine | Second canonical event store |
 | `platform::windows` | Named mutex, Job Object, executable/root leases, inherited-handle list, named-pipe peer admission, TCP owner observation, protected DACL validation, immutable publication and mutable selection replacement | V2 platform/policy/manifest framework |
@@ -400,7 +403,24 @@ Revision-aware source/target, relation kind, optional grounds group, locator and
 
 ### 4.6 `job`
 
-Finite background work: identity/project/purpose/target/state, active/pending slot, origin/cause, due/attempt/retry/waiting, frozen inputs and recipe revision, claim/limits/disclosure/profile, exact request/blob/digest, controller Operation/request/profile/adapter/connection/destination, result artifact/Memory blob, per-copy cleanup, decoded state and applied/coverage handles.
+Finite background work retains identity/project/purpose/target/state, active/pending slot, origin/cause, due/attempt/retry/waiting, frozen inputs and recipe revision, claim/limits/disclosure/profile, exact request blob/digest and application result.
+
+For controller-backed work it also retains this exact non-secret identity:
+
+```text
+controller_client_id
+client_request_id
+method + canonical bounded request identity
+controller_operation_id when known
+profile/adapter/connection/destination snapshot
+credential-reference generation/digest diagnostics
+result artifact ID/length/digest when known
+Memory result blob
+controller_reconciliation = not_required | reconcile_required | caller_identity_unavailable
+input/result cleanup state and release Operation/disposition
+```
+
+The credential diagnostic is over a non-secret reference/generation record, never token bytes or a reusable token verifier. It can explain which credential was presented; it does not own the Operation. Every job for one admitted installation must name its stable `controller_client_id`. A different ID is damage or blocked principal migration, not token rotation.
 
 Per-copy state:
 
@@ -498,7 +518,7 @@ Retain/validate parent no-follow; create same-directory temp `CREATE_NEW`; bound
 Supervisor-only under installation mutex:
 
 1. read/retain current and require expected generation;
-2. build complete `generation+1` record with current/previous roots and current/pending/previous credential refs;
+2. build complete `generation+1` record with stable installation/controller caller identity, current/previous roots and current/pending/previous Store credential refs;
 3. write/flush/close temp and retain expected digest;
 4. `MoveFileExW(temp, installation.toml, REPLACE_EXISTING | WRITE_THROUGH)`;
 5. parent flush;
@@ -523,11 +543,11 @@ One transaction locks current, rejects stale revision, copies history, writes ne
 
 ### 5.7 Job claim
 
-Only configured/enabled/eligible handlers. Waiting for idle/profile/disclosure/resume is not failure. One transaction fairly claims slot, freezes finite inputs + exact method, reduces disclosure and selects profile. Save exact request before controller I/O. Reclaim never rebuilds a different request for an admitted Operation.
+Only configured/enabled/eligible handlers. Waiting for idle/profile/disclosure/resume is not failure. One transaction fairly claims slot, freezes finite inputs + exact method, reduces disclosure and selects profile. For controller-backed work it loads the admitted installation's expected `controller_client_id`, builds the canonical request identity and saves all request/job fields before possible application I/O. Reclaim never rebuilds a different request for an admitted Operation.
 
 ### 5.8 External result/cleanup
 
-Poll/read outside Store. Verify result ranges, retain controller identity + Memory blob, decode retained bytes. Store conflict replays proposal, not inference. Release dispositions: `memory_copy_verified`, `terminal_without_result`, `abandon_for_erasure`. Input/result states independent; release never rolls back valid publication.
+Controller authentication/readback happens outside Store. The adapter verifies the typed hello receipt before every new physical connection. Caller mismatch sets `caller_identity_unavailable` and sends no application frame. Verify result ranges, retain controller identity + Memory blob, decode retained bytes. Store conflict replays proposal, not inference. Release dispositions: `memory_copy_verified`, `terminal_without_result`, `abandon_for_erasure`. Input/result states independent; release never rolls back valid publication. Local Operator erasure may delete by exact provenance without exposing result bytes or adopting caller ownership.
 
 ### 5.9 Exact `open`
 
@@ -588,9 +608,23 @@ No reconversion on read/newer substitution. Corrections/refutations/conditions/e
 
 One Memory client from [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md) over pinned `swarm-client`; no copied framing/MCP/CLI. Controller route is not Task/Attempt and does not own Memory semantics.
 
-Before I/O save stable request ID, profile, disclosure/origin, exact input blob/digest, limits/format and source/recipe revisions. Exact replay uses same identity. Possible-send failure unknown. Known Operation uses readback. Complete/usable partial requires artifact readback; malformed output is not no-change. Release semantics solely Contract 0.4.
+Before any application I/O, the adapter loads the admitted installation's expected stable `controller_client_id`, authenticates with the configured private credential and validates a closed typed hello receipt:
 
-Embeddings use same Operation/copy/read/release and one result/error per input key; exact revision/representation mapping, no zero/shifted vectors. Research separates search/run/status/artifact/report-section/cited-open and saves idempotency before submission.
+```text
+receipt.client_id == installation.controller_client_id == credential.client_id
+receipt.role == inference_client
+receipt.protocol_version supported
+```
+
+The inspected `swarm-client` donor currently discards this receipt, so typed exposure/verification is a required controller change. Mismatch closes the connection before an application frame and holds affected jobs `caller_identity_unavailable`; it does not create a new principal or use Operator/admin as ordinary recovery.
+
+Before first possible application send, atomically save stable caller ID, request ID, method/canonical bounded request identity, profile, disclosure/origin, exact input blob/digest, limits/format, source/recipe revisions and non-authoritative credential-reference generation/digest. Token bytes and reusable token hashes never enter Store.
+
+Exact replay is permitted only under the same authenticated caller. Known Operation uses `operation.get`/artifact/release readback. Possible send with unknown Operation ID replays the same method/request identity under the same caller; proven no-send may dispatch the retained request once. A new request ID or `client_id` is not recovery. Complete/usable partial requires exact-caller artifact readback; malformed output is not no-change. Release semantics are solely Contract 0.6.
+
+A same-`client_id` token rotation can preserve ownership only after old authenticated connections are closed/restarted, the new typed hello is validated and a pre-rotation Operation is read/released. Changing `client_id` is explicit principal migration outside initial Base.
+
+Embeddings use the same Operation/copy/read/release and one result/error per input key; exact revision/representation mapping, no zero/shifted vectors. Research separates search/run/status/artifact/report-section/cited-open and saves idempotency before submission.
 
 ## 10. Learning
 
@@ -629,11 +663,11 @@ Do not claim complete while any controlled copy or possible Store write remains 
 
 Surreal logical export is not owner: HTTP can hide terminal job failure and import is partial. Backup is daemon-owned over six tables, selected-root blobs, active deletion notices, retained failed quarantine and finite pending spool.
 
-Steps: close mutation/replay/claims/cleanup; reconcile writes and active replay; hold cross-process spool publication lock and cut exact pending+failed inventory; keep new direct capture `stage_required`; page tables through fixed stable DTO queries; encode versioned canonical JSONL with fixed field order/no unordered maps/no normalization/finite numbers/header identity; exact-byte hashes; copy blobs/spool/deletions; include sanitized config; manifest format/schema/selection/binary/storage/cut/count/digest/inventory/gaps; immutable publish; reopen only after success/failure/unknown recorded.
+Steps: close mutation/replay/claims/cleanup; reconcile writes and active replay; hold cross-process spool publication lock and cut exact pending+failed inventory; keep new direct capture `stage_required`; page tables through fixed stable DTO queries; encode versioned canonical JSONL with fixed field order/no unordered maps/no normalization/finite numbers/header identity; exact-byte hashes; copy blobs/spool/deletions; include sanitized config; manifest format/schema/selection/binary/storage/cut/count/digest/inventory/gaps plus stable Memory installation ID and `controller_client_id`; immutable publish; reopen only after success/failure/unknown recorded.
 
 Manifest carries the strictest disclosure of included content. The automatic backup remains under the protected local installation root and is never sent to external storage by Base.
 
-Credentials/verifiers/secrets excluded. Unfinished external jobs retain exact identity/state. Failed quarantine restores as failed. Only explicitly supported backup/schema generations accepted.
+Credentials/verifiers/token bytes are excluded. Unfinished external jobs retain exact stable caller/request/method/Operation/artifact/release identity, per-copy cleanup and non-secret credential-reference diagnostics. Failed quarantine restores as failed. Only explicitly supported backup/schema generations accepted.
 
 ### 12.3 Restore is exact rollback, not hidden merge
 
@@ -644,24 +678,28 @@ Initial restore activates exact application state of one backup cut after newer 
 - previous root remains retained, so later rows remain recoverable until retirement;
 - only deletion notices and pending/failed spool auto-union/merge;
 - post-backup Store rows/revisions/jobs/settings are not copied silently;
-- restored jobs with known controller Operation IDs are held `reconcile_required`: use exact operation/artifact/release readback, never redispatch with a new request ID;
-- pending jobs without admitted Operation may resume from their retained exact request only after new Store admission;
+- every restored controller job must name the manifest/installation `controller_client_id`; a different retained ID is damaged/unsupported, not migration;
+- restored jobs with known controller Operation IDs are held `reconcile_required`: use exact operation/artifact/release readback under the same authenticated caller, never redispatch;
+- possible-send jobs without a known Operation ID replay only the retained method/canonical request identity under the same caller; pending jobs proven unsent may issue that retained request once after new Store admission;
+- a credential/hello mismatch becomes `caller_identity_unavailable`: no read/cancel/release or redispatch claim, and controller-copy cleanup/erasure remains incomplete;
 - current unresolved external Operations outside target backup block cutover until terminal/released or explicitly abandoned;
 - restore is refused while another unretired `previous_root_id` exists. The owner must retire it or first convert it into a controlled typed backup and delete the root.
 
 A previous root is a recovery source, never a directly reselectable active root. Returning to it always uses the typed restore pipeline into a fresh candidate so current deletion fences/config/credentials are applied.
 
+A caller-identity failure does not corrupt unrelated Base records or authorize another provider call. The selected Store may serve Base while inference admission stays closed; status exposes affected job/Operation IDs and exact cleanup debt. Recovery requires a credential for the same registered principal or an explicit non-disclosing local-Operator abandonment/erasure action. Operator access never transfers ownership or creates cognitive result bytes.
+
 #### Candidate preparation
 
-Daemon validates retained backup ID, owner intent and safety/disaster precondition, then sends closed restore request with expected selection generation. Supervisor resolves beneath backups root, refuses stale generation/retained previous root, creates fresh candidate root and one isolated candidate child, runs short bootstrap, creates candidate Owner/Editor with current secrets, migrates, verifies all manifest/page/blob/spool/deletion/config digests, unions current deletion ledger, restores unfenced rows/blobs through fixed Owner DTOs, stages pending/failed separately, compares config explicitly, verifies counts/reads/constraints/jobs and restarts/admitted candidate under Editor. Daemon cannot mutate candidate before cutover. Any failure discards whole candidate.
+Daemon validates retained backup ID, owner intent and safety/disaster precondition, then sends closed restore request with expected selection generation. Supervisor resolves beneath backups root, refuses stale generation/retained previous root, creates fresh candidate root and one isolated candidate child, runs short bootstrap, creates candidate Owner/Editor with current secrets, migrates, verifies all manifest/page/blob/spool/deletion/config digests, unions current deletion ledger, restores unfenced rows/blobs through fixed Owner DTOs, stages pending/failed separately, compares config explicitly, verifies counts/reads/constraints/jobs and requires all backed-up inference jobs to match the manifest's stable caller identity. It restarts/admitted candidate under Editor. Daemon cannot mutate candidate before cutover. Any failure discards whole candidate.
 
 #### Cutover
 
-Supervisor sends quiesce. Daemon closes mutation/replay/jobs, returns `stage_required`, drains/reconciles writes/replay, freezes spool/deletion facts and closes active Store socket. Supervisor verifies cut facts, stops old Store, merges staged backup spool with current exact command/disposition, publishes deletion union and replaces selection current=candidate/previous=old. `SELECTION_UNKNOWN` resolves by readback. It sends new descriptor; daemon independently admits root/process/listener/peer/Editor/schema/typed probe; only then resume.
+Supervisor sends quiesce. Daemon closes mutation/replay/jobs, returns `stage_required`, drains/reconciles writes/replay, freezes spool/deletion facts and closes active Store socket. Supervisor verifies cut facts, stops old Store, merges staged backup spool with current exact command/disposition, publishes deletion union and replaces selection current=candidate/previous=old. `SELECTION_UNKNOWN` resolves by readback. It sends new descriptor; daemon independently admits root/process/listener/peer/Editor/schema/typed probe; only then Base resumes. Controller-backed jobs resume only after their typed hello caller/role/protocol check; otherwise they remain held without blocking unrelated Base reads/capture.
 
 Loss before selection replacement abandons candidate. Loss after possible replacement reconciles actual selection on startup. Previous root remains until explicit retirement. Status names rollback source and divergence, never current-row merge.
 
-### 12.4 Credential rotation and session revocation
+### 12.4 Store credential rotation and session revocation
 
 At most one pending/previous reference per role; another rotation is refused until resolved/retired.
 
@@ -679,6 +717,8 @@ Editor rotation must revoke the already authenticated daemon session:
 If current still works and pending does not, retry same pending under finite budget. If neither/both violate expected transition, block with both refs retained.
 
 Owner rotation follows the same pending/probe/selection/restart pattern using root or current Owner. Root rotation is outside first Base. Store restart is part of rotation completion because changing the stored password alone does not prove revocation of already authenticated WebSocket sessions.
+
+Inference-client token rotation is a separate controller integration governed by Contract 0.6. It keeps the same `controller_client_id`, stops new inference admission, retains one pending/current credential reference, classifies unknown token update with the same pending secret, closes every old authenticated controller connection or restarts the host, validates the new typed hello receipt and proves read/release of a pre-rotation Operation before old-secret retirement. Changing `client_id` is principal migration, not rotation; initial Base has no implicit ownership-transfer path.
 
 ### 12.5 Previous-generation retirement
 
@@ -713,9 +753,10 @@ Daemon owns external surface/operation IDs; delegates only closed privileged eff
 - backup disclosure/cut/manifest/safety generation;
 - restore rollback source, non-merge divergence, restored-job reconciliation, candidate/quiesce/cutover/selection unknown/deletion+spool merge;
 - previous-root/backup controlled-copy erasure debt;
-- context/open/jobs/controller/per-copy cleanup.
+- expected/authenticated controller client ID, hello role/protocol, credential-reference generation, `caller_identity_unavailable` jobs, exact Operation/artifact/release identity and per-copy cleanup debt;
+- context/open/jobs and cognitive publication state.
 
-Do not equate request with effect, candidate with cutover, selection replacement with daemon admission, deletion fence with physical erase, password update with session revocation, previous-root retention with merged data, or local digest with confidentiality. Unknown usage/cost/account remains unknown.
+Do not equate request with effect, candidate with cutover, selection replacement with daemon admission, deletion fence with physical erase, password/token update with live-session revocation, credential-file contents with authenticated principal, Operator erasure with result-byte access, previous-root retention with merged data, or local digest with confidentiality. Unknown usage/cost/account remains unknown.
 
 ## 14. Implementation sequence
 
@@ -759,11 +800,11 @@ Claude relay, continuation, exact/full-text retrieval, notes/corrections/commitm
 
 ### Slice 3 — Controller inference owner
 
-Contract 0.4 role/connection/profile/destination/method/artifact/dedup/cancel/unknown/runner/readback/per-copy cleanup/release/erasure fence; no Task/Attempt/ScriptRun/new table.
+Contract 0.6 stable caller registration, typed hello receipt, role/connection/profile/destination/method/artifact/dedup/cancel/unknown/runner/readback, exact-caller result bytes, non-disclosing Operator erasure, per-copy cleanup/release and same-client token rotation/revocation; no Task/Attempt/ScriptRun/new table.
 
 ### Slice 4 — First learning
 
-Pinned `swarm-client`, one controller adapter, one episode handler, exact request/result, decode/publication/later context/cleanup. Extend restore to reconcile target jobs and block/abandon out-of-target unresolved Operations without duplicate inference.
+Pinned verified `swarm-client`, one controller adapter, one episode handler, exact request/result, decode/publication/later context/cleanup. Restore reconciles target jobs only under the retained caller, holds `caller_identity_unavailable`, and blocks/abandons out-of-target unresolved Operations without duplicate inference.
 
 ### Slices 5–6
 
@@ -771,6 +812,6 @@ Add vectors/views/documents/Research/hosts only by real prerequisites, then adva
 
 ### Final verification
 
-After connected product: concurrency/restart, executable/root/pipe/peer ownership, privileged channel/selection, Store conflicts/unknowns, socket cancellation, spool durability/quiesce, exact-open pagination, protected backup/exact rollback/deletion union/spool merge/restored jobs, credential revocation, physical erasure and optional failures. Stub providers qualify local mapping only.
+After connected product: concurrency/restart, executable/root/pipe/peer ownership, privileged channel/selection, Store conflicts/unknowns, socket cancellation, spool durability/quiesce, exact-open pagination, protected backup/exact rollback/deletion union/spool merge/restored jobs, Store credential revocation, stable controller caller across token rotation and Memory restore, hello mismatch refusal, exact-caller result-byte isolation, physical erasure and optional failures. Stub providers qualify local mapping only.
 
 Measure latency, I/O, calls, retained bytes, dependencies and code size. LOC is diagnostic, not quota.
