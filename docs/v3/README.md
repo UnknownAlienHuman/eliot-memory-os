@@ -33,23 +33,25 @@ V3 does not assume that naming an SDK or database makes persistence correct. The
 - exact SurrealDB server path/version/size/digest and storage engine are installation-owned inputs;
 - the first qualification target is SurrealDB 3.3.4 with external RocksDB and explicit `sync=every`; no silent fallback to SurrealKV, another version or another URL spelling;
 - the supervisor launches one numeric-IPv4 loopback child with a sanitized environment, closed Origin, metrics/identification/slowlog/telemetry/Postgres/import disabled and no inherited arbitrary `SURREAL_*` settings;
+- root credentials exist in a child environment only for the short first bootstrap: after root persistence the child is stopped and the same store restarts without root environment material before namespace/database/user provisioning;
 - the live HTTP surface is RPC only; selected RPC methods are `signin`, `use`, `version`, `query` and `ping`, while arbitrary query is admitted only for authenticated `system` principals;
 - Memory uses a small bounded JSON WebSocket client, not the current Rust SDK or V2 adapter;
 - JSON carries only explicit application DTOs: no generic Surreal `Value`, `SELECT *` persistence format or implicit `NONE`/`NULL`, record-ID, UUID, datetime, duration, decimal or non-finite-float round-trip;
 - only fixed application queries with bound JSON-safe variables, explicit projections and exact decoders are exposed;
 - the database is `STRICT`, the six application tables are `SCHEMAFULL`, and schema generation/definitions are verified before mutation;
-- database-scoped Editor owns ordinary runtime access; database-scoped Owner owns migrations, user rotation and typed restore; root exists only for first bootstrap;
+- database-scoped Editor owns ordinary runtime access; database-scoped Owner owns migrations, user rotation and typed restore; root is not a normal daemon/migration credential;
 - database users are provisioned from current Credential Manager secrets through locally derived Argon2 `PASSHASH`, never plaintext `PASSWORD` in SurrealQL/argv/logs;
 - composite unique indexes own occurrence/idempotency/cardinality where possible;
 - snapshot-isolation conflicts retry the whole immutable transaction only after exact classification/readback;
 - transport, shutdown or grouped-WAL-sync failure after possible application is `OUTCOME_UNKNOWN`, not rollback;
-- V3 owns backup/restore as typed pages over six tables plus exact blobs, deletion notices and a finite pending-spool cut; Surreal logical export/import and live-engine copying are not the application contract.
+- shutdown/backup quiesce returns private `stage_required` before Store ownership, so relays publish the exact command to spool; public `rejected` is never overloaded as temporary deferral;
+- V3 owns backup/restore as canonical typed pages over six tables plus exact blobs, deletion notices, pending and retained failed spool and a sanitized configuration snapshot; Surreal logical export/import and live-engine copying are not the application contract.
 
 The official Rust SDK may be reconsidered later, but the current 3.3.4 dependency requires Rust 1.95 while this repository declares MSRV 1.94, and its published license metadata does not fit the current `cargo-deny` allowlist without an explicit preflight. A dependency is not admitted because its API looks convenient. V3 also does not copy SurrealDB's vendor-specific CBOR tag protocol into another client.
 
 Store admission requires the exact owned process/listener and binary identity, upstream `/ready`, Editor `signin/use`, exact version, the closed route/method/subject/function denial matrix, schema/definition checks and one bounded typed write/read/delete through the production client. Port, `/health`, `/status`, `/ready` or clean child exit alone proves none of that.
 
-Normal shutdown first stages new capture, drains finite admitted work, closes daemon Store sockets and requests the qualified graceful SurrealDB path. Job Object termination is deadline/crash containment only. SurrealDB bounds maintenance drain and can continue after logging cleanup failures, so restart always repeats full admission and application readback.
+Normal shutdown first closes mutation admission, returns `stage_required` for new direct capture, drains finite admitted work, closes daemon Store sockets and requests the qualified graceful SurrealDB path. Job Object termination is deadline/crash containment only. SurrealDB bounds maintenance drain and can continue after logging cleanup failures, so restart always repeats full admission and application readback.
 
 The first Windows durability profile is a local fixed NTFS/ReFS volume. Immutable blob/spool/deletion/backup publication uses:
 
@@ -63,7 +65,9 @@ create-new same-directory temporary file
 
 `MOVEFILE_REPLACE_EXISTING` is forbidden for immutable publication. Rename success followed by failed parent sync/readback is post-commit unknown, not `staged`; reconciliation must verify the final file and complete directory sync. The same rule applies when replay deletes/moves a pending entry or when backup/cutover files are published.
 
-These mechanisms remain unimplemented until Slice 0 proves the exact Windows binary/profile, `sync=every`, credential split, typed wire DTOs, transaction/unknown behavior, graceful/forced shutdown, durable publication and application-owned backup/typed restore round-trip.
+Backup pages use a versioned canonical application JSON Lines encoding with fixed DTO field order, stable application-identity ordering, no unordered maps/sets and digests over exact bytes. The manifest owns completion. Unsupported backup/schema generations are refused explicitly rather than fed into a speculative generic migration system.
+
+These mechanisms remain unimplemented until Slice 0 proves the exact Windows binary/profile, `sync=every`, short root bootstrap, credential split, typed wire DTOs, transaction/unknown behavior, `stage_required`, graceful/forced shutdown, durable publication and canonical application backup/typed restore round-trip.
 
 ## First Base host and durable capture
 
@@ -106,21 +110,21 @@ build exact CaptureCommand once
 → call daemon `capture`
 → committed only after Store identity/digest readback
 
-lost/unavailable daemon result
+stage_required / lost / unavailable / uncertain direct result
 → atomically publish the same command to `spool/pending`
 → staged only after durable file publication
 → daemon replays the same `capture` operation
 → delete pending file only after Store readback
 ```
 
-The daemon is the sole replayer. Corrupt or permanently rejected entries move to `spool/failed` with a bounded non-content reason; they do not loop forever. Successful replay removes the pending body instead of maintaining a second `committed` content archive.
+`stage_required` is internal direct-delivery control, not a fifth public capture result. It is returned before Store/blob ownership when mutation admission is closed. The daemon is the sole replayer. Corrupt or permanently rejected entries move to `spool/failed` with a bounded non-content reason; they do not loop forever. Successful replay removes the pending body instead of maintaining a second `committed` content archive.
 
 The public capture outcomes mean exactly:
 
 - `committed` — the Store owns the observation and exact readback matched;
 - `staged` — the exact command is durably present in the pending spool;
 - `unknown` — neither Store commit nor durable spool publication can be established;
-- `rejected` — deterministic validation, exclusion or bound failure before ownership transfer.
+- `rejected` — deterministic validation, exclusion or bound failure before ownership transfer; temporary quiesce is not rejection.
 
 ### Context is content, not a service-status phrase
 
@@ -280,7 +284,7 @@ Base implements capture, explicit updates and reuse. The first learning extensio
 
 [Implementation §14](IMPLEMENTATION.md#14-implementation-sequence) defines connected slices:
 
-0. Exact SurrealDB/Windows preflight: binary/profile/`sync=every`, closed environment and capability surface, root→Owner/Editor `PASSHASH` bootstrap, typed JSON DTOs, transaction/WAL unknowns, graceful/forced shutdown, immutable publication and application-owned backup/typed restore.
+0. Exact SurrealDB/Windows preflight: binary/profile/`sync=every`, closed environment and capability surface, short root bootstrap followed by root-free Owner/Editor `PASSHASH` provisioning, typed JSON DTOs, transaction/WAL unknowns, `stage_required`, graceful/forced shutdown, immutable publication and canonical application backup/typed restore including pending+failed spool and config comparison.
 1. Store/lifecycle and exact persistence.
 2. Useful Base with one host, retrieval/context/source open and maintenance.
 3. Controller one-shot inference owner: connection/profile admission, direct IPC, controlled input/optional result, exact readback and per-copy `inference.release` without Task/Attempt.
