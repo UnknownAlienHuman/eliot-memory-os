@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.22 · 2026-10-25 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.23 · 2026-10-25 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, data and connected operations. [Cognition](COGNITION.md) defines algorithms. [One-shot inference contract](INFERENCE-CONTRACT.md) is the sole normative Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) records checked evidence, decisions and open gaps.
 
@@ -65,13 +65,17 @@ It is not a generated policy database, route registry, module catalogue or inven
 
 `installation.toml` is a small installer-owned input, not a second state store. It pins:
 
-- exact SurrealDB executable path, version and SHA-256;
-- exact storage URL/engine and durability parameters;
+- exact SurrealDB executable path, version, size and SHA-256;
+- exact canonical storage URL and storage engine;
+- the explicit RocksDB durability mode;
 - namespace/database names;
-- loopback endpoint policy;
-- schema generation expected by this Eliot build.
+- loopback endpoint and closed launch profile;
+- schema generation expected by this Eliot build;
+- the non-secret launch/environment identity last admitted by the supervisor.
 
-The first qualification target is SurrealDB **3.3.4**. The initial production storage candidate is the external server with RocksDB because SurrealDB 3.3 documents RocksDB as the recommended on-disk engine while SurrealKV remains beta. This is a qualification target, not a completed proof: Store readiness is unavailable until the exact Windows binary/engine passes restart, conflict, export/import and power-loss-oriented publication checks. Do not silently fall back to another server version or storage engine.
+The first qualification target is SurrealDB **3.3.4**. The initial production storage candidate is the external server with RocksDB because SurrealDB 3.3 documents RocksDB as the recommended on-disk engine while SurrealKV remains beta. The installer generates one canonical Windows storage URL bound to the retained data root and appends explicit `sync=every`; callers do not supply alternate URL spellings or query parameters.
+
+This is a qualification target, not a completed proof. Store readiness is unavailable until the exact Windows binary and profile pass startup, restart, conflict, acknowledged-commit durability, typed Store transport, application backup/restore and durable-file publication checks. Do not silently fall back to another server version or storage engine.
 
 Provider connections, provider credentials, adapter IDs and `actual_destination` declarations stay with `eliot-swarm-controller`. Memory stores only selected profile names and frozen non-secret execution identity returned by controller.
 
@@ -81,32 +85,63 @@ The supervisor holds a named mutex for the stable installation root throughout s
 
 Create SurrealDB and daemon children suspended, assign them to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resume them. If assignment fails, terminate the still-suspended child. Do not kill unrelated processes by name or port.
 
+The supervisor creates a minimal child environment block rather than inheriting the caller environment. Preserve only required Windows process variables and explicitly selected SurrealDB settings. Arbitrary `SURREAL_*`, `RUST_LOG`, slow-query, import, Postgres, metrics and OpenTelemetry settings from the parent are not inherited.
+
+The first closed qualification profile is equivalent to:
+
+```text
+surreal start <installer-owned-rocksdb-url>?sync=every
+--bind 127.0.0.1:<owned-port>
+--deny-all
+--allow-arbitrary-query system
+--deny-arbitrary-query guest,record
+--allow-http rpc
+--allow-rpc signin,use,version,query,ping
+--no-defaults
+--no-identification-headers
+--client-ip none
+--allow-origin <installer-owned-reserved-origin>
+```
+
+The environment explicitly disables metrics and leaves slow-query logging, import, Postgres and telemetry unconfigured. `/ready`, `/health` and `/status` are loopback lifecycle probes supplied by the server; they are not substitutes for Store admission and are never exposed outside the owned listener. HTTP `signin`, `export` and `import` routes are not selected. The only statement surface is authenticated RPC `query` behind the private fixed-query Store client.
+
+Windows Credential Manager is the only secret authority. On an empty store, the supervisor supplies a one-use root bootstrap credential only to the SurrealDB child environment, signs in through RPC and creates the configured namespace, `STRICT` database and two database-scoped users:
+
+- **Editor** — ordinary daemon Store reads and mutations;
+- **Owner** — migrations, DB-user rotation and typed restore writes.
+
+The installer derives a standard Argon2 PHC verifier locally and provisions users with fixed `PASSHASH` statements; plaintext database-user passwords are not placed in SurrealQL, argv or logs. Slow-query logging remains disabled because `PASSWORD`, `PASSHASH` and `PASSSCRAM` are literal-bearing DDL. SCRAM material is not created while Postgres/SCRAM transports are disabled. After both users can sign in, restart without the root bootstrap environment and prove Editor/Owner access again.
+
 Store readiness requires all of these observations:
 
-1. the exact configured SurrealDB executable digest matches;
-2. the owned child starts and keeps its retained process handle;
-3. it binds only the configured loopback endpoint;
-4. authenticated RPC `version` matches the pinned exact version;
-5. namespace/database selection succeeds;
-6. schema generation and `INFO FOR DB/TABLE` checks match §5.2;
-7. one bounded write/read/delete probe succeeds through the same Store client used by production.
+1. the exact configured SurrealDB executable path, size and digest match retained installation identity;
+2. the owned child starts, retains its process handle and owns the expected loopback listener;
+3. `/ready` succeeds for that process after upstream startup/heartbeat gates;
+4. database-scoped Editor RPC `signin`, `use` and `version` succeed and the version matches exactly;
+5. namespace/database selection and the closed route/method/subject/function denial matrix match the installed profile;
+6. schema generation and `INFO FOR DB/TABLE` checks match §5.1;
+7. one bounded typed write/read/delete probe succeeds through the same Store client used by production.
 
-A listening port or process heartbeat alone is not Store readiness. A version/schema mismatch stops Store mutation before host relays can claim capture ownership.
-
-Restarting a failed daemon does not restart a healthy database. If the supervisor dies, owned children terminate with the Job Object; the next demand start opens existing data and repeats Store admission.
+A listening port, process heartbeat, `/health`, `/status`, `/ready` or successful version call alone is not Store readiness. A binary, profile, credential, schema or typed-probe mismatch stops Store mutation before host relays can claim capture ownership.
 
 After Store is ready, the daemon begins bounded fair replay of `spool/pending`. Replay does not block primary exact reads or new capture indefinitely. It pages entries in stable order, processes a finite batch, then yields to foreground work. Corrupt or permanently rejected entries move to `spool/failed`; transient Store failure leaves them pending. A replayed command uses the same application `capture` operation and command ID as direct delivery.
 
-Before normal idle shutdown:
+Normal idle or explicit shutdown is not Job Object termination. It proceeds as follows:
 
-1. stop new external dispatch;
+1. stop new external dispatch and make new capture fall back to durable staging;
 2. stop claiming new background work;
 3. allow one finite drain interval for already eligible work and a bounded spool batch;
-4. persist collected results and progress;
-5. stop daemon and database;
-6. wait for exit and release the mutex.
+4. persist collected results/progress and close daemon Store sockets;
+5. request the qualified graceful SurrealDB shutdown path;
+6. wait through a finite supervisor deadline and record the actual child exit;
+7. if the child does not exit, terminate the owned Job Object as crash containment;
+8. release the installation mutex only after process ownership is settled.
 
-Pending spool data, a completed background job or an internal poll cannot renew the interval indefinitely. Explicit shutdown does not start a final Dreamer cycle. Unknown controller/provider outcomes remain reconcilable after restart; shutdown does not authorize another request ID.
+SurrealDB itself bounds its maintenance drain and may continue shutdown after logging cleanup failures. A clean exit is therefore not an application durability receipt. The next start always repeats Store admission and exact application readback. A mutation error delivered after RocksDB applied the transaction but before grouped WAL sync completed is `OUTCOME_UNKNOWN`; it is reconciled by application identity before retry.
+
+If the supervisor dies, the Job Object terminates owned children. The next demand start treats this as crash recovery, opens the retained root and repeats full admission. Restarting a failed daemon does not restart a healthy database.
+
+Pending spool data, a completed background job or an internal poll cannot renew the idle interval indefinitely. Explicit shutdown does not start a final Dreamer cycle. Unknown controller/provider outcomes remain reconcilable after restart; shutdown does not authorize another request ID.
 
 Primary capture and exact/lexical reads become available as soon as Store is admitted. They do not wait for controller inference, embeddings, project orientation, graph refresh or complete spool drain.
 
@@ -119,7 +154,7 @@ Use one library package plus a thin executable selecting supervisor/daemon/relay
 | Module | Owns | Does not own |
 |---|---|---|
 | `model` | Small values crossing real internal boundaries | Vendor SDKs, runtime, universal contract catalogue |
-| `store` | Bounded SurrealDB RPC client, schema/migrations, fixed queries, transactions, exact reads and blob references | Arbitrary SurrealQL surface, interpretation, host protocol, model selection |
+| `store` | Bounded SurrealDB RPC client, schema/migrations, fixed queries, typed DTOs, transactions, exact reads and blob references | Arbitrary SurrealQL or generic Surreal value surface, interpretation, host protocol, model selection |
 | `memory` | Semantic item operations, revisions, history, grounds and source links | Raw host/provider I/O |
 | `context` | Continuation reconstruction, candidate selection, applicability, relation expansion and packing | Second Store or model scheduler |
 | `learning` | Purpose-specific input selection, request builders, disclosure reduction, decoders, reducers and publication proposals | Job claims, provider retries or credentials |
@@ -400,7 +435,7 @@ There is no `committed` spool archive. Canonical committed content is in Store/b
 
 ## 5. Store, schema and durable local publication
 
-### 5.0 Bounded SurrealDB transport
+### 5.0 Bounded SurrealDB transport and wire types
 
 The Store uses one small internal remote-only JSON WebSocket RPC client over the supervisor-owned loopback SurrealDB child. It reuses ordinary dependencies such as `tokio-tungstenite` and `serde_json`; it does not link the database engine and does not import the V2 Store adapter.
 
@@ -414,22 +449,36 @@ query
 ping
 ```
 
-The socket sends `Sec-WebSocket-Protocol: json`, has finite frame/message/request deadlines and initially permits one in-flight request per socket. Every request has an exact response ID. The client accepts only the owned loopback endpoint and closed authentication/configuration; no arbitrary external endpoint, live query, generic CRUD builder or caller-supplied SurrealQL is exposed.
+The socket sends `Sec-WebSocket-Protocol: json`, has finite frame/message/request deadlines and initially permits one in-flight request per socket. Every request has an exact response ID. The client accepts only the retained owned endpoint and closed authentication/configuration. No arbitrary external endpoint, HTTP SQL, live query, generic CRUD builder or caller-supplied SurrealQL is exposed.
 
-Application queries are checked-in `.surql` assets or compile-time fixed strings with JSON variables. Dynamic identifiers are selected from closed enums and rendered by Store code, never supplied as raw user/agent text.
+JSON is only the envelope for **closed application DTOs**. It is not a generic SurrealDB value codec: the upstream JSON mapping collapses `NONE` and `NULL`, stringifies native record IDs, UUID, datetime, duration and decimal, and maps non-finite floats to null. Therefore:
 
-A transport failure after a mutation may have been sent is `OUTCOME_UNKNOWN`. Reconnect does not replay the mutation blindly. The application reads by its unique operation/command/item identity first; only a proven non-commit or a bounded retryable transaction conflict permits the exact transaction to run again.
+- every fixed query has an explicit projection and one exact decoder;
+- wire scalars are bounded strings, signed integers, booleans and finite floats;
+- application IDs and references use canonical strings under closed table/kind enums;
+- time uses an integer epoch plus explicit precision/uncertainty fields;
+- optional values have explicit presence/state fields when `NONE` and `NULL` differ;
+- vectors reject NaN/Infinity and verify exact dimension/order;
+- large or exact bytes remain immutable blobs and cross the Store only by reference/digest;
+- no operation decodes generic Surreal `Value`, uses `SELECT *` as a persistence format or relies on implicit native-type JSON round-trip.
 
-### 5.1 Schema and migration ownership
+SurrealDB's CBOR format preserves special values through vendor-specific tags. V3 does not copy that private tag protocol into another client. A later admitted typed dependency may replace the JSON DTO layer only after exact MSRV/license/size and behavior proof.
 
-The installer/bootstrap owner applies ordered, checksummed `.surql` migrations before Store becomes ready. Do not add SurrealKit, a migration service or a migration database for the initial product.
+Application queries are checked-in `.surql` assets or compile-time fixed strings with JSON-safe bound variables. Dynamic table/index identifiers are selected from closed enums. A variable that can affect grammar is never supplied as raw user/agent text. Query results project only the fields needed by the named operation, with row/byte limits and stable continuation keys.
+
+A transport, shutdown or WAL-sync failure after a mutation may have been applied is `OUTCOME_UNKNOWN`. Reconnect does not replay the mutation blindly. The application reads by its unique operation/command/item identity first; only a proven non-commit or a bounded retryable transaction conflict permits the exact transaction to run again.
+
+### 5.1 Schema, credentials and migration ownership
+
+The installer/bootstrap Owner applies ordered, checksummed `.surql` migrations before Store becomes ready. Do not add SurrealKit, a migration service or a migration database for the initial product.
 
 Baseline schema rules:
 
-- define namespace and a `STRICT` database explicitly;
+- define the configured namespace and a `STRICT` database explicitly under `--no-defaults`;
 - define the six application tables as `SCHEMAFULL`;
 - define every owned field and type explicitly;
 - use `FLEXIBLE` only on a named bounded native-metadata object whose unknown fields are intentionally retained;
+- keep wire-facing application identity/time/optional representations compatible with §5.0 DTO rules;
 - define composite unique indexes for stream and observation identities;
 - define unique indexes on `memory.address_unique_key`, `memory_history(item, revision)` and active/pending job slot keys;
 - define ordinary indexes only for queries that appear in a connected reader;
@@ -439,9 +488,11 @@ Baseline schema rules:
 
 Store the expected migration number in database parameter `$eliot_schema_generation`. Startup reads `INFO FOR DB` and `INFO FOR TABLE` and compares the actual definitions/digest against checked-in migration metadata. `IF NOT EXISTS` is not enough for a changed definition: a mismatched existing table/field/index blocks mutation until the named migration resolves it.
 
+The database-scoped Owner owns migrations and user rotation. The ordinary daemon receives only the Editor credential. User creation/rotation uses one fixed DDL shape with a locally generated Argon2 PHC verifier in `PASSHASH`; it runs only while slow-query logging and telemetry are disabled and the verifier is never retained in application logs, backup manifests or Store result bodies. Successful DDL is followed by an independent sign-in probe and restart readback. Root is not a normal migration credential.
+
 ### 5.2 Transaction and conflict rules
 
-The RPC `query` call executes one complete fixed transaction text with bound variables. The client inspects **every** per-statement status/result; a successful WebSocket response or final `COMMIT`-shaped value cannot hide an earlier failed statement.
+The RPC `query` call executes one complete fixed transaction text with bound variables. The client inspects **every** per-statement status/result; a successful WebSocket response or final `COMMIT`-shaped value cannot hide an earlier failed statement. Every result is decoded through the operation's explicit DTO, never through a broad row map.
 
 SurrealDB transactions provide snapshot isolation. Therefore:
 
@@ -452,7 +503,9 @@ SurrealDB transactions provide snapshot isolation. Therefore:
 - a predicate-only invariant over a set uses a deterministic sentinel/slot record or unique derived key; an existence query alone is not serialization;
 - `UPSERT` without an exact deterministic record identity is not an idempotency primitive.
 
-If two transactions modify the same record or unique value, one may fail with a retryable conflict. Retry the **whole** transaction with the same immutable command, IDs and expected revisions under a finite attempt/backoff budget. Unique-constraint conflict after a retry is resolved by exact readback and byte/binding comparison. Unknown transport outcome is reconciled before any retry.
+If two transactions modify the same record or unique value, one may fail with a retryable conflict. Retry the **whole** transaction with the same immutable command, IDs and expected revisions under a finite attempt/backoff budget. Unique-constraint conflict after a retry is resolved by exact readback and byte/binding comparison. Unknown transport, shutdown or WAL-sync outcome is reconciled before any retry.
+
+With the selected RocksDB `sync=every` profile, a transaction is applied before the grouped `flush_wal(true)` completion is returned. Failure at that edge is not proof of rollback. Only a matching application readback can classify it as committed; absence under a qualified healthy Store may permit a retry.
 
 Network, controller, document and Research calls never run inside a database transaction. Blob publication happens before the row transaction; unreferenced immutable blobs are later cleanup candidates.
 
@@ -493,7 +546,7 @@ One internal Windows primitive owns immutable publication:
 
 If the final path already exists, never overwrite it. Open/verify it and perform a successful parent-directory flush before returning prior `staged`; different bytes are conflict.
 
-If rename succeeds but parent sync or final readback fails, publication is **post-commit unknown**, not staged and not a pre-commit failure. Reconciliation reopens the exact final path, verifies bytes, retries directory sync and only then returns staged. The same rule applies to immutable blob publication and deletion notices.
+If rename succeeds but parent sync or final readback fails, publication is **post-commit unknown**, not staged and not a pre-commit failure. Reconciliation reopens the exact final path, verifies bytes, retries directory sync and only then returns staged. The same rule applies to immutable blob publication, deletion notices, backup manifests and installation cutover files.
 
 The legacy `atomic_replace_file` donor uses `MOVEFILE_REPLACE_EXISTING` and is therefore not the V3 spool primitive. The existing directory-flush donor demonstrates the required Windows handle flags and error propagation, but V3 keeps only the minimal physical mechanism in its internal module.
 
@@ -692,23 +745,47 @@ Withdrawal stops guidance, not physical deletion.
 
 For erasure, publish an exact text-free deletion notice through the same durable-file primitive, cancel pending work, fence unresolved controller work and prevent late Store/Research/spool reintroduction. Page/remove controlled observations, memory/history, representations, packet/job blobs, staged commands, links and affected backups. Do not claim complete while any controlled copy remains or mismatches.
 
-### 12.2 Backup
+### 12.2 Application-owned backup cut
 
-Use SurrealDB logical export plus referenced immutable blobs and finite selected pending spool entries. Include schema generation/definitions, six tables, history/links, retained external results and non-secret configuration metadata.
+SurrealDB logical export is not the application backup owner. Although the core exporter reads one database snapshot, the HTTP route can commit status before the export job ends and surface a later job failure only in server logs while the client sees an ordinary body EOF. Import is statement-by-statement and may leave partial state. The selected Store profile therefore keeps HTTP `export` and `import` disabled.
 
-Do **not** copy a live RocksDB/SurrealKV directory as the application backup contract. Freeze mutations/dispatch, complete short transactions, run the exact supported logical export under the owned server, copy referenced blobs, write checksummed manifest/counts and publish backup only after every byte succeeds. Failure leaves live data intact.
+Backup is a V3 operation over the six owned tables, immutable blobs, active deletion notices and a finite pending-spool cut:
 
-### 12.3 Restore
+1. enter `backup_preparing`; stop new daemon Store mutations, claims, cleanup and blob/deletion maintenance;
+2. finish or reconcile all admitted short Store mutations; any unresolved write outcome blocks successful backup;
+3. acquire the cross-process spool publication mutex used by relays, establish a cut ID and enumerate exact immutable pending files; a relay blocked behind the cut publishes afterwards and is post-cut;
+4. release the publication mutex; keep Store mutation admission closed so new capture stages rather than enters the database cut;
+5. page every table through checked-in read-only queries with explicit DTO projections, stable order, immutable cursor fences and per-page count/digest;
+6. copy the exact referenced immutable blobs, selected pending commands and active deletion notices, verifying identity/length/digest;
+7. write a manifest containing format version, source installation/binary/storage/schema identity, cut ID, table/page/row counts and digests, blob/spool/deletion inventories, gaps and non-secret configuration metadata;
+8. publish the complete backup through the same create-new/file-sync/no-replace/directory-sync/readback primitive;
+9. reopen mutation admission and replay only after publication or a recorded failed/unknown backup disposition.
 
-Restore into a fresh candidate directory/database using the same pinned server version/engine and ordered schema owner. Import may partially apply, so retry only into another empty candidate. Verify current/history/blob reads, uniqueness probes, schema generation and deletion notices; hold unfinished external jobs for reconciliation rather than redispatch.
+Every table page is read while application mutation admission is closed. Background SurrealDB metadata maintenance does not authorize changes to V3 application rows. The manifest—not EOF—owns completion. A failed backup leaves live data intact and no published successful manifest.
 
-Switch selected data root through one durable installation update under the mutex. Keep prior data until explicit retirement. Credentials/profiles are not overwritten. Primary reads become available before optional refresh.
+Credentials, root bootstrap material, controller/provider secrets and database-user verifiers are not backup content. Unfinished external jobs retain their exact operation/copy/reconciliation state as ordinary rows; backup never redispatches them.
+
+### 12.3 Typed restore and cutover
+
+Restore never imports a SurrealQL dump and never writes into the selected live root.
+
+1. create a fresh candidate root under the same pinned SurrealDB version/engine and explicit `sync=every` profile;
+2. bootstrap root once, create the configured namespace/`STRICT` database and database Owner/Editor from current Credential Manager secrets, then restart without root;
+3. apply the ordered checked migrations and verify schema generation/definitions;
+4. verify the backup manifest and every table page/blob/spool/deletion digest before admitting its content;
+5. restore rows through fixed Owner queries and explicit per-table DTOs, preserving application identities/revisions/links/job states without generic JSON `Value` conversion;
+6. restore immutable blobs, deletion notices and selected pending files through create-new publication; never overwrite a conflicting retained object;
+7. verify counts/digests, exact current/history/source reads, uniqueness/cardinality probes, deletion fences, job/controller identities and representative write/read/delete behavior;
+8. shut down and restart the candidate under the ordinary Editor profile, repeat full Store admission and exact verification;
+9. durably switch the selected installation root under the installation mutex; keep the prior root until explicit retirement.
+
+Any parse, DTO, schema, row, blob, spool, deletion, conflict, restart or verification failure discards the entire candidate. A retry starts with another empty candidate. Primary reads become available after successful cutover; optional embeddings/views/Research refresh later through ordinary jobs.
 
 ## 13. Control and observability
 
-Direct controls: status/inbox, inspect/open, pause/resume jobs, cancel queued work, configure projects/hosts/disclosure/profiles, correct/withdraw/erase, backup/restore, shutdown.
+Direct controls: status/inbox, inspect/open, pause/resume jobs, cancel queued work, configure projects/hosts/disclosure/profiles, correct/withdraw/erase, backup/restore or shutdown.
 
-Status derives from real facts. Show provider binary/version/digest, storage engine/schema generation, Store readiness gap, capture committed/staged/unknown/rejected, spool counts/age/publication-unknown, context prepared/emitted/gap, exact-open dispositions, job/profile/controller states, result/application and per-copy cleanup.
+Status derives from real facts. Show binary/version/digest/signature disposition, canonical storage URL/engine/sync mode, admitted launch/environment identity, Editor/Owner credential readiness without secret material, schema generation, Store readiness gap, graceful/forced last shutdown, capture committed/staged/unknown/rejected, spool counts/age/publication-unknown, backup cut/disposition/manifest, restore candidate state, context prepared/emitted/gap, exact-open dispositions, job/profile/controller states, result/application and per-copy cleanup.
 
 Do not equate adjacent lifecycle states. Missing usage/cost/account is unknown. Notification failure does not block status/control.
 
@@ -718,22 +795,26 @@ Write connected production code first. Run minimum relevant build/Clippy after e
 
 Before each slice: one integrator/edge; cheap preflight before setup; no overlap without disposition; measure merged behavior/blockers.
 
-### Slice 0 — dependency and durability preflight
+### Slice 0 — dependency, wire and durability preflight
 
 Before Base code:
 
-1. acquire/pin exact SurrealDB 3.3.4 Windows binary and SHA-256;
-2. prove the selected binary starts RocksDB on a disposable local root or record an explicit blocker—no SurrealKV fallback;
-3. run version/signin/use/query and strict schema/index migration through the minimal RPC client;
-4. exercise unique conflict, `FOR UPDATE`, whole-transaction retry and unknown-after-send readback;
-5. exercise create-new temp, no-replace write-through rename, directory flush, post-rename sync failure reconciliation, delete/move directory flush and restart readback on the supported filesystem;
-6. complete one logical export/import round-trip into a fresh candidate.
+1. acquire/pin the exact SurrealDB 3.3.4 Windows binary, size, SHA-256, PE and observed signature disposition;
+2. prove the selected binary starts and restarts the same canonical RocksDB root with explicit `sync=every`, `--no-defaults` and no SurrealKV fallback;
+3. prove the sanitized environment, exact loopback listener, reserved Origin, disabled metrics/identification/slowlog/telemetry/Postgres/import and allowed/denied HTTP/RPC/query/function matrix;
+4. bootstrap root once, provision database Owner/Editor through locally derived `PASSHASH`, prove both sign-ins, then restart without root material;
+5. run version/signin/use/query, strict schema/index migration and full Store admission through the minimal client;
+6. freeze explicit JSON-safe DTOs and round-trip optional-state, ID/reference, integer-time, finite-vector and pagination boundaries without generic `Value` or `SELECT *`;
+7. exercise unique conflict, `FOR UPDATE`, whole-transaction retry, disconnect and applied-before-WAL-sync/shutdown unknown readback;
+8. exercise create-new temp, no-replace write-through rename, directory flush, post-rename sync failure reconciliation, delete/move directory flush and restart readback on the supported filesystem;
+9. complete one application-owned backup cut and typed restore into a fresh candidate, including concurrent relay staging, exact blobs/deletion notices/pending spool, forced page/blob mismatch, candidate discard, restart and cutover verification;
+10. exercise graceful shutdown with active maintenance and forced Job Object containment, then prove consistent restart admission/readback.
 
-This preflight changes dependencies only when evidence requires it. It does not build a second storage framework.
+This preflight changes dependencies only when evidence requires it. It does not build a second storage framework or copy SurrealDB's CBOR protocol.
 
 ### Slice 1 — Store and local lifecycle
 
-Implement supervisor/daemon/owned SurrealDB, exact Store admission, schema/migrations, `CaptureCommand`, immutable blob publication, exact read after restart, pending spool publication/replay, status/shutdown and revision/history.
+Implement supervisor/daemon/owned SurrealDB, closed process profile, exact Store admission, schema/migrations, typed Store DTOs, `CaptureCommand`, immutable blob publication, exact read after restart, pending spool publication/replay, status/shutdown and revision/history.
 
 ```text
 real event → committed or staged → replay if staged → restart → exact open
@@ -741,7 +822,7 @@ real event → committed or staged → replay if staged → restart → exact op
 
 ### Slice 2 — Useful Base and first host
 
-Connect Claude relay profile, continuation, exact/full-text retrieval, notes/corrections/commitments, actual SessionStart/UserPromptSubmit context emission, packet retention/handoff, source open and Base backup/restore/erase. Base runs with controller/model/vector/document/Research disabled.
+Connect Claude relay profile, continuation, exact/full-text retrieval, notes/corrections/commitments, actual SessionStart/UserPromptSubmit context emission, packet retention/handoff, source open and application-owned Base backup/restore/erase. Base runs with controller/model/vector/document/Research disabled.
 
 ### Slice 3 — Controller inference owner
 
@@ -757,6 +838,6 @@ Add vectors, views, documents, Research and hosts only by real prerequisites, th
 
 ### Final verification
 
-After connected product, build the suite over production operations, concurrency, restart, Store conflict/unknown outcomes, spool durability/replay, exact-open pagination, backup/restore, erasure and optional failure. Stub providers qualify local mapping only.
+After connected product, build the suite over production operations, concurrency, restart, Store conflict/unknown outcomes, spool durability/replay, exact-open pagination, application backup/restore, erasure and optional failure. Stub providers qualify local mapping only.
 
 Measure actual latency, I/O, calls, retained bytes, dependencies and code size. Line count is diagnostic, not quota.
