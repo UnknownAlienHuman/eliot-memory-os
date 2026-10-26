@@ -1,18 +1,20 @@
 # Eliot V3 — One-shot inference contract
 
-**Revision 0.4-draft · 2026-10-24 · shared boundary for Memory OS and `eliot-swarm-controller`; not implemented.**
+**Revision 0.5-draft · 2026-10-26 · shared boundary for Memory OS and `eliot-swarm-controller`; not implemented.**
 
 This is the sole normative Memory↔controller contract for one-shot model execution. It prevents these wrong implementations:
 
 1. wrapping one memory extraction in controller Task/Attempt/review/acceptance;
 2. copying provider credentials, routing and retry logic into Memory OS;
-3. restoring the old Governor route/capability/fingerprint platform around a reversible request;
-4. routing inference through ScriptRun/module-binding machinery merely because it is taskless;
-5. retaining controller copies of prompts or results indefinitely after Memory no longer needs them;
-6. calling an unspecified “OpenAI-compatible” service through arbitrary headers/body fields and treating interface similarity as qualified behavior;
-7. losing the input-cleanup path when an Operation fails, is cancelled or is abandoned before producing a result.
+3. restoring the old Governor platform around a reversible request;
+4. routing inference through ScriptRun/module-binding machinery because it is taskless;
+5. retaining controller prompt/result copies indefinitely;
+6. calling an unspecified “OpenAI-compatible” service through arbitrary fields;
+7. losing input cleanup when an Operation has no result;
+8. changing caller identity during credential rotation and thereby orphaning retained Operations/artifacts;
+9. restoring a Memory job under a new principal and redispatching inference because exact-caller readback is no longer available.
 
-Memory owns its finite job, frozen source membership, exact processing recipe, disclosure reduction, stable request identity, cognitive decoding and publication. Controller owns configured connections and credentials, physical provider invocation, Operation deduplication/readback and temporary controlled input/result copies.
+Memory owns its finite job, frozen sources, exact recipe, disclosure reduction, stable request identity, decoding and publication. Controller owns caller authentication, configured connection/profile, provider invocation, Operation deduplication/readback and temporary controlled copies.
 
 ## 1. Public methods
 
@@ -33,19 +35,11 @@ artifact.get
 artifact.read
 ```
 
-`inference.text` and `inference.embed` are mutations because they may spend quota and create an external effect. `inference.release` is an idempotent mutation over one exact inference Operation. It releases every controller-owned content copy that the validated disposition permits, including an input-only Operation with no result.
+`inference.text` and `inference.embed` are mutations because they may spend quota and create an external effect. `inference.release` is idempotent over one exact inference Operation and releases every controller-owned content copy permitted by the validated disposition, including input-only Operations.
 
-None of these methods creates or requires:
+None of these methods creates or requires Task, Requirement, Attempt, binding, workspace, native agent session, review, submission, acceptance, ScriptRun or Memory-side provider credentials.
 
-- Task or Requirement;
-- Attempt;
-- binding, workspace or native agent session;
-- review, submission or acceptance;
-- agent tools or continuation;
-- ScriptRun registry, interpreter or effect lifecycle;
-- a Memory-side provider credential.
-
-## 2. Narrow caller authority and direct IPC
+## 2. Narrow caller authority
 
 Controller adds one authenticated role:
 
@@ -53,229 +47,186 @@ Controller adds one authenticated role:
 inference_client
 ```
 
-It is not Manager, Operator, Observer, Participant or a bound Module. It has no MCP discovery surface and no generic writer authority.
+It is not Manager, Operator, Observer, Participant or bound Module. It has no MCP discovery surface and no generic writer authority.
 
-Its complete application surface is:
+Complete application surface:
 
 ```text
 mutations:
   inference.text
   inference.embed
   inference.release
-  operation.cancel       # only its own still-queued inference Operation
+  operation.cancel       # only own still-queued inference Operation
 
 reads:
-  operation.get          # only its own retained Operation receipt
-  artifact.get           # only its own retained inference result
-  artifact.read          # only its own retained inference result
+  operation.get          # only own retained Operation receipt
+  artifact.get           # only own retained inference result
+  artifact.read          # only own retained inference result
 ```
 
-The Store dispatches this role through an explicit allowlist before generic writer handling. `Principal::require_writer` continues to reject it outside that branch. A local setup owner registers the credential once; the credential carries no project, Task, workspace or binding authority.
+Store dispatches this role through an explicit allowlist before generic writer handling. Existing exact-caller Operation/artifact authorization is reused; there is no second receipt store or admin-shaped fallback.
 
-Existing exact-caller Operation readback is reused. There is no second receipt store.
+### 2.1 Stable logical caller identity
 
-### 2.1 Direct IPC client
+Controller credentials contain two different things:
 
-Memory calls controller through the existing authenticated local IPC protocol, not MCP and not a spawned CLI command.
+```text
+client_id   logical retained principal
+secret      replaceable authentication material
+```
 
-The current `swarm-client` already:
+For Memory OS, `client_id` is installation-scoped and stable across daemon restart, Store rollback and token rotation. Conceptually:
 
-- accepts an arbitrary method name and JSON params;
-- performs no task or role policy;
-- retries only Windows pipe establishment before authentication/application I/O;
+```text
+eliot-memory:<stable-installation-id>
+```
+
+The exact string format is implementation-owned, but it is generated once, bounded, non-secret and retained in Memory installation identity and controller registration. It is not derived from PID, executable path, data-root generation, backup generation, token digest or wall clock.
+
+Every Memory inference job retains:
+
+```text
+controller_client_id
+client_request_id
+controller_operation_id when known
+result artifact identity/digest when known
+credential generation/digest as non-authoritative diagnostics only
+```
+
+The Operation owner is `controller_client_id`, not the token generation. A new credential with the same authenticated `client_id` may read/cancel/release retained Operations according to their current state. A token change must not rewrite `caller_id`, request identity, Operation ID or artifact provenance.
+
+Changing `client_id` is **principal migration**, not credential rotation. No implicit migration is selected. Without an explicit controller-side transfer protocol that rewrites/aliases every retained Operation, artifact grant and cleanup owner atomically, a new `client_id` cannot adopt old work. Memory must not use local Operator access or a new request ID as a normal recovery shortcut.
+
+### 2.2 Direct IPC client
+
+Memory calls controller through exact-revision `swarm-client`, not MCP or a spawned CLI.
+
+The pinned client:
+
+- connects to the configured local IPC root;
+- sends one `client.hello` carrying `client_id + token` before any application request;
 - never automatically resends an application request;
 - reports cancellation/disconnect/partial reply after possible write as `OUTCOME_UNKNOWN` and retires the connection.
 
-Memory reuses this implementation as an exact-revision Git dependency from the controller repository. It does not copy framing or authentication code. `publish=false` is not a reason to fork the protocol; changing the pin is an explicit integration update.
+Memory does not copy framing/authentication code. Changing the Git pin is an explicit integration update.
 
 Memory configuration stores only:
 
 ```text
-controller data root / IPC root
-private inference-client credential file
-bounded IPC settings, normally controller defaults
+controller IPC/data root
+private inference-client credential path/reference
+expected stable controller_client_id
+bounded IPC settings
 selected inference profile names
 ```
 
-The public inference payload must fit the configured IPC frame. The initial contract has no generic upload/session protocol for oversized prompts; admission returns `IPC_FRAME_LIMIT` or `INPUT_LIMIT_EXCEEDED` before provider I/O.
+Raw token bytes never enter Memory Store rows, backups, logs or public status. The public inference payload must fit the configured IPC frame; the initial contract has no generic upload/session path.
 
-## 3. Static connections and profiles
+### 2.3 Credential rotation and connection revocation
 
-Controller configuration owns static `InferenceConnection` and `InferenceProfile` records. Neither is an agent Route, dynamic registry, capability-evidence record or admission receipt.
+The controller currently authenticates once during `client.hello` and retains the resulting Principal for that connection. Therefore changing the stored token hash alone does not revoke an already authenticated socket.
+
+A qualified inference-client credential rotation must:
+
+1. keep the same `client_id`;
+2. stop new inference admission for that principal or place it in a bounded rotating state;
+3. create one pending secret and durable pending generation/reference;
+4. update the token hash for the same registered `client_id`;
+5. classify unknown update outcome by probing pending credential first and current credential second; never generate another pending token;
+6. close every authenticated connection for that `client_id` or restart the controller host before declaring the old token revoked;
+7. reconnect Memory with the pending/current credential and prove `operation.get` plus an allowed artifact/release read against a retained pre-rotation Operation;
+8. promote pending to current and retain old secret/reference until restart/readback confirms continuity;
+9. retire the old secret only in a later explicit cleanup step.
+
+If both credentials authenticate, neither authenticates, or old authenticated sessions cannot be enumerated/closed, rotation is incomplete. It must not be reported as revocation.
+
+The pinned controller revision `e42c464d` supplies authenticated IPC and exact-caller ownership donors, but it does **not** implement `inference_client`, inference methods or this rotation/revocation workflow. Runtime status remains `NOT IMPLEMENTED`.
+
+## 3. Connections and profiles
+
+Controller owns static `InferenceConnection` and `InferenceProfile` records. Neither is an agent Route, dynamic registry or admission-proof platform.
 
 ### 3.1 `InferenceConnection`
 
-A connection owns transport and secret material independently of model behavior:
-
-```toml
-[[inference_connections]]
-name = "memory-loopback-gateway"
-transport = "loopback_http_v1"
-base_url = "http://127.0.0.1:8000/v1/"
-credential_file = "C:\\EliotPrivate\\memory-gateway.json" # optional
-actual_destination = "external"                             # local | external
-```
-
-`actual_destination` describes where supplied content ultimately goes, not merely the next TCP hop. A loopback gateway forwarding to a cloud provider is `external`. Controller cannot infer upstream egress from a loopback URL; the local installation declares it and the frozen receipt preserves it.
-
-The connection reader follows the existing bounded-private-file pattern:
-
-- absolute configured path;
-- bounded regular file, no symlink or pipe;
-- closed schema;
-- optional `none` or Bearer authentication for the first adapter;
-- secrets never copied into Operation JSON, logs, profile digest or public receipts.
-
-The initial connection contract does not support arbitrary request headers, arbitrary query parameters, arbitrary `extra_body`, environment proxy discovery or redirects.
-
-Controller computes a non-secret `connection_digest` over behavior-changing connection fields:
+A connection owns:
 
 ```text
-connection name
-+ transport ID
-+ canonical endpoint
-+ actual destination
-+ authentication mode, not credential bytes/path
-+ explicit transport-security options
+name
+versioned transport ID
+canonical endpoint
+private credential reference
+actual_destination = local | external
+explicit transport-security behavior
 ```
 
-Credential/account rotation under an unchanged connection digest is not described as a proven identical account. Unavailable account or billing identity remains unknown.
+`actual_destination` describes where supplied content ultimately goes. A loopback gateway forwarding to cloud is external.
+
+Connection files are absolute, bounded private regular files with closed schema. Secrets never enter Operation JSON, logs, digests or receipts. Initial adapters support no arbitrary headers, query parameters, extra body, environment proxy or redirects.
+
+`connection_digest` covers non-secret behavior-changing fields, not credential bytes/path. Credential/account rotation under unchanged digest is not proof of identical provider account; unavailable account/billing identity remains unknown.
 
 ### 3.2 `InferenceProfile`
 
-A profile selects one versioned serializer/decoder and model over one connection:
-
-```toml
-[[inference_profiles]]
-name = "memory-text-default"
-adapter = "openai_chat_completions_loopback_v1"
-connection = "memory-loopback-gateway"
-model = "configured-model-id"
-allow_automatic = false
-max_input_bytes = 262144
-max_output_tokens = 4096
-timeout_seconds = 120
-max_concurrency = 1
-response_formats = ["text", "json_object"]
-```
-
-Numeric values are examples, not normative defaults.
-
-The resolved profile inherits `actual_destination` and `connection_digest` from its connection. Controller validates finite positive bounds and a supported adapter/connection/model combination.
-
-Controller computes the immutable `profile_digest` over non-secret behavior-changing fields:
+A profile selects:
 
 ```text
-profile name
-+ versioned adapter ID
-+ connection reference and connection digest
-+ requested model
-+ actual destination
-+ automatic-use flag
-+ input/output/time/concurrency limits
-+ response-format capabilities
+name
+versioned adapter ID
+connection reference/digest
+requested model
+actual destination
+allow_automatic
+finite input/output/time/concurrency limits
+supported response formats
 ```
 
-A manually maintained generation counter is not required. Reconfiguration changes the digest and affects a new explicit request; it never mutates the snapshot retained by an admitted Operation.
+Controller validates positive finite bounds and a supported adapter/connection/model combination. `profile_digest` covers all non-secret behavior-changing fields. Reconfiguration affects new explicit requests and never mutates an admitted Operation snapshot.
 
-There is no implicit fallback. An unavailable connection, profile, provider, model or capacity returns a specific waiting, rejection, failure or unknown state. Controller does not silently switch provider, model, account, destination, retention or billing semantics.
+Memory selects only a profile name. It does not construct provider headers, arbitrary extras or fallback ladders. There is no implicit provider/model/account/destination fallback.
 
-## 4. Disclosure and authoritative admission
+## 4. Disclosure and admission
 
-Memory reduces the material actually supplied to one value:
+Memory reduces all supplied material to:
 
 ```text
 local_only
 external_allowed
 ```
 
-Rules:
+Project default may be narrowed by a source. Derived content cannot widen the strictest source it still contains or reveals. Mixed input uses the strictest class. Reuse scope does not widen disclosure.
 
-- project configuration supplies the default;
-- an observation or source can be stricter;
-- a derived item cannot be less restrictive than content it still contains or reveals;
-- mixed input uses the strictest contributing value;
-- reusable scope does not widen disclosure;
-- protected material is not silently omitted merely to make another profile admissible.
+Controller resolves the actual profile/connection and authoritatively checks:
 
-Memory selects a profile name and sends the reduced disclosure with the exact input. Controller authoritatively resolves the profile and connection, inherits `actual_destination`, and checks:
+- caller role and stable client identity;
+- profile/connection existence and enabled state;
+- `actual_destination` versus disclosure;
+- automatic-use permission;
+- exact input digest/length and IPC/profile limits;
+- output/format limits;
+- known capacity.
 
-- profile and connection existence/enabled state;
-- disclosure versus actual destination;
-- explicit versus automatic origin;
-- input/output/time and format limits;
-- adapter/connection compatibility;
-- known capacity before provider I/O where possible.
+Protected content is not silently omitted to make an external destination pass. Admission failure is not cognitive no-change and does not mark input processed.
 
-`local_only` requires `actual_destination=local`. Memory must not pre-approve a request from a loopback URL or stale duplicate connection configuration.
+## 5. Controlled input and result artifacts
 
-If necessary material cannot use the selected profile, the job waits or fails with a specific profile/destination/disclosure state. That is not no-change and does not mark input processed.
-
-This two-state reduction is deliberately smaller than the old privacy-policy platform. It is checked at the actual external-send owner.
-
-## 5. Controlled request and result artifacts
-
-One inference Operation owns at most two controller content artifacts:
+One inference Operation creates at most:
 
 ```text
 inference_input
 inference_result
 ```
 
-Both use deterministic controller-generated IDs, immutable regular files and exact digests. Each has a row in the existing `artifacts` table.
+Before provider I/O, controller stages exact accepted input under deterministic Operation-owned identity, verifies bytes/digest and commits Operation metadata without raw input in generic JSON. An orphan file without committed Operation is never dispatchable and is cleanup material.
 
-### 5.1 Input artifact
-
-The public request carries prompt or embedding inputs, but generic mutation code must **not** store raw content in `operations.original_request_json`.
-
-Custom inference admission:
-
-1. validates request identity, hashes, bounds and profile/disclosure compatibility;
-2. builds one canonical input payload;
-3. atomically publishes an `inference_input` file before provider I/O;
-4. inserts the artifact row and inference Operation in one short Store transaction;
-5. stores only bounded identity facts in Operation request/effective records:
-   - content artifact identity;
-   - content length and digest;
-   - profile name/digest and connection digest;
-   - adapter, requested model and actual destination;
-   - origin, disclosure and output limits;
-   - method-specific role/format fields.
-
-A crash before DB commit may leave an unregistered file. It is an orphan eligible for bounded local cleanup and never authorizes provider execution.
-
-`inference_input` is controller-private. Memory already owns the source request and receives no artifact read grant for this duplicate.
-
-### 5.2 Result artifact
-
-A usable provider response is published as `inference_result`.
-
-Text results contain the exact visible assistant content selected by the versioned adapter, not the complete HTTP envelope or hidden reasoning. Embedding results contain one canonical JSON body with independent per-input outcomes.
-
-Before publishing the file, controller records bounded pending-result identity on the Operation:
-
-```text
-status
-expected artifact ID
-byte length
-content digest
-requested/observed execution facts
-finish/usage/limit metadata
-```
-
-Then it atomically publishes the file and settles the Operation with artifact row and closed public receipt in one transaction.
+When visible result exists, controller stages exact bounded bytes, verifies digest/length, publishes the file and settles the Operation with a closed receipt. Provider-safe failure metadata may exist without `inference_result`; raw provider errors are not automatically cognitive content.
 
 Crash states remain explicit:
 
-- pending metadata but no file → result body unavailable; never complete;
-- exact file present but settlement missing → restart verifies expected file and may finish settlement;
-- settled receipt without exact file/digest → damaged retained result, not successful no-change.
+- metadata but no exact input/result file → unavailable/damaged, never complete;
+- exact file present but settlement missing → restart may verify and finish settlement;
+- settled receipt without exact file/digest → damaged result, not no-change.
 
-A received provider error may be represented by bounded safe failure metadata without an `inference_result`. Raw provider error bodies are not automatically retained as cognitive content.
-
-### 5.3 Per-copy cleanup state
-
-Controller tracks cleanup independently for input and result:
+Per-copy cleanup state:
 
 ```text
 not_created
@@ -287,7 +238,7 @@ mismatch
 unknown
 ```
 
-The aggregate release state is derived:
+Aggregate state is derived:
 
 ```text
 retained
@@ -296,7 +247,7 @@ cleanup_incomplete
 released
 ```
 
-A single aggregate boolean is insufficient because one file may be removed while the other remains or fails exact verification.
+A single boolean cannot hide one remaining controlled copy.
 
 ## 6. `inference.text`
 
@@ -315,21 +266,9 @@ Conceptual request:
 }
 ```
 
-`origin` is `explicit` or `automatic`. Automatic requests are rejected before provider I/O unless the frozen profile allows automatic use.
+`origin` is `explicit | automatic`. Automatic requests are rejected before provider I/O unless profile permits them.
 
-Validation checks:
-
-- bounded stable request ID;
-- exact prompt bytes and digest;
-- IPC/profile input limit;
-- profile and connection existence/enabled state;
-- actual destination versus disclosure;
-- requested output not exceeding profile;
-- response format supported by adapter/profile;
-- automatic-use permission;
-- known controller capacity.
-
-Memory recipe and source IDs are not controller domain objects. They are already bound inside the exact prompt and retained Memory job. Controller does not validate the cognitive JSON schema beyond requested transport response format.
+Validation includes bounded request ID, exact bytes/digest, caller continuity, frame/profile limits, profile/connection/destination, output/format, automatic permission and capacity. Memory recipe/source IDs remain inside Memory's exact retained request; controller does not own the cognitive schema.
 
 ## 7. `inference.embed`
 
@@ -348,394 +287,184 @@ Conceptual request:
 }
 ```
 
-`role` is `query` or `document` and maps through the selected adapter's actual task parameter or prefix.
+`role = query | document` maps through the adapter's actual task parameter/prefix.
 
-Canonical result body:
+Canonical result contains one exact result or error per input key and one effective space identity: profile digest, observed model, dimensions and role. Missing/duplicate/unresolvable positions, inconsistent dimensions and non-finite vectors are errors. Never repair with zero vectors or shifted assignment.
 
-```json
-{
-  "space": {
-    "profile_digest": "...",
-    "observed_model": "...",
-    "dimensions": 1024,
-    "role": "document"
-  },
-  "items": [
-    {"input_key": "memory:abc@7", "vector": [0.1, 0.2]},
-    {"input_key": "memory:def@2", "error": {"code": "INPUT_TOO_LARGE"}}
-  ]
-}
-```
+## 8. Admission, replay and retained identity
 
-Each input has exactly one independently addressable result or error. Missing, duplicate or unresolvable positions are errors; they are never repaired with zero vectors or shifted assignment. A provider that aggregates several inputs into one vector does not satisfy this contract for independent Memory items.
-
-## 8. Admission and exact replay
-
-Controller reuses its existing identity rule:
+Operation identity is:
 
 ```text
-(caller identity, client_request_id, method, canonical bounded request identity)
+(controller_client_id,
+ client_request_id,
+ method,
+ canonical bounded request identity)
 ```
 
-Canonical identity includes input digest/length rather than raw bytes. Exact replay returns the original Operation/admission state. Different method, profile, limits, format, role or input digest under the same request ID is `REQUEST_ID_CONFLICT`.
+Canonical identity includes input digest/length rather than raw bytes. Exact replay by the same stable caller returns the original Operation/admission state. Different method/profile/limits/format/role/input digest under the same request ID is `REQUEST_ID_CONFLICT`.
 
 The existing Operation table is sufficient initially:
 
+- `caller_id` — stable `controller_client_id`;
+- `client_request_id` — caller correlation key;
 - `original_request_json` — bounded identity, never raw prompt/input;
-- `effective_request_json` — frozen profile/connection snapshot, controlled input reference and execution/readback facts;
-- `result_json` — closed public result and per-copy release state;
-- existing Operation state — queued, sending, native accepted when known, settled, rejected, cancelled, abandoned or outcome unknown.
+- `effective_request_json` — frozen profile/connection, controlled input and execution facts;
+- `result_json` — closed public receipt and per-copy cleanup;
+- existing state — queued, sending, native accepted, settled, rejected, cancelled, abandoned or unknown.
 
-Do not add `inference_runs`, a generic external-job framework or a second scheduler before an actual field cannot be represented or queried through this owner.
+Do not add `inference_runs`, a second scheduler or generic external-job platform. The generic mutation helper is not called unchanged because it would persist raw payload and cannot stage private artifacts correctly.
 
-The generic mutation helper is reused conceptually for identity and receipts, but not called unchanged: it would persist raw public payload and cannot stage private files correctly.
+## 9. Initial adapters
 
-## 9. Initial provider adapters
-
-### 9.1 Text adapter
-
-The first text implementation is exactly:
+Initial text adapter:
 
 ```text
 openai_chat_completions_loopback_v1
 ```
 
-It calls a configured loopback HTTP origin. The gateway may serve a local model or forward to an external provider; `actual_destination` records that distinction.
-
-Wire behavior is closed and versioned:
+Closed wire:
 
 ```text
 POST <base>/chat/completions
 Content-Type: application/json
 Accept: application/json
-optional Bearer authorization from the private connection file
+optional Bearer from private connection file
 ```
 
-Request body contains only:
+Body contains only model, one user message with exact prompt, admitted `max_tokens`, and typed `json_object` response format when supported. No tools, streaming, temperature, stop list, arbitrary headers/fields or fallback model.
 
-```text
-model
-messages = [{ role: "user", content: exact prompt }]
-max_tokens = admitted max_output_tokens
-response_format = { type: "json_object" } only when requested and supported
-```
+Response requires bounded JSON and one usable `choices[0].message.content`. Record observed model/finish/response ID/usage only when supplied. Tool-only/content-free/unsupported multimodal output fails. Length finish is partial, never complete. No hidden retry; possible-send transport failure is unknown.
 
-The adapter sends no tools, streaming flag, temperature, stop list, arbitrary headers, arbitrary provider fields or fallback model. Provider-specific changes require another typed adapter revision.
-
-Response decoding requires a bounded JSON response with one usable `choices[0].message.content` string. It records observed model, finish reason, response ID and usage only when supplied. Tool calls, content-free answers and unsupported multimodal blocks fail explicitly. `finish_reason=length` or equivalent yields `partial`, never `complete`.
-
-No hidden transport/SDK retry is enabled. A received non-success response is retained as one failed attempt with bounded safe metadata. A transport failure after possible send is `unknown`.
-
-### 9.2 Embedding adapter
-
-The first embedding implementation is exactly:
+Initial embedding adapter:
 
 ```text
 openai_embeddings_loopback_v1
 ```
 
-It uses bounded `POST <base>/embeddings` with `model` and input array. The adapter verifies response indices, count, finite numeric vectors and one consistent dimension, then converts output into the canonical per-input body in §7. Provider batching failure does not shift results or create zero vectors.
+It posts bounded model/input array, verifies indices/count/finite vectors/consistent dimension and emits §7 canonical per-input output.
 
-### 9.3 Transport hardening and HTTPS
-
-The current controller OpenCode HTTP client is a donor for:
-
-- no redirects;
-- no environment proxy;
-- no hidden retries;
-- connect and request deadlines;
-- bounded response/error bodies;
-- safe public errors;
-- unknown outcome after possible mutation send.
-
-It is not reused as a session/provider abstraction.
-
-Current controller `reqwest` uses `default-features=false` with `json,stream`; direct external HTTPS is therefore not qualified by current source. A later adapter such as `openai_chat_completions_https_v1` must explicitly enable/qualify TLS, require HTTPS, keep redirects and implicit proxies disabled, and retain the same no-replay and controlled-copy lifecycle.
+Loopback does not prove local destination. Current controller `reqwest` lacks qualified direct HTTPS/TLS in the inspected build; a future HTTPS adapter requires explicit TLS qualification, no redirects/proxies and identical no-replay/copy lifecycle.
 
 ## 10. One bounded runner
 
-A small controller runner consumes only queued `inference.text` and `inference.embed` Operations. It reuses controller wake signal and Operation ledger; it is not a second scheduler or process.
+One controller runner consumes queued `inference.text/embed` Operations. It reuses Operation ledger/wake signal and is not another process or scheduler.
 
-Execution:
-
-1. select eligible queued Operation under frozen profile concurrency limit;
-2. verify private input artifact and frozen profile/connection snapshot;
+1. select eligible queued Operation under frozen profile concurrency;
+2. verify exact input artifact and frozen profile/connection/caller state;
 3. CAS `queued → sending` before provider I/O;
 4. perform one provider attempt outside Store transaction;
-5. record native admission/response identity when actually supplied;
-6. persist pending result metadata, exact result file and terminal receipt;
+5. retain native admission/response identity when supplied;
+6. persist exact result when present and terminal receipt;
 7. wake readers and continue finite work.
 
-Timeout or connection loss after possible send becomes `outcome_unknown` unless native idempotency/readback resolves it. A new request ID is not recovery.
+Possible-send timeout/loss becomes unknown unless native idempotency/readback resolves it. A new request ID is not recovery.
 
-At controller restart:
+Restart behavior:
 
-- queued Operations with verified input remain eligible;
-- sending/native-accepted Operations use native readback when supported;
-- otherwise they remain `outcome_unknown`;
-- verified pending result file may finish settlement;
-- abandoned Operations never re-enter provider dispatch or publish a late result;
-- no restart path automatically issues another provider call.
+- verified queued input remains eligible;
+- sending/native-accepted uses native readback when supported, otherwise unknown;
+- verified pending result may finish settlement;
+- abandoned never redispatches/publishes late result;
+- no restart automatically issues another provider call.
 
-## 11. Public result and cleanup receipt
+## 11. Public receipt and artifact authorization
 
-`operation.get` grants a bounded receipt to the exact caller without Task linkage. Projection is closed and never exposes arbitrary provider JSON or credential data.
+`operation.get` grants a bounded receipt to the exact authenticated `controller_client_id` without Task linkage. Only that principal receives its `client_request_id`. Projection never exposes arbitrary provider JSON or credentials.
 
-Conceptual result:
+Receipt contains status, optional result artifact/digest/length/encoding, requested profile/adapter/connection/model/destination, observed provider/model/response/finish/usage/cost when known, limits and independent input/result cleanup state.
 
-```json
-{
-  "status": "complete",
-  "artifact_ref": "inference-result-id",
-  "byte_length": 1234,
-  "sha256": "...",
-  "encoding": "utf-8",
-  "requested": {
-    "profile": "memory-text-default",
-    "profile_digest": "...",
-    "adapter": "openai_chat_completions_loopback_v1",
-    "connection_digest": "...",
-    "model": "configured-model-id",
-    "actual_destination": "local"
-  },
-  "observed": {
-    "provider": "...",
-    "model": "...",
-    "response_id": "..."
-  },
-  "finish_reason": "stop",
-  "usage": {"input_tokens": 1000, "output_tokens": 200},
-  "cost": null,
-  "limits": [],
-  "controlled_copies": {
-    "input": "retained",
-    "result": "retained"
-  },
-  "release_state": "retained"
-}
-```
+Missing usage/cost/account remains unknown, never zero/inferred.
 
-Application status is:
+`inference_result` authorization requires:
 
-```text
-complete
-partial
-failed
-unknown
-```
+- artifact kind `inference_result`;
+- settled target Operation names same artifact/digest/length;
+- requesting principal's `client_id` equals retained `caller_id`, or verified local Operator uses an explicitly permitted diagnostic/erasure path;
+- released content is unreadable.
 
-Rules:
+`inference_input` has no public read grant. Do not relabel artifacts as script/native result or trust metadata alone.
 
-- `complete`/`partial` require exact retained result bytes and usable artifact readback;
-- empty, malformed or cognitively invalid text may still be a transport-complete body; Memory decides decode success;
-- `unknown` retains Operation/request/profile identity and does not authorize another call;
-- requested and observed facts remain distinct;
-- missing usage/cost/response ID/account stays absent or explicit unknown, never zero or inferred;
-- truncation/output-limit facts appear in `limits` and cannot be hidden behind `complete`;
-- cleanup projection reports input and result independently.
+## 12. Cancellation, restore and caller loss
 
-Controller artifact authorization is closed. Add `InferenceResult` provenance verification:
+`operation.cancel` handles only exact caller's still-queued inference Operation. Cancellation races runner CAS; one wins. Once provider I/O may have begun, local cancellation cannot prove non-execution.
 
-- artifact kind is `inference_result`;
-- settled inference Operation names same artifact, digest and length;
-- requesting principal is exact Operation caller or verified local operator;
-- released content is not readable.
+A Memory backup retains non-secret `controller_client_id`, request ID, Operation ID, artifact/release identity and cleanup state, but never token. Restore verifies the currently configured inference credential authenticates as the same `controller_client_id` **before** reconciling any restored inference job.
 
-Do not relabel result as `script_result` or `native_result`, trust metadata alone, or grant it through Task scope. `inference_input` has no public read grant.
+Restored jobs:
 
-## 12. Cancellation and abandonment
+- known Operation ID → `operation.get`/artifact/release readback under same caller; never redispatch;
+- stable request ID but unknown Operation ID after possible send → exact replay under same caller only, returning original Operation or conflict;
+- no admitted Operation and proven no-send → request may proceed under retained exact request identity;
+- credential authenticates as another `client_id` → `caller_identity_unavailable`; no read/cancel/release or redispatch claim is made;
+- out-of-target current Operations during Store rollback block cutover until terminal/released or explicitly abandoned by an authorized erasure owner.
 
-`operation.cancel` handles only an exact caller's still-queued inference Operation. Cancellation races runner CAS; one wins.
-
-Once provider I/O may have begun, local cancellation cannot prove non-execution. Preserve Operation for reconciliation. A future adapter may expose native cancellation, but acknowledgement never proves no response, copy or charge occurred.
-
-Queued cancellation produces a terminal no-result Operation whose input artifact is releasable through `inference.release` with `terminal_without_result`.
-
-An `outcome_unknown` Operation is not ordinary terminal failure. It may be abandoned only through the explicit `abandon_for_erasure` release disposition in §13. That decision prevents future controller reconciliation/publication for the Operation but cannot delete provider-held data or undo a provider-side effect.
+Loss of the old logical caller prevents complete controlled-copy cleanup. Recovery requires restoring a credential for the same registered `client_id` or an explicit verified local-operator abandonment/erasure action. Operator access does not transfer ownership, fabricate cognitive result or authorize duplicate inference.
 
 ## 13. `inference.release`
 
-Release is the only content-cleanup mutation for an inference Operation. It is safe for three validated dispositions:
+Request names target Operation, disposition and expected artifact/digest/length when required.
 
-```text
-memory_copy_verified       Memory copied and verified an existing result
-terminal_without_result    Operation can no longer produce a result and has none
-abandon_for_erasure        owner accepts loss of reconciliation for erasure
-```
-
-Conceptual request:
-
-```json
-{
-  "client_request_id": "stable-release-key",
-  "operation_id": "inference-operation-id",
-  "disposition": "memory_copy_verified",
-  "expected_input_sha256": "optional-known-input-digest",
-  "expected_result": {
-    "artifact_ref": "inference-result-id",
-    "sha256": "..."
-  }
-}
-```
-
-`expected_result` is:
-
-- required for `memory_copy_verified`;
-- absent for `terminal_without_result` when no result exists;
-- optional for `abandon_for_erasure` only when the result is absent or intentionally discarded under erasure.
-
-Controller independently validates caller, target Operation, artifact identities and disposition eligibility:
+Controller independently validates authenticated caller, target owner/state, artifact identities and disposition.
 
 ### 13.1 `memory_copy_verified`
 
-Allowed only when target Operation has a retained result matching expected artifact/digest and Memory acknowledges its durable exact copy. Input and result become cleanup targets.
+Only when exact result is retained and Memory acknowledges durable matching copy. Input/result become cleanup targets.
 
 ### 13.2 `terminal_without_result`
 
-Allowed only when target Operation is rejected, failed without retained result, or cancelled before send, and no future controller result can be published. Input is cleanup target; result state is `not_created`.
+Only when rejected, failed without retained result or cancelled before send, and no future result can publish. Input is cleanup target; result is `not_created`.
 
 ### 13.3 `abandon_for_erasure`
 
-Allowed for exact caller or verified local operator when erasure requires ending reconciliation of queued/sending/unknown work.
+Allowed for exact caller or verified local Operator when erasure explicitly ends reconciliation of queued/sending/unknown work. Controller atomically marks Operation abandoned and fences future dispatch, settlement and publication before deleting controlled copies. Late provider content is discarded by exact file owner; only bounded non-content facts remain.
 
-Before deleting content, controller atomically marks the target Operation abandoned and fenced from dispatch, settlement and result publication. A late provider response is not exposed as a result; any controller-received content is discarded through the same exact-file owner and only bounded non-content late-arrival facts remain.
+This cannot prove provider non-execution, deletion or no charge.
 
-This disposition cannot prove that provider execution, storage or billing did not occur. The public receipt states that external effects/copies remain unknown or external.
+### 13.4 Physical cleanup
 
-### 13.4 Cleanup algorithm
+For each expected file controller verifies Operation provenance, canonical path, regular-file/no-reparse identity, length/digest when present, exact deletion and parent-directory durability. Missing exact file becomes `already_absent`; mismatch blocks deletion. Partial input/result cleanup remains visible and retryable under same caller/Operation identity.
 
-Release is a narrow owner operation:
-
-1. validate disposition and exact expected identities;
-2. transactionally reserve `cleanup_pending` independently for input and result and retain the release Operation;
-3. outside transaction, verify and remove only exact regular files under controller artifact root;
-4. transactionally delete matching artifact rows and store per-copy outcome;
-5. derive aggregate `released` or `cleanup_incomplete` and settle release Operation.
-
-Add private `ArtifactFiles::remove_exact(record)`. It rejects symlinks, path mismatch and digest mismatch and synchronizes the parent directory. There is no public generic artifact-delete method.
-
-Per-copy outcomes:
-
-```text
-removed
-already_absent
-not_created
-mismatch
-unknown
-```
-
-Crash recovery:
-
-- file still present + cleanup pending → verify and continue removal;
-- exact file absent + matching pending artifact row → finalize as already absent;
-- mismatch/unrelated reference → retain `mismatch`, never delete guessed path;
-- release replay returns retained release result;
-- partial success remains explicit per copy.
-
-After successful release:
-
-- controller retains only bounded text-free identity/status/deduplication facts;
-- later `artifact.read` returns released/unavailable;
-- Memory backup contains its copied result bytes when a result existed;
-- target Operation cannot recreate released controller content.
-
-If cleanup is incomplete, Memory may still use a verified result but reports controlled duplicate gap. Erasure is incomplete while either controller content copy remains. Provider-held copies are outside `inference.release`.
+Release is idempotent. Memory records release Operation ID, disposition and each copy state. Release failure never rolls back a verified Memory publication.
 
 ## 14. Reuse and explicit non-donors
 
-Reuse from current controller:
+Reuse:
 
-- `swarm-client` authenticated bounded IPC and no-application-replay semantics;
-- Operations exact caller/request identity and conflict behavior;
-- exact-caller `operation.get` authorization;
-- existing Operation states and failure observations;
-- immutable `ArtifactFiles` publish/read/digest verification;
-- generic `artifacts` table;
-- controller wake signal and bounded worker pattern;
-- current bounded/no-redirect/no-hidden-retry HTTP patterns.
+- exact-revision `swarm-client` authenticated bounded IPC and no application replay;
+- stable `client_id` Principal donor and token-hash authentication;
+- Operation exact caller/request identity and conflict behavior;
+- exact-caller operation/artifact authorization;
+- existing Operation states/failure observations;
+- immutable artifact publish/read/digest verification;
+- wake signal and bounded worker pattern;
+- bounded no-redirect/no-hidden-retry HTTP patterns.
 
-Extend narrowly:
+Do not reuse:
 
-- `InferenceClient` role and allowlist;
-- exact-revision Memory dependency on `swarm-client`;
-- static connection/profile config and versioned adapter IDs;
-- inference validators and custom admission;
-- `inference_input` / `inference_result` artifact kinds;
-- closed result and per-copy cleanup projection;
-- one inference runner;
-- `remove_exact` and three-disposition `inference.release` recovery.
+- Task/Attempt/workspace/review/acceptance lifecycle;
+- ScriptRun/interpreter/effect lifecycle;
+- Manager/Operator as ordinary inference caller;
+- module binding or agent route types;
+- generic mutation storing raw request;
+- generic writer fallback;
+- hidden provider retry/fallback;
+- credential rotation that changes `client_id`;
+- old authenticated connections left alive after token change;
+- normal recovery through Operator/admin read or a new request ID;
+- another task/profile/capability/receipt registry.
 
-Do **not** reuse as inference lifecycle:
+## 15. Implementation order and open runtime gaps
 
-- Task/Requirement/Attempt;
-- `script.run`, script registry, bundles, interpreter identities, ScriptEffect or automation cause;
-- Module binding/handshake/supervisor;
-- agent `Route.native_options`;
-- OpenCode session/service semantics;
-- arbitrary `extra_headers`/`extra_body` or blind retry loop;
-- review/submission/acceptance;
-- generic artifact deletion endpoint.
+1. add `inference_client` role and closed dispatch/read scopes;
+2. add stable installation-scoped registration and private credential materialization;
+3. add same-`client_id` token rotation with active-connection revocation and retained-operation continuity proof;
+4. add inference artifact domains and exact private cleanup owner;
+5. add connection/profile parser/digests/admission;
+6. implement staged-input mutation identity and `inference.text` runner;
+7. add result readback, cancellation and all release dispositions;
+8. connect one Memory job/restore reconciliation path;
+9. add embeddings through the same lifecycle;
+10. qualify direct HTTPS only when explicitly needed.
 
-The taskless ScriptRun fixture qualifies Store admission only and explicitly does not execute worker. Production ScriptRun owns a different product: registered scripts, interpreter/process custody, start gates, automation authority, effects and multiple artifacts. Its recovery ideas are useful; its lifecycle is not this implementation.
-
-## 15. Status and failure vocabulary
-
-The exact public schema is implementation-owned, but it must distinguish at least:
-
-```text
-PROFILE_NOT_FOUND
-PROFILE_DISABLED
-CONNECTION_NOT_FOUND
-DESTINATION_MISMATCH
-AUTOMATIC_USE_DISABLED
-IPC_FRAME_LIMIT
-INPUT_LIMIT_EXCEEDED
-OUTPUT_LIMIT_EXCEEDED
-RESPONSE_FORMAT_UNSUPPORTED
-CAPACITY_UNAVAILABLE
-REQUEST_ID_CONFLICT
-EXTERNAL_OUTCOME_UNKNOWN
-INPUT_NOT_RETAINED
-RESULT_NOT_RETAINED
-RESULT_DIGEST_MISMATCH
-PROVIDER_RESPONSE_INVALID
-PROVIDER_OUTPUT_UNSUPPORTED
-RELEASE_DISPOSITION_INVALID
-RELEASE_RESULT_REQUIRED
-RELEASE_RESULT_UNEXPECTED
-RESULT_RELEASE_CONFLICT
-RELEASE_CLEANUP_PENDING
-RELEASE_CLEANUP_INCOMPLETE
-ABANDONED_FOR_ERASURE
-```
-
-These are operational states, not cognitive outcomes. Memory never converts them into `changes=[]` or successful no-change.
-
-## 16. Implementation order
-
-Controller owner:
-
-1. add `InferenceClient` and exact Store-call allowlist;
-2. add static connection/profile config and canonical connection/profile digests;
-3. add closed request DTOs and method policy;
-4. add controlled input admission without raw payload in Operation JSON;
-5. add one Operation-backed runner and `openai_chat_completions_loopback_v1` with hidden retries disabled;
-6. add pending-result recovery, immutable result artifact and closed public receipt/grant;
-7. add per-copy cleanup state, `remove_exact` and idempotent `inference.release` for result, no-result and erasure-abandon dispositions;
-8. add `openai_embeddings_loopback_v1` through the same lifecycle;
-9. qualify direct HTTPS only in a later adapter with explicit TLS feature;
-10. run minimum relevant build/Clippy after each coherent production increment.
-
-Memory owner, after Base:
-
-1. pin/reuse controller `swarm-client` rather than copying IPC;
-2. implement one controller adapter for text/embed/read/cancel/release;
-3. add disclosure fields/reduction;
-4. save exact request before I/O;
-5. copy and verify result before decode/release;
-6. publish through existing job/revision path;
-7. call `inference.release` with correct disposition;
-8. retain per-copy cleanup and external-boundary status;
-9. keep Base usable with learning disabled.
-
-The full automated test suite follows connected product implementation. Fixtures or serializer tests do not qualify a provider route or demonstrate learning.
+At the inspected controller revision `e42c464d`, the following remain absent: `inference_client`, inference methods, inference artifact kinds, runner, release cleanup, same-principal credential rotation/revocation and Memory restore continuity. This document is design, not runtime proof.
