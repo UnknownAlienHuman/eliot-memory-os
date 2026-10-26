@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.23 · 2026-10-25 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.24 · 2026-10-25 · concrete design for the greenfield rewrite.**
 
 This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, data and connected operations. [Cognition](COGNITION.md) defines algorithms. [One-shot inference contract](INFERENCE-CONTRACT.md) is the sole normative Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) records checked evidence, decisions and open gaps.
 
@@ -105,12 +105,22 @@ surreal start <installer-owned-rocksdb-url>?sync=every
 
 The environment explicitly disables metrics and leaves slow-query logging, import, Postgres and telemetry unconfigured. `/ready`, `/health` and `/status` are loopback lifecycle probes supplied by the server; they are not substitutes for Store admission and are never exposed outside the owned listener. HTTP `signin`, `export` and `import` routes are not selected. The only statement surface is authenticated RPC `query` behind the private fixed-query Store client.
 
-Windows Credential Manager is the only secret authority. On an empty store, the supervisor supplies a one-use root bootstrap credential only to the SurrealDB child environment, signs in through RPC and creates the configured namespace, `STRICT` database and two database-scoped users:
+Windows Credential Manager is the only secret authority. Root bootstrap is deliberately short-lived:
+
+1. on an empty store, start one bootstrap child with a one-use root username/password in its child-only environment;
+2. wait until upstream startup has persisted the root user and `/ready` succeeds;
+3. gracefully stop that child and restart the same root **without** root credentials in its environment;
+4. sign in as root over RPC using the Credential Manager secret and create the configured namespace, `STRICT` database and two database-scoped users;
+5. prove both database users can sign in, restart again without root environment material and repeat Editor/Owner admission.
+
+This prevents a long-running child from retaining the root password in its process environment. The persisted root account remains protected by its Credential Manager secret so an existing store cannot be re-bootstrapped merely because another process supplies new startup credentials.
+
+The two database-scoped users are:
 
 - **Editor** — ordinary daemon Store reads and mutations;
 - **Owner** — migrations, DB-user rotation and typed restore writes.
 
-The installer derives a standard Argon2 PHC verifier locally and provisions users with fixed `PASSHASH` statements; plaintext database-user passwords are not placed in SurrealQL, argv or logs. Slow-query logging remains disabled because `PASSWORD`, `PASSHASH` and `PASSSCRAM` are literal-bearing DDL. SCRAM material is not created while Postgres/SCRAM transports are disabled. After both users can sign in, restart without the root bootstrap environment and prove Editor/Owner access again.
+The installer derives a standard Argon2 PHC verifier locally and provisions users with fixed `PASSHASH` statements; plaintext database-user passwords are not placed in SurrealQL, argv or logs. Slow-query logging remains disabled because `PASSWORD`, `PASSHASH` and `PASSSCRAM` are literal-bearing DDL. SCRAM material is not created while Postgres/SCRAM transports are disabled. Credential DDL buffers and RPC errors are handled as secret-bearing material: logs retain only bounded error class and operation identity, never the statement or verifier.
 
 Store readiness requires all of these observations:
 
@@ -128,7 +138,7 @@ After Store is ready, the daemon begins bounded fair replay of `spool/pending`. 
 
 Normal idle or explicit shutdown is not Job Object termination. It proceeds as follows:
 
-1. stop new external dispatch and make new capture fall back to durable staging;
+1. close mutation admission; direct capture that reached the daemon receives internal `stage_required` before any blob/Store ownership, so the relay publishes the same command to durable spool;
 2. stop claiming new background work;
 3. allow one finite drain interval for already eligible work and a bounded spool batch;
 4. persist collected results/progress and close daemon Store sockets;
@@ -136,6 +146,8 @@ Normal idle or explicit shutdown is not Job Object termination. It proceeds as f
 6. wait through a finite supervisor deadline and record the actual child exit;
 7. if the child does not exit, terminate the owned Job Object as crash containment;
 8. release the installation mutex only after process ownership is settled.
+
+`stage_required` is a private direct-delivery disposition, not a fifth public capture result and not `rejected`. The relay returns public `staged` only after its own immutable pending-file publication succeeds; otherwise it returns `unknown`.
 
 SurrealDB itself bounds its maintenance drain and may continue shutdown after logging cleanup failures. A clean exit is therefore not an application durability receipt. The next start always repeats Store admission and exact application readback. A mutation error delivered after RocksDB applied the transaction but before grouped WAL sync completed is `OUTCOME_UNKNOWN`; it is reconciled by application identity before retry.
 
@@ -550,16 +562,27 @@ If rename succeeds but parent sync or final readback fails, publication is **pos
 
 The legacy `atomic_replace_file` donor uses `MOVEFILE_REPLACE_EXISTING` and is therefore not the V3 spool primitive. The existing directory-flush donor demonstrates the required Windows handle flags and error propagation, but V3 keeps only the minimal physical mechanism in its internal module.
 
+Direct daemon delivery has four private dispositions:
+
+```text
+committed
+rejected
+stage_required
+unknown
+```
+
+`stage_required` is returned before blob/Store ownership whenever shutdown, backup or another explicit quiesce has closed mutation admission. It is transient and never maps to public `rejected`.
+
 Relay delivery:
 
 1. call daemon `capture`;
 2. accept `committed` only with matching Store readback;
-3. accept deterministic `rejected` only when no ownership transfer occurred;
-4. treat disconnect/timeout/malformed reply after possible send as unknown;
-5. publish the exact same serialized command through the durable primitive;
-6. return `staged` only after successful final verification.
+3. accept deterministic `rejected` only when no ownership transfer occurred and the command must not be retained;
+4. on `stage_required`, unavailable daemon, or disconnect/timeout/malformed reply after possible send, publish the exact same serialized command through the durable primitive;
+5. return public `staged` only after successful final verification;
+6. if Store commit and durable pending publication both remain unestablished, return `unknown`.
 
-If neither Store commit nor durable pending publication is established, return `unknown`. Do not return `forwarded` as success.
+Do not return `forwarded` as success and do not overload rejection to mean temporary quiesce.
 
 ### 5.5 Daemon spool replay
 
@@ -749,43 +772,49 @@ For erasure, publish an exact text-free deletion notice through the same durable
 
 SurrealDB logical export is not the application backup owner. Although the core exporter reads one database snapshot, the HTTP route can commit status before the export job ends and surface a later job failure only in server logs while the client sees an ordinary body EOF. Import is statement-by-statement and may leave partial state. The selected Store profile therefore keeps HTTP `export` and `import` disabled.
 
-Backup is a V3 operation over the six owned tables, immutable blobs, active deletion notices and a finite pending-spool cut:
+Backup is a V3 operation over the six owned tables, immutable blobs, active deletion notices, retained failed quarantine and a finite pending-spool cut:
 
-1. enter `backup_preparing`; stop new daemon Store mutations, claims, cleanup and blob/deletion maintenance;
+1. enter `backup_preparing`; close mutation admission, claims, cleanup and blob/deletion maintenance;
 2. finish or reconcile all admitted short Store mutations; any unresolved write outcome blocks successful backup;
-3. acquire the cross-process spool publication mutex used by relays, establish a cut ID and enumerate exact immutable pending files; a relay blocked behind the cut publishes afterwards and is post-cut;
-4. release the publication mutex; keep Store mutation admission closed so new capture stages rather than enters the database cut;
-5. page every table through checked-in read-only queries with explicit DTO projections, stable order, immutable cursor fences and per-page count/digest;
-6. copy the exact referenced immutable blobs, selected pending commands and active deletion notices, verifying identity/length/digest;
-7. write a manifest containing format version, source installation/binary/storage/schema identity, cut ID, table/page/row counts and digests, blob/spool/deletion inventories, gaps and non-secret configuration metadata;
-8. publish the complete backup through the same create-new/file-sync/no-replace/directory-sync/readback primitive;
-9. reopen mutation admission and replay only after publication or a recorded failed/unknown backup disposition.
+3. acquire the cross-process spool publication mutex used by relays, establish a cut ID and enumerate exact immutable pending and retained failed files; a relay blocked behind the cut publishes afterwards and is post-cut;
+4. release the publication mutex; direct daemon capture receives `stage_required`, so new accepted commands stage rather than enter the database cut;
+5. page every table through checked-in read-only queries in stable canonical application-identity order with immutable cursor fences;
+6. encode each page as a versioned canonical application JSON Lines format: fixed DTO struct/field order, no unordered maps/sets, no Unicode/content normalization, finite numbers only, exact escaped UTF-8 bytes and a header carrying table/schema/page/cursor/count identity;
+7. hash the exact page bytes; copy and verify every referenced immutable blob, selected pending command, retained failed entry and active deletion notice;
+8. include a sanitized non-secret `config.toml` snapshot and digest for later comparison/rebinding, but never a secret or Credential Manager value;
+9. write a manifest containing backup-format version, supported schema generation, source installation/binary/storage identity, cut ID, table/page/row counts and digests, blob/spool/deletion/config inventories and explicit gaps;
+10. publish the complete backup through the same create-new/file-sync/no-replace/directory-sync/readback primitive;
+11. reopen mutation admission and replay only after publication or a recorded failed/unknown backup disposition.
 
 Every table page is read while application mutation admission is closed. Background SurrealDB metadata maintenance does not authorize changes to V3 application rows. The manifest—not EOF—owns completion. A failed backup leaves live data intact and no published successful manifest.
 
-Credentials, root bootstrap material, controller/provider secrets and database-user verifiers are not backup content. Unfinished external jobs retain their exact operation/copy/reconciliation state as ordinary rows; backup never redispatches them.
+Credentials, root bootstrap material, controller/provider secrets and database-user verifiers are not backup content. Unfinished external jobs retain their exact operation/copy/reconciliation state as ordinary rows; backup never redispatches them. Failed quarantine is restored as failed, never silently promoted to pending.
+
+The first implementation accepts only backup format/schema generations explicitly supported by the running build. Unsupported older/newer input is an exact refusal; do not invent a generic migration framework before a real compatible format exists.
 
 ### 12.3 Typed restore and cutover
 
 Restore never imports a SurrealQL dump and never writes into the selected live root.
 
 1. create a fresh candidate root under the same pinned SurrealDB version/engine and explicit `sync=every` profile;
-2. bootstrap root once, create the configured namespace/`STRICT` database and database Owner/Editor from current Credential Manager secrets, then restart without root;
-3. apply the ordered checked migrations and verify schema generation/definitions;
-4. verify the backup manifest and every table page/blob/spool/deletion digest before admitting its content;
-5. restore rows through fixed Owner queries and explicit per-table DTOs, preserving application identities/revisions/links/job states without generic JSON `Value` conversion;
-6. restore immutable blobs, deletion notices and selected pending files through create-new publication; never overwrite a conflicting retained object;
-7. verify counts/digests, exact current/history/source reads, uniqueness/cardinality probes, deletion fences, job/controller identities and representative write/read/delete behavior;
-8. shut down and restart the candidate under the ordinary Editor profile, repeat full Store admission and exact verification;
-9. durably switch the selected installation root under the installation mutex; keep the prior root until explicit retirement.
+2. run the short root-bootstrap child, stop it after root persistence, restart without root environment material, then sign in as root from Credential Manager;
+3. create the configured namespace/`STRICT` database and database Owner/Editor with `PASSHASH`; prove both sign-ins and restart again without root environment material;
+4. apply the ordered checked migrations and verify schema generation/definitions;
+5. verify backup-format/schema support, manifest and every table page/blob/spool/deletion/config digest before admitting content;
+6. restore rows through fixed Owner queries and explicit per-table DTOs, preserving application identities/revisions/links/job states without generic JSON `Value` conversion;
+7. restore immutable blobs, deletion notices, selected pending and retained failed files through create-new publication into their original dispositions; never overwrite a conflicting retained object;
+8. compare the sanitized configuration snapshot with current configuration and report/rebind differences explicitly; never overwrite current secrets, paths or profiles silently;
+9. verify counts/digests, exact current/history/source reads, uniqueness/cardinality probes, deletion fences, job/controller identities and representative write/read/delete behavior;
+10. shut down and restart the candidate under the ordinary Editor profile, repeat full Store admission and exact verification;
+11. durably switch the selected installation root under the installation mutex; keep the prior root until explicit retirement.
 
-Any parse, DTO, schema, row, blob, spool, deletion, conflict, restart or verification failure discards the entire candidate. A retry starts with another empty candidate. Primary reads become available after successful cutover; optional embeddings/views/Research refresh later through ordinary jobs.
+Any parse, DTO, schema, row, blob, spool, deletion, config, conflict, restart or verification failure discards the entire candidate. A retry starts with another empty candidate. Primary reads become available after successful cutover; optional embeddings/views/Research refresh later through ordinary jobs.
 
 ## 13. Control and observability
 
 Direct controls: status/inbox, inspect/open, pause/resume jobs, cancel queued work, configure projects/hosts/disclosure/profiles, correct/withdraw/erase, backup/restore or shutdown.
 
-Status derives from real facts. Show binary/version/digest/signature disposition, canonical storage URL/engine/sync mode, admitted launch/environment identity, Editor/Owner credential readiness without secret material, schema generation, Store readiness gap, graceful/forced last shutdown, capture committed/staged/unknown/rejected, spool counts/age/publication-unknown, backup cut/disposition/manifest, restore candidate state, context prepared/emitted/gap, exact-open dispositions, job/profile/controller states, result/application and per-copy cleanup.
+Status derives from real facts. Show binary/version/digest/signature disposition, canonical storage URL/engine/sync mode, admitted launch/environment identity, bootstrap/restart phase without secret material, Editor/Owner credential readiness, schema generation, Store readiness gap, graceful/forced last shutdown, capture committed/staged/unknown/rejected, internal stage-required count, spool pending/failed counts/age/publication-unknown, backup cut/disposition/format/manifest, restore candidate state, context prepared/emitted/gap, exact-open dispositions, job/profile/controller states, result/application and per-copy cleanup.
 
 Do not equate adjacent lifecycle states. Missing usage/cost/account is unknown. Notification failure does not block status/control.
 
@@ -802,13 +831,14 @@ Before Base code:
 1. acquire/pin the exact SurrealDB 3.3.4 Windows binary, size, SHA-256, PE and observed signature disposition;
 2. prove the selected binary starts and restarts the same canonical RocksDB root with explicit `sync=every`, `--no-defaults` and no SurrealKV fallback;
 3. prove the sanitized environment, exact loopback listener, reserved Origin, disabled metrics/identification/slowlog/telemetry/Postgres/import and allowed/denied HTTP/RPC/query/function matrix;
-4. bootstrap root once, provision database Owner/Editor through locally derived `PASSHASH`, prove both sign-ins, then restart without root material;
+4. run the short root-bootstrap child, restart without root environment material, provision database Owner/Editor through root RPC and locally derived `PASSHASH`, then restart and prove both database sign-ins again;
 5. run version/signin/use/query, strict schema/index migration and full Store admission through the minimal client;
 6. freeze explicit JSON-safe DTOs and round-trip optional-state, ID/reference, integer-time, finite-vector and pagination boundaries without generic `Value` or `SELECT *`;
 7. exercise unique conflict, `FOR UPDATE`, whole-transaction retry, disconnect and applied-before-WAL-sync/shutdown unknown readback;
 8. exercise create-new temp, no-replace write-through rename, directory flush, post-rename sync failure reconciliation, delete/move directory flush and restart readback on the supported filesystem;
-9. complete one application-owned backup cut and typed restore into a fresh candidate, including concurrent relay staging, exact blobs/deletion notices/pending spool, forced page/blob mismatch, candidate discard, restart and cutover verification;
-10. exercise graceful shutdown with active maintenance and forced Job Object containment, then prove consistent restart admission/readback.
+9. prove `stage_required` under backup/shutdown quiesce, concurrent relay publication and exact public `staged|unknown` mapping;
+10. complete one application-owned canonical backup cut and typed restore into a fresh candidate, including exact blobs/deletion notices/pending+failed spool, sanitized config comparison, forced page/blob mismatch, unsupported format, candidate discard, restart and cutover verification;
+11. exercise graceful shutdown with active maintenance and forced Job Object containment, then prove consistent restart admission/readback.
 
 This preflight changes dependencies only when evidence requires it. It does not build a second storage framework or copy SurrealDB's CBOR protocol.
 
