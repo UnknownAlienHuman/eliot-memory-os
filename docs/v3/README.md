@@ -14,7 +14,7 @@ V1 and V2 are donors. V3 is a greenfield implementation.
 6. [Audit conclusion](AUDIT.md) — evidence, root causes, rejected machinery and source limits.
 7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for original requirements, audits and donors.
 
-Architecture draft.9, Implementation draft.29 and Cognition draft.12 describe one product at increasing depth. Inference Contract 0.8 is one narrow cross-repository boundary, not another architecture or workflow layer. The complete target is not a prerequisite for useful Base. None of these documents is implemented product code.
+Architecture draft.9, Implementation draft.30 and Cognition draft.13 describe one product at increasing depth. Inference Contract 0.8 is one narrow cross-repository boundary, not another architecture or workflow layer. The complete target is not a prerequisite for useful Base. None of these documents is implemented product code.
 
 `ANALYSIS-REGISTRY.md` is the only active analysis ledger. `AUDIT-MAP.md` is the stable source/decision matrix.
 
