@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.12 · 2026-10-26 · normative algorithms used by V3.**
+**Revision 1.0-draft.13 · 2026-10-26 · normative algorithms used by V3.**
 
 This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves context, learns from outcomes and improves connected methods. It does not define extra services. State, execution and ownership are defined in [Implementation](IMPLEMENTATION.md). External model execution, connection/profile admission, controlled artifacts and all cleanup dispositions are defined by [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md).
 
@@ -285,14 +285,14 @@ Before controller application I/O:
 2. reduce disclosure over material actually supplied;
 3. select configured controller profile name;
 4. build exact prompt and response format;
-5. load the admitted installation's stable `controller_client_id`;
+5. load the admitted installation's stable `controller_client_id` plus selected non-secret `credential_id` and positive `credential_generation`;
 6. build the stable client request ID, method and canonical bounded request identity;
-7. save prompt bytes/blob, length, digest, profile, disclosure, limits, source mapping, caller/request identity and non-secret credential-reference generation/digest;
-8. authenticate and require a typed hello receipt whose `client_id`, `inference_client` role and protocol match the retained installation/job identity.
+7. save prompt bytes/blob, length, digest, profile, disclosure, limits, source mapping, caller/request identity and selected credential ID/generation;
+8. authenticate and require the exact protocol-v2 typed hello receipt whose client ID, `inference_client` role, credential ID/generation and protocol match installation selection and the retained job.
 
-Token bytes and reusable token hashes/verifiers never enter the job or backup. A mismatched/malformed hello receipt closes the connection before an application frame and sets `caller_identity_unavailable`. It does not authorize a new `client_id`, Operator/admin recovery or a new request ID.
+Token bytes, token hashes, token-derived fingerprints and reusable verifiers never enter the job or backup. The controller-local maintenance command that provisioned the private inference credential owns controller Operator authority; Memory does not. A missing, unknown, malformed or mismatched hello field closes the connection before an application frame and sets `caller_identity_unavailable` or the specific credential/protocol failure. It does not authorize a new `client_id`, Operator/admin recovery or a new request ID.
 
-Do not drop protected material to make an external destination pass. Controller admission authoritatively resolves profile/connection/`actual_destination`, validates disclosure, origin, limits and format, and either admits Operation or returns a specific operational state. Rejection/wait leaves input unprocessed.
+Do not drop protected material to make an external destination pass. Controller admission authoritatively resolves profile/connection/`actual_destination`, validates disclosure, origin, limits and format, and either reconciles/admit the Operation or returns a specific operational state. Rejection/wait leaves input unprocessed.
 
 Provider/controller execution occurs outside Store transactions. Memory retains exact returned bytes and operational metadata before cognitive decoding.
 
@@ -374,15 +374,14 @@ Controller operational state is distinct from cognitive result:
 |---|---|
 | profile/connection missing, disabled or incompatible | No provider request; input remains pending or explicitly failed |
 | automatic use denied | No provider request; automatic job waits for configuration/operator change |
-| hello client/role/protocol mismatch | `caller_identity_unavailable`; no application request, read, release or replay |
-| admission reply lost | Replay exact caller/request/method/identity; do not invent attempt |
+| hello client/role/credential/protocol mismatch | `caller_identity_unavailable` or specific credential/protocol failure; no application request, read, release or reconciliation call |
+| admission reply lost / Operation ID unknown | After verified hello, invoke the same method with exact retained caller/request/canonical identity once; controller returns matching Operation, creates first admission if absent, or conflicts |
 | queued | Operation exists; cancellation may still win |
 | sending/native accepted | Provider I/O may have occurred; local cancellation cannot prove non-execution |
-| `unknown` | Preserve identity and reconcile; no new request ID automatically |
+| provider Operation `unknown` | Preserve Operation identity and use controller-native readback when available; never redispatch provider work |
 | restored known Operation | Read exact Operation/artifact/release state under same caller; never redispatch |
-| possible send, Operation ID unknown | Replay exact method/request identity under same caller only |
-| proven no-send | The retained request may make its first application dispatch once |
-| same-client token rotation | Revoke old connection, validate new typed hello, continue the same Operation owner |
+| stale credential generation | Controller rejects before application admission with `CREDENTIAL_STALE`; close/reap transport and reconnect only with selected current generation |
+| same-client credential rotation | New generation retains the same Operation owner; prove pre-rotation Operation read/release before previous-secret retirement |
 | controller result retained | Continue exact readback, not inference replay |
 | result copied into Memory | Safe to decode/publish; controller copies still need cleanup |
 | terminal without result | No cognitive body exists; release retained input with `terminal_without_result` |
@@ -394,17 +393,16 @@ Controller `complete`/`partial` requires exact result artifact readback by the r
 
 Restart/restore reconciliation is ordered:
 
-1. validate the typed hello receipt against installation and job `controller_client_id`, role and supported protocol;
-2. on mismatch, hold `caller_identity_unavailable`; do not send an application frame, substitute Operator/admin, change principal or invent request identity;
+1. validate the exact protocol-v2 typed hello receipt against installation/job client ID, role, credential ID and positive generation;
+2. on mismatch, hold `caller_identity_unavailable` or the specific credential/protocol failure; do not send an application frame, substitute Operator/admin, change principal or invent request identity;
 3. if Operation ID is known, use `operation.get`, exact-caller artifact read and release readback;
-4. if a send was possible but Operation ID is unknown, replay only the same method/canonical request under the same caller so controller returns the original Operation or conflict;
-5. only a proven no-send request may perform its first dispatch.
+4. if Operation ID is unknown, invoke the same retained method/canonical request once under the same caller; controller performs reconcile-or-admit and returns the matching Operation, first admission or conflict.
 
-Ambiguous provider timeout is not no-change and not permission to buy a second call. A same-client token rotation preserves ownership only after old sessions are revoked and a pre-rotation Operation is read/released through the verified new connection.
+Memory does not retain a separate `possible_send`/`proven_no_send` state machine. Ambiguous provider timeout remains inside the admitted controller Operation; it is not no-change and not permission to buy a second call. Same-client credential rotation preserves ownership only after protocol-v2 hello and a pre-rotation Operation are read/released through the verified new generation. Generation fencing, not whole-controller restart, revokes old inference application authority.
 
 ### 7.5 Decode, validate, publish and release
 
-For a result-bearing Operation, the same verified `controller_client_id` reads the artifact in bounded ranges, verifies length/digest, and durably saves exact bytes in Memory **before** decoding or release. A local Operator erasure path may delete exact controller copies without receiving result bytes; it never produces a cognitive result or transfers ownership.
+For a result-bearing Operation, the same verified `controller_client_id` reads the artifact in bounded ranges through the selected current credential generation, verifies length/digest, and durably saves exact bytes in Memory **before** decoding or release. A local Operator erasure path may delete exact controller copies without receiving result bytes; it never produces a cognitive result or transfers ownership.
 
 Parse one complete JSON object, optionally removing one enclosing code fence without changing body.
 
@@ -415,7 +413,7 @@ Do **not** treat these as `changes=[]`:
 - malformed change;
 - provider/controller operational error;
 - profile/connection/destination/disclosure rejection;
-- caller identity/role/protocol mismatch;
+- caller identity/role/credential/protocol mismatch;
 - missing or damaged result artifact;
 - truncated or unfinished result;
 - unresolved external outcome.
@@ -529,7 +527,7 @@ Self-diagnosis asks which connected edge failed:
 2. direct Store ownership or durable spool publication;
 3. spool replay;
 4. source selection/disclosure reduction;
-5. controller caller/role/protocol admission;
+5. controller caller/role/credential-generation/protocol admission;
 6. profile/connection/destination admission;
 7. controller/provider execution;
 8. result retention/readback/release;
@@ -581,10 +579,10 @@ Physical erasure traverses controlled sources, derivatives, packets, job inputs/
 
 For each inference Operation:
 
-- verified Memory result → the same verified caller releases with `memory_copy_verified`;
+- verified Memory result → the same verified caller through the selected current credential generation releases with `memory_copy_verified`;
 - terminal no-result → the same verified caller releases with `terminal_without_result`;
 - queued/sending/unknown selected for erase → the same verified caller or the contract's non-disclosing Operator erasure branch uses `abandon_for_erasure` to fence late publication before cleanup;
-- unavailable original caller → do not expose bytes, transfer ownership or redispatch; retain exact cleanup debt until same-principal recovery or verified Operator erasure completes.
+- unavailable original caller/current credential → do not expose bytes, transfer ownership or redispatch; retain exact cleanup debt until same-principal recovery or verified Operator erasure completes.
 
 The daemon checks deletion notices before committing a replayed capture command. A historical spool entry cannot resurrect erased scope.
 
@@ -605,8 +603,8 @@ A late provider result cannot reintroduce erased data through controller. A prov
 | Episode membership/coverage | `learning` |
 | Disclosure reduction | `learning` pure reducer |
 | Text request construction/decoding | Purpose handler in `learning` |
-| Controller IPC, typed hello verification, exact-caller Operation/result reads and release dispositions | `adapters::controller` |
-| Job timing, retained caller/request identity and `caller_identity_unavailable` reconciliation | `jobs` |
+| Protocol-v2 controller IPC, typed hello verification, same-caller reconcile-or-admit, exact-caller Operation/result reads and release dispositions | `adapters::controller` |
+| Job timing, retained caller/request/credential identity and `caller_identity_unavailable` reconciliation | `jobs` |
 | Atomic revisions and history | `memory` + `store` |
 | Vector-space identity and result mapping | `vectors` + `jobs` |
 | Document/Research translation | `adapters::source` |
