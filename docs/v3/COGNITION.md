@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.11 · 2026-10-24 · normative algorithms used by V3.**
+**Revision 1.0-draft.12 · 2026-10-26 · normative algorithms used by V3.**
 
 This document defines how Eliot reconstructs current work, resolves revisable knowledge, retrieves context, learns from outcomes and improves connected methods. It does not define extra services. State, execution and ownership are defined in [Implementation](IMPLEMENTATION.md). External model execution, connection/profile admission, controlled artifacts and all cleanup dispositions are defined by [INFERENCE-CONTRACT](INFERENCE-CONTRACT.md).
 
@@ -102,7 +102,7 @@ Last write, highest similarity, retrieval frequency and model confidence are not
 
 Prepare replacement outside transaction. Publish new revision, revision-specific grounds, scoped retirement and job result atomically.
 
-Failed publication leaves prior committed state intact. Competing replacements revalidate current revision. Result for source version A does not become evidence about version B because it was published later.
+Failed publication leaves prior committed state intact. Competing replacements revalidate current revision. Result for source version A does not become evidence about source version B because it was published later.
 
 After A→B, withdrawing B does not automatically restore A. Return another supported alternative or unknown. Restoring A requires new evidence or correction of original replacement decision.
 
@@ -279,14 +279,18 @@ The handler receives:
 
 The job retains ref→exact handle/revision/range mapping. A ref is request-local, not another registry. Include failures and read-only findings as well as successes. Label derived summaries, compact summaries and replayed Eliot context so they do not become new evidence.
 
-Before controller I/O:
+Before controller application I/O:
 
 1. freeze exact members and ranges;
 2. reduce disclosure over material actually supplied;
 3. select configured controller profile name;
 4. build exact prompt and response format;
-5. save prompt bytes/blob, length, digest, profile, disclosure, limits and source mapping;
-6. assign one stable client request ID for this explicit attempt.
+5. load the admitted installation's stable `controller_client_id`;
+6. build the stable client request ID, method and canonical bounded request identity;
+7. save prompt bytes/blob, length, digest, profile, disclosure, limits, source mapping, caller/request identity and non-secret credential-reference generation/digest;
+8. authenticate and require a typed hello receipt whose `client_id`, `inference_client` role and protocol match the retained installation/job identity.
+
+Token bytes and reusable token hashes/verifiers never enter the job or backup. A mismatched/malformed hello receipt closes the connection before an application frame and sets `caller_identity_unavailable`. It does not authorize a new `client_id`, Operator/admin recovery or a new request ID.
 
 Do not drop protected material to make an external destination pass. Controller admission authoritatively resolves profile/connection/`actual_destination`, validates disclosure, origin, limits and format, and either admits Operation or returns a specific operational state. Rejection/wait leaves input unprocessed.
 
@@ -362,7 +366,7 @@ Rules:
 - an empty list never means delete everything;
 - model does not choose database IDs, origin project, reuse scope, disclosure, permissions, profile or job completion.
 
-### 7.4 Operational execution and cleanup states
+### 7.4 Operational execution, restart and cleanup states
 
 Controller operational state is distinct from cognitive result:
 
@@ -370,10 +374,15 @@ Controller operational state is distinct from cognitive result:
 |---|---|
 | profile/connection missing, disabled or incompatible | No provider request; input remains pending or explicitly failed |
 | automatic use denied | No provider request; automatic job waits for configuration/operator change |
+| hello client/role/protocol mismatch | `caller_identity_unavailable`; no application request, read, release or replay |
 | admission reply lost | Replay exact caller/request/method/identity; do not invent attempt |
 | queued | Operation exists; cancellation may still win |
 | sending/native accepted | Provider I/O may have occurred; local cancellation cannot prove non-execution |
 | `unknown` | Preserve identity and reconcile; no new request ID automatically |
+| restored known Operation | Read exact Operation/artifact/release state under same caller; never redispatch |
+| possible send, Operation ID unknown | Replay exact method/request identity under same caller only |
+| proven no-send | The retained request may make its first application dispatch once |
+| same-client token rotation | Revoke old connection, validate new typed hello, continue the same Operation owner |
 | controller result retained | Continue exact readback, not inference replay |
 | result copied into Memory | Safe to decode/publish; controller copies still need cleanup |
 | terminal without result | No cognitive body exists; release retained input with `terminal_without_result` |
@@ -381,13 +390,21 @@ Controller operational state is distinct from cognitive result:
 | released | Every created controller input/result copy is removed or verified absent |
 | abandoned for erasure | No cognitive result may later publish; provider effect/copy remains external unknown |
 
-Controller `complete`/`partial` requires exact result artifact readback before it can affect cognition. Controller `failed`, missing result, digest mismatch, unsupported output or operational limit is not cognitive no-change.
+Controller `complete`/`partial` requires exact result artifact readback by the retained authenticated caller before it can affect cognition. Controller `failed`, missing result, digest mismatch, unsupported output or operational limit is not cognitive no-change.
 
-Lost admission reply is recovered by repeating exact stable request ID and canonical parameters as the same client. Once Operation ID is known, read the Operation. Ambiguous provider timeout is not no-change and not permission to buy a second call.
+Restart/restore reconciliation is ordered:
+
+1. validate the typed hello receipt against installation and job `controller_client_id`, role and supported protocol;
+2. on mismatch, hold `caller_identity_unavailable`; do not send an application frame, substitute Operator/admin, change principal or invent request identity;
+3. if Operation ID is known, use `operation.get`, exact-caller artifact read and release readback;
+4. if a send was possible but Operation ID is unknown, replay only the same method/canonical request under the same caller so controller returns the original Operation or conflict;
+5. only a proven no-send request may perform its first dispatch.
+
+Ambiguous provider timeout is not no-change and not permission to buy a second call. A same-client token rotation preserves ownership only after old sessions are revoked and a pre-rotation Operation is read/released through the verified new connection.
 
 ### 7.5 Decode, validate, publish and release
 
-For a result-bearing Operation, read the artifact in bounded ranges, verify length/digest, and durably save exact bytes in Memory **before** decoding or release.
+For a result-bearing Operation, the same verified `controller_client_id` reads the artifact in bounded ranges, verifies length/digest, and durably saves exact bytes in Memory **before** decoding or release. A local Operator erasure path may delete exact controller copies without receiving result bytes; it never produces a cognitive result or transfers ownership.
 
 Parse one complete JSON object, optionally removing one enclosing code fence without changing body.
 
@@ -398,6 +415,7 @@ Do **not** treat these as `changes=[]`:
 - malformed change;
 - provider/controller operational error;
 - profile/connection/destination/disclosure rejection;
+- caller identity/role/protocol mismatch;
 - missing or damaged result artifact;
 - truncated or unfinished result;
 - unresolved external outcome.
@@ -414,13 +432,13 @@ Valid complete no-change records only supplied input and purpose. Background and
 
 Cleanup selection is operational, not cognitive:
 
-- result copied and verified → `inference.release(memory_copy_verified)`;
-- terminal Operation with no result → `inference.release(terminal_without_result)`;
-- unresolved Operation selected for physical erase → `inference.release(abandon_for_erasure)`.
+- result copied and verified → exact caller uses `inference.release(memory_copy_verified)`;
+- terminal Operation with no result → exact caller uses `inference.release(terminal_without_result)`;
+- unresolved Operation selected for physical erase → exact caller or the contract's verified non-disclosing Operator branch uses `inference.release(abandon_for_erasure)`.
 
 Malformed cognitive output still uses `memory_copy_verified` after exact bytes are durably copied; semantic failure is not a reason to retain controller content indefinitely.
 
-Release reports input/result independently. One removed file does not imply complete cleanup. Release failure does not revoke verified Memory bytes. Physical erasure remains incomplete while either controlled controller copy persists or mismatches.
+Release reports input/result independently. One removed file does not imply complete cleanup. Release failure does not revoke verified Memory bytes. If the original caller is unavailable, normal read/release is unavailable and cleanup remains unproven unless the bounded Operator erasure branch completes exact deletion. Physical erasure remains incomplete while either controlled controller copy persists or mismatches.
 
 `kind=method` becomes ordinary advice available to exact/lexical context with conditions/limitations. The next relevant context opens published revision and cited sources, not raw JSON as unread report.
 
@@ -511,16 +529,17 @@ Self-diagnosis asks which connected edge failed:
 2. direct Store ownership or durable spool publication;
 3. spool replay;
 4. source selection/disclosure reduction;
-5. profile/connection/destination admission;
-6. controller/provider execution;
-7. result retention/readback/release;
-8. decoding;
-9. publication;
-10. retrieval/applicability;
-11. packet construction;
-12. host emission;
-13. use/correlation;
-14. method quality.
+5. controller caller/role/protocol admission;
+6. profile/connection/destination admission;
+7. controller/provider execution;
+8. result retention/readback/release;
+9. decoding;
+10. publication;
+11. retrieval/applicability;
+12. packet construction;
+13. host emission;
+14. use/correlation;
+15. method quality.
 
 Correct the supported failing edge. Do not create recursive diagnosis from accounting, missing telemetry or every no-change.
 
@@ -562,13 +581,14 @@ Physical erasure traverses controlled sources, derivatives, packets, job inputs/
 
 For each inference Operation:
 
-- verified Memory result → release with `memory_copy_verified`;
-- terminal no-result → release with `terminal_without_result`;
-- queued/sending/unknown selected for erase → `abandon_for_erasure` fences late controller publication before cleanup.
+- verified Memory result → the same verified caller releases with `memory_copy_verified`;
+- terminal no-result → the same verified caller releases with `terminal_without_result`;
+- queued/sending/unknown selected for erase → the same verified caller or the contract's non-disclosing Operator erasure branch uses `abandon_for_erasure` to fence late publication before cleanup;
+- unavailable original caller → do not expose bytes, transfer ownership or redispatch; retain exact cleanup debt until same-principal recovery or verified Operator erasure completes.
 
 The daemon checks deletion notices before committing a replayed capture command. A historical spool entry cannot resurrect erased scope.
 
-A late provider result cannot reintroduce erased data through controller. A provider-held copy/effect may remain an external unknown. If either controller input/result copy cannot be confirmed removed, report exact per-copy gap and incomplete erasure.
+A late provider result cannot reintroduce erased data through controller. A provider-held copy/effect may remain an external unknown. If either controller input/result copy cannot be confirmed removed, report exact per-copy gap and incomplete erasure. Operator erasure may prove deletion/status only; it never supplies a cognitive result.
 
 ## 14. Algorithm ownership
 
@@ -585,8 +605,8 @@ A late provider result cannot reintroduce erased data through controller. A prov
 | Episode membership/coverage | `learning` |
 | Disclosure reduction | `learning` pure reducer |
 | Text request construction/decoding | Purpose handler in `learning` |
-| Controller IPC, Operation/result readback and release dispositions | `adapters::controller` |
-| Job timing/reconciliation | `jobs` |
+| Controller IPC, typed hello verification, exact-caller Operation/result reads and release dispositions | `adapters::controller` |
+| Job timing, retained caller/request identity and `caller_identity_unavailable` reconciliation | `jobs` |
 | Atomic revisions and history | `memory` + `store` |
 | Vector-space identity and result mapping | `vectors` + `jobs` |
 | Document/Research translation | `adapters::source` |
