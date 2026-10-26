@@ -32,9 +32,15 @@ V3 does not assume that naming an SDK or database makes persistence correct. The
 
 - exact SurrealDB server path/version/size/digest and storage engine are installation-owned inputs;
 - the first qualification target is SurrealDB 3.3.4 with external RocksDB and explicit `sync=every`; no silent fallback to SurrealKV, another version or another URL spelling;
-- the supervisor launches one numeric-IPv4 loopback child with a sanitized environment, closed Origin, metrics/identification/slowlog/telemetry/Postgres/import disabled and no inherited arbitrary `SURREAL_*` settings;
-- root credentials exist in a child environment only for the short first bootstrap: after root persistence the child is stopped and the same store restarts without root environment material before namespace/database/user provisioning;
-- the live HTTP surface is RPC only; selected RPC methods are `signin`, `use`, `version`, `query` and `ping`, while arbitrary query is admitted only for authenticated `system` principals;
+- the supervisor launches one numeric-IPv4 loopback child with a sanitized environment, metrics/identification/slowlog/telemetry/Postgres/import disabled and no inherited arbitrary `SURREAL_*` settings;
+- the loopback port is selected per start, not trusted from a prior file: a temporary reservation narrows the race, and Windows TCP-table listener plus established-peer ownership must match the retained child process before any credential is sent;
+- the live HTTP surface is RPC only and the only allowed RPC method is `query`;
+- database/root authentication and namespace/database selection occur in a Basic-authenticated WebSocket upgrade on the already verified raw TCP stream; RPC `signin`, `use`, `version` and `ping` are not exposed;
+- exact binary digest plus process/listener/peer ownership establish service identity; WebSocket control Ping/Pong establishes transport liveness;
+- `--allow-origin` is not WebSocket authorization: SurrealDB's CORS middleware adds response headers but the RPC upgrade does not reject Origin, so Origin is defense-in-depth metadata only;
+- unauthenticated WebSocket upgrade remains possible upstream, but guest arbitrary query is denied; anonymous connection-exhaustion behavior must pass Slice 0 or trigger a separate pinned-WSS/proxy hardening decision;
+- root credentials exist in a child environment only for the short first bootstrap: after possible root persistence the child is stopped and the same store restarts without root environment material before root RPC provisioning;
+- a failed/unknown bootstrap retries with the same retained root credential after root-free reconciliation, never a newly generated password;
 - Memory uses a small bounded JSON WebSocket client, not the current Rust SDK or V2 adapter;
 - JSON carries only explicit application DTOs: no generic Surreal `Value`, `SELECT *` persistence format or implicit `NONE`/`NULL`, record-ID, UUID, datetime, duration, decimal or non-finite-float round-trip;
 - only fixed application queries with bound JSON-safe variables, explicit projections and exact decoders are exposed;
@@ -49,7 +55,7 @@ V3 does not assume that naming an SDK or database makes persistence correct. The
 
 The official Rust SDK may be reconsidered later, but the current 3.3.4 dependency requires Rust 1.95 while this repository declares MSRV 1.94, and its published license metadata does not fit the current `cargo-deny` allowlist without an explicit preflight. A dependency is not admitted because its API looks convenient. V3 also does not copy SurrealDB's vendor-specific CBOR tag protocol into another client.
 
-Store admission requires the exact owned process/listener and binary identity, upstream `/ready`, Editor `signin/use`, exact version, the closed route/method/subject/function denial matrix, schema/definition checks and one bounded typed write/read/delete through the production client. Port, `/health`, `/status`, `/ready` or clean child exit alone proves none of that.
+Store admission requires exact binary identity, retained process handle, observed listener owner, observed established peer owner, upstream `/ready`, Editor Basic handshake with exact authentication/selection headers, the query-only route/method/subject/function denial matrix, schema/definition checks and one bounded typed write/read/delete through the production client. Port, `/health`, `/status`, `/ready`, TCP connect, WebSocket 101 or clean child exit alone proves none of that.
 
 Normal shutdown first closes mutation admission, returns `stage_required` for new direct capture, drains finite admitted work, closes daemon Store sockets and requests the qualified graceful SurrealDB path. Job Object termination is deadline/crash containment only. SurrealDB bounds maintenance drain and can continue after logging cleanup failures, so restart always repeats full admission and application readback.
 
@@ -67,7 +73,7 @@ create-new same-directory temporary file
 
 Backup pages use a versioned canonical application JSON Lines encoding with fixed DTO field order, stable application-identity ordering, no unordered maps/sets and digests over exact bytes. The manifest owns completion. Unsupported backup/schema generations are refused explicitly rather than fed into a speculative generic migration system.
 
-These mechanisms remain unimplemented until Slice 0 proves the exact Windows binary/profile, `sync=every`, short root bootstrap, credential split, typed wire DTOs, transaction/unknown behavior, `stage_required`, graceful/forced shutdown, durable publication and canonical application backup/typed restore round-trip.
+These mechanisms remain unimplemented until Slice 0 proves the exact Windows binary/profile, `sync=every`, dynamic port and listener/peer ownership, Basic-authenticated query-only transport, Origin non-authority, anonymous-connection bounds, short/reconciled root bootstrap, credential split, typed wire DTOs, transaction/unknown behavior, `stage_required`, graceful/forced shutdown, durable publication and canonical application backup/typed restore round-trip.
 
 ## First Base host and durable capture
 
@@ -284,7 +290,7 @@ Base implements capture, explicit updates and reuse. The first learning extensio
 
 [Implementation §14](IMPLEMENTATION.md#14-implementation-sequence) defines connected slices:
 
-0. Exact SurrealDB/Windows preflight: binary/profile/`sync=every`, closed environment and capability surface, short root bootstrap followed by root-free Owner/Editor `PASSHASH` provisioning, typed JSON DTOs, transaction/WAL unknowns, `stage_required`, graceful/forced shutdown, immutable publication and canonical application backup/typed restore including pending+failed spool and config comparison.
+0. Exact SurrealDB/Windows preflight: binary/profile/`sync=every`, sanitized environment, dynamic port plus listener/peer owner, Origin non-authority and anonymous-connection bounds, peer-verified Basic query-only transport, reconciled short root bootstrap, Owner/Editor `PASSHASH`, typed JSON DTOs, transaction/WAL unknowns, `stage_required`, graceful/forced shutdown, immutable publication and canonical application backup/typed restore including pending+failed spool and config comparison.
 1. Store/lifecycle and exact persistence.
 2. Useful Base with one host, retrieval/context/source open and maintenance.
 3. Controller one-shot inference owner: connection/profile admission, direct IPC, controlled input/optional result, exact readback and per-copy `inference.release` without Task/Attempt.
