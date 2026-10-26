@@ -1,8 +1,8 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-26 · нормативная база Architecture draft.9 / Implementation draft.30 / Cognition draft.13 / Inference Contract 0.8; controller baseline `e42c464d`; активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-26 · Architecture draft.9 / Implementation draft.30 / Cognition draft.13 / Inference Contract 0.9; текущая controller authority `c8c0ee122c98a01be86bc5296a22a389662a1c89`; активный рабочий реестр, не runtime gate.**
 
-Это **единственный активный реестр** V3. Он показывает, что проверено, что решено только на design-уровне, чего нет в runtime и что делать следующим. Architecture/Implementation/Cognition/Inference Contract — нормативный проект; [AUDIT](AUDIT.md) и [AUDIT-MAP](AUDIT-MAP.md) сохраняют доказательства и стабильные source dispositions. Новый проход обновляет этот файл, а не создаёт новый отчёт.
+Это **единственный активный реестр** V3. Он хранит текущее решение, границу доказательства, оставшийся разрыв и следующий connected step. [AUDIT](AUDIT.md) и [AUDIT-MAP](AUDIT-MAP.md) сохраняют исходные доказательства/dispositions; новый проход обновляет этот файл, а не создаёт новый отчёт.
 
 ## 1. Статусы
 
@@ -11,18 +11,19 @@
 | `CHECKED` | Указанный source/design scope прочитан и вывод согласован. Не означает работающий runtime. |
 | `DECIDED` | Для V3 выбрано решение; код/живой прогон отсутствует. |
 | `PARTIAL` | Проверена часть connected edge; остаётся материальный непроверенный участок. |
-| `GAP` | В выбранном caller→owner→result→consumer пути отсутствует необходимая связь. |
+| `GAP` | В caller→owner→result/unknown→consumer пути отсутствует необходимая связь. |
 | `OPEN` | Требуется решение или чтение источника. |
 | `BLOCKED` | Нужный источник недоступен. |
-| `NOT SELECTED` | Механизм не нужен выбранной конструкции; это не полный аудит донора. |
-| `NOT QUALIFIED` | Артефакт/механизм идентифицирован, но требуемый живой прогон не выполнен. |
+| `NOT SELECTED` | Механизм не нужен выбранной конструкции. |
+| `NOT QUALIFIED` | Артефакт/механизм найден, но требуемый живой прогон не выполнен. |
+| `SUPERSEDED` | Решение было корректно для прежнего baseline, но текущая authority выбрала другой механизм. |
 
 Правила:
 
-- README, search hit, DTO, fixture, receipt, release metadata или compilation сами по себе не дают runtime `CHECKED`;
-- `IMPLEMENTED` появится только после реального input→operation→durable result/unknown→consumer→restart/readback;
-- release/build provenance отличается от runtime qualification;
+- README, DTO, schema fixture, receipt, CI или compilation сами по себе не дают runtime `CHECKED`;
+- `IMPLEMENTED` появляется только после реального input→operation→durable result/unknown→consumer→restart/readback;
 - новый механизм не вводится без named caller, owner, result/unknown и consumer;
+- controller V1 source используется только как явно названный donor; реализация идёт против текущего controller V2;
 - подробная хронология остаётся в Git; здесь хранится текущее состояние.
 
 ## 2. Активная матрица
@@ -31,83 +32,96 @@
 
 | ID | Объект | Статус | Решение / разрыв | Следующее действие |
 |---|---|---|---|---|
-| R-001 | Product ownership | `CHECKED` design | Host/controller owns external work; daemon owns Memory application state; supervisor owns privileged installation/process effects. | Не возвращать Task/provider stack в Memory и не делать supervisor public admin service. |
-| R-002 | Process family / idle drain | `DECIDED` / `NOT IMPLEMENTED` | One supervisor, daemon, active Store child, at most one disposable candidate; retained launch/root identity; finite drains. | Slice 0 process/IPC/shutdown implementation. |
-| R-003 | Continuation address | `DECIDED` | Project/workspace + task or actor/session; path/branch/HEAD are environment. | Two-workspace/fork/late-result cases. |
-| R-004 | Context packet identity | `CHECKED` design / `NOT IMPLEMENTED` | Rendered bytes/digest + exact revisions + gaps in ordinary observation/blob+links. | Coherent hydration and real host emission. |
-| R-005 | Structured correction | `DECIDED` | Correction observation + revision/history + saved result in one transaction. | Stale conflict/replay/readback. |
-| R-006 | Six tables / Store operations | `CHECKED` design / `NOT IMPLEMENTED` | STRICT DB, six SCHEMAFULL tables, fixed queries, typed DTOs and indexes. | Migration 0001/query corpus/DTOs. |
-| R-007 | Current/history | `DECIDED` | Exact version handles; no fall-forward or predecessor resurrection. | Atomic publication/restart readback. |
-| R-008 | Compound grounds | `PARTIAL` | Required groups/alternatives/advisory support separated. | Reducer, cycles, erase, concurrency. |
-| R-009 | Retrieval arms / packing | `PARTIAL` | Exact/address/lexical/vector/relation arms independent. | Real plans/limits/noise/exception coverage. |
-| R-010 | Processing-method consumer | `DECIDED` | Job freezes exact recipe revision and later consumer must read result. | Demonstrate changed later request/context. |
-| R-011 | Cross-project reuse/disclosure | `DECIDED` | Origin, reuse scope and disclosure independent. | Scoped queries and deterministic reduction. |
-| R-012 | Native hook capture | `CHECKED` design / `NOT IMPLEMENTED` | Finite Claude event profile selected. | Installed-build payload qualification. |
-| R-013 | Native context delivery | `CHECKED` design / `NOT IMPLEMENTED` | Actual packet crosses host boundary; prepared/emitted/use distinct. | Timeout/resume/compact/fork/subagent cases. |
-| R-019 | Backup/restore | `DECIDED` / `NOT IMPLEMENTED` | Application typed backup; exact rollback, stable installation/controller caller identity and same-principal job reconciliation; no invented row merge or duplicate inference. | Windows round-trip, safety/disaster and caller-mismatch paths. |
-| R-020 | Erasure/reappearance | `PARTIAL` | Monotonic fence, replay drain, controller fence and controlled-copy inventory. | Physical traversal across all generations. |
-| R-021 | Recursive improvement | `PARTIAL` | Diagnose concrete failed edge; no intelligence score. | Connected source→revision→later-context path. |
+| R-001 | Product ownership | `CHECKED` design | Host/controller owns external work; Memory daemon owns memory semantics/state; supervisor owns privileged installation/process effects. | Не возвращать Task/provider stack в Memory. |
+| R-002 | Process family / idle drain | `DECIDED` / `NOT IMPLEMENTED` | Supervisor + daemon + active Store child + at most one candidate; retained identities; finite drains. | Slice 0 process/IPC/shutdown. |
+| R-003 | Continuation address | `DECIDED` | Project/workspace + task or actor/session; path/branch/HEAD are environment. | Fork/two-workspace/late-result cases. |
+| R-004 | Context packet identity | `CHECKED` design / `NOT IMPLEMENTED` | Rendered bytes/digest + exact revisions + gaps in ordinary data. | Real host emission/readback. |
+| R-005 | Structured correction | `DECIDED` | Correction observation + revision/history + saved result atomically. | Conflict/replay/readback. |
+| R-006 | Six tables / Store operations | `CHECKED` design / `NOT IMPLEMENTED` | STRICT schema, fixed projections/queries, typed DTOs/indexes. | Migration 0001/query corpus. |
+| R-007 | Current/history | `DECIDED` | Exact version handles; no fall-forward or predecessor resurrection. | Publication/restart readback. |
+| R-008 | Compound grounds | `PARTIAL` | Required groups, alternatives and advisory support separated. | Reducer/cycle/erase/concurrency. |
+| R-009 | Retrieval arms / packing | `PARTIAL` | Exact/address/lexical/vector/relation arms independent. | Real plans/limits/noise/exceptions. |
+| R-010 | Processing-method consumer | `DECIDED` | Job freezes exact recipe revision; later consumer must actually read result. | Demonstrate changed later context. |
+| R-011 | Reuse/disclosure | `DECIDED` | Origin, reuse scope and disclosure are independent. | Scoped queries/reduction. |
+| R-012 | Native hook capture | `CHECKED` design / `NOT IMPLEMENTED` | Finite Claude event profile. | Installed-build payload qualification. |
+| R-013 | Native context delivery | `CHECKED` design / `NOT IMPLEMENTED` | Actual packet crosses host boundary; prepared/emitted/use distinct. | Resume/compact/fork/subagent cases. |
+| R-019 | Backup/restore | `PARTIAL` / `NOT IMPLEMENTED` | Typed application backup and exact rollback selected; controller external-work cut now requires Contract 0.9 high-water inventory; spool cut lock still needs correction. | Close R-127–R-129, then Windows round-trip. |
+| R-020 | Erasure/reappearance | `PARTIAL` | Monotonic fence + physical controlled-copy traversal; provider-side effects remain external. | All generations/copies. |
+| R-021 | Recursive improvement | `PARTIAL` | Diagnose a concrete failed edge; no intelligence score. | Source→revision→later-context path. |
 | R-022 | Disagreement/anticipation | `CHECKED` design | Alternatives + grounds + cheapest discriminating observation; no voting. | Ordinary records after Base. |
-| R-023 | Control/status/inbox | `DECIDED` | Daemon owns public control; privileged effect crosses inherited channel; status from actual facts. | Operation IDs and cross-owner readback. |
-| R-024 | Normative synchronization | `CHECKED` design / `NOT IMPLEMENTED` runtime | Architecture 9, Implementation 30, Cognition 13, Contract 0.8 and README agree on controller-local provisioning, protocol-v2 hello, credential generation fence, exact same-caller reconcile-or-admit, result-byte isolation and non-disclosing Operator erasure. | Change all affected owner documents together when the selected mechanism changes. |
-| R-025 | Interpretation triggers | `DECIDED` | New committed input/correction/question only; bookkeeping does not self-trigger. | Inspect enqueue callers and loops. |
-| R-026 | Active/pending jobs | `DECIDED` | One active + one coalesced pending successor; waiting ≠ retry. | Continuous arrivals/modes/shutdown. |
-| R-028 | Recipe bootstrap | `DECIDED` | Save default on first enable; upgrades do not overwrite edited method. | Purpose address and first-enable code. |
-| R-029 | Outcome→next decision | `DECIDED` | One contribution per method revision/attempt/criterion. | Reducer/contradiction cases. |
-| R-030 | Multi-stream coverage | `DECIDED` | Per-stream ranges; selected/supplied/covered distinct. | Late child/partial/omitted/successor cases. |
-| R-033 | Useful Base / light extensions | `DECIDED` | One package/internal modules/vertical increments. | Enforce imports/features/startup. |
-| R-034 | Vector→context | `DECIDED` | Exact revision/representation/effective space; no zero/shifted vector. | One connected semantic query after R-015. |
-| R-035 | Overconstraints | `DECIDED` | Checks at actual owner boundary; no Governor platform. | Keep unknown metadata from becoming global gate. |
-| R-036 | Commitments | `DECIDED` | Ordinary scoped memory; ACK/due/notification not resolution. | Create/update/read path. |
+| R-023 | Control/status/inbox | `DECIDED` | Daemon public control; supervisor closed privileged effects; status from readback. | Operation/readback paths. |
+| R-024 | Normative synchronization | `PARTIAL` | Contract 0.9 now follows controller V2; Architecture/Implementation/Cognition/README still contain V1-specific names and must be corrected before implementation. | One synchronized owner-doc pass. |
+| R-025 | Interpretation triggers | `DECIDED` | New committed input/correction/question only; bookkeeping does not self-trigger. | Inspect enqueue callers. |
+| R-026 | Active/pending jobs | `DECIDED` | One active + one coalesced successor; waiting ≠ retry. | Arrival/shutdown modes. |
+| R-028 | Recipe bootstrap | `DECIDED` | Save default on first enable; upgrades do not overwrite edited method. | First-enable code. |
+| R-029 | Outcome→next decision | `DECIDED` | One contribution per method revision/attempt/criterion. | Contradiction reducer. |
+| R-030 | Multi-stream coverage | `DECIDED` | Selected/supplied/covered ranges remain distinct. | Late child/partial/omitted cases. |
+| R-033 | Useful Base / light extensions | `DECIDED` | One package/internal modules/vertical increments. | Enforce startup/import boundaries. |
+| R-034 | Vector→context | `DECIDED` | Exact revision/representation/effective space; no zero/shifted vector. | One connected semantic query. |
+| R-035 | Overconstraints | `DECIDED` | Checks at actual owner boundary; no Governor platform. | Prevent metadata gates. |
+| R-036 | Commitments | `DECIDED` | Ordinary scoped memory; ACK/due/notification is not resolution. | Create/update/read path. |
 | R-037 | Stable work identity | `DECIDED` | Work identity separate from environment. | Attach/capture/query/late result. |
-| R-038 | Resource/version continuity | `DECIDED` | Dirty bytes retained; rename/copy/convert do not rewrite identity. | Edit/move/partial-read cases. |
-| R-039 | Decision frame→lexical | `DECIDED` | Focused cues and native candidate arm; no LLM query planner. | Actual tokens/plans/empty input. |
-| R-040 | Bounded source reads | `DECIDED` | Metadata/excerpt then identity-bound pages; units explicit. | UTF-8/long-line/JSON/file readers. |
-| R-041 | Automatic work/drain | `DECIDED` | off/idle/background; finite drain; profile may deny automatic. | Manual then one automatic episode. |
-| R-042 | Curation consumer | `DECIDED` | Output must alter normal context/open/method request. | Before/after consumer proof. |
-| R-043 | Consolidation/split | `DECIDED` | Replay/group/revision/synthesis/split distinct; old handles survive. | Publication/history code. |
-| R-044 | Forgetting changes reader | `DECIDED` | Current reader follows current revision links; rarity/use ≠ truth. | Restart/correction/negative-memory cases. |
-| R-045 | First episode result | `DECIDED` | create/revise/no-change/partial/error typed; operational failure ≠ no-change. | Useful/no-change/malformed/conflict runs. |
+| R-038 | Resource/version continuity | `DECIDED` | Dirty bytes retained; rename/copy/convert do not rewrite identity. | Edit/move/partial-read. |
+| R-039 | Decision frame→lexical | `DECIDED` | Focused cues and native lexical arm; no LLM query planner. | Actual token/plans. |
+| R-040 | Bounded source reads | `DECIDED` | Metadata/excerpt then identity-bound pages; explicit units. | UTF-8/long-line/JSON/file readers. |
+| R-041 | Automatic work/drain | `DECIDED` | off/idle/background; finite drain; profile may deny automatic. | Manual then automatic episode. |
+| R-042 | Curation consumer | `DECIDED` | Output must change normal context/open/method request. | Before/after consumer proof. |
+| R-043 | Consolidation/split | `DECIDED` | Replay/group/revision/synthesis/split distinct; old handles survive. | Publication/history. |
+| R-044 | Forgetting changes reader | `DECIDED` | Current reader follows current revision links; rarity/use ≠ truth. | Restart/correction/negative-memory. |
+| R-045 | First episode result | `DECIDED` | create/revise/no-change/partial/error typed; operational failure ≠ no-change. | Useful/malformed/conflict runs. |
 
 ### 2.2 Inference, external capabilities and cognition
 
 | ID | Объект | Статус | Решение / разрыв | Следующее действие |
 |---|---|---|---|---|
-| R-014 | Controller Task/agent route | `PARTIAL` / `NOT SELECTED` baseline | Useful for real agent work, excessive for one-shot Memory inference. | Keep optional richer route only. |
-| R-015 | Batch embeddings | `GAP` | Contract exists; controller method absent. | Implement same Operation/copy/release lifecycle. |
+| R-014 | Agent route | `NOT SELECTED` baseline | Real software-agent work may use controller Agents; one-shot Memory inference must not. | Keep optional richer route separate. |
+| R-015 | Batch embeddings | `GAP` | Contract 0.9 defines shape; controller V2 method/runtime absent. | Later after connected text path. |
 | R-016 | Research path | `PARTIAL` | Run/status/report/section/citation donors exist. | Close R-031/R-032. |
-| R-017 | Project views | `PARTIAL` | Scoped versioned views selected; real tool/deployment unqualified. | Two checkouts/late result/refresh. |
-| R-018 | Documents | `PARTIAL` | Original bytes, retained representation and exact open selected. | Partial page/image conversion and limits. |
-| R-027 | Agent result artifact projection | `GAP` | Optional agent route loses nested artifact refs publicly. | Fix only with real consumer. |
-| R-031 | Research MCP decoder | `GAP` | Old request shape rejects current method/model before service. | Connect to current decoder. |
-| R-032 | Citation/index coupling | `GAP` | Retained citation can fail when active index changes. | Read retained representation/range directly. |
-| R-046 | Agent-route terminal body durability | `GAP` | Boot-local LRU before page capture. | Fix only if agent route selected. |
-| R-047 | One-shot inference ownership | `CHECKED` design / `NOT IMPLEMENTED` | Memory owns semantics; controller owns physical execution/readback/copies. | Controller slice. |
-| R-048 | `inference.text/embed` | `GAP` | Methods absent at `e42c464d`. | Implement staged admission/runner/result/unknown. |
-| R-049 | Verification order | `DECIDED` | Production code first; minimum relevant build/Clippy after coherent increments; full suite after connected product. | Apply during runtime slices, not docs-only audit. |
-| R-050 | Connection/profile/privacy/budget | `CHECKED` design / `NOT IMPLEMENTED` | Static connection/profile/digests/destination/limits/no fallback. | Parser/admission/disclosure reducer. |
-| R-051 | Controlled-copy lifecycle | `GAP` | Input staged, result optional, independent cleanup and three dispositions designed. | Exact file owner/recovery. |
-| R-052 | ScriptRun donor | `CHECKED` / `NOT SELECTED` | Wrong lifecycle; reuse Operation/recovery ideas only. | Do not route inference through ScriptRun. |
-| R-053 | Narrow caller role | `DECIDED` / `NOT IMPLEMENTED` | `inference_client` exact allowlist; no MCP/generic writer. | Role registration/dispatch/read/cancel. |
-| R-054 | Inference artifact provenance | `GAP` | Current domains/deletion omit inference. | Add input/result kinds and exact cleanup owner. |
-| R-055 | Operation runner/recovery | `DECIDED` / `NOT IMPLEMENTED` | Existing ledger/wake/cancel enough; generic mutate unsafe; Memory reconciliation reuses same request identity. | Custom admission + bounded runner. |
-| R-056 | Direct controller IPC | `CHECKED` framing donor / `GAP` verified client | Pin exact `swarm-client`; no copied protocol/MCP/CLI. Current `connect` discards authenticated hello identity. | Implement protocol-v2 typed receipt before returning application-capable handle. |
-| R-057 | Initial provider adapters | `DECIDED` / `NOT IMPLEMENTED` | Closed loopback chat/embedding adapters; no arbitrary extras/retry/fallback. | Implement text first; HTTPS later. |
-| R-068 | Destination admission | `CHECKED` design / `NOT IMPLEMENTED` | Controller resolves actual connection/destination and checks disclosure. | State mapping. |
-| R-069 | One Memory controller adapter | `DECIDED` / `NOT IMPLEMENTED` | One client verifies hello and owns text/embed/read/cancel/release under one stable caller. | Pin verified client and connect. |
-| R-070 | No-result cleanup / erase abandonment | `CHECKED` design / `NOT IMPLEMENTED` | Result optional; terminal cleanup and abandonment fence selected. | Implement dispositions/recovery. |
+| R-017 | Project views | `PARTIAL` | Scoped versioned views selected; deployment unqualified. | Two-checkout/late-result refresh. |
+| R-018 | Documents | `PARTIAL` | Original bytes, retained representation and exact open selected. | Partial-page/image conversion. |
+| R-027 | Agent result artifact projection | `GAP` | Optional richer agent route loses nested artifact refs publicly. | Fix only with real consumer. |
+| R-031 | Research decoder | `GAP` | Old request shape rejects current method/model before service. | Current decoder. |
+| R-032 | Citation/index coupling | `GAP` | Retained citation may fail after active index change. | Read retained representation directly. |
+| R-046 | Agent terminal body durability | `GAP` | Optional agent route uses boot-local body before page capture. | Fix only if selected. |
+| R-047 | One-shot ownership | `CHECKED` design / `NOT IMPLEMENTED` | Memory owns semantics; controller owns physical execution/readback/copies. | Controller V2 extension. |
+| R-048 | `inference.text/embed` | `GAP` | No current controller V2 methods. | Implement Contract 0.9 after controller L1. |
+| R-049 | Verification order | `DECIDED` | Production code first; scoped build/Clippy after coherent increments; full suite after connected product. | Apply during code. |
+| R-050 | Profile/privacy/budget | `CHECKED` design / `NOT IMPLEMENTED` | Static connection/profile/destination/limits; no fallback. | V2 config/admission. |
+| R-051 | Controlled-copy lifecycle | `DECIDED` / `NOT IMPLEMENTED` | Private call-owned input/result files; independent cleanup/dispositions. | Exact file owner/recovery. |
+| R-052 | Script/automation donor | `CHECKED` / `NOT SELECTED` | Controller V2 automation journal has wrong principal/trigger lifecycle. | Do not route inference through it. |
+| R-053 | Narrow caller | `DECIDED` / `NOT IMPLEMENTED` | Dedicated `memory_inference`; no owner/Agent/project/automation fallback. | Registration/allowlist/fence. |
+| R-054 | Inference provenance | `GAP` | Memory deletion/backup must include controller call/copy facts. | Add exact call/copy identities. |
+| R-055 | Runner/recovery | `DECIDED` / `NOT IMPLEMENTED` | One bounded `inference_calls` runner; queued once, sending→readback/unknown. | V2 call row/runner. |
+| R-056 | Controller IPC | `CHECKED` current design / `GAP` runtime | Use V2 JSON-RPC client and `client.identity`; V1 `swarm-client` is donor only. | Implement after V2 API. |
+| R-057 | Initial adapters | `DECIDED` / `NOT IMPLEMENTED` | Closed loopback chat/embedding subsets; no extras/retry/redirect/fallback. | Text first. |
+| R-068 | Destination admission | `CHECKED` design / `NOT IMPLEMENTED` | Controller resolves actual destination and checks disclosure. | State mapping. |
+| R-069 | One Memory adapter | `DECIDED` / `NOT IMPLEMENTED` | One adapter owns identity/text/read/cancel/release/high-water/list. | Connect first learning loop. |
+| R-070 | No-result cleanup / erase abandonment | `CHECKED` design / `NOT IMPLEMENTED` | Result optional; release and late-publication fence explicit. | Dispositions/recovery. |
+| R-114 | Restored controller jobs | `SUPERSEDED` mechanism / `DECIDED` goal | Old unknown-Operation-ID path removed: Memory persists WriteId before send; same ID replays admission/readback. | Implement Contract 0.9 restore. |
+| R-117 | Stable caller continuity | `CHECKED` design / `GAP` runtime | Stable `client_id`; V2 `token_version` rotates without changing call ownership. | Pre/post-rotation call read/release. |
+| R-118 | V1 protocol-v2 hello | `SUPERSEDED` | Current authority is V2 JSON-RPC; selected identity read is `client.identity`, not invented V1 protocol 2. | Remove stale owner-doc text. |
+| R-119 | Owner erasure vs result bytes | `DECIDED` / `GAP` runtime | Owner can fence/erase exact calls by non-content facts; result bytes stay exact caller only. | Denial matrix. |
+| R-120 | V1 `operator.json` pending bundle | `SUPERSEDED` | V2 owner command + domain-separated deterministic token derivation removes unrecoverable-token window. | Implement owner install/rotate WriteId. |
+| R-121 | Current-version fence | `DECIDED` / `GAP` runtime | Every Memory read/mutation reloads current client registration/token_version; stale transport closes. | Per-dispatch fence. |
+| R-122 | Reconcile-or-admit | `SUPERSEDED` | V2 external WriteId already provides exact retry/first admission/conflict. | Remove stale owner-doc state. |
+| R-123 | Current controller authority | `CHECKED` | `c8c0ee1` / PR #197 selects fresh SQLite/JSON-RPC/WriteId V2 and marks current Rust stack legacy. | Never implement against V1. |
+| R-124 | Dedicated Memory principal | `DECIDED` / `NOT IMPLEMENTED` | `memory_inference` stable client + scoped token; no owner, Agent or automation reuse. | Controller decision/code after L1. |
+| R-125 | WriteId call identity | `DECIDED` / `NOT IMPLEMENTED` | Memory commits ULID before send; call ID = WriteId; same payload returns same call. | Receipt/call integration. |
+| R-126 | Minimal V2 durable state | `DECIDED` / `NOT IMPLEMENTED` | Reuse `write_receipts`; add only client registration + `inference_calls`; content files remain private, not generic artifacts. | Schema/retention/runner. |
+| R-128 | Restore external-work inventory | `DECIDED` / `NOT IMPLEMENTED` | Backup stores per-client controller admission high-water; restore inventories calls after cut and disables all new inference until disposition. | high-water/list/history-gap path. |
+| R-129 | Inference retention gap | `DECIDED` / `NOT IMPLEMENTED` | Controller advances `earliest_retained_seq`; old restore gets `history_gap`, never false empty. | Retention/read contract. |
 
 ### 2.3 Development-system failure analysis
 
 | ID | Объект | Статус | Решение / разрыв |
 |---|---|---|---|
-| R-058 | Delivery incentives | `CHECKED` | Artifacts displaced integrated behavior; progress denominator is connected product edge. |
-| R-059 | Append-only authority | `PARTIAL` | V3 docs/registry current; V2 authorities retire at cutover. |
+| R-058 | Delivery incentives | `CHECKED` | Integrated behavior, not artifact count, is progress denominator. |
+| R-059 | Append-only authority | `PARTIAL` | V3 docs current for Memory; controller boundary changed and owner docs need replacement-in-place. |
 | R-060 | Cheap preflight / WIP | `DECIDED` | Deterministic blockers before setup; overlap waits for terminal disposition. |
 | R-061 | Completion criterion | `CHECKED` design | caller→owner→durable result/unknown→consumer→restart/readback. |
-| R-062 | Crate/manifest inversion | `CHECKED` representative | ~188 packages and large manifests turned helpers into products. |
+| R-062 | Crate/manifest inversion | `CHECKED` representative | Large package graph turned helpers into products. |
 | R-063 | Generated inventories | `CHECKED` | Repository scans became permanent work; do not port. |
-| R-064 | Intent–mechanism inversion | `CHECKED` | Intent-first prose coexisted with mandatory object families. |
+| R-064 | Intent–mechanism inversion | `CHECKED` | Intent prose coexisted with mandatory object families. |
 | R-065 | Crate-first capacity target | `CHECKED` correlation / `PARTIAL` causality | One package/modules until measured boundary. |
 | R-066 | Identity/proof multiplication | `CHECKED` | Synchronization graph outgrew product edge. |
 | R-067 | Anti-proxy without backpressure | `CHECKED` | New mechanisms require connected need, one ledger and WIP stop. |
@@ -116,177 +130,156 @@
 
 | ID | Объект | Статус | Решение / разрыв | Следующее действие |
 |---|---|---|---|---|
-| R-071 | Legacy hook forwarder | `CHECKED` exact code / `NOT SELECTED` | `forwarded` without send; content-hash spool; no replayer. | Do not port. |
-| R-072 | Relay/spool ownership | `CHECKED` design / `NOT IMPLEMENTED` | Same immutable command; committed needs Store readback; staged needs file+directory durability. | Pipe/publication/replayer. |
-| R-073 | Occurrence identity | `CHECKED` design / `NOT IMPLEMENTED` | Native/command ID occurrence; digest verifies bytes only. | Schema/index/conflict code. |
+| R-071 | Legacy hook forwarder | `CHECKED` / `NOT SELECTED` | `forwarded` without send; no replayer. | Do not port. |
+| R-072 | Relay/spool ownership | `CHECKED` design / `NOT IMPLEMENTED` | One immutable command; committed needs Store readback; staged needs file+directory durability. | Pipe/publication/replayer. |
+| R-073 | Occurrence identity | `CHECKED` design / `NOT IMPLEMENTED` | Native/command ID identifies occurrence; digest verifies bytes only. | Schema/index/conflict. |
 | R-074 | Claude schema drift | `PARTIAL` | Public profile selected; installed build unverified. | Installed qualification. |
 | R-075 | Packet handoff | `CHECKED` design / `NOT IMPLEMENTED` | Actual packet; prepared/emitted/action/use distinct. | Host effect/readback. |
-| R-077 | Legacy explicit packet call | `CHECKED` exact code / `NOT SELECTED` | Packet only after agent call; no SessionStart link. | Do not port. |
-| R-078 | Legacy packet authority | `CHECKED` representative / `NOT SELECTED` | Parallel authority/projection without delivery. | Ordinary data only. |
-| R-079 | Legacy empty exact selector/relation loss | `CHECKED` exact path | Empty selector broadens; endpoint filter hides relations. | Exact handle + relation descriptors. |
-| R-080 | Legacy read caps/cursor | `CHECKED` exact path | Fixed caps without honest continuation. | Typed cursor/envelope. |
-| R-081 | Exact-open consistency | `CHECKED` design / `NOT IMPLEMENTED` | Exact current/history/source/representation handles and dispositions. | Implement readers. |
-| R-082 | SurrealDB Rust SDK fit | `CHECKED` / `NOT SELECTED` baseline | SDK 3.3.4 requires Rust 1.95 vs declared 1.94; policy/size unresolved. | Reconsider only after exact preflight. |
-| R-083 | Exact Windows release identity | `CHECKED` release / `NOT QUALIFIED` | v3.3.4 commit/asset/size/SHA pinned. | Download/hash/PE/signature/live run. |
-| R-084 | Store RPC/replay | `CHECKED` design / `NOT IMPLEMENTED` | Peer-verified Basic query-only socket owner; exact IDs; poison ambiguous link; typed JSON DTOs. | Implement. |
-| R-085 | Schema/migrations/transactions | `CHECKED` design / `NOT IMPLEMENTED` | Checksummed migrations, generation/INFO, strict schema, unique/sentinel/FOR UPDATE. | Migration 0001/conflict tests. |
-| R-086 | Durable publication / selection | `CHECKED` design / `NOT IMPLEMENTED` | Immutable no-replace and mutable expected-generation replacement are distinct. | Force old/new/unknown outcomes. |
-| R-087 | RocksDB runtime | `CHECKED` build provenance / `OPEN` runtime | Official Windows build includes RocksDB; live profile unrun. | Slice 0 Windows run. |
-| R-088 | CLI/env/capability posture | `CHECKED` source / `NOT QUALIFIED` | `surreal start`; sanitized env and closed arguments. | Exact Windows argv/env. |
-| R-089 | Store capability surface | `CHECKED` source / `NOT QUALIFIED` | HTTP rpc, RPC query, system subject only; fixed-query client is statement boundary. | Allowed/denied matrix. |
-| R-090 | Surreal export/import | `CHECKED` / `NOT SELECTED` | HTTP completion can hide export failure; import partial. | Keep disabled. |
-| R-091 | Root/Owner/Editor | `DECIDED` / `NOT QUALIFIED` | Short root bootstrap; supervisor root/Owner; daemon Editor. | Live role/bootstrap/migration proof. |
+| R-077 | Legacy explicit packet call | `CHECKED` / `NOT SELECTED` | Packet only after agent call; no SessionStart link. | Do not port. |
+| R-078 | Legacy packet authority | `CHECKED` / `NOT SELECTED` | Parallel projection without delivery. | Ordinary data only. |
+| R-079 | Empty exact selector/relation loss | `CHECKED` | Empty selector broadens; endpoint filter hides relations. | Exact handle + descriptors. |
+| R-080 | Read caps/cursor | `CHECKED` | Fixed caps without continuation are incomplete. | Typed cursor/envelope. |
+| R-081 | Exact-open consistency | `CHECKED` design / `NOT IMPLEMENTED` | Exact current/history/source/representation handles/dispositions. | Readers. |
+| R-082 | Surreal Rust SDK fit | `CHECKED` / `NOT SELECTED` baseline | SDK toolchain/policy cost unresolved; fixed JSON RPC chosen. | Reconsider only after measured need. |
+| R-083 | Windows release identity | `CHECKED` release / `NOT QUALIFIED` | Surreal 3.3.4 asset/commit/size/SHA pinned. | Download/hash/PE/signature/live. |
+| R-084 | Store RPC/replay | `CHECKED` design / `NOT IMPLEMENTED` | Peer-verified Basic query-only socket owner; exact IDs; poison ambiguity; DTOs. | Implement. |
+| R-085 | Schema/migrations/transactions | `CHECKED` design / `NOT IMPLEMENTED` | Checksummed migrations, strict schema, unique/sentinel/FOR UPDATE. | Migration 0001. |
+| R-086 | Durable publication / selection | `CHECKED` design / `NOT IMPLEMENTED` | Immutable no-replace and mutable expected-generation replace are distinct. | Old/new/unknown outcomes. |
+| R-087 | RocksDB runtime | `CHECKED` provenance / `OPEN` runtime | Official build includes RocksDB; live profile unrun. | Slice 0. |
+| R-088 | CLI/env/capability posture | `CHECKED` source / `NOT QUALIFIED` | Closed argv/env/profile. | Windows process inspection. |
+| R-089 | Store capability surface | `CHECKED` source / `NOT QUALIFIED` | RPC query/system only; fixed-query statement boundary. | Allowed/denied matrix. |
+| R-090 | Export/import | `CHECKED` / `NOT SELECTED` | Completion/partial failure semantics unsafe. | Keep disabled. |
+| R-091 | Root/Owner/Editor | `DECIDED` / `NOT QUALIFIED` | Short root bootstrap; supervisor root/Owner; daemon Editor. | Live provisioning. |
 | R-092 | Store readiness | `CHECKED` design / `NOT QUALIFIED` | Root/binary/process/listener/peer/ready/auth/socket/schema/typed probe conjunction. | Failure matrix. |
-| R-093 | Startup import | `CHECKED` / `NOT SELECTED` | Failures can be logged while server becomes ready. | Never use. |
-| R-094 | Storage URL/defaults | `CHECKED` source / `NOT QUALIFIED` | Supervisor canonical root URL + sync=every; no raw URL; no-defaults. | Windows spelling/restart. |
-| R-095 | Binary materialization/signature | `PARTIAL` | SHA/build known; actual Authenticode unknown; retained executable handles selected. | Inspect exact asset and launch races. |
-| R-096 | Graceful shutdown | `CHECKED` source / `NOT QUALIFIED` | Daemon quiesces; supervisor stops Store; Job kill containment; clean exit not receipt. | Active-maintenance/hang/restart. |
-| R-097 | Acknowledged commit durability | `CHECKED` source / `NOT QUALIFIED` | sync=every can apply before fsync error; unknown requires readback. | Crash/fsync qualification. |
-| R-098 | User provisioning/log secrecy | `CHECKED` source / `NOT QUALIFIED` | Local Argon2 PASSHASH; no credential/DDL/raw error logs. | Create/rotate/log proof. |
-| R-099 | Closed environment/loopback | `CHECKED` source / `NOT QUALIFIED` | Defaults too open; supervisor supplies minimal profile. | Process inspection/adversarial env. |
-| R-100 | JSON wire budget | `DECIDED` / `NOT IMPLEMENTED` | Explicit DTOs only; no generic Value/SELECT */copied CBOR. | Per-query round-trips. |
-| R-101 | Application backup cut | `DECIDED` / `NOT IMPLEMENTED` | Daemon coherent typed cut; manifest owns completion. | Locks/encoding/mismatch/crash. |
-| R-102 | WS Origin/auth | `CHECKED` source / `NOT QUALIFIED` | CORS is not WS auth; Basic on owned peer; guest query denied. | Origin/no-auth/socket exhaustion. |
-| R-103 | Dynamic listener/peer ownership | `CHECKED` design / `NOT IMPLEMENTED` | Ephemeral reservation + retained child + listener/peer PID + existing-stream handshake. | Squat/PID/peer/bind cases. |
-| R-104 | Relay→daemon IPC | `CHECKED` donor/design / `NOT IMPLEMENTED` | First named-pipe instance, DACL, remote rejection, mutual live-process attestation, bounded one-request protocol. | Implement hostile cases. |
-| R-105 | Retained executable identity | `CHECKED` donor/design / `NOT IMPLEMENTED` | No-follow executable/ancestor handles, bounded digest, suspended child comparison. | Exact binary/race qualification. |
-| R-106 | Store socket owner/cancellation | `CHECKED` donor/design / `NOT IMPLEMENTED` | Dedicated task; late/wrong/cancel ambiguity poisons connection. | Owner state tests. |
-| R-107 | Replay barrier/restore monotonicity | `CHECKED` design / `NOT IMPLEMENTED` | Pause/drain active replay; deletion union; exact spool merge. | Implement. |
-| R-108 | Supervisor↔daemon privileged channel | `CHECKED` design / `NOT IMPLEMENTED` | Exact inherited anonymous pipes, closed frames/op IDs; daemon quiesce, supervisor privileged effects. | Handle-list/channel/crash cases. |
-| R-109 | Mutable selection/credential generations | `CHECKED` design / `NOT IMPLEMENTED` | Expected generation, current/pending/previous refs, unknown readback, delayed retirement. | Replacement/rotation/restart. |
-| R-110 | Exact rollback denominator | `CHECKED` design / `NOT IMPLEMENTED` | No post-backup row merge without change log; safety backup and previous root retain divergence. | Rollback/disaster/prior-root proof. |
-| R-111 | Retained data-root identity and ACL | `CHECKED` design / `NOT IMPLEMENTED` | Closed root ID beneath protected local root; no-follow directory/ancestor lease and DACL retained for Store lifetime. | Prove RocksDB works under selected sharing/ACL; force rename/reparse/broad ACL. |
-| R-112 | Fence versus physical erasure | `CHECKED` design / `NOT IMPLEMENTED` | Deletion ledger prevents reintroduction but does not erase previous/candidate roots or backups; initial Base deletes whole offline generation or reports incomplete. | Physical delete/parent flush/absence and external-copy reporting. |
-| R-113 | Store credential session revocation | `CHECKED` design / `NOT IMPLEMENTED` | Password update alone does not revoke authenticated WebSocket; rotation closes sockets and restarts Store before completion. | Editor/Owner rotation under active sessions and unknown mutation. |
-| R-114 | Restored controller jobs | `CHECKED` design / `NOT IMPLEMENTED` | Known Operation uses same-caller readback. Unknown Operation ID performs one exact same-caller reconcile-or-admit call; no durable possible-send/proven-no-send split. Caller/credential mismatch holds `caller_identity_unavailable`. | Implement after protocol-v2 verified client. |
-| R-115 | Generation backpressure | `CHECKED` design / `NOT IMPLEMENTED` | At most one unretired previous root and pending/previous Store or inference credential; second transition blocked. | Cutover/rotation/retirement state machine. |
-| R-116 | Local plaintext confidentiality boundary | `CHECKED` design / `NOT IMPLEMENTED` | Local DB/spool/backups protected by account/DACL/volume, not app encryption; off-machine copies external. | DACL qualification and future portable-backup decision only if required. |
-
-### 2.5 Stable controller caller continuity
-
-| ID | Объект | Статус | Решение / разрыв | Следующее действие |
-|---|---|---|---|---|
-| R-117 | Inference caller identity across rotation/restore | `CHECKED` source/design / `GAP` runtime | Operation/artifact owner is stable installation-scoped `controller_client_id`. `credential_id` and monotonic generation authenticate one physical generation; new client ID is unsupported migration. | Implement generation-aware role/methods and prove pre-rotation/pre-restore Operation read/release. |
-| R-118 | Typed authenticated hello receipt | `CHECKED` exact source / `GAP` runtime | Donor host returns client ID/role/protocol v1 and client discards result. V3 selects exact protocol v2 receipt with client ID, role, credential ID and generation; no application handle/frame on mismatch. | Implement closed receipt and verified constructor. |
-| R-119 | Operator erasure versus result-byte disclosure | `DECIDED` design / `GAP` runtime | `inference_result` bytes remain exact-caller only. Verified local Operator may fence/erase by exact provenance and receive bounded non-content status; it never reads bytes, adopts ownership or fabricates Memory result. | Implement separate non-disclosing erasure branch and denial matrix. |
-| R-120 | Inference credential provisioning owner | `CHECKED` source/design / `GAP` runtime | Controller-local maintenance command loads controller `operator.json`, durably creates/reuses one pending private bundle before Store commit and emits only private credential reference + non-secret receipt. Memory never receives controller Operator authority. | Implement install command and crash/unknown reconciliation. |
-| R-121 | Specialized install/rotation and generation fence | `CHECKED` source/design / `GAP` runtime | Generic `client.register` has wrong authority, rejects existing client and persists supplied verifier in generic request JSON. Selected specialized redacted operations update one registration; every inference method reloads generation and stale sessions close. | Implement install/rotate, Principal fields and per-dispatch fence. |
-| R-122 | Admission reconciliation without submission ledger | `DECIDED` / `NOT IMPLEMENTED` | Unknown Operation ID reuses same caller/request/method/canonical identity once after verified hello: return existing, create first admission, or conflict. Provider uncertainty stays inside controller Operation. | Implement one reconcile-or-admit admission path and restore cases. |
+| R-093 | Startup import | `CHECKED` / `NOT SELECTED` | Server may become ready after import failure. | Never use. |
+| R-094 | Storage URL/defaults | `CHECKED` source / `NOT QUALIFIED` | Canonical root URL + sync=every + no-defaults. | Windows spelling/restart. |
+| R-095 | Binary materialization/signature | `PARTIAL` | SHA/build known; Authenticode/live launch unknown. | Inspect exact asset. |
+| R-096 | Graceful shutdown | `CHECKED` source / `NOT QUALIFIED` | Daemon quiesce; supervisor Store stop; Job containment; exit not receipt. | Active-maintenance/hang. |
+| R-097 | Commit durability | `CHECKED` source / `NOT QUALIFIED` | sync=every still allows applied-before-fsync-error; readback required. | Crash/fsync run. |
+| R-098 | User provisioning/log secrecy | `CHECKED` source / `NOT QUALIFIED` | PASSHASH; no credential/raw-error logging. | Create/rotate/log proof. |
+| R-099 | Closed environment/loopback | `CHECKED` source / `NOT QUALIFIED` | Minimal env and exact loopback owner. | Adversarial env. |
+| R-100 | JSON wire budget | `DECIDED` / `NOT IMPLEMENTED` | Explicit DTOs; no generic Value/`SELECT *`/copied CBOR. | Query round-trips. |
+| R-101 | Application backup cut | `PARTIAL` / `NOT IMPLEMENTED` | Coherent typed cut/manifest selected; current long-held spool publication lock is wrong. | R-127. |
+| R-102 | WS Origin/auth | `CHECKED` source / `NOT QUALIFIED` | CORS is not auth; Basic on owned peer; guest query denied. | Origin/no-auth/exhaustion. |
+| R-103 | Listener/peer ownership | `CHECKED` design / `NOT IMPLEMENTED` | Reservation + retained child + listener/peer PID + stream handshake. | Squat/PID/peer. |
+| R-104 | Relay→daemon IPC | `CHECKED` donor/design / `NOT IMPLEMENTED` | First pipe instance, DACL, remote rejection, mutual process attestation. | Hostile cases. |
+| R-105 | Retained executable identity | `CHECKED` donor/design / `NOT IMPLEMENTED` | No-follow handles, digest, suspended child comparison. | Binary/race qualification. |
+| R-106 | Store socket owner/cancellation | `CHECKED` donor/design / `NOT IMPLEMENTED` | Dedicated task; late/wrong/cancel ambiguity poisons socket. | Owner tests. |
+| R-107 | Replay barrier/restore monotonicity | `CHECKED` design / `NOT IMPLEMENTED` | Pause/drain active replay; deletion union; exact spool continuity. | Implement with R-127. |
+| R-108 | Privileged inherited channel | `CHECKED` design / `NOT IMPLEMENTED` | Anonymous pipes, closed frames/op IDs; daemon quiesce, supervisor effects. | Handle/channel/crash. |
+| R-109 | Selection/credential generations | `CHECKED` design / `NOT IMPLEMENTED` | Expected generation, current/pending/previous, unknown readback, delayed retirement. | Replacement/rotation. |
+| R-110 | Exact rollback denominator | `CHECKED` design / `NOT IMPLEMENTED` | No post-backup row merge; safety backup/previous root retain divergence. | Rollback/disaster. |
+| R-111 | Data-root identity/ACL | `CHECKED` design / `NOT IMPLEMENTED` | Protected local root, retained no-follow identity/DACL. | RocksDB sharing/ACL. |
+| R-112 | Fence vs physical erasure | `CHECKED` design / `NOT IMPLEMENTED` | Offline root/backup must be deleted whole or erasure remains incomplete. | Delete/flush/absence. |
+| R-113 | Store credential revocation | `CHECKED` design / `NOT IMPLEMENTED` | Password change alone does not revoke WS; close sockets/restart Store. | Active-session rotation. |
+| R-115 | Generation backpressure | `CHECKED` design / `NOT IMPLEMENTED` | At most one unretired previous root/credential generation. | Transition state machine. |
+| R-116 | Local plaintext boundary | `CHECKED` design / `NOT IMPLEMENTED` | DB/spool/backups protected by account/DACL/volume, not app encryption. | DACL qualification. |
+| R-127 | Backup spool publication cut | `DECIDED` correction / `NOT IMPLEMENTED` | Backup must not hold spool publication lock while paging/copying. Take a brief exact inventory/generation cut, release lock, copy immutable listed entries; post-cut relay staging continues separately. | Replace long lock in Implementation/README and prove crash/delta cases. |
 
 ## 3. Source coverage
 
 | ID | Источник | Статус / граница |
-|---|---|
-| S-001–S-007 | V1/V2 requirements and supplied audits/reports | `CHECKED` for previously named sections/full supplied texts; not fresh full code audit. |
+|---|---|---|
+| S-001–S-007 | V1/V2 requirements and supplied audits | `CHECKED` named scopes; not fresh full-code audit. |
 | S-008 | Release ZIP `audit-2026-10-16-incomplete` | `BLOCKED`; full corpus unavailable. |
 | S-009 | `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` | `BLOCKED`; full text absent. |
-| S-010 | Named donors D01–D47 | `PARTIAL`; findings limited to exact paths/revisions. |
-| S-011 | Independent subagent review | `OPEN`; no subagent execution tool available. |
-| S-012 | Consolidated failure audit | `PARTIAL`; selected path, counts/runtime not reproduced. |
-| S-013–S-016 | Controller inference/taskless/IPC/transport donors through `e42c464d` | `CHECKED` selected source paths; no live provider/worker run. |
-| S-017–S-019 | Delivery collapse, workspace/manifests/inventories, retained old books | `CHECKED` exact issues/samples/targeted sections. |
-| S-020 | Inference Contract 0.1–0.7 synchronization | Historical `CHECKED`; superseded by 0.8. |
-| S-021–S-025 | Legacy Base hooks/packet/exact read and current Base docs | `CHECKED` selected paths/design; no live host. |
-| S-026–S-031 | Dependency/platform inventory, Surreal docs/release/build/start | `CHECKED` source/release identity; no Windows run. |
-| S-032–S-042 | Surreal capability/export/IAM/readiness/endpoint/shutdown/RocksDB/credentials/network/JSON | `CHECKED` exact `v3.3.4` paths; no live qualification. |
-| S-043 | Application backup replacement | `CHECKED` design from exact Store sources/model; no round-trip. |
-| S-044–S-048 | CORS/auth, endpoint owner, named-pipe, process-path, WebSocket lifecycle donors | `CHECKED` exact donors; no V3 implementation. |
-| S-049 | Inherited supervisor-channel primitives | `CHECKED` Win32 docs + exact handle-list donor; no live channel. |
-| S-050 | Mutable selection replacement | `CHECKED` Win32 MoveFileEx/ReplaceFile/Flush docs; no crash run. |
-| S-051 | Restore merge denominator | `CHECKED` current model + absence of change log; exact rollback selected. |
-| S-052 | Data-root/access and controlled-copy boundary | `CHECKED` current Windows/profile design; DACL/root lease/physical deletion unrun. |
-| S-053 | Controller caller credential and handshake at `e42c464d` | `CHECKED`: `Credential {client_id, token}`, `client.hello`, retained Principal per connection. |
-| S-054 | Controller exact-caller Operation/artifact scope at `e42c464d` | `CHECKED`: Operation stores caller_id; client_request_id projects only to same client_id; ExactCaller/ExactResultOperationCaller grants exist. |
-| S-055 | Current normative synchronization | `CHECKED` design: Architecture 9 / Implementation 30 / Cognition 13 / Contract 0.8 / README agree; runtime remains absent. |
-| S-056 | `swarm-client` hello-result handling at `e42c464d` | `CHECKED` exact source: server returns client_id/role/protocol v1; client discards result before returning handle. |
-| S-057 | Controller provisioning/registration authority at `e42c464d` | `CHECKED` exact source: bootstrap Operator lives in private `operator.json`; generic `client.register` accepts GM/local Operator, rejects existing client and carries token_hash through generic mutation persistence. |
+| S-010 | Named donors D01–D47 | `PARTIAL`; exact paths/revisions only. |
+| S-011 | Independent subagent review | `OPEN`; no subagent execution tool exposed. |
+| S-012 | Consolidated failure audit | `PARTIAL`; selected evidence, counts/runtime not reproduced. |
+| S-013–S-019 | Controller V1/taskless/IPC/delivery donors through `e42c464d` | `CHECKED` donor scope; no longer implementation authority. |
+| S-020 | Inference Contract 0.1–0.8 | Historical; 0.8 superseded by 0.9. |
+| S-021–S-025 | Legacy Base hooks/packet/open + current Base docs | `CHECKED` selected paths/design; no live host. |
+| S-026–S-052 | Surreal release/build/capabilities/IAM/network/JSON/Windows durability/selection/restore | `CHECKED` exact source/design; no full Windows runtime. |
+| S-053–S-057 | Controller V1 credential/hello/Operation/artifact/provisioning source | `CHECKED` donor facts; superseded as target. |
+| S-058 | Controller V2 authority `c8c0ee1`, merged PR #197 | `CHECKED`: fresh build, SQLite WAL, local JSON-RPC, WriteId, old runtime legacy. |
+| S-059 | Controller V2 `vision/architecture/decisions/roadmap` | `CHECKED`: no Task engine; Memory OS requires explicit extension; L1 foundation not implemented. |
+| S-060 | Controller V2 `spec/api/core/configuration/monitoring/automation` | `CHECKED`: owner/Agent/automation identities do not fit Memory; WriteId/receipt, routing-key/token, custody and retention donors selected. |
+| S-061 | Controller PR #197 review threads | `CHECKED`: caller-custody race, token revocation, secret allowlists, receipt retention and activation defects were corrected in current spec. |
+| S-062 | Backup/spool lock analysis | `CHECKED` design defect: long publication lock blocks relay staging during quiesce. |
+| S-063 | Disaster rollback external-work analysis | `CHECKED` design gap: lost current Memory Store cannot inventory post-backup controller calls without per-client high-water/list/gap. |
+| S-064 | Contract 0.9 | `CHECKED` design / `NOT IMPLEMENTED`: V2 principal, WriteId call identity, two-row state, controlled copies and restore inventory. |
 
 ## 4. Current findings
 
+### Controller V2 boundary
+
+```text
+Memory persists WriteId before send
+→ authenticated V2 JSON-RPC `memory_inference` principal
+→ receipt lookup / id_conflict / first admission
+→ one inference_calls row + private input/result copies
+→ bounded runner: queued → sending → settled|failed|unknown
+→ exact caller range-read/release
+→ later Memory consumer
+```
+
+- `e42c464d` is now donor-only. Adding Memory methods to its `swarm-client`/Operation stack would implement against code selected for deletion.
+- V2 no-token owner fallback is too broad; Agent token is generation-bound; project automation is rule-owned. None is the Memory principal.
+- `WriteId` removes the unknown-Operation-ID branch. Lost reply repeats the same ID and exact bytes.
+- Generic V2 artifacts are nonsecret configuration snapshots; content-bearing prompts/results need private call-owned files.
+- One client-registration row and one `inference_calls` row are the minimum honest new state. Reusing `commands` or automation would corrupt ownership.
+- Restore needs `admission_seq/high_water/earliest_retained_seq`; a missing range is `history_gap`, not empty.
+
 ### Store/Windows/Base
 
-- Store child identity includes retained executable **and selected data-root** identity; a config path is not enough.
-- Daemon and supervisor are separate authority/failure domains. Public control stays with daemon; root/Owner/process/cutover stays with supervisor through one inherited closed channel.
+- Store child identity includes retained executable **and selected data-root** identity.
+- Daemon and supervisor are separate authority/failure domains; privileged effects cross one inherited closed channel.
 - Store transport is query-only, peer-verified and cancellation-safe; Origin/CORS is not authorization.
-- `sync=every` still has an applied-before-fsync-error edge; unknown outcome reconciles by application identity.
-- Immutable publication and mutable selection replacement require different primitives.
-- Backup is a coherent application cut; restore is exact rollback, not invented merge.
-- Deletion fence prevents reintroduction but does not prove physical deletion of offline roots/backups.
-- Password rotation must revoke live sessions; Store restart is part of completion.
-- Previous generations are bounded and retired explicitly; pointer update never hides remaining bytes/secrets.
-- Local backup is plaintext under Windows account/DACL, not portable encrypted backup.
+- `sync=every` still has applied-before-fsync-error; unknown reconciles by application identity.
+- Immutable publication and mutable selection need different primitives.
+- Backup is a coherent application cut; restore is exact rollback, not row merge.
+- The current backup wording wrongly holds the spool publication lock across long reads/copies; only the cut/inventory is locked.
+- Deletion fence prevents reintroduction but does not prove deletion of offline roots/backups.
+- Store password rotation must revoke authenticated sockets; restart is part of completion.
+- Previous generations are bounded and retired explicitly.
+- Local backup is plaintext under account/DACL/volume security, not portable encrypted backup.
 
-### Controller caller continuity
+### Synchronization state
 
-Exact controller source establishes:
-
-```text
-Credential { client_id, token }
-→ client.hello
-→ host returns authenticated client_id + role + protocol_version=1
-→ Client::connect discards hello result
-→ Principal retained for connection without credential generation
-→ Operation caller_id = principal.client_id
-→ client_request_id and result bytes remain exact-caller scoped
-```
-
-Contract 0.8 selects the missing connected boundary:
-
-```text
-controller-local private install/rotate bundle
-→ specialized redacted registration mutation
-→ protocol-v2 hello returns client_id + role + credential_id + generation
-→ verified constructor returns application-capable handle
-→ every inference method checks current credential generation
-→ stable caller owns Operations across rotation
-→ unknown Operation ID uses exact reconcile-or-admit
-```
-
-This preserves exact-caller ownership without giving controller Operator authority to Memory, persisting token verifiers in generic Operations, retaining stale authenticated sessions or creating a Memory-side submission ledger. Architecture 9, Implementation 30, Cognition 13, Contract 0.8 and README now own this rule consistently. Runtime remains absent.
+Contract 0.9 is current for the controller boundary. Architecture draft.9, Implementation draft.30, Cognition draft.13 and the existing README still name V1 `swarm-client`, protocol-v2 hello, credential_id/generation, Operation/artifact and reconcile-or-admit. Those passages are superseded but must be replaced before code starts; R-024 remains `PARTIAL`.
 
 ## 5. Frozen anti-patterns
 
 Do not:
 
-- create another registry, task manager, supervisor API, admin bus or proof platform;
+- implement Memory inference in controller V1 or revive its roles/Operation/artifact surface;
+- authenticate Memory as controller owner, Agent, project automation, script or no-token fallback;
+- create another Task/Attempt/workflow/receipt/submission ledger;
+- use a new WriteId after uncertain submission;
+- place prompts/results in generic nonsecret artifacts, receipts, config or logs;
+- replay provider work after possible send;
+- infer external-call ordering from ULID time instead of controller admission sequence;
+- treat post-backup controller inventory gap as empty;
+- adopt post-backup result into restored cognition without exact job/source mapping;
+- hold spool publication lock while paging Store or copying backup bytes;
 - pass root/Owner, arbitrary SQL/path/argv/endpoint/secret into daemon control;
-- give controller `operator.json` or Operator token to Memory;
-- use generic `client.register` or generic mutation JSON for inference credentials;
-- trust the supplied controller credential file as proof of authenticated client/role/credential/protocol;
-- discard hello identity and then issue application requests;
-- treat protocol v1 or unknown hello fields as generation-aware support;
-- change inference `client_id` during token rotation;
-- keep stale-generation controller or Store sockets usable after credential revocation;
-- recover old inference through Operator/admin as normal path or issue a new request ID;
-- let Operator erasure expose result bytes, adopt caller ownership or create a Memory result;
-- create a Memory-side possible-send/proven-no-send ledger instead of exact reconcile-or-admit;
-- claim physical erasure from a deletion fence while previous root/backup remains;
-- run another cutover/rotation before prior generation is retired;
-- claim portable encrypted backup from a local plaintext generation;
-- merge post-backup Store rows without retained change log/conflict policy;
-- use broad raw SurrealQL/generic CRUD/Value/SELECT *;
-- equate path/PID/port/health/ready/101/acknowledgement with ownership or completion;
+- claim physical erasure while previous root/backup/call copy remains;
+- run a second cutover/rotation before prior generation retires;
+- merge post-backup Store rows without a retained change log/conflict policy;
+- use broad SurrealQL/generic CRUD/Value/`SELECT *`;
+- equate path/PID/port/health/ready/101/ack with ownership/completion;
 - use content digest as occurrence identity;
 - report staged before file+directory durability/readback;
-- replay provider work or inference under another caller/request identity after unknown outcome;
 - treat clean process exit as durability receipt;
 - silently fall back provider/model/destination/Store version/engine;
-- port V2 crate/manifest/inventory/lease/proof machinery without a connected consumer.
+- port V2 manifests/inventories/lease/proof machinery without a connected consumer.
 
 ## 6. Queue
 
 | Priority | Work | Closes |
 |---|---|---|
-| P0 | Slice 0: exact binaries; executable/root leases+DACL; inherited supervisor channel; relay pipe; canonical RocksDB sync=every/no-defaults; sanitized env; listener/peer; root/Owner/Editor; query-only socket owner; DTO/migrations/conflicts/fsync unknown; immutable/mutable files; replay barrier; protected backup/exact rollback; physical erasure; credential revocation; generation backpressure; graceful/forced shutdown. | R-002, R-006, R-019–R-020, R-072–R-073, R-081–R-116 |
-| P1 | Base Slice 1: supervisor/daemon/Store, selection owner, IPC/socket owners, migrations, capture/blob/spool/replay/status/restart/open. | R-001–R-007, R-019–R-020, R-033, R-037–R-040, R-071–R-116 |
-| P1 | Base Slice 2: qualified Claude relay, continuation, packet emission, lexical retrieval, exact open, notes/corrections/commitments, backup/rollback/erase. | R-003–R-013, R-023–R-024, R-036, R-039–R-044, R-074–R-081, R-101, R-104, R-107–R-116 |
-| P1a | Controller connected inference: narrow role, credential ID/generation, controller-local generation-1 install, protocol-v2 verified hello, generation fence, profiles, controlled copies, text runner/readback/release and non-disclosing Operator erasure; no Task/ScriptRun/new table. | R-048, R-050–R-057, R-068–R-070, R-117–R-122 |
-| P1a | One Memory controller adapter and first episode-learning path; unknown Operation ID uses exact reconcile-or-admit and restore never duplicates provider execution. | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057, R-069–R-070, R-114, R-117–R-122 |
-| P1b | Controller credential rotation: pending/current/previous, lost-reply classification, stale-session reaping, old Operation continuity and delayed old-secret retirement. | R-109, R-115, R-117–R-121 |
+| P0-doc | Synchronize Architecture/Implementation/Cognition/README with Contract 0.9; replace V1 controller names, WriteId flow, token_version, high-water/list/history-gap and spool cut. | R-024, R-101, R-114, R-118, R-120, R-122, R-127–R-129 |
+| P0 | Slice 0: binaries; executable/root leases+DACL; inherited supervisor channel; relay pipe; RocksDB profile; listener/peer; root/Owner/Editor; socket owner; DTO/migrations/fsync unknown; immutable/mutable files; brief spool cut; backup/exact rollback; physical erasure; credential revocation; shutdown. | R-002, R-006, R-019–R-020, R-072–R-073, R-081–R-113, R-115–R-116, R-127 |
+| P1 | Base Slice 1: supervisor/daemon/Store, IPC/socket owners, migrations, capture/blob/spool/replay/status/restart/open. | R-001–R-007, R-019–R-020, R-033, R-037–R-040, R-071–R-113, R-127 |
+| P1 | Base Slice 2: qualified Claude relay, continuation, packet emission, lexical retrieval, notes/corrections/commitments, backup/rollback/erase. | R-003–R-013, R-023–R-024, R-036, R-039–R-045, R-074–R-081, R-101, R-104, R-107–R-113, R-127 |
+| P1-controller | Complete controller V2 L0/L1 foundation first; do not patch legacy runtime. | R-123, S-058–S-060 |
+| P1a | Controller V2 connected text inference: stable controller/client identity, token_version, `client.identity`, WriteId receipts, profiles, private copies, inference_calls runner, get/read/cancel/release/high-water/list and non-disclosing erase. | R-048, R-050–R-057, R-068–R-070, R-117, R-119, R-121, R-124–R-129 |
+| P1a | One Memory adapter and first episode-learning consumer; restore reconciles same WriteIds and post-cut inventory without duplicate provider execution. | R-010, R-021, R-028–R-030, R-041–R-045, R-047–R-057, R-069–R-070, R-124–R-129 |
+| P1b | Controller client-token rotation: same owner WriteId, deterministic re-derivation, stale transport reaping, pending/current/previous and delayed retirement. | R-109, R-115, R-117, R-121, R-124 |
 | P1 | One integrator/product edge/cheap preflight/terminal overlap disposition per slice. | R-049, R-058–R-061, R-067 |
-| P2 | Installed Claude qualification. | R-012–R-013, R-074, S-022 |
-| P2 | Embeddings/vector, optional agent projection, Research fixes, documents/views/grounds as independent increments. | R-008, R-014–R-018, R-027, R-031–R-032, R-034, R-046 |
-| P2 | Retire V2 generated inventories/manifests during cutover. | R-059, R-063 |
+| P2 | Installed Claude qualification. | R-012–R-013, R-074 |
+| P2 | Embeddings/vector, optional agent projection, Research, documents/views/grounds as independent increments. | R-008, R-014–R-018, R-027, R-031–R-032, R-034, R-046 |
+| P2 | Retire old generated inventories/manifests at cutover. | R-059, R-063 |
 | P3 | Obtain unavailable ZIP/report; deepen donors only for a selected unresolved edge. | S-008–S-010 |
 | Final | Full tests after connected implementation; minimum relevant build/Clippy during code. | R-049 |
 
@@ -294,11 +287,8 @@ Do not:
 
 | Date / baseline | Change |
 |---|---|
-| 2026-10-23–24 | Episode recipe, controller boundary and Contract 0.1–0.4; R-047–R-070. |
-| 2026-10-24 | Delivery collapse, anti-bureaucracy, Base capture/packet/open; R-058–R-081. |
-| 2026-10-25 | Store/schema/Windows/release/capability/readiness/durability/backup; R-082–R-103. |
-| 2026-10-26 / draft.26–27 | Relay IPC, retained launch, replay barrier, privileged channel, mutable selection, exact rollback; R-104–R-110. |
-| 2026-10-26 / draft.28 | Retained data-root/DACL, physical erasure, restored-job reconciliation, session revocation, generation backpressure and local plaintext boundary; R-111–R-116. |
-| 2026-10-26 / Contract 0.5 | Stable controller caller identity, same-client token rotation/revocation and restore continuity; R-117, S-053–S-054. |
-| 2026-10-26 / Implementation 29, Cognition 12, Contract 0.6 | Typed authenticated hello requirement and exact-caller bytes/non-disclosing Operator erasure; R-118–R-119, S-056. |
-| 2026-10-26 / Implementation 30, Cognition 13, Contract 0.8 + README | Owner-document synchronization for controller-local provisioning, exact protocol-v2 credential receipt/generation fence, specialized redacted install/rotate, same-caller reconcile-or-admit and P1a/P1b split; R-024, R-120–R-122, S-055, S-057. |
+| 2026-10-23–24 | Episode recipe, initial controller boundary, delivery-collapse and Base semantics; R-047–R-081. |
+| 2026-10-25 | Store/schema/Windows/release/readiness/durability/backup; R-082–R-103. |
+| 2026-10-26 / draft.26–30, Contract 0.5–0.8 | Relay IPC, retained launch/root, exact rollback, stable V1 caller and credential-generation design; R-104–R-122. |
+| 2026-10-26 / controller `c8c0ee1`, Contract 0.9 | Rebased boundary onto current controller V2: dedicated Memory principal, pre-send WriteId, two-row state, private copies, high-water restore inventory; old protocol-v2/Operation path superseded. R-123–R-129, S-058–S-064. |
+| 2026-10-26 / backup audit | Found long-held spool publication lock defect; selected brief cut/inventory with post-cut staging continuity. R-127. |
