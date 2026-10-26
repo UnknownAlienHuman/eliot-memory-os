@@ -2,24 +2,34 @@
 
 ## Current work: V3 design
 
-The owner has retired V1/V2 as active product designs and selected a fresh V3 implementation **after documentation**. The files below are the current design discussion. They are drafts, not evidence of implemented or accepted runtime support.
+The owner retired V1/V2 Memory implementations as active product designs and selected a fresh V3 implementation after the current documentation boundary is coherent. These files are design authority, not evidence of implemented runtime support.
 
-| Need | Source |
+| Need | Current V3 source |
 |---|---|
-| Stage, reading order, donor pins, open decisions | [v3/README.md](v3/README.md) |
-| Purpose and preserved properties | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) |
-| Proposed mechanisms and future behavioral scenarios | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) |
-| Consolidated Russian audit, 34 requirements, 29 original scenarios, donor map | [v3/AUDIT.md](v3/AUDIT.md) |
+| Stage, versions, reading order and proof ceiling | [v3/README.md](v3/README.md) |
+| Product purpose, ownership and invariants | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) — draft.10 |
+| Runtime, Store, maintenance and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.31 |
+| Retrieval, current work, learning and revision algorithms | [v3/COGNITION.md](v3/COGNITION.md) — draft.14 |
+| Memory↔controller V2 boundary | [v3/INFERENCE-CONTRACT.md](v3/INFERENCE-CONTRACT.md) — Contract 0.9 |
+| Active decisions, gaps, source coverage and queue | [v3/ANALYSIS-REGISTRY.md](v3/ANALYSIS-REGISTRY.md) |
+| Consolidated evidence, criticism and donor rationale | [v3/AUDIT.md](v3/AUDIT.md) |
+| Requirement/source dispositions | [v3/AUDIT-MAP.md](v3/AUDIT-MAP.md) |
 | Version precedence | [ARCHITECTURE_CONTRACT.md](ARCHITECTURE_CONTRACT.md) |
-| Current repository workflow | [../AGENTS.md](../AGENTS.md), [../START.md](../START.md), [../WORKFLOW.md](../WORKFLOW.md) |
+| Repository workflow | [../AGENTS.md](../AGENTS.md), [../START.md](../START.md), [../WORKFLOW.md](../WORKFLOW.md) |
 
-Read Architecture and Implementation together when changing a V3 contract. Follow the relevant audit evidence back to its source. The audit is a requested consolidated deliverable; it is not an extra normative book or a task generator.
+Read Architecture, Implementation, Cognition and Inference Contract together when changing a load-bearing V3 boundary. `ANALYSIS-REGISTRY.md` is the only active audit/work ledger. The consolidated audit is evidence and rationale; it is not another normative book or task generator.
+
+### Current controller boundary
+
+The inspected controller authority is `eliot-swarm-controller@c8c0ee122c98a01be86bc5296a22a389662a1c89` from merged PR #197. It selects a new local JSON-RPC + SQLite WAL V2 with canonical external ULID `WriteId` receipts and declares the old Rust/`swarm-client`/Operation runtime legacy.
+
+Current Memory design therefore uses a dedicated `memory_inference` principal, stable client ID, monotonic token version, pre-send `WriteId`, private call-owned input/result copies and controller admission-sequence inventory during restore. The old V1 protocol-v2 hello, generic Operation/artifact ownership and reconcile-or-admit path are donor history only.
 
 ## Retained V2 donor documentation
 
-These files describe the old tree. Their historical use of “current,” “active,” or “accepted” refers to V2 unless a V3 decision explicitly adopts a bounded part. They do not grant authority to resume the old programmes.
+These files describe the old Memory tree. Their historical use of “current,” “active” or “accepted” refers to V2 unless a current V3 owner document explicitly adopts a bounded property. They do not grant authority to resume old programmes.
 
-The V2 ACTIVE registry and its validators still retain their original active values. This documentation change establishes the human-directed version/scope boundary; it does not migrate that machine registry or claim a machine-enforced freeze.
+The V2 ACTIVE registry and validators retain their original active values. This branch establishes a human-directed version boundary; it does not migrate that machine registry or claim a machine-enforced freeze.
 
 | Need | V2 donor reference |
 |---|---|
@@ -31,7 +41,7 @@ The V2 ACTIVE registry and its validators still retain their original active val
 | Historical programme records | [../workstreams/ACTIVE.toml](../workstreams/ACTIVE.toml) |
 | Dependency, operations, releases, integrations, ADRs | [DEPENDENCY_POLICY.md](DEPENDENCY_POLICY.md), [operations/](operations/), [release/](release/), [integrations/](integrations/), [ADR/](ADR/) |
 
-The generated routing block below applies to these donor surfaces. Its receipts attest to exact bytes read; they do not make a proposed V3 mechanism implemented or inherit V2's physical topology.
+The generated routing block below applies only to donor surfaces. Its receipts attest to exact bytes read; they do not make a V3 mechanism implemented or inherit V2 physical topology.
 
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
@@ -41,6 +51,6 @@ Start with the [mandatory verified-reading protocol](architecture/READING_PROTOC
 
 ## Documentation checks and evidence
 
-For V3 documentation, verify changed Markdown links, version/status consistency, preservation of the required behavior, and `git diff --check`. Use a relevant donor verifier when changing a donor projection or index; do not regenerate the V2 normative pair as a fictitious V3 adoption receipt.
+For V3 documentation, verify current version/status consistency, links, ownership, normal/failure paths, source attribution and `git diff --check`. A relevant donor verifier applies only when its governed donor surface changed; never regenerate the V2 normative pair as a fictitious V3 adoption receipt.
 
-Keep the requested consolidated audit and stable design rationale in Git. Raw downloaded research, generated bundles/receipts, local databases, agent transcripts, and temporary review notes remain outside the source tree. Record executed checks, their limits, and remaining questions in the issue/PR. Repository CI requirements and integration ownership remain governed by WORKFLOW.
+Keep the requested consolidated audit and stable design rationale in Git. Raw research downloads, generated bundles/receipts, local databases, agent transcripts and temporary review notes remain outside the source tree. Record executed checks, their limits and remaining uncertainty in the issue/PR. Repository CI and integration ownership remain governed by WORKFLOW.
