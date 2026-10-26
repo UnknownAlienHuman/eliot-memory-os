@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.8 · 2026-10-24 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.9 · 2026-10-26 · normative design for the greenfield rewrite.**
 
 V1 and V2 are donors. V3 is a new implementation, not a compatibility migration.
 
@@ -51,13 +51,17 @@ More metadata, stages, checks, processes or interfaces are not benefits by thems
 | User goal, permissions and acceptance of external work | Human and host/controller |
 | Agent sessions, tools, task execution and swarm orchestration | Host/controller |
 | Host event translation and host-supported context emission | Narrow host adapter/relay |
-| Observations, revisions, retrieval, context, source links, outcomes and finite memory jobs | Eliot Memory OS |
+| Observations, revisions, retrieval, context, source links, outcomes and finite memory jobs | Eliot daemon/application operations |
+| Application Store mutations, Editor-authenticated access, replay/jobs, backup cut and quiesce evidence | Eliot daemon |
+| Installation selection, root/Owner credentials, schema migration, DB-user rotation, Store-child lifecycle and restore cutover | Supervisor/installer outside the daemon failure domain |
 | Interpretation, consolidation and method improvement | Eliot learning handlers |
 | Provider credentials, configured connections, physical model invocation and provider readback | `eliot-swarm-controller` |
 | Persistence, native indexes and transactions | SurrealDB through one private Memory Store |
 | Code/document/source translation | Narrow adapters and configured specialist tools |
 | External research execution and large research corpora | Eliot Research or another configured research system |
-| Detection of daemon/process-family failure | Supervisor outside the daemon failure domain |
+| Detection and containment of daemon/process-family failure | Supervisor outside the daemon failure domain |
+
+External `control` reaches the daemon first. The daemon validates the user-visible operation and owns application quiesce, replay drain and exact Store facts. A privileged effect—root/Owner use, migration, user rotation, SurrealDB start/stop/restart or installation cutover—crosses one private inherited supervisor channel as a closed typed intent. The supervisor independently resolves approved resources and Credential Manager references; it never accepts arbitrary SQL, command line, endpoint, filesystem path or secret from that channel. The daemon never receives root or Owner credentials.
 
 Eliot may link an external task, attempt, action and result, but it does **not** become another task manager, acceptance authority, permission engine, swarm controller or research platform.
 
@@ -179,6 +183,7 @@ The initial product is:
 
 - one Rust package and one codebase;
 - one executable with supervisor, daemon and transient relay modes;
+- one private inherited supervisor↔daemon control channel with no public endpoint;
 - one private application Store;
 - one SurrealDB server child;
 - ordinary internal modules;
@@ -298,6 +303,27 @@ actually used or influential: usually unknown unless separately observed
 ```
 
 Failure to emit a packet leaves explicit retrieval and source opening available. The host receives a specific gap rather than fabricated empty success.
+
+### 3.6 Privileged lifecycle is one inherited boundary, not another service
+
+Supervisor and daemon are different failure/authority domains, so they need one real internal boundary. The supervisor creates it before daemon launch and passes only its exact handles to that child. It is not a named public endpoint, plugin protocol or generic administration API.
+
+The channel carries a closed finite vocabulary such as:
+
+```text
+store_descriptor / daemon_ready
+maintenance_request / maintenance_result
+quiesce / quiesced / resume
+shutdown_ready / shutdown_complete
+```
+
+One exact operation ID correlates a finite exchange. The daemon may name an already retained backup/credential/configuration identity; it cannot submit raw SQL, executable arguments, endpoint, arbitrary path or secret. The supervisor reopens and revalidates the referenced object itself.
+
+The daemon owns application mutation admission and produces the quiesce proof: replay stopped, current replay reconciled, Store writes settled or explicitly unknown, sockets closed and spool/deletion cut identified. The supervisor owns privileged execution and installation selection. Neither side reports successful restore, rotation or shutdown from acknowledgement alone; the final state is read back from the selected Store, credential handshake, process exit or installation selection.
+
+Channel loss is fail-closed. A daemon that loses its supervisor closes mutation admission, stages new capture where possible and exits boundedly. A supervisor that loses the daemon does not continue a privileged cutover from an unconfirmed request; a disposable candidate is abandoned unless the durable installation selection already proves the cutover committed.
+
+Immutable blobs, spool entries, deletion notices and backup generations remain no-replace publications. The small mutable installation selection is a different owner and operation: only the supervisor may replace it under the installation mutex, with a monotonic generation, file and directory synchronization, exact readback and explicit unknown reconciliation. The previous data root remains until deliberate retirement.
 
 ## 4. Identity and memory invariants
 
@@ -551,22 +577,26 @@ Persist enough information to distinguish:
 - aggregate cleanup pending, incomplete or released;
 - abandoned for erasure;
 - provider-side effect/copy external unknown;
+- privileged maintenance requested, admitted, quiescing, quiesced, executing, cutover-unknown, resumed, failed or completed;
+- installation selection generation and previous/current root;
 - partial, failed, cancelled or erased.
 
-Acknowledgement is not completion. Heartbeat is not progress. Prepared context is not handoff. Provider body is not a decoded proposal. Proposal is not published memory. Published memory is not proof of external success. Cleanup success is not cognitive success; cognitive success is not cleanup success.
+Acknowledgement is not completion. Heartbeat is not progress. Prepared context is not handoff. Provider body is not a decoded proposal. Proposal is not published memory. Published memory is not proof of external success. Cleanup success is not cognitive success; cognitive success is not cleanup success. A daemon→supervisor request is not a completed privileged effect.
 
 Primary capture and reads remain available when optional routes fail. External I/O never runs inside a Store transaction. Unknown outcomes reconcile through saved identity and native readback, not a new request ID.
 
-Secrets remain in controller. Memory stores profile name, frozen non-secret execution identity, Operation/result references and observed facts. Missing usage, cost or account identity remains unknown.
+Secrets remain in their actual owner. Controller owns model-provider secrets. Supervisor/installer owns root and database Owner references. Daemon receives only Editor access plus non-secret Store/process descriptors. Memory stores profile name, frozen non-secret execution identity, Operation/result references and observed facts. Missing usage, cost or account identity remains unknown.
 
 Physical erasure traverses Memory inputs/results, pending spool, controlled backups and each controller content artifact. A late result cannot reintroduce erased material through an abandoned Operation. Do not report complete erasure while a controlled copy remains or mismatches; do not report provider-side deletion unless the provider actually guarantees it.
 
-Direct control provides status/inbox, inspect/open, configure, pause/resume/cancel, correct/withdraw/erase, backup/restore and shutdown. It reports capture ownership, spool backlog/failures, context handoff gaps, exact-read gaps, profile/connection unavailability, destination mismatch, unknown inference outcome, abandonment and exact per-copy cleanup gaps.
+Direct control provides status/inbox, inspect/open, configure, pause/resume/cancel, correct/withdraw/erase, backup/restore and shutdown. The daemon owns this external surface and reports the operation ID immediately; it delegates only the closed privileged effect to the inherited supervisor channel. Status reports capture ownership, spool backlog/failures, context handoff gaps, exact-read gaps, profile/connection unavailability, destination mismatch, unknown inference outcome, abandonment, privileged-maintenance/quiesce/cutover state, installation-selection generation and exact per-copy cleanup gaps.
 
 ## 10. Explicit non-goals
 
 V3 does not add these without a demonstrated consumer and owner decision:
 
+- a public supervisor API, generic administration bus or second control daemon;
+- arbitrary commands, paths, SQL or secrets over the supervisor↔daemon channel;
 - a second task manager or workflow engine inside Memory;
 - a duplicated provider/credential/router stack;
 - controller Task/Attempt for one-shot inference;
@@ -620,6 +650,8 @@ real host event in session A
 ```
 
 A local spool file without replay is not Base capture. A rendered packet without host emission is not context delivery. An exact-read response with hidden truncation or missing relation descriptors is not complete open.
+
+For privileged maintenance, minimum evidence is an external control request accepted by the daemon, a correlated inherited-channel intent, daemon quiesce/readback, supervisor-owned root/Owner/process effect, exact installation/credential/process readback, daemon reconnection/resume and restart reconciliation. A channel acknowledgement, candidate directory or changed file alone is not successful restore/rotation/shutdown.
 
 For first learning, minimum evidence is one retained episode, exact recipe/disclosure, one frozen connection/profile behavior, one controller Operation, exact result read/Memory copy when result exists, decoded publication or valid no-change, later context reading the resulting revision, and exact cleanup disposition showing input/result removed or an explicit per-copy gap.
 
