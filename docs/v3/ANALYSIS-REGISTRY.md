@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-26 · нормативная база Architecture draft.9 / Implementation draft.29 / Cognition draft.12 / Inference Contract 0.8; controller baseline `e42c464d`; активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-26 · нормативная база Architecture draft.9 / Implementation draft.30 / Cognition draft.13 / Inference Contract 0.8; controller baseline `e42c464d`; активный рабочий реестр, не runtime gate.**
 
 Это **единственный активный реестр** V3. Он показывает, что проверено, что решено только на design-уровне, чего нет в runtime и что делать следующим. Architecture/Implementation/Cognition/Inference Contract — нормативный проект; [AUDIT](AUDIT.md) и [AUDIT-MAP](AUDIT-MAP.md) сохраняют доказательства и стабильные source dispositions. Новый проход обновляет этот файл, а не создаёт новый отчёт.
 
@@ -49,7 +49,7 @@
 | R-021 | Recursive improvement | `PARTIAL` | Diagnose concrete failed edge; no intelligence score. | Connected source→revision→later-context path. |
 | R-022 | Disagreement/anticipation | `CHECKED` design | Alternatives + grounds + cheapest discriminating observation; no voting. | Ordinary records after Base. |
 | R-023 | Control/status/inbox | `DECIDED` | Daemon owns public control; privileged effect crosses inherited channel; status from actual facts. | Operation IDs and cross-owner readback. |
-| R-024 | Normative synchronization | `PARTIAL` / `NOT IMPLEMENTED` runtime | Contract 0.8 and README agree on controller-local provisioning, protocol-v2 hello, credential generation fence and reconcile-or-admit. Implementation 29 and Cognition 12 still contain Contract 0.6/restart/possible-send language. | Synchronize both owner documents before restoring `CHECKED`. |
+| R-024 | Normative synchronization | `CHECKED` design / `NOT IMPLEMENTED` runtime | Architecture 9, Implementation 30, Cognition 13, Contract 0.8 and README agree on controller-local provisioning, protocol-v2 hello, credential generation fence, exact same-caller reconcile-or-admit, result-byte isolation and non-disclosing Operator erasure. | Change all affected owner documents together when the selected mechanism changes. |
 | R-025 | Interpretation triggers | `DECIDED` | New committed input/correction/question only; bookkeeping does not self-trigger. | Inspect enqueue callers and loops. |
 | R-026 | Active/pending jobs | `DECIDED` | One active + one coalesced pending successor; waiting ≠ retry. | Continuous arrivals/modes/shutdown. |
 | R-028 | Recipe bootstrap | `DECIDED` | Save default on first enable; upgrades do not overwrite edited method. | Purpose address and first-enable code. |
@@ -176,7 +176,7 @@
 ## 3. Source coverage
 
 | ID | Источник | Статус / граница |
-|---|---|---|
+|---|---|
 | S-001–S-007 | V1/V2 requirements and supplied audits/reports | `CHECKED` for previously named sections/full supplied texts; not fresh full code audit. |
 | S-008 | Release ZIP `audit-2026-10-16-incomplete` | `BLOCKED`; full corpus unavailable. |
 | S-009 | `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` | `BLOCKED`; full text absent. |
@@ -197,7 +197,7 @@
 | S-052 | Data-root/access and controlled-copy boundary | `CHECKED` current Windows/profile design; DACL/root lease/physical deletion unrun. |
 | S-053 | Controller caller credential and handshake at `e42c464d` | `CHECKED`: `Credential {client_id, token}`, `client.hello`, retained Principal per connection. |
 | S-054 | Controller exact-caller Operation/artifact scope at `e42c464d` | `CHECKED`: Operation stores caller_id; client_request_id projects only to same client_id; ExactCaller/ExactResultOperationCaller grants exist. |
-| S-055 | Current normative synchronization | `PARTIAL`: Contract 0.8 and README agree; Implementation 29/Cognition 12 still require exact replacement of 0.6/restart/submission-state language. Runtime absent. |
+| S-055 | Current normative synchronization | `CHECKED` design: Architecture 9 / Implementation 30 / Cognition 13 / Contract 0.8 / README agree; runtime remains absent. |
 | S-056 | `swarm-client` hello-result handling at `e42c464d` | `CHECKED` exact source: server returns client_id/role/protocol v1; client discards result before returning handle. |
 | S-057 | Controller provisioning/registration authority at `e42c464d` | `CHECKED` exact source: bootstrap Operator lives in private `operator.json`; generic `client.register` accepts GM/local Operator, rejects existing client and carries token_hash through generic mutation persistence. |
 
@@ -242,7 +242,7 @@ controller-local private install/rotate bundle
 → unknown Operation ID uses exact reconcile-or-admit
 ```
 
-This preserves exact-caller ownership without giving controller Operator authority to Memory, persisting token verifiers in generic Operations, retaining stale authenticated sessions or creating a Memory-side submission ledger. Contract 0.8 and README own this rule; Implementation/Cognition synchronization remains open and runtime is absent.
+This preserves exact-caller ownership without giving controller Operator authority to Memory, persisting token verifiers in generic Operations, retaining stale authenticated sessions or creating a Memory-side submission ledger. Architecture 9, Implementation 30, Cognition 13, Contract 0.8 and README now own this rule consistently. Runtime remains absent.
 
 ## 5. Frozen anti-patterns
 
@@ -301,4 +301,4 @@ Do not:
 | 2026-10-26 / draft.28 | Retained data-root/DACL, physical erasure, restored-job reconciliation, session revocation, generation backpressure and local plaintext boundary; R-111–R-116. |
 | 2026-10-26 / Contract 0.5 | Stable controller caller identity, same-client token rotation/revocation and restore continuity; R-117, S-053–S-054. |
 | 2026-10-26 / Implementation 29, Cognition 12, Contract 0.6 | Typed authenticated hello requirement and exact-caller bytes/non-disclosing Operator erasure; R-118–R-119, S-056. |
-| 2026-10-26 / Contract 0.8 + README | Controller-local provisioning owner, exact protocol-v2 credential receipt/generation fence, specialized redacted install/rotate, reconcile-or-admit and P1a/P1b split; R-120–R-122, S-057. Implementation/Cognition sync remains open. |
+| 2026-10-26 / Implementation 30, Cognition 13, Contract 0.8 + README | Owner-document synchronization for controller-local provisioning, exact protocol-v2 credential receipt/generation fence, specialized redacted install/rotate, same-caller reconcile-or-admit and P1a/P1b split; R-024, R-120–R-122, S-055, S-057. |
