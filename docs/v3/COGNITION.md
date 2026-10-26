@@ -292,7 +292,7 @@ Before controller application I/O:
 
 Token bytes, token hashes, token-derived fingerprints and reusable verifiers never enter the job or backup. The controller-local maintenance command that provisioned the private inference credential owns controller Operator authority; Memory does not. A missing, unknown, malformed or mismatched hello field closes the connection before an application frame and sets `caller_identity_unavailable` or the specific credential/protocol failure. It does not authorize a new `client_id`, Operator/admin recovery or a new request ID.
 
-Do not drop protected material to make an external destination pass. Controller admission authoritatively resolves profile/connection/`actual_destination`, validates disclosure, origin, limits and format, and either reconciles/admit the Operation or returns a specific operational state. Rejection/wait leaves input unprocessed.
+Do not drop protected material to make an external destination pass. Controller admission authoritatively resolves profile/connection/`actual_destination`, validates disclosure, origin, limits and format, and either reconciles with or admits the Operation, or returns a specific operational state. Rejection/wait leaves input unprocessed.
 
 Provider/controller execution occurs outside Store transactions. Memory retains exact returned bytes and operational metadata before cognitive decoding.
 
