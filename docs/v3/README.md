@@ -14,7 +14,7 @@ V1 and V2 are donors. V3 is a greenfield implementation.
 6. [Audit conclusion](AUDIT.md) — evidence, root causes, rejected machinery and source limits.
 7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for original requirements, audits and donors.
 
-Architecture draft.9, Implementation draft.29 and Cognition draft.12 describe one product at increasing depth. Inference Contract 0.6 is one narrow cross-repository boundary, not another architecture or workflow layer. The complete target is not a prerequisite for useful Base. None of these documents is implemented product code.
+Architecture draft.9, Implementation draft.29 and Cognition draft.12 describe one product at increasing depth. Inference Contract 0.8 is one narrow cross-repository boundary, not another architecture or workflow layer. The complete target is not a prerequisite for useful Base. None of these documents is implemented product code.
 
 `ANALYSIS-REGISTRY.md` is the only active analysis ledger. `AUDIT-MAP.md` is the stable source/decision matrix.
 
@@ -27,7 +27,7 @@ One local Rust package/codebase provides supervisor, daemon and transient relay 
 - **Controller:** caller authentication, provider credentials and physical model execution.
 - **Host/controller:** user task/action execution and acceptance.
 
-The installation identity owns one stable non-secret Memory installation ID and expected controller `client_id`. That identity survives Store-root cutover, rollback, daemon restart and inference-token rotation. A credential generation authenticates the principal; it does not own old Operations or replace their caller.
+The installation identity owns one stable non-secret Memory installation ID and expected controller `client_id`, plus the selected non-secret controller `credential_id` and positive `credential_generation`. The stable caller survives Store-root cutover, rollback, daemon restart and inference-token rotation. Credential identity authenticates one physical generation; it does not own old Operations or replace their caller.
 
 Root/Owner material never enters the daemon path. One inherited duplex channel carries only closed maintenance intents/results—never arbitrary SQL, argv, endpoint, path or secret. A request/acknowledgement is not completion; process, credential, Store and selection readback own the result.
 
@@ -110,17 +110,31 @@ Store admission is the conjunction of selected-root/executable identity, listene
 
 ### Controller IPC identity
 
-Memory uses pinned `swarm-client`, not MCP or a spawned CLI. Controller authenticates `client_id + token` during `client.hello` and returns authenticated `client_id`, role and protocol version. The inspected donor server already returns those fields, but current `swarm-client::connect` discards them; it is therefore incomplete for stable-caller recovery.
+Memory uses pinned `swarm-client`, not MCP or a spawned general-purpose CLI. The inspected donor authenticates `client_id + token` and returns `client_id`, role and `protocol_version=1`, but current `swarm-client::Client::connect` discards that result. Protocol version 1 has no credential-generation fence and cannot authorize V3 inference.
 
-Before an application-capable client exists, the implementation must expose and validate a closed typed hello receipt:
+The first generation-aware inference protocol is exactly version 2. Before an application-capable client exists, `connect_verified` or an equivalent closed constructor must expose and validate exactly:
+
+```text
+client_id
+role
+credential_id
+credential_generation
+protocol_version
+```
+
+Admission requires:
 
 ```text
 receipt.client_id == installation.controller_client_id == credential.client_id
 receipt.role == inference_client
-receipt.protocol_version supported
+receipt.credential_id == installation.selected_credential_id
+receipt.credential_generation == installation.selected_credential_generation > 0
+receipt.protocol_version == 2
 ```
 
-Mismatch closes the connection before application I/O and holds affected jobs `caller_identity_unavailable`. Supplying a credential file is not proof of the authenticated principal. Manager/Operator/Module identity with the same-looking ID is not accepted.
+Missing, unknown or malformed fields fail closed. Mismatch closes the connection before application I/O and holds affected jobs `caller_identity_unavailable` or the more specific credential/protocol failure. Supplying a credential file is not proof of the authenticated principal. Manager/Operator/Module identity is not accepted.
+
+Controller inference install/rotation is owned by a controller-local maintenance command. It loads the controller's private `operator.json` internally, durably creates/reuses one pending credential bundle before possible Store commit and invokes specialized redacted operations. Memory receives only the private inference credential reference and non-secret receipt; it never receives controller Operator authority.
 
 ## Local durability and selection
 
@@ -136,7 +150,7 @@ create-new same-directory temp
 
 Post-rename sync/readback failure is unknown, not staged.
 
-Mutable `installation.toml` is supervisor-only expected-generation replacement with `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`, parent flush and exact readback. It carries the stable installation/controller caller identity, one current and at most one unretired previous root, and at most one pending/previous Store credential per role. Another cutover/rotation is blocked until the prior generation is retired. `ReplaceFileW` is not treated as write-through. Possible replacement failure becomes `SELECTION_UNKNOWN`; startup reads actual old/new state.
+Mutable `installation.toml` is supervisor-only expected-generation replacement with `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`, parent flush and exact readback. It carries the stable installation/controller caller identity, selected controller credential ID/generation, one current and at most one unretired previous root, at most one pending/previous Store credential per role, and at most one pending/previous inference credential reference. Another cutover/rotation is blocked until the prior generation is retired. `ReplaceFileW` is not treated as write-through. Possible replacement failure becomes `SELECTION_UNKNOWN`; startup reads actual old/new state.
 
 Previous roots/credentials stay until a separate retirement operation survives restart/readback. A previous root is never directly reselected; recovery goes through typed restore so current deletion fences/config/credentials apply.
 
@@ -175,7 +189,7 @@ Surreal HTTP export/import and startup import are not application owners.
 
 Daemon closes mutations/replay, reconciles writes, and cuts versioned canonical typed pages over six tables, selected-root blobs, deletion notices, pending and retained failed spool and sanitized config. Fixed field order and exact-byte digests; manifest owns completion. Manifest carries strictest disclosure, stable Memory installation ID and `controller_client_id`. Backup remains under protected local root.
 
-Inference jobs retain non-secret caller/request/method/Operation/artifact/release identity, per-copy cleanup and credential-reference diagnostics. Token bytes, reusable token hashes and verifiers are excluded.
+Inference jobs retain non-secret caller/request/method/Operation/artifact/release identity, per-copy cleanup and selected credential ID/generation diagnostics. Token bytes, reusable token hashes and verifiers are excluded.
 
 ### Restore is exact rollback
 
@@ -188,13 +202,12 @@ Initial restore activates one backup cut after newer deletion fences and exact s
 - post-backup rows/jobs/config are not copied silently;
 - restored job/manifest caller IDs must match the installation identity;
 - known controller Operation → exact same-caller operation/artifact/release readback, never redispatch;
-- possible send with unknown Operation ID → exact method/request replay under the same caller only;
-- proven no-send → retained request may make its first dispatch once;
-- hello caller/role/protocol mismatch → `caller_identity_unavailable`, no read/release/redispatch claim and explicit cleanup debt;
+- unknown controller Operation ID → one exact same-caller reconcile-or-admit call using retained method/request identity;
+- hello caller/credential/role/protocol mismatch → `caller_identity_unavailable`, no read/release/admission call and explicit cleanup debt;
 - unresolved out-of-target Operations block or require explicit abandonment;
 - restore is blocked while another unretired previous root exists.
 
-Candidate is built/admitted by supervisor with root/Owner. At cutover daemon quiesces writes/replay/jobs and closes old socket; supervisor merges external continuity, replaces selection current=candidate/previous=old, then daemon independently admits selected Store with Editor before Base resumes. Controller-backed jobs resume only after typed hello verification. Channel loss before replacement abandons candidate; after possible replacement startup reads actual selection.
+Candidate is built/admitted by supervisor with root/Owner. At cutover daemon quiesces writes/replay/jobs and closes old socket; supervisor merges external continuity, replaces selection current=candidate/previous=old, then daemon independently admits selected Store with Editor before Base resumes. Controller-backed jobs resume only after typed protocol-v2 hello verification. Channel loss before replacement abandons candidate; after possible replacement startup reads actual selection.
 
 ### Controlled-copy erasure
 
@@ -224,11 +237,13 @@ create pending secret + durable pending ref
 
 Store restart is required because changing stored password alone does not prove revocation of already authenticated WebSocket sessions. Owner follows same pattern. Root rotation is outside first Base.
 
-### Controller inference token
+### Controller inference credential
 
-Inference-token rotation keeps the same stable `controller_client_id`. It stops new inference admission, creates one pending secret/reference, updates the token for the same principal, classifies unknown outcome with pending then current, closes every old authenticated controller connection or restarts the host, validates the new typed hello receipt and proves read/release of a pre-rotation Operation before old-secret retirement.
+Controller-local install/rotate creates and durably flushes one pending private credential bundle before possible Store commit, then invokes specialized local-Operator-only redacted operations. The stable `controller_client_id` never changes. Registration and authenticated Principal carry independent `credential_id` and monotonic `credential_generation`.
 
-Changing `client_id` is principal migration, not token rotation. Initial Base has no implicit ownership transfer. A new principal cannot adopt old Operations/artifacts/cleanup duties, and Operator access is not a normal recovery shortcut.
+Every inference-client read/mutation reloads current registration and compares both values. An old authenticated Principal evaluated after rotation receives `CREDENTIAL_STALE` before application admission; client and server close/reap that stale transport. Generation fencing, not a whole-host restart, is the selected revocation mechanism.
+
+After an unknown rotate reply, the same controller-local command probes the retained pending credential first and current second. Memory promotes pending/current/previous only after protocol-v2 hello, redacted rotation receipt and pre-rotation Operation read/release agree. Previous secret retirement is a later explicit cleanup. Changing `client_id` remains unsupported principal migration.
 
 ## Why V2 stalled
 
@@ -260,7 +275,7 @@ Dreamer is one finite Memory job:
 
 ```text
 stable controller caller + exact request identity
-→ verified typed hello
+→ protocol-v2 verified typed hello with credential ID/generation
 → controller Operation + controlled input
 → exact result when present, readable only by same caller
 → verified Memory copy
@@ -269,7 +284,7 @@ stable controller caller + exact request identity
 → exact-caller release or non-disclosing Operator erasure
 ```
 
-Known Operation is read back. Possible-send without known Operation ID replays only the same request under the same caller. Proven no-send may dispatch once. Caller mismatch is `caller_identity_unavailable`, not permission to change principal or buy another call.
+Known Operation is read back. Unknown Operation ID invokes one deliberate exact same-caller reconcile-or-admit call with the retained method/request identity. Controller returns the matching original Operation, creates the first admission if absent, or reports conflict; provider-send uncertainty remains inside that Operation and is never redispatched. Caller/credential mismatch holds the job instead of changing principal or buying another call.
 
 No-result is operational, not cognitive no-change. Erasure uses abandon-for-erasure and cannot prove provider-side non-execution/deletion. Controller owns provider execution; Memory owns job/source/recipe/disclosure/copy/decode/publication.
 
@@ -278,10 +293,11 @@ No-result is operational, not cognitive no-change. Erasure uses abandon-for-eras
 0. Exact Windows/Surreal discrimination: executable+root leases/DACL, explicit inherited handles, privileged channel, relay pipe, canonical RocksDB sync=every, sanitized process, dynamic peer ownership, Origin/anonymous bounds, root/Owner/Editor, query-only socket owner, DTOs/conflicts/unknowns, immutable vs mutable files, replay barrier, protected backup/exact rollback with safety/non-merge/restored-job handling, controlled-copy erasure, Store credential restart/revocation and previous-generation backpressure.
 1. Store/lifecycle and exact persistence.
 2. Useful Base with one host/context/open/backup/rollback/erase.
-3. Controller one-shot inference owner: stable caller registration, typed hello receipt, exact-caller bytes, non-disclosing Operator erasure, same-client token rotation/revocation, no Task/Attempt.
-4. First learning and restore reconciliation for controller Operations under the retained caller; mismatch remains held without duplicate inference.
-5. Independent vector/view/document/Research/host increments.
-6. Advanced curation after Base paths work.
+3. Controller inference P1a: `inference_client`, generation-1 controller-local install, protocol-v2 verified hello, generation fence, static profiles, controlled copies, `inference.text`, exact readback/release and non-disclosing Operator erasure—no Task/Attempt.
+4. One Memory adapter and first episode-learning path, including unknown-Operation reconcile-or-admit and restore under the retained caller.
+5. Controller credential P1b: pending/current/previous rotation, lost-reply classification, stale-session reaping, pre-rotation Operation continuity and later old-secret retirement.
+6. Independent vector/view/document/Research/host increments.
+7. Advanced curation after Base paths work.
 
 Production code first. Minimum relevant build/Clippy after coherent increments. Full suite after connected product. Cheap blockers first; one integrator; leaf compile/docs/receipt do not close a slice.
 
