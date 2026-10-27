@@ -8,7 +8,7 @@ V1/V2 Memory implementations are archived donors. V3 is a fresh implementation t
 |---|---|
 | Reading order and proof ceiling | [v3/README.md](v3/README.md) |
 | Product purpose, authority and invariants | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) — draft.19 |
-| Runtime, Store/query contract and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.40 |
+| Runtime, Store/schema/query contract and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.41 |
 | Reconstruction, retrieval and learning algorithms | [v3/COGNITION.md](v3/COGNITION.md) — draft.23 |
 | Memory↔controller V2 boundary | [v3/INFERENCE-CONTRACT.md](v3/INFERENCE-CONTRACT.md) — Contract 0.18 |
 | Active decisions, gaps and queue | [v3/ANALYSIS-REGISTRY.md](v3/ANALYSIS-REGISTRY.md) |
@@ -24,6 +24,9 @@ Read Architecture, Implementation, Cognition and Inference Contract together for
 - final backup directory first appears with a durable canonical fence already inside;
 - terminal abort/retire records remain authoritative after content cleanup;
 - restore retains directory/fence/manifest handles and streams one verified part at a time under finite limits;
+- Base IDs are canonical OS-random values; derived keys are domain-separated length-prefixed hashes;
+- direct continuation uses explicit indexed work-address columns rather than parsing `binding_json`;
+- migration 0001 uses read-only identities, closed literals and cross-field assertions for body, validity, claim, request and slot invariants;
 - migration bundle identity includes runner protocol, wrapper template, DDL and expected catalog;
 - schema admission compares plain `INFO` maps, never unstable `STRUCTURE` or raw JSON order;
 - scored FTS uses numbered match references and bounded top-K snapshots, not durable lexical cursors;
