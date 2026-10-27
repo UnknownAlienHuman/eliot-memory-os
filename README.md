@@ -9,14 +9,14 @@ Eliot preserves exact experience, reconstructs current work, supplies applicable
 | Read | Purpose |
 |---|---|
 | [V3 navigation](docs/v3/README.md) | Current versions, reading order, selected construction and proof ceiling |
-| [Architecture draft.15](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
-| [Implementation draft.36](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
-| [Cognition draft.19](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning, rollback-safe backup dependencies and revision algorithms |
-| [Inference Contract 0.14](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
+| [Architecture draft.16](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
+| [Implementation draft.37](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
+| [Cognition draft.20](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning, rollback-safe backup dependencies/retirement and revision algorithms |
+| [Inference Contract 0.15](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
 | [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, source coverage and queue |
 | [Consolidated audit](docs/v3/AUDIT.md) | Evidence, criticism, donor analysis and rationale |
 
-Architecture 15, Implementation 36, Cognition 19 and Contract 0.14 describe one synchronized design. Source presence, specification text, green build or receipt does not establish working behavior.
+Architecture 16, Implementation 37, Cognition 20 and Contract 0.15 describe one synchronized design. Source presence, specification text, green build or receipt does not establish working behavior.
 
 Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
@@ -54,7 +54,8 @@ retained episode
 → typed result or unknown
 → ordinary Memory revision
 → changed later context
-→ rollback-safe installation fence and dependency-aware cleanup
+→ rollback-safe backup publication/retirement authority
+→ dependency-aware cleanup
 ```
 
 Provider result does not grant Memory authority or prove external task completion.
@@ -99,38 +100,41 @@ controller_dependent    backup still needs controller state/result/copy/readback
 
 Old backup never first-admits absent call ID. While any retained or provisional backup marks a call dependent, Memory blocks release that would remove required controller state/copies. `retain_after_seq` remains monotonic and is not lowered for these in-cut dependencies.
 
-### Rollback-safe backup publication authority
+### Rollback-safe backup publication
 
-Before writing backup parts, Memory captures the exact spool/controller cut, constructs a canonical immutable plan and computes:
+Before writing backup parts, Memory captures the exact spool/controller cut, constructs a canonical immutable plan and computes `backup_plan_digest` over a field set that excludes the digest itself, publication state and later part/manifest digests.
 
-```text
-backup_plan_digest
-```
-
-The digest preimage excludes the digest field itself, publication state and later part/manifest digests. Memory then durably publishes:
+It durably publishes:
 
 ```text
 backups/<backup-id>/fence.json
 ```
 
-outside rollback Store roots. Final `manifest.json` repeats the plan digest plus actual page/blob/spool/deletion/config inventories. There is no precommitted final-manifest digest inside the Store data being backed up.
+outside rollback Store roots. Final `manifest.json` repeats the plan digest plus actual inventories. There is no precommitted final-manifest digest inside Store data being backed up.
 
-Controlled file states:
+### Monotonic backup retirement
+
+Controlled records:
 
 ```text
-fence.json + valid matching manifest.json  -> published
-fence.json + exact absence + valid abort   -> aborted_before_publish
-fence.json without valid manifest/abort    -> preparing | publication_unknown
-mismatch/ambiguity                         -> publication_unknown
+fence.json
+parts/...
+manifest.json
+abort.json?     # candidate never became published
+retire.json?    # valid published backup made non-restorable
 ```
 
-`preparing` and `publication_unknown` pin both dependent-call release and post-cut retention at their high-water. Exact Memory rollback cannot erase this authority. A Store maintenance row is status mirror only.
+A published backup is retired only by create-new durable `retire.json` binding backup ID, plan digest, observed manifest digest and local retirement operation. Deleting manifest/fence/parts is not retirement. `abort.json` and `retire.json` are mutually exclusive.
+
+Until retirement-marker readback succeeds, backup remains restorable and pins release/retention. After success, restore refuses it and pins may be recomputed. Physical content cleanup is later; retirement tombstone remains. Retirement is not physical erasure.
+
+`preparing` and `publication_unknown` provisional fences pin both dependent-call release and post-cut retention at their high-water. Exact Memory rollback cannot erase this authority.
 
 Controller registration owns `last_admission_seq` and guaranteed `retain_after_seq`. Fixed-window inventory below cut returns `history_gap`. Erased content above cut leaves bounded text-free membership tombstone until every backup pinning interval is retired and cut advances.
 
 With valid caller, cleanup uses optional `inference.cancel` and `inference.release(...)`. Controller-owner `inference.erase` is local break-glass. Memory never receives owner authority and records owner-action-required debt until non-content owner readback.
 
-Exact details live only in [Contract 0.14](docs/v3/INFERENCE-CONTRACT.md).
+Exact details live only in [Contract 0.15](docs/v3/INFERENCE-CONTRACT.md).
 
 Controller issue #200 must repair binding-revision allocator/schema authority. V2 L0/L1 must then exist before issue #199 implements Memory inference. Do not patch legacy controller runtime.
 
@@ -156,7 +160,7 @@ The [documentation map](docs/README.md) separates V3 authority from V2 donor ref
 
 | Repository | V3 relationship |
 |---|---|
-| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External Agent/task owner and Contract 0.14 one-shot inference boundary after controller #200 + V2 L0/L1 |
+| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External Agent/task owner and Contract 0.15 one-shot inference boundary after controller #200 + V2 L0/L1 |
 | [eliot-search](https://github.com/UnknownAlienHuman/eliot-search) | Optional source preparation/retrieval adapter for concrete selected path |
 | [eliot-research](https://github.com/UnknownAlienHuman/eliot-research) | Optional external research/acquisition owner for concrete remaining gap |
 
