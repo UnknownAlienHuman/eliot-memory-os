@@ -8,20 +8,20 @@ The synchronized V3 set is:
 
 | Surface | Current role |
 |---|---|
-| [Architecture draft.13](v3/ARCHITECTURE.md) | Product purpose, authority owners, Base, extensions and invariants |
-| [Implementation draft.34](v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation order |
-| [Cognition draft.17](v3/COGNITION.md) | Reconstruction, retrieval, learning, backup dependencies and revision algorithms |
-| [Inference Contract 0.12](v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
+| [Architecture draft.14](v3/ARCHITECTURE.md) | Product purpose, authority owners, Base, extensions and invariants |
+| [Implementation draft.35](v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation order |
+| [Cognition draft.18](v3/COGNITION.md) | Reconstruction, retrieval, learning, backup publication/dependencies and revision algorithms |
+| [Inference Contract 0.13](v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
 | [Active analysis registry](v3/ANALYSIS-REGISTRY.md) | Sole active decisions/gaps/source-coverage/work queue |
 | [V3 navigation](v3/README.md) | Reading order, current baseline and proof ceiling |
 | [V3 audit](v3/AUDIT.md), [source map](v3/AUDIT-MAP.md) | Evidence, criticism, donor analysis and stable source dispositions; not independent subsystem authority |
 | `docs/architecture/`, `docs/normative-pair.toml`, existing source/scripts/workstreams | Retained V2 donor surfaces; old status terms are historical |
 
-Architecture intent prevails over conflicting lower-level mechanism. Implementation and Cognition agree with Architecture and Contract 0.12. Resolve changed load-bearing mechanism in every affected owner document in same work sequence; do not add errata layer or second active contract.
+Architecture intent prevails over conflicting lower-level mechanism. Implementation and Cognition agree with Architecture and Contract 0.13. Resolve a changed load-bearing mechanism in every affected owner document in the same work sequence; do not add an errata layer or second active contract.
 
-A new mechanism, budget, process count, database choice, credential path or evaluation threshold is not accepted because an agent wrote it. It needs concrete caller, owner, durable result/unknown and consumer, plus appropriate evidence.
+A new mechanism, budget, process count, database choice, credential path or evaluation threshold is not accepted because an agent wrote it. It needs a concrete caller, owner, durable result/unknown and consumer, plus appropriate evidence.
 
-There is no V3 adoption digest or product acceptance receipt in this revision. Do not generate one by relabelling V2 pair. Synchronized V3 documents establish implementation target; they do not establish completed code, model integration, learning, backup, recovery or runtime qualification.
+There is no V3 adoption digest or product acceptance receipt in this revision. Do not generate one by relabelling the V2 pair. Synchronized V3 documents establish implementation target; they do not establish completed code, model integration, learning, backup, recovery or runtime qualification.
 
 ## Controller version boundary
 
@@ -39,15 +39,18 @@ Therefore:
 
 - revision `e42c464d`, V1 roles/hello/Operation/artifacts and generic registration are donor evidence only;
 - no Memory implementation may add one-shot inference to retired stack;
-- active boundary is Contract 0.12: dedicated `memory_inference`, stable random installation client ID, monotonic token version, `client.identity`, global pre-send WriteIds, rollback-safe generator state, minimal client/call state, private call-owned copies, guaranteed `retain_after_seq`, backup admission/dependency closure and fixed-window restore inventory;
+- active boundary is Contract 0.13: dedicated `memory_inference`, stable random installation client ID, monotonic token version, `client.identity`, global pre-send WriteIds, rollback-safe generator state, minimal client/call state, private call-owned copies, guaranteed `retain_after_seq`, backup admission/dependency closure, provisional publication fences and fixed-window restore inventory;
 - controlled backup includes admitted calls only; proven-absent IDs are permanently retired and unknown admission makes continuity incomplete;
-- every admitted in-cut call is controller-closed or controller-dependent; dependent call stays unreleased while any restorable backup needs it;
+- every admitted in-cut call is controller-closed or controller-dependent;
+- before backup file publication, ordinary Memory maintenance state installs a provisional dependency fence;
+- `preparing` and `publication_unknown` fences block release across restart until exact final-path reconciliation;
+- dependent call stays unreleased while any restorable or possible backup needs it;
 - monotonic retain cut protects post-cut membership and is not lowered to pin old in-cut dependency;
 - caller cleanup uses cancel/release; controller-owner erase is external break-glass and cannot be submitted by Memory;
 - content erasure above cut leaves bounded text-free membership tombstone until pinned backups retire and cut advances;
 - controller issue #200 must repair binding-revision allocator/schema authority;
 - controller V2 L0/L1 must exist before issue #199 implements Memory extension;
-- missing V2 capability is real dependency, not permission to revive V1.
+- missing V2 capability is a real dependency, not permission to revive V1.
 
 Controller roadmap is sole status tracker. At this authority revision L0.1–L1.11 are unchecked. Controller PR #201 repairs schema-validator fixtures but does not close #200 allocator semantics.
 
