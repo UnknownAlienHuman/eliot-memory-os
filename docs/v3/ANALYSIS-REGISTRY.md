@@ -45,10 +45,10 @@
 | R-003 | Continuation address | `DECIDED` | Project/workspace + task or actor/session; path/branch/HEAD = environment. | Fork/two-workspace/late-result. |
 | R-004 | Context packet | `CHECKED` design / `NOT IMPLEMENTED` | Exact rendered bytes/digest/revisions/gaps; prepared/emitted/use distinct. | Real host emission/readback. |
 | R-005 | Structured correction | `DECIDED` | Observation + history/current revision + result atomically. | Conflict/replay/readback. |
-| R-006 | Six Base tables | `CHECKED` design / `NOT IMPLEMENTED` | `stream`, `observation`, `memory`, `memory_history`, `link`, `job`; canonical IDs, immutable fields, row assertions, reader-backed indexes, fixed DTO queries and migration 0001. | Write assets/query corpus and live-qualify. |
+| R-006 | Six Base tables | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | `stream`, `observation`, `memory`, `memory_history`, `link`, `job`; canonical IDs, immutable fields, reader-backed indexes, fixed DTO queries. Candidate migration/query pack now exists, but exact mutation scripts/cross-field guards/live catalog remain open. | Compile pack; finish mutation assets; live-qualify. |
 | R-007 | Current/history | `DECIDED` | Exact version handles; no fall-forward/resurrection. | Publication/restart readback. |
 | R-008 | Compound grounds | `PARTIAL` | Required groups, alternatives and advisory support separated. | Reducer/cycle/erase/concurrency. |
-| R-009 | Retrieval arms | `CHECKED` design / `NOT IMPLEMENTED` | Direct/address/exact/lexical/vector/relation arms independent. Lexical = bounded snapshot, not fake durable cursor. | Real plans/limits/noise/exceptions. |
+| R-009 | Retrieval arms | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | Direct/address/exact/lexical/vector/relation arms independent. Fixed read shapes now concrete; lexical = bounded snapshot, not fake durable cursor. | Compile DTOs, real plans/limits/noise/exceptions. |
 | R-010 | Method consumer | `DECIDED` | Job freezes recipe revision; output must reach later context/open/request. | Before/after product effect. |
 | R-011 | Reuse/disclosure | `DECIDED` | Origin, reuse and disclosure independent. | Scoped queries/reduction. |
 | R-012 | Claude capture | `CHECKED` design / `NOT IMPLEMENTED` | Finite event profile. | Installed-build qualification. |
@@ -73,25 +73,28 @@
 | R-101/R-107 | Backup cut/replay barrier | `CHECKED` design / `NOT IMPLEMENTED` | Brief spool cut, active replay drain, typed pages, deletion/spool continuity. | Crash/in-flight/mismatch. |
 | R-102–R-106 | Endpoint/IPC/launch | `CHECKED` donor/design / `NOT IMPLEMENTED` | Origin not auth; listener+peer owner; mutual relay attestation; retained executable/root identity; cancellation-safe socket owner. | Windows implementation. |
 | R-108–R-116 | Privileged lifecycle/rollback/ACL/rotation | `CHECKED` design / `NOT IMPLEMENTED` | Inherited supervisor channel, expected-generation selection, exact rollback, controlled roots/backups, session revocation and generation backpressure. | Slice 0. |
-| R-150 | Schema bundle authority | `CHECKED` design / `PARTIAL` source / `NOT IMPLEMENTED` | Bundle preimage includes format, runner protocol, wrapper, ordered DDL and expected catalog. PARAM rollback and cancelled index overwrite are exact-tag evidence; complete wrapper, bound metadata and all DDL rollback remain unqualified. | Execute exact wrapper/failure/readback matrix on 3.3.4. |
-| R-151 | JSON-safe application/query boundary | `CHECKED` design / `NOT IMPLEMENTED` | Canonical string IDs; native record IDs internal; fixed projections/DTOs; no generic codec. | Freeze exact grammar/query assets. |
-| R-152 | Base lexical indexes | `CHECKED` source/design / `NOT IMPLEMENTED` | Exact analyzer/FULLTEXT syntax and representative index iteration confirmed. | Write assets; measure write cost and reader plans. |
-| R-153 | Optional unique keys | `CHECKED` exact source/design / `NOT IMPLEMENTED` | 3.3.4 UNIQUE skips a tuple containing either NONE or NULL. V3 writes only NONE for “not applicable”; NULL is forbidden in conditional-key fields. | Concurrent insert/conflict through production client. |
-| R-154 | Numbered FTS score query | `CHECKED` exact tests/design / `NOT IMPLEMENTED` | `@n@` binds `search::score(n)`; EXPLAIN can show `Iterate Index`; score 0 is a real match. | Exact query assets/live representative corpus. |
-| R-155 | Lexical snapshot | `CHECKED` design / `NOT IMPLEMENTED` | BM25 order changes with corpus. One bounded top-K statement snapshot; no cross-call lexical cursor. | Context/concurrent-write cases. |
-| R-156 | Plain INFO catalog | `CHECKED` exact tests/design / `NOT IMPLEMENTED` | Plain `INFO FOR DB/TABLE` maps hold canonical DEFINE strings. Sort owned keys; compare exact pinned-version strings. `STRUCTURE` is a separate AST-like form and forbidden. | Expected catalog/live readback. |
+| R-150 | Schema bundle authority | `CHECKED` design / `PARTIAL` source+asset / `NOT IMPLEMENTED` | Bundle preimage includes format, runner protocol, wrapper, ordered DDL and expected catalog. Candidate transaction body now exists. PARAM rollback and cancelled index overwrite are exact-tag evidence; complete wrapper, bound metadata and all DDL rollback remain unqualified. | Execute exact pack/failure/readback matrix on 3.3.4. |
+| R-151 | JSON-safe application/query boundary | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | Canonical string IDs; native record IDs internal; explicit projections/DTOs; no generic codec. Candidate read-query corpus now exists. | Compile DTOs and exact statement digests. |
+| R-152 | Base lexical indexes | `CHECKED` source/design / `PARTIAL` asset / `NOT IMPLEMENTED` | Exact analyzer/FULLTEXT syntax and representative index iteration confirmed; candidate analyzer/index/query statements are checked in. | Run exact binary; measure write cost and reader plans. |
+| R-153 | Optional unique keys | `CHECKED` exact source/design / `PARTIAL` asset / `NOT IMPLEMENTED` | 3.3.4 UNIQUE skips tuple containing NONE or NULL. V3 writes only NONE for “not applicable”; candidate unique indexes are concrete. | Concurrent insert/conflict through production client. |
+| R-154 | Numbered FTS score query | `CHECKED` exact tests/design / `PARTIAL` asset / `NOT IMPLEMENTED` | `@n@` binds `search::score(n)`; score 0 is a real match. Candidate observation/memory top-K queries are concrete. | Exact binary and representative corpus. |
+| R-155 | Lexical snapshot | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | BM25 order changes with corpus. One bounded top-K statement snapshot; no cross-call lexical cursor. | Context/concurrent-write cases. |
+| R-156 | Plain INFO catalog | `CHECKED` exact tests/design / `PARTIAL` asset / `NOT IMPLEMENTED` | Plain `INFO FOR DB/TABLE` map reads are concrete. Sort owned keys; compare exact pinned strings. `STRUCTURE` forbidden. Expected catalog still requires live canonical output. | Generate/verify expected catalog from exact run. |
 | R-157 | Bounded streaming restore lease | `CHECKED` source/design / `NOT IMPLEMENTED` | Logical lease plus final/parts directory, fence and manifest handles; finite manifest limits; one verified part handle at a time. | Windows sharing/limit/substitution/crash matrix. |
-| R-158 | Base application ID generator | `CHECKED` design / `NOT IMPLEMENTED` | Prefix + canonical 26-char Crockford of 128 OS-random bits; retained before retryable write; collision is integrity failure. | Codec/CSPRNG/regex/collision. |
-| R-159 | Derived unique-key encoding | `CHECKED` design / `NOT IMPLEMENTED` | Domain-separated SHA-256 over length-prefixed UTF-8 components. | Golden vectors/mismatch/conflict. |
-| R-160 | Field and cross-field invariants | `CHECKED` design / `PARTIAL` exact source / `NOT IMPLEMENTED` | Type coercion precedes ASSERT; row context exposes value/before/after/input/current row. Row-local body XOR/validity/claim/request/slot checks remain operation-rechecked. Broad cross-row invariants are not ASSERT-owned. | Compile exact assets and run positive/negative writes. |
-| R-161 | Reader-backed index set | `CHECKED` design / `NOT IMPLEMENTED` | Stream sequence, task/session continuation, memory, forward/reverse link and due-job indexes only. | EXPLAIN/query-plan qualification. |
-| R-162 | Explicit work-address projection | `CHECKED` design / `NOT IMPLEMENTED` | Workspace/task/actor/session/call/parent/resource/version explicit; continuation never parses `binding_json`. | Capture projection/query cases. |
-| R-163 | Exact DEFINE FIELD grammar | `CHECKED` exact parser/design / `NOT IMPLEMENTED` | Clauses are single-use; DEFAULT and VALUE conflict; FLEXIBLE is legal only immediately after compatible TYPE. Assets use canonical emitted clause order. | Compile all migration assets on exact binary. |
-| R-164 | READONLY semantics | `CHECKED` exact tests/design / `NOT IMPLEMENTED` | Initial assignment and same-value replay succeed; changed value fails. READONLY guards update but does not generate/own identity. | Create/same/change matrix for every immutable field class. |
-| R-165 | ASSERT boundary | `CHECKED` exact source/tests / `NOT IMPLEMENTED` | String regex uses `$value = /.../`; `TYPE regex` is not string validation. ASSERT is row-local defense; byte digests, replay and set invariants remain application/transaction owned. | Exact row-local assertion corpus. |
-| R-166 | DDL transaction coverage | `PARTIAL` | Exact tests prove persisted PARAM rollback and cancelled index overwrite preservation. No evidence yet for the entire selected table/field/analyzer/index wrapper under production transport. | Force failure at each asset boundary and classify catalog. |
-| R-167 | Bound metadata values | `OPEN` / `NOT QUALIFIED` | Parser accepts full expressions in DEFINE PARAM, but exact RPC-bound `$bound_*` metadata inside migration wrapper has not been run. | Execute through query-only production client. |
+| R-158 | Base application ID generator | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | Prefix + canonical 26-char Crockford of 128 OS-random bits; candidate field assertions encode exact ID shape. | Codec/CSPRNG/regex/collision. |
+| R-159 | Derived unique-key encoding | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | Domain-separated SHA-256 over length-prefixed UTF-8 components; candidate fields/indexes now concrete. | Golden vectors/mismatch/conflict. |
+| R-160 | Field and cross-field invariants | `CHECKED` design / `PARTIAL` exact source+asset / `NOT IMPLEMENTED` | Candidate pack includes safe per-field guards only. Body XOR, validity, address digest, claim/request/slot tuples remain fixed-writer and exact negative-test obligations; guessed cross-field ASSERT was intentionally not added. | Finish exact writer scripts; qualify row-local expressions before promotion. |
+| R-161 | Reader-backed index set | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | Stream sequence, task/session continuation, memory, forward/reverse link and due-job indexes are concrete. | EXPLAIN/query-plan qualification. |
+| R-162 | Explicit work-address projection | `CHECKED` design / `PARTIAL` asset / `NOT IMPLEMENTED` | Workspace/task/actor/session/call/parent/resource/version fields and task/session queries are concrete; continuation never parses `binding_json`. | Capture projection/DTO cases. |
+| R-163 | Exact DEFINE FIELD grammar | `CHECKED` exact parser/design / `PARTIAL` asset / `NOT IMPLEMENTED` | Clauses are single-use; DEFAULT and VALUE conflict; FLEXIBLE placement exact. Candidate assets use selected canonical order. | Compile every migration statement on exact binary. |
+| R-164 | READONLY semantics | `CHECKED` exact tests/design / `PARTIAL` asset / `NOT IMPLEMENTED` | Initial assignment and same-value replay succeed; changed value fails. Candidate immutable field classes now explicit. | Create/same/change matrix. |
+| R-165 | ASSERT boundary | `CHECKED` exact source/tests / `PARTIAL` asset / `NOT IMPLEMENTED` | Candidate uses only simple per-value regex/range/closed-state assertions. Cross-field/set invariants remain application-owned until live qualification. | Exact positive/negative corpus. |
+| R-166 | DDL transaction coverage | `PARTIAL` | Exact tests prove persisted PARAM rollback and cancelled index overwrite preservation. Candidate complete transaction exists but has not run. | Force failure after each table/field/analyzer/index boundary. |
+| R-167 | Bound metadata values | `OPEN` / `NOT QUALIFIED` | Candidate wrapper binds `$bound_*` in three DEFINE PARAM statements; production RPC execution remains unrun. | Execute through query-only client. |
 | R-168 | Plan evidence ceiling | `DECIDED` | Correctness never depends on optimizer choice. Slice 0 records query digest/input/EXPLAIN/DTO and may reject unbounded plans for latency, not truth. | Representative cardinality plans. |
+| R-169 | Design-only migration asset pack | `DECIDED` / `NOT QUALIFIED` | `store/0001-base.surql` makes six tables, selected fields, indexes, analyzer and metadata wrapper concrete without claiming runtime admission. | Parse/execute exact bytes; produce live catalog. |
+| R-170 | Fixed read-query asset pack | `DECIDED` / `NOT QUALIFIED` | `store/queries-base.surql` contains explicit source/current/history/relation/continuation/FTS/job/backup/catalog read shapes; runtime embeds named blocks only. | Split/embed, digest, decode and EXPLAIN each selected block. |
+| R-171 | Mutation-script and cross-field gap | `OPEN` / `NOT QUALIFIED` | Pack intentionally omits guessed IF/THROW branching for capture/revision/job mutation and unrun row-cross-field ASSERTs. These remain the next asset work, not hidden prose completion. | Write exact mutation scripts from production operation semantics and run failure matrix. |
 
 ## 5. Inference, backup authority и retention
 
@@ -129,7 +132,7 @@
 
 | ID | Объект | Статус | Решение |
 |---|---|---|---|
-| R-024 | Normative synchronization | `CHECKED` design | Architecture 19 / Implementation 42 / Cognition 23 / Contract 0.18 / V3 README agree on product/backup/controller boundaries. Implementation owns exact 3.3.4 schema qualification and proof ceiling. |
+| R-024 | Normative synchronization | `CHECKED` design | Architecture 19 / Implementation 42 / Cognition 23 / Contract 0.18 / V3 README agree on product/backup/controller boundaries. Store candidate pack is explicitly subordinate and design-only. |
 | R-076 | Base/Store synchronization | `CHECKED` design / `NOT IMPLEMENTED` | Host/capture/Store/Windows/schema/query/backup baseline synchronized and independent of inference availability. |
 
 ## 8. Source coverage added in current passes
@@ -147,6 +150,7 @@
 | S-086 | SurrealDB `v3.3.4` unique-index implementation | `CHECKED` exact source | Tuple containing NONE or NULL bypasses UNIQUE; V3 canonical absence remains an application decision. |
 | S-087 | SurrealDB `v3.3.4` PARAM/INFO/FTS/index-cancel tests | `CHECKED` exact tests / `PARTIAL` migration-wide inference | PARAM rollback, index overwrite cancel, plain INFO maps, numbered score, zero-score match and representative `Iterate Index`. Does not prove complete V3 wrapper. |
 | S-088 | Implementation 42 + registry | `CHECKED` design | Exact-source facts separated from Slice 0 runtime qualification. |
+| S-089 | `docs/v3/store/` candidate pack | `CHECKED` design artifact / `NOT QUALIFIED` runtime | Concrete migration/read-query inputs subordinate to Implementation; mutation branching, cross-field guards, expected catalog and live execution remain open. |
 
 Existing S-001–S-055 remain historical evidence with their exact recorded scope; no donor is qualified wholesale.
 
@@ -156,10 +160,10 @@ Existing S-001–S-055 remain historical evidence with their exact recorded scop
 |---|---|---|
 | P0 | Controller #200 implementation and validator acceptance. | R-131 |
 | P0 | Keep issue #199 blocked until #200 + V2 L0/L1; never revive V1. | R-048, R-123, R-130 |
-| P1 | Write migration 0001 assets, exact wrapper, expected catalog and fixed queries from Implementation 42. | R-006, R-150–R-168 |
-| P1 | Slice 0: compile exact grammar; run bound metadata/full DDL rollback/catalog; unique concurrency; query DTO/EXPLAIN; then Windows/process/IPC/Store/files/backup-owner/lease/rollback/rotation/shutdown. | R-002, R-019–R-020, R-083–R-116, R-133, R-141, R-144, R-147–R-168 |
-| P1 | Base Slice 1: event→Store/spool→replay→restart→exact open. | R-001–R-013, R-071–R-107, R-158–R-168 |
-| P1 | Base Slice 2: Claude relay, continuation, lexical top-K, packet emission, notes/corrections/commitments and maintenance. | R-003–R-045, R-154–R-155, R-162, R-168 |
+| P1 | Compile/execute candidate migration and read-query pack; add exact capture/revision/job mutation scripts, row-cross-field guards and expected catalog from the pinned run. | R-006, R-150–R-171 |
+| P1 | Slice 0: bound metadata/full DDL rollback/catalog; unique concurrency; query DTO/EXPLAIN; then Windows/process/IPC/Store/files/backup-owner/lease/rollback/rotation/shutdown. | R-002, R-019–R-020, R-083–R-116, R-133, R-141, R-144, R-147–R-171 |
+| P1 | Base Slice 1: event→Store/spool→replay→restart→exact open. | R-001–R-013, R-071–R-107, R-158–R-171 |
+| P1 | Base Slice 2: Claude relay, continuation, lexical top-K, packet emission, notes/corrections/commitments and maintenance. | R-003–R-045, R-154–R-155, R-162, R-168–R-171 |
 | P1 | Controller V2 L0/L1. | R-130–R-131 |
 | P1 | Inference P1a after foundation. | R-047–R-057, R-117, R-125–R-148, R-157 |
 | P2 | Rotation, embeddings, documents/views/Research/other hosts. | R-015–R-018, R-031–R-032 |
@@ -186,3 +190,4 @@ It also reported `surrealdb_provisioner = provision_failed`. No fabricated evide
 | 2026-10-27 / Contract 0.18 | Numbered FTS, lexical snapshot, plain INFO, wrapper identity and bounded lease. |
 | 2026-10-27 / Implementation 41 | Base IDs, derived keys, assertions, indexes and explicit work-address columns. |
 | 2026-10-27 / Implementation 42 | Exact SurrealDB 3.3.4 field/unique/PARAM/INFO/FTS findings; complete wrapper and Windows runtime remain Slice 0. |
+| 2026-10-27 / Store candidate pack | Added design-only `0001-base.surql` and fixed read-query corpus; exact mutation/control-flow scripts, expected catalog and live qualification remain open. |

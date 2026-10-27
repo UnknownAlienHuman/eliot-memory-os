@@ -10,13 +10,14 @@ V1/V2 Memory implementations are donors. V3 is greenfield. Current `eliot-swarm-
 2. [Implementation draft.42](IMPLEMENTATION.md) — runtime, exact SurrealDB 3.3.4 migration/query boundary, Windows/process, backup/rollback and sequence.
 3. [Cognition draft.23](COGNITION.md) — reconstruction, retrieval, learning, backup authority and failure algorithms.
 4. [Inference Contract 0.18](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
-5. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, decisions, gaps and queue.
-6. [Audit](AUDIT.md) — root causes, rejected machinery and evidence limits.
-7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for requirements and donors.
+5. [Store candidate assets](store/README.md) — design-only migration/query pack for Slice 0; subordinate to Implementation and not runtime evidence.
+6. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, decisions, gaps and queue.
+7. [Audit](AUDIT.md) — root causes, rejected machinery and evidence limits.
+8. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for requirements and donors.
 
 Architecture 19, Implementation 42, Cognition 23, Contract 0.18 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
 
-None of these documents proves implemented runtime behavior.
+The Store pack is a subordinate review artifact: it makes the selected DDL and fixed read-query shapes concrete, but its exact bytes remain `NOT QUALIFIED` until Slice 0 executes them against the pinned Windows/RocksDB profile. None of these documents proves implemented runtime behavior.
 
 ## Construction and authority
 
@@ -57,6 +58,15 @@ six SCHEMAFULL tables
 Application IDs crossing JSON are canonical bounded strings; native Surreal record IDs remain internal. Base IDs are generated from 128 OS-random bits, retained before retryable writes and never treated as time order. Derived unique keys are domain-separated SHA-256 over length-prefixed components. Every fixed query has an explicit projection and DTO; direct work reconstruction uses explicit indexed workspace/task/actor/session fields rather than parsing `binding_json`.
 
 Migration bundle identity includes format version, runner protocol, exact wrapper template, ordered UTF-8/LF DDL assets and expected catalog template. Bound generation/digest values remain outside the preimage. Schema admission uses plain `INFO FOR DB` / `INFO FOR TABLE` maps, sorted by owned keys and compared as exact pinned-version canonical `DEFINE` strings. `INFO ... STRUCTURE` is not an admission API.
+
+The design-only Store pack now contains:
+
+```text
+store/0001-base.surql
+store/queries-base.surql
+```
+
+The first file makes the six-table field/index/analyzer/metadata candidate concrete. The second makes exact readers, stable continuations, lexical top-K, backup pages and catalog reads concrete. It deliberately does not invent unrun transaction branching or cross-field ASSERT expressions; those remain named Slice 0 gaps rather than fake executable proof.
 
 Exact tag source/tests establish:
 
@@ -130,7 +140,7 @@ Contract 0.18 uses stable `memory_inference` client ID, current token version, p
 
 ## Implementation order
 
-0. **Slice 0:** exact DDL grammar, wrapper-bound metadata/full rollback/catalog, unique concurrency, fixed query DTO/EXPLAIN, then Windows/process/IPC/Surreal/Store, external-ID state, staged backup publication, bounded restore lease, rollback/erasure/rotation/shutdown.
+0. **Slice 0:** compile the candidate Store pack; finish exact capture/revision/job mutation scripts and row-local guards; run wrapper-bound metadata/full rollback/catalog, unique concurrency and fixed-query DTO/EXPLAIN qualification; then Windows/process/IPC/Surreal/Store, external-ID state, staged backup publication, bounded restore lease, rollback/erasure/rotation/shutdown.
 1. **Base Slice 1:** event → Store/spool → replay → restart → exact open.
 2. **Base Slice 2:** qualified Claude relay, indexed continuation, lexical top-K retrieval, actual context emission, notes/corrections/commitments and maintenance.
 3. **Controller #200 + V2 L0/L1.**
