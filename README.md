@@ -10,13 +10,13 @@ Eliot preserves exact experience, reconstructs current work, supplies applicable
 |---|---|
 | [V3 navigation](docs/v3/README.md) | Current versions, construction and proof ceiling |
 | [Architecture draft.19](docs/v3/ARCHITECTURE.md) | Purpose, ownership, Base, schema/backup invariants |
-| [Implementation draft.40](docs/v3/IMPLEMENTATION.md) | Runtime, exact Store/query contract, Windows/process, backup/rollback and sequence |
+| [Implementation draft.41](docs/v3/IMPLEMENTATION.md) | Runtime, exact Store/schema/query contract, Windows/process, backup/rollback and sequence |
 | [Cognition draft.23](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning and failure diagnosis |
 | [Inference Contract 0.18](docs/v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller V2 boundary |
 | [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, evidence and queue |
 | [Consolidated audit](docs/v3/AUDIT.md) | Donor evidence, criticism and rationale |
 
-Architecture 19, Implementation 40, Cognition 23 and Contract 0.18 describe one synchronized implementation target. Specification text, source presence, green build or receipt does not establish working behavior.
+Architecture 19, Implementation 41, Cognition 23 and Contract 0.18 describe one synchronized implementation target. Specification text, source presence, green build or receipt does not establish working behavior.
 
 Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
@@ -52,14 +52,16 @@ retained episode
 - one Rust codebase with supervisor, daemon and transient relay modes;
 - SurrealDB 3.3.4/RocksDB `sync=every` qualification target;
 - six Base `SCHEMAFULL` tables plus immutable blobs;
-- canonical string application IDs and fixed query DTOs;
+- canonical OS-random application IDs, domain-separated derived keys and fixed query DTOs;
+- explicit indexed workspace/task/actor/session projection for direct continuation;
+- read-only identity/creation fields plus body/validity/claim/request/slot assertions;
 - schema-bundle identity covers runner protocol, wrapper template, ordered DDL and expected catalog;
 - plain `INFO FOR DB/TABLE` catalog readback; unstable `STRUCTURE` is forbidden;
-- scored FTS uses numbered match references and returns one bounded top-K snapshot, not a cross-call cursor;
+- scored FTS uses numbered match references and one bounded top-K snapshot, not a cross-call cursor;
 - daemon-owned controller-mutation and backup-set owners;
-- backup ID `b_<32hex>` and atomic staged-directory publication with fence already present at first final visibility;
+- atomic backup-directory first visibility with fence already present;
 - self-contained abort/retire tombstones;
-- bounded streaming restore lease: directory/fence/manifest handles plus one verified part at a time;
+- bounded streaming restore lease with one verified part at a time;
 - supervisor candidate process/root and final cutover; candidate discard on daemon/channel loss;
 - exact rollback rather than invented merge.
 
