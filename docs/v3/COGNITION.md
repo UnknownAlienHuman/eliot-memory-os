@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.16 · 2026-10-26 · normative algorithms used by V3.**
+**Revision 1.0-draft.17 · 2026-10-26 · normative algorithms used by V3.**
 
-[Architecture](ARCHITECTURE.md) owns product/authority invariants. [Implementation](IMPLEMENTATION.md) owns runtime and persistence. [Inference Contract 0.11](INFERENCE-CONTRACT.md) owns the sole Memory↔controller call boundary. This document defines reconstruction, retrieval, learning, revision and self-improvement algorithms.
+[Architecture](ARCHITECTURE.md) owns product/authority invariants. [Implementation](IMPLEMENTATION.md) owns runtime and persistence. [Inference Contract 0.12](INFERENCE-CONTRACT.md) owns the sole Memory↔controller call boundary. This document defines reconstruction, retrieval, learning, revision and self-improvement algorithms.
 
 Nothing here implies model-weight training. Initial learning changes external memory, processing methods, context selection and bounded configuration.
 
@@ -17,7 +17,7 @@ Base cognition works without controller inference:
 - deterministic applicability/grounds handling;
 - bounded context packing.
 
-Model-assisted learning waits for controller V2 issue #200, V2 L0/L1 and Contract 0.11 P1a. Missing inference never disables Base.
+Model-assisted learning waits for controller V2 issue #200, V2 L0/L1 and Contract 0.12 P1a. Missing inference never disables Base.
 
 ## 1. Observations, claims and revisions
 
@@ -83,7 +83,7 @@ Path, branch, commit and resource version are observed environment, not task ide
 
 1. Resolve captured project/workspace/task binding.
 2. Open current addressed goal/plan/progress/commitments directly.
-3. Add later observations bound to the same continuing work.
+3. Add later observations bound to same continuing work.
 4. Apply explicit correction/withdrawal/supersession revisions.
 5. Mark unresolved association or changed environment as gaps.
 6. Only then retrieve related experience.
@@ -111,11 +111,11 @@ inapplicable
 conditional_or_unknown
 ```
 
-Evaluate material selectors, validity, resource/work version and explicit exceptions. Token overlap or vector similarity is never sufficient proof. A method and its contraindication travel together.
+Evaluate material selectors, validity, resource/work version and explicit exceptions. Token overlap or vector similarity is never sufficient proof. Method and contraindication travel together.
 
 ### 3.3 Source change
 
-A correction, refutation, live-condition change or erasure triggers bounded reverse traversal over affected conclusion revisions. Load complete grounds groups before impact decision. Traversal pages/coalesces; it does not verify the whole graph before ordinary reads.
+Correction, refutation, live-condition change or erasure triggers bounded reverse traversal over affected conclusion revisions. Load complete grounds groups before impact decision. Traversal pages/coalesces; it does not verify whole graph before ordinary reads.
 
 ## 4. Episode membership and coverage
 
@@ -133,7 +133,7 @@ Freeze job input explicitly. Distinguish:
 ```text
 selected       candidate source members/ranges
 supplied       exact bytes/revisions placed in request
-processed      portions the result actually covers
+processed      portions result actually covers
 unavailable    omitted/missing/damaged material
 remaining      eligible material not covered
 ```
@@ -144,11 +144,11 @@ There is no global processed bit. Useful partial output cannot mark omitted mate
 
 ### 5.1 Notes and commitments
 
-Explicit notes/commitments use ordinary Memory items with source observation and scope. Acknowledgement, display, due time or notification does not resolve a commitment. Resolution follows a matching observed event or explicit owner change.
+Explicit notes/commitments use ordinary Memory items with source observation and scope. Acknowledgement, display, due time or notification does not resolve a commitment. Resolution follows matching observed event or explicit owner change.
 
 ### 5.2 Corrections
 
-Structured correction is authoritative user intent about Memory content, not automatic truth about the external world.
+Structured correction is authoritative user intent about Memory content, not automatic truth about external world.
 
 One transaction:
 
@@ -186,11 +186,11 @@ Generate bounded candidates independently from:
 - typed relations;
 - local and eligible reusable methods.
 
-Apply project/work selectors before arm limits. Union before final selection. One arm's top-k cannot erase a material exception found by another.
+Apply project/work selectors before arm limits. Union before final selection. One arm's top-k cannot erase material exception found by another.
 
 ### 6.3 Ranking
 
-Rank relevance separately from support/applicability. A retrieved item remains qualified by source, revision, limitations and conditions. Retrieval frequency does not strengthen truth.
+Rank relevance separately from support/applicability. Retrieved item remains qualified by source, revision, limitations and conditions. Retrieval frequency does not strengthen truth.
 
 ### 6.4 Packing
 
@@ -204,7 +204,7 @@ Pack, in priority order:
 6. dissent, uncertainty and missing checks;
 7. exact source handles.
 
-If a complete qualified unit cannot fit, emit faithful bounded reduction plus handle or omit it with explicit gap. Never drop negation/version/contraindication to fit.
+If complete qualified unit cannot fit, emit faithful bounded reduction plus handle or omit it with explicit gap. Never drop negation/version/contraindication to fit.
 
 ### 6.5 Handoff states
 
@@ -220,7 +220,7 @@ Do not infer use/success from packet creation. Context failure does not roll bac
 
 ## 7. Exact source opening
 
-`open` requires one exact handle/locator and optional bounded range. It never reruns search, conversion, Research or inference to satisfy a historical handle.
+`open` requires one exact handle/locator and optional bounded range. It never reruns search, conversion, Research or inference to satisfy historical handle.
 
 Return:
 
@@ -240,7 +240,7 @@ Historical handle never falls forward. Current handle does not resurrect history
 
 ## 8. Processing methods and first enable
 
-A processing method is an ordinary versioned Memory item:
+A processing method is ordinary versioned Memory item:
 
 ```text
 purpose
@@ -251,7 +251,7 @@ conditions/limitations
 disclosure consequences
 ```
 
-First enable stores one real default method. Upgrade never overwrites user-edited/learned revision. Job claim freezes exact method revision; request builder opens that body. A stored method with no consumer is knowledge, not improvement.
+First enable stores one real default method. Upgrade never overwrites user-edited/learned revision. Job claim freezes exact method revision; request builder opens that body. Stored method with no consumer is knowledge, not improvement.
 
 ## 9. Controller-backed job lifecycle
 
@@ -287,7 +287,7 @@ retired_not_admitted
 admission_unknown
 ```
 
-During normal live recovery, a prepared ID may still first-admit. During backup/restore, §14 applies the stricter cut semantics.
+During normal live recovery, prepared ID may still first-admit. During backup/restore, §14 applies stricter cut semantics.
 
 ### 9.3 Result read and decode
 
@@ -298,7 +298,8 @@ During normal live recovery, a prepared ID may still first-admit. During backup/
 5. Decode through purpose-specific closed schema.
 6. Retain malformed/partial transport facts without cognitive success.
 7. Publish accepted revisions atomically under expected revisions.
-8. Create release WriteId and release only after verified Memory copy or terminal no-result.
+8. Create release WriteId only after verified Memory copy or terminal no-result.
+9. Before sending release, re-evaluate retained backup dependencies.
 
 Store conflict replays retained decoded proposal/result, not inference.
 
@@ -315,7 +316,7 @@ operational_failed       admission/provider/readback failure, no cognitive body
 
 Profile unavailable/disallowed, disclosure mismatch, provider failure, no result, malformed output, truncation or omitted input is not successful no-change.
 
-### 9.5 Cleanup authority and states
+### 9.5 Cleanup authority and backup release fences
 
 Cleanup is separate from cognitive outcome:
 
@@ -323,9 +324,20 @@ Cleanup is separate from cognitive outcome:
 - terminal call with no future result → `terminal_without_result`;
 - unresolved work selected for erasure → `abandon_for_erasure`.
 
-With a valid caller, queued work may first receive caller `inference.cancel`, then caller `inference.release(abandon_for_erasure)`. Input/result copies retain independent state.
+With valid caller, queued work may first receive `inference.cancel`, then caller `inference.release(...)`.
 
-Controller-owner `inference.erase` is local break-glass. Memory cannot call it. When caller cleanup is unavailable, Memory records `owner_action_required` plus exact non-content call identity and waits for observed owner readback. Request alone is not effect.
+For each admitted in-cut call, backup stores:
+
+```text
+controller_closed
+controller_dependent
+```
+
+`controller_closed` means backup contains exact terminal Memory-owned result/no-result and no future controller settlement, copy, cleanup or readback is required.
+
+`controller_dependent` means backup still needs controller status, current/future result bytes or cleanup/readback. While any restorable backup has this state for the call, release remains pending even when current Memory already copied/used result. Do not lower `retain_after_seq`; preservation comes from controller no-prune-unreleased rule.
+
+Controller-owner `inference.erase` is local break-glass. Memory cannot call it. When caller cleanup unavailable, Memory records `owner_action_required` plus non-content call identity and waits for observed owner readback. Request alone is not effect.
 
 A useful revision may be consumed while cleanup remains incomplete; status/erasure exposes debt.
 
@@ -356,9 +368,9 @@ generalization
 correction/split
 ```
 
-A broader pattern creates separate provisional item linked to exact sources. It does not merge source IDs or rewrite historical handles. Split publishes new current items/relations while old handles remain exact.
+Broader pattern creates separate provisional item linked to exact sources. It does not merge source IDs or rewrite historical handles. Split publishes new current items/relations while old handles remain exact.
 
-A curation result is complete only when ordinary context/open/method consumers change. An unread report is not product behavior.
+Curation result is complete only when ordinary context/open/method consumers change. Unread report is not product behavior.
 
 ## 12. Outcome attribution and method improvement
 
@@ -389,33 +401,36 @@ No global intelligence score or mandatory model judge.
 
 Disagreement belongs to question, scope and time. Preserve alternatives/grounds, then select cheapest useful discriminating observation. Voting is not evidence. Provisional choice records rationale and reconsideration trigger.
 
-A prediction records expected observation before action, conditions and available check. Static dependency, co-change and causal explanation are distinct.
+Prediction records expected observation before action, conditions and available check. Static dependency, co-change and causal explanation are distinct.
 
-Research starts from retained Memory/exact local sources. External acquisition answers a concrete remaining gap. Store compact findings, alternatives, coverage and exact report/source handles. Failed request, completed-uninformative and useful-partial are different outcomes. Do not loop merely because uncertainty remains.
+Research starts from retained Memory/exact local sources. External acquisition answers concrete remaining gap. Store compact findings, alternatives, coverage and exact report/source handles. Failed request, completed-uninformative and useful-partial are different outcomes. Do not loop merely because uncertainty remains.
 
-## 14. Backup admission closure, retention and rollback cognition
+## 14. Backup admission closure, dependency pins, retention and rollback
 
-### 14.1 Admission cut
+### 14.1 Admission and dependency cut
 
 Before controlled backup:
 
 1. stop new controller-backed admission requests;
-2. pause/drain the single controller-dispatch owner so no send races the cut;
+2. pause/drain single controller-dispatch owner so no send races cut;
 3. persist every already-created call/cancel/release WriteId;
 4. authenticate exact controller/client identity;
 5. classify every call ID:
    - exact call/readback → `admitted` + `admission_seq`;
-   - exact healthy absence and no in-flight sender → `retired_not_admitted`, never send again;
-   - unavailable/ambiguous → `admission_unknown` and controller-continuity gap;
+   - exact healthy absence/no sender → `retired_not_admitted`, never send again;
+   - unavailable/ambiguous → `admission_unknown`, continuity gap;
 6. reconcile created cancel/release from actual call state or retire proven-unsent mutation;
-7. only then record controller `high_water` and guaranteed `retain_after_seq`;
-8. freeze Store/spool backup facts through Implementation's brief cut.
+7. classify every admitted call:
+   - `controller_closed` if backup is fully self-contained and no controller state/copy remains required;
+   - otherwise `controller_dependent`;
+8. only then record controller `high_water` and guaranteed `retain_after_seq`;
+9. freeze Store/spool facts through Implementation's brief cut.
 
-The installation-scoped WriteId generator is not part of rollback backup.
+Installation-scoped WriteId generator is not part of rollback backup.
 
-A controller-continuous backup contains only admitted external calls. Local source/recipe intent may remain after a retired attempt, but the retired ID is not a call and does not pin retention.
+A controller-continuous backup contains admitted calls only. Local source/recipe intent may remain after retired attempt, but retired ID is not a call and does not pin retention.
 
-### 14.2 Retention cut
+### 14.2 Post-cut retention cut
 
 ```text
 required_retain_after_seq =
@@ -424,20 +439,26 @@ required_retain_after_seq =
 
 After local backup set changes durably, create maintenance record with expected/new cut and precommitted retention WriteId, then call `inference.retention.advance`. Lost reply reuses same ID. Advance before backup-set readback is invalid; failure to advance is conservative.
 
-Calls above cut retain bounded membership metadata. If content is erased above cut, controller leaves text-free tombstone until cut advancement. Deleting even tombstone requires retirement of every backup pinning interval first.
+Do not lower monotonic cut for in-cut dependencies. They remain protected because release is fenced and controller cannot prune open/unreleased call/copies.
 
 ### 14.3 In-cut jobs after restore
 
 ```text
-admitted + matching call -> read/cancel/release original
-admitted call missing/below guarantee -> history_gap/damaged; never first-admit
-retired_not_admitted -> old ID remains retired; fresh successor only after inventory
-admission_unknown -> hold with inference disabled
-mismatch -> conflict
-caller unavailable -> hold
+controller_closed
+  restore from backup facts; controller row may be absent
+
+controller_dependent
+  exact call and required copy must remain;
+  absence/mismatch is damaged/history_gap
+
+retired_not_admitted
+  old ID remains retired; fresh successor only after inventory
+
+admission_unknown
+  hold with inference disabled
 ```
 
-An old backup never first-admits an absent call ID.
+Old backup never first-admits absent call ID.
 
 ### 14.4 Post-cut calls
 
@@ -448,11 +469,23 @@ inference.list(after = backup_high_water,
                through = inventory_high_water)
 ```
 
-Cursor binds controller/client, bounds, API version and page shape. If backup high-water is below `retain_after_seq`, return `history_gap`; physical presence of some rows does not make interval complete.
+Cursor binds controller/client, bounds, API version and page shape. If backup high-water below `retain_after_seq`, return `history_gap`; physical presence of some rows does not make interval complete.
 
-Because absent cut attempts were retired, returned calls are outside the backup's admitted set. Do not adopt results as restored cognition. With valid caller, use cancel/release-abandon. Without caller, retain owner-action-required debt until controller-local owner readback.
+Because absent cut attempts were retired, returned calls are outside backup's admitted set. Do not adopt results. With valid caller, use cancel/release-abandon after dependency check. Without caller, retain owner-action-required debt until controller-local owner readback.
 
-All new inference remains disabled until inventory completes and every row is dispositioned. Base remains usable. Controller/caller unavailability, admission unknown or history gap produces `external_work_inventory_unavailable`, never false empty or complete rollback.
+All new inference remains disabled until inventory completes and every row is dispositioned. Base remains usable. Controller/caller unavailability, admission unknown, missing dependent copy or history gap produces `external_work_inventory_unavailable`, never false empty or complete rollback.
+
+### 14.5 Backup retirement and release
+
+When backup is retired/replaced/non-restorable:
+
+1. durably publish/read back new controlled backup set;
+2. recompute dependent calls from remaining manifests;
+3. clear release fence only for calls with no remaining dependency;
+4. then allow pending caller release;
+5. advance post-cut retain cut separately according to remaining backup high-waters.
+
+Crash before release is conservative. Never release first and then discover a retained dependency.
 
 ## 15. Forgetting and erasure
 
@@ -464,19 +497,20 @@ Physical erasure:
 2. close affected mutation/replay admission;
 3. reconcile active Store/replay/controller effects;
 4. cancel/fence pending jobs;
-5. use caller cancel/release-abandon when caller is valid;
-6. otherwise record owner-action-required and wait for observed break-glass result;
-7. delete current rows/blobs/spool/packet/job copies;
-8. delete affected previous roots/candidates/backups wholly when selective offline rewrite is absent;
-9. retain explicit provider/off-machine/tombstone gaps.
+5. delete/invalidate every controlled backup marked controller-dependent for affected call;
+6. use caller cancel/release-abandon when caller valid;
+7. otherwise record owner-action-required and wait for observed break-glass result;
+8. delete current rows/blobs/spool/packet/job copies;
+9. delete affected previous roots/candidates/backups wholly when selective offline rewrite absent;
+10. retain explicit provider/off-machine/tombstone gaps.
 
-A controller call above `retain_after_seq` may retain only bounded non-content membership tombstone after content deletion. Complete deletion of tombstone requires prior backup retirement and cut advancement.
+Controller call above `retain_after_seq` may retain only bounded non-content membership tombstone after content deletion. Complete deletion of tombstone requires prior backup retirement and cut advancement.
 
-Deletion fence/tombstone prevents false reintroduction/inventory but is not proof every controlled copy was deleted. Complete erasure requires exact absence or explicit incomplete debt.
+Deletion fence/tombstone prevents false reintroduction/inventory but is not proof every controlled copy deleted. Complete erasure requires exact absence or explicit incomplete debt.
 
 ## 16. Failure diagnosis
 
-Classify the failed connected edge:
+Classify failed connected edge:
 
 ```text
 host capture
@@ -485,6 +519,7 @@ Store/spool durability
 work binding/source selection
 controller identity/WriteId admission
 backup admission closure
+backup dependency classification/release fence
 profile/disclosure/capacity
 provider execution/readback
 retention/history inventory
@@ -520,19 +555,19 @@ stable caller + precommitted global WriteId
 → exact result or typed no-result/unknown
 → decoded revision or valid no-change
 → later context reads resulting revision
-→ exact caller-authorized cleanup
+→ dependency-aware caller cleanup
 → backup admission closure + restart/rollback reconciliation
 ```
 
-Retention/erasure evidence:
+Retention/backup evidence:
 
 ```text
 backup contains admitted calls only
-→ proven absent attempts retired
-→ backup-set change durably read back
-→ monotonic retain-after advance
+→ every admitted call is controller-closed or dependent
+→ dependent call remains unreleased even below current cut
 → fixed-window list complete above cut
-→ erased content leaves membership tombstone while pinned
+→ controller-closed call restores without controller row
+→ backup retirement clears fence
 → explicit history_gap/owner debt when guarantees unavailable
 ```
 
