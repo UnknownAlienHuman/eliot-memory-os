@@ -1,20 +1,20 @@
 # Eliot Memory OS V3
 
-**Layered Base and additive extensions · 2026-10-26 · normative design, not implemented code.**
+**Layered Base and additive extensions · 2026-10-27 · normative design, not implemented code.**
 
 V1/V2 Memory implementations are donors. V3 is greenfield. Current `eliot-swarm-controller` V2 is also a fresh implementation target; its existing V1 runtime is donor-only.
 
 ## Reading order
 
-1. [Architecture draft.14](ARCHITECTURE.md) — product purpose, authority, Base, extensions and invariants.
-2. [Implementation draft.35](IMPLEMENTATION.md) — runtime, Store, Windows/process, durability, backup/rollback and implementation order.
-3. [Cognition draft.18](COGNITION.md) — reconstruction, retrieval, learning, backup publication/dependency and revision algorithms.
-4. [Inference Contract 0.13](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
+1. [Architecture draft.15](ARCHITECTURE.md) — product purpose, authority, Base, extensions and invariants.
+2. [Implementation draft.36](IMPLEMENTATION.md) — runtime, Store, Windows/process, durability, backup/rollback and implementation order.
+3. [Cognition draft.19](COGNITION.md) — reconstruction, retrieval, learning, rollback-safe backup dependencies and revision algorithms.
+4. [Inference Contract 0.14](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
 5. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, decisions, gaps and queue.
 6. [Audit](AUDIT.md) — root causes, rejected machinery and evidence limits.
 7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for requirements and donors.
 
-Architecture 14, Implementation 35, Cognition 18, Contract 0.13 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
+Architecture 15, Implementation 36, Cognition 19, Contract 0.14 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
 
 None of these documents proves implemented runtime behavior.
 
@@ -23,11 +23,11 @@ None of these documents proves implemented runtime behavior.
 One local Rust package/codebase provides supervisor, daemon and transient relay modes. One active external SurrealDB child owns persistence; one isolated disposable candidate may exist during restore.
 
 - **Daemon:** application operations, Editor-authenticated Store mutations, replay/jobs, backup cuts, context/retrieval and public control.
-- **Supervisor/installer:** executable/root/process identity, root/Owner credentials, migrations, Store lifecycle, credential rotation and installation cutover.
+- **Supervisor/installer:** executable/root/process identity, root/Owner credentials, migrations, Store lifecycle, installation-scoped backup fence records, credential rotation and cutover.
 - **Controller V2:** one-shot caller authentication, model profiles, provider execution/readback, global `WriteId` receipts and private temporary inference copies.
 - **Host/controller:** user task/action execution and acceptance.
 
-Root/Owner material never enters daemon. Inherited supervisor channel carries closed typed maintenance intent/result—never arbitrary SQL, argv, endpoint, path or secret. Request/acknowledgement is not completion; process, credential, Store and selection readback own result.
+Root/Owner material never enters daemon. Inherited supervisor channel carries closed typed maintenance intent/result—never arbitrary SQL, argv, endpoint, path or secret. Request/acknowledgement is not completion; process, credential, Store, installation-file and selection readback own result.
 
 Base captures real events, preserves notes/corrections/commitments, supplies exact/lexical context and reopens exact sources after restart. It starts without inference, vectors, converter or Research. Extensions reuse same records/jobs/revisions/context; there is no second Lite/Full memory engine.
 
@@ -68,7 +68,7 @@ create-new same-directory temp
 → exact reopen/readback
 ```
 
-Mutable `installation.toml` and `controller-write-id.state` are separate expected-state replacements with exact old/new/unknown reconciliation. External-WriteId state lives outside rollback roots.
+Mutable `installation.toml` and `controller-write-id.state` are separate expected-state replacements with exact old/new/unknown reconciliation. External-WriteId state and backup fence/manifest/abort records live outside rollback Store roots.
 
 ## Host capture, spool and context
 
@@ -115,15 +115,15 @@ Surreal HTTP export/import and startup import are not application backup owners.
 Backup uses a brief exact spool cut:
 
 ```text
-stop Store mutations/replay
-→ reconcile active replay
-→ hold publication lock only for inventory/generation cut
-→ release lock
+stop Store mutations/replay and controller mutations
+→ reconcile active replay and controller calls/cleanup
+→ capture exact spool/controller cut
+→ publish rollback-safe backup plan fence
 → relay continues post-cut staging
-→ copy exact immutable cut entries
+→ copy exact immutable cut entries and typed Store pages
 ```
 
-It publishes canonical typed pages over six tables, selected-root blobs, deletion notices, cut pending/failed spool and sanitized config. Manifest owns completion.
+It publishes canonical typed pages over six tables, selected-root blobs, deletion notices, cut pending/failed spool and sanitized config. Final manifest owns completion.
 
 Restore is exact rollback to one backup cut, not invented merge of later Store rows. Healthy current Store first gets safety backup; previous root remains until retirement. Current deletion notices dominate backup content; current post-cut spool merges by exact command bytes/disposition.
 
@@ -141,7 +141,7 @@ This is still specification target. `docs/roadmap.md` is its sole status tracker
 
 Controller issue #200 blocks foundation correctness. Current binding allocation conflates selected pointer and next immutable revision. Draft PR #201 repairs fixtures but not allocator/schema semantics. Issue #199 owns later Memory extension and remains blocked on #200 and V2 L0/L1.
 
-## One-shot inference Contract 0.13
+## One-shot inference Contract 0.14
 
 Stable principal:
 
@@ -164,7 +164,7 @@ WriteId globally unique
 
 Same identity returns original/current call; mismatch is `id_conflict`; valid absent ID may first-admit only during normal live operation. No separate Operation ID/submission ledger.
 
-Memory owns one locked atomic external-WriteId generator outside rollback roots. Cancel, release and retention advance also receive durable pre-send IDs.
+Memory owns one locked atomic external-WriteId generator outside rollback roots. Call admission, cancel, release and retention advance are serialized through one controller-mutation owner and receive durable pre-send IDs.
 
 Minimal controller state:
 
@@ -186,7 +186,7 @@ retain_after_seq
 
 ### Backup admission and dependency closure
 
-Before backup high-water, Memory pauses/drains one controller-dispatch owner and classifies every created call ID:
+Before backup high-water, Memory closes/drains one controller-mutation owner and classifies every created call ID:
 
 ```text
 admitted                exact call and admission_seq exist
@@ -206,35 +206,53 @@ controller_dependent
 
 Old backup never first-admits absent ID. `retain_after_seq` stays monotonic and is not lowered for in-cut dependencies.
 
-### Crash-safe publication fence
+### Rollback-safe plan fence
 
-Before writing backup parts or final manifest, Memory durably records a provisional maintenance fence with:
-
-```text
-backup candidate/generation
-expected final manifest identity + digest
-controller/client/high-water/cut
-exact controller-dependent calls
-publication_state = preparing
-```
-
-Release checks retained manifests and provisional fences. `preparing` and `publication_unknown` both block deletion of dependent controller state/copies.
+Before writing any backup part, Memory constructs a canonical immutable plan containing:
 
 ```text
-exact final manifest + parent durability/readback
-  -> publish into controlled backup set, then clear provisional fence
-
-definite pre-rename failure + exact final absence
-  -> aborted_before_publish, clear fence
-
-rename may have succeeded but sync/readback failed
-  -> publication_unknown, keep fence
-
-malformed/mismatch/ambiguity
-  -> keep fence and block release
+backup ID + expected final manifest identity
+selected root/schema and exact spool cut
+controller/client/token/high-water/retain-cut
+admitted calls + dependency states
+retired attempts
+disclosure and explicit gaps
 ```
 
-Startup reconciles unresolved fences before any caller release or owner-cleanup handoff. A stale dependency index cannot authorize release; exact manifests plus unresolved maintenance jobs are authoritative.
+It computes `backup_plan_digest` over an explicit field set that excludes the digest field itself, publication state and all later page/part/manifest digests. Then it durably publishes:
+
+```text
+backups/<backup-id>/fence.json
+```
+
+outside rollback Store roots. A Store maintenance row mirrors status but is not authoritative and may be rolled back.
+
+Final `manifest.json` repeats the plan digest plus actual page/blob/spool/deletion/config inventories and digests. There is no precommitted digest of the final manifest inside the Store data being backed up.
+
+Controlled records:
+
+```text
+fence.json
+parts/...
+manifest.json
+abort.json?
+```
+
+Derived states:
+
+```text
+preparing
+publication_unknown
+published
+aborted_before_publish
+```
+
+- valid fence + matching durable manifest → published;
+- valid fence + exact manifest absence + durable partial cleanup + matching abort → aborted;
+- fence without valid manifest/abort → preparing or publication_unknown;
+- malformed/mismatch/ambiguity → publication_unknown.
+
+`preparing` and `publication_unknown` pin both dependent-call release and post-cut retention at their high-water. Startup/restore scans installation records before release, owner-cleanup handoff or retention advance. Exact Memory rollback cannot erase this authority.
 
 ### Cleanup authority
 
@@ -249,7 +267,7 @@ Controller-owner `inference.erase` is local break-glass. Memory has no owner cre
 
 ### Retention and erasure tombstones
 
-Erasing content for call above `retain_after_seq` leaves bounded text-free membership tombstone until cut advancement. Deleting even tombstone requires retirement of every controlled backup pinning interval. Otherwise erasure remains incomplete rather than silently breaking inventory.
+Required retention cut is the minimum high-water among valid retained restorable backups **and** unresolved preparing/publication-unknown fences. Erasing content for call above `retain_after_seq` leaves bounded text-free membership tombstone until cut advancement. Deleting even tombstone requires retirement of every controlled backup pinning interval. Otherwise erasure remains incomplete rather than silently breaking inventory.
 
 After rollback:
 
@@ -283,11 +301,11 @@ Controller-local install/rotate publishes raw token only into admitted create-ne
 
 ## Implementation order
 
-0. **Memory Slice 0:** exact Windows executable/root/process/IPC/Surreal/Store/file/WriteId-state/backup/rollback/erasure/rotation/shutdown qualification.
+0. **Memory Slice 0:** exact Windows executable/root/process/IPC/Surreal/Store/file/WriteId-state/backup-plan-fence/rollback/erasure/rotation/shutdown qualification.
 1. **Base Slice 1:** event → Store/spool → replay → restart → exact open.
 2. **Base Slice 2:** qualified Claude relay, continuation, lexical retrieval, actual context emission, notes/corrections/commitments and Base maintenance.
 3. **Controller #200 + V2 L0/L1:** repair specification/validator, then implement fresh foundation; never extend V1.
-4. **Inference P1a:** stable principal, WriteId state, single dispatch owner, admission/dependency classification, provisional publication fences, calls/private copies, text runner, dependency-aware cleanup, high-water/list/retention/tombstones, owner break-glass boundary and one result changing later context.
+4. **Inference P1a:** stable principal, WriteId state, one mutation owner, admission/dependency classification, canonical plan digest, installation-scoped provisional fences, calls/private copies, text runner, dependency-aware release+retention, high-water/list/tombstones, owner break-glass boundary and one result changing later context.
 5. **Inference P1b:** rotation, stale-session fence and delayed credential retirement.
 6. Independent embeddings, views, documents, Research and additional hosts.
 7. Advanced curation only after Base paths work.
