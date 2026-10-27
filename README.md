@@ -1,40 +1,38 @@
 # Eliot Memory OS
 
-> **V3 is the current design authority.** V1 and V2 Memory implementations are archived donors. No V3 runtime is implemented by this documentation revision.
+> **V3 is the current design authority.** V1 and V2 Memory implementations are archived donors. This documentation does not claim a V3 runtime exists.
 
-Eliot is a memory, understanding and learning system for people and AI agents. It preserves exact experience, reconstructs current work, supplies useful context before the next decision, learns bounded procedures from observed outcomes and revises mistaken memory without losing source history.
+Eliot preserves exact experience, reconstructs current work, supplies applicable context before the next decision, learns bounded procedures from observed outcomes and revises mistaken memory without losing source history.
 
 ## Start with V3
 
 | Read | Purpose |
 |---|---|
 | [V3 navigation](docs/v3/README.md) | Current versions, reading order, selected construction and proof ceiling |
-| [Architecture draft.11](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
-| [Implementation draft.32](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
-| [Cognition draft.15](docs/v3/COGNITION.md) | Current-work reconstruction, retrieval, learning, retention and revision algorithms |
-| [Inference Contract 0.10](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
+| [Architecture draft.12](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
+| [Implementation draft.33](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
+| [Cognition draft.16](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning, backup admission closure and revision algorithms |
+| [Inference Contract 0.11](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
 | [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, source coverage and queue |
 | [Consolidated audit](docs/v3/AUDIT.md) | Evidence, criticism, donor analysis and rationale |
 
-Architecture 11, Implementation 32, Cognition 15 and Contract 0.10 describe one synchronized design at increasing depth. Source presence, specification text, a green build or a receipt does not establish a working capability.
+Architecture 12, Implementation 33, Cognition 16 and Contract 0.11 describe one synchronized design. Source presence, specification text, a green build or a receipt does not establish working behavior.
 
-The current documentation task is [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
+Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
 ## Version boundary
 
-The existing Rust workspace, old architecture shards, scripts and workstream records describe **V2 Memory**. They remain available for selective investigation and reuse; their checklists do not authorize continuing V2 implementation or importing its physical architecture into V3.
+The existing Rust workspace, old architecture shards, scripts and workstream records describe **V2 Memory**. They remain selective donors; their checklists do not authorize continuing V2 implementation or importing its physical architecture into V3.
 
 - [V2 source snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105)
 - [V2 unfinished audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete)
 - [V1 donor snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7)
 
-This is a documentation-stage donor freeze. Old source bytes and issues remain available; data import, runtime replacement and code removal are later separately scoped work. The V2 `ACTIVE.toml` registry retains historical values and is not V3 authority.
-
-[Architecture authority](docs/ARCHITECTURE_CONTRACT.md) records precedence. Active V3 owner documents define the implementation target; the audit explains evidence and alternatives without turning every idea into a required subsystem.
+[Architecture authority](docs/ARCHITECTURE_CONTRACT.md) records precedence. The active V3 owner documents define the implementation target; the audit explains evidence and alternatives without turning every idea into a required subsystem.
 
 ## Selected product boundary
 
-Memory owns durable observations, revisions, context, provenance, finite learning jobs and outcome-linked methods. External hosts/controllers own goals, actions, agent/task execution and user acceptance.
+Memory owns durable observations, revisions, context, provenance, finite learning jobs and outcome-linked methods. Hosts/controllers own goals, actions, Agent/task execution and user acceptance.
 
 Useful Base comes first:
 
@@ -56,10 +54,10 @@ retained episode
 → typed result or unknown
 → ordinary Memory revision
 → changed later context
-→ exact cleanup state
+→ exact caller-authorized cleanup
 ```
 
-A provider result does not grant Memory authority or demonstrate external task completion.
+A provider result does not grant Memory authority or prove external task completion.
 
 ## Controller boundary
 
@@ -71,7 +69,7 @@ main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
 merged PR #198
 ```
 
-It selects a fresh local JSON-RPC + SQLite WAL V2 with global external ULID `WriteId` receipts and treats the old Rust/`swarm-client`/Operation runtime as V1 legacy pending deletion.
+It selects fresh local JSON-RPC + SQLite WAL V2 with global external ULID `WriteId` receipts and treats the old Rust/`swarm-client`/generic Operation runtime as V1 legacy pending deletion.
 
 Memory targets:
 
@@ -79,16 +77,28 @@ Memory targets:
 principal_kind = memory_inference
 client_id      = memory:<random-stable-installation-id>
 token_version  = current credential version
-call identity  = global WriteId + client_id + method + semantic payload
+live call ID   = global WriteId + client_id + method + semantic payload
 ```
 
-Memory persists each controller mutation WriteId before send. Lost reply, restart or restore reuses the same ID and exact bytes. Cancel, release and retention advance have their own precommitted IDs. One monotonic generator state lives outside rollback Store roots.
+Memory persists every caller mutation WriteId before send. One monotonic generator state lives outside rollback Store roots. Cancel, release and retention advance receive their own IDs.
 
-Controller registration owns `last_admission_seq` and guaranteed `retain_after_seq`. A physical `earliest_retained_seq` is diagnostic only. Restore pages a fixed `(after, through]` interval; reads below the guaranteed cut return `history_gap`, never a false empty set.
+Before a controlled backup records controller high-water, Memory pauses/drains one controller-dispatch owner and classifies every created call ID:
 
-Exact details live only in [Contract 0.10](docs/v3/INFERENCE-CONTRACT.md).
+```text
+admitted                exact call and admission_seq exist
+retired_not_admitted    exact healthy absence; old ID can never be sent
+admission_unknown       controller continuity incomplete
+```
 
-Controller issue #200 must repair binding-revision allocator/schema authority. V2 L0/L1 must then exist before issue #199 can implement Memory inference. Do not patch legacy controller runtime to make Memory appear connected.
+An old backup never first-admits an absent call ID.
+
+Controller registration owns `last_admission_seq` and guaranteed `retain_after_seq`. Fixed-window inventory below the cut returns `history_gap`. Erased content above the cut leaves a bounded text-free membership tombstone until every backup pinning the interval is retired and the cut advances.
+
+With a valid caller, cleanup uses optional `inference.cancel` and `inference.release(abandon_for_erasure)`. Controller-owner `inference.erase` is local break-glass. Memory never receives owner authority and records owner-action-required debt until non-content owner readback is observed.
+
+Exact details live only in [Contract 0.11](docs/v3/INFERENCE-CONTRACT.md).
+
+Controller issue #200 must repair binding-revision allocator/schema authority. V2 L0/L1 must then exist before issue #199 can implement Memory inference. Do not patch the legacy controller runtime.
 
 ## Repository work
 
@@ -112,7 +122,7 @@ The [documentation map](docs/README.md) separates current V3 authority from V2 d
 
 | Repository | V3 relationship |
 |---|---|
-| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External agent/task owner and Contract 0.10 one-shot inference boundary after controller #200 + V2 L0/L1 |
+| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External Agent/task owner and Contract 0.11 one-shot inference boundary after controller #200 + V2 L0/L1 |
 | [eliot-search](https://github.com/UnknownAlienHuman/eliot-search) | Optional source preparation/retrieval adapter for a concrete selected path |
 | [eliot-research](https://github.com/UnknownAlienHuman/eliot-research) | Optional external research/acquisition owner for a concrete remaining gap |
 
