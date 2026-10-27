@@ -10,13 +10,13 @@ Eliot preserves exact experience, reconstructs current work, supplies applicable
 |---|---|
 | [V3 navigation](docs/v3/README.md) | Current versions, construction and proof ceiling |
 | [Architecture draft.19](docs/v3/ARCHITECTURE.md) | Purpose, ownership, Base, schema/backup invariants |
-| [Implementation draft.41](docs/v3/IMPLEMENTATION.md) | Runtime, exact Store/schema/query contract, Windows/process, backup/rollback and sequence |
+| [Implementation draft.42](docs/v3/IMPLEMENTATION.md) | Runtime, exact SurrealDB 3.3.4 Store/schema/query contract, Windows/process, backup/rollback and sequence |
 | [Cognition draft.23](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning and failure diagnosis |
 | [Inference Contract 0.18](docs/v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller V2 boundary |
 | [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, evidence and queue |
 | [Consolidated audit](docs/v3/AUDIT.md) | Donor evidence, criticism and rationale |
 
-Architecture 19, Implementation 41, Cognition 23 and Contract 0.18 describe one synchronized implementation target. Specification text, source presence, green build or receipt does not establish working behavior.
+Architecture 19, Implementation 42, Cognition 23 and Contract 0.18 describe one synchronized implementation target. Specification text, source presence, upstream tests, green build or receipt do not establish working behavior.
 
 Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
@@ -54,10 +54,13 @@ retained episode
 - six Base `SCHEMAFULL` tables plus immutable blobs;
 - canonical OS-random application IDs, domain-separated derived keys and fixed query DTOs;
 - explicit indexed workspace/task/actor/session projection for direct continuation;
-- read-only identity/creation fields plus body/validity/claim/request/slot assertions;
-- schema-bundle identity covers runner protocol, wrapper template, ordered DDL and expected catalog;
-- plain `INFO FOR DB/TABLE` catalog readback; unstable `STRUCTURE` is forbidden;
-- scored FTS uses numbered match references and one bounded top-K snapshot, not a cross-call cursor;
+- `READONLY` as changed-value guard, never identity generator;
+- canonical `NONE` absence for conditional unique keys; no `NULL` in those fields;
+- row-local ASSERT defense plus operation-owned replay/digest/cross-row invariants;
+- schema-bundle identity covering runner protocol, wrapper, ordered DDL and expected catalog;
+- plain `INFO FOR DB/TABLE` catalog readback; `STRUCTURE` forbidden;
+- exact-tag evidence for field grammar, PARAM rollback, conditional uniqueness and numbered FTS, with complete wrapper/concurrency/runtime still Slice 0;
+- scored FTS as one bounded top-K statement snapshot, not a cross-call cursor;
 - daemon-owned controller-mutation and backup-set owners;
 - atomic backup-directory first visibility with fence already present;
 - self-contained abort/retire tombstones;
