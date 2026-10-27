@@ -1,10 +1,10 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.13 · 2026-10-26 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.14 · 2026-10-26 · normative design for the greenfield rewrite.**
 
 V1/V2 Memory implementations are donors. V3 is a new implementation, not a compatibility migration. Current `eliot-swarm-controller` V2 is also a fresh implementation target; its existing V1 runtime is donor-only and must not receive new Memory functionality.
 
-This document owns product purpose, authority and invariants. [Implementation](IMPLEMENTATION.md) owns concrete runtime, Store and maintenance paths. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.12](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only active work ledger.
+This document owns product purpose, authority and invariants. [Implementation](IMPLEMENTATION.md) owns concrete runtime, Store and maintenance paths. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.13](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only active work ledger.
 
 ## 0. Current external dependency
 
@@ -97,9 +97,9 @@ exact input + profile + disclosure + finite limits + precommitted WriteId
 → exact visible body when present + bounded observed facts
 ```
 
-Memory uses dedicated controller V2 `memory_inference` principal and Contract 0.12 methods. It does not create controller Agent, binding, turn, command, Goal, automation run/action, workspace, native session, Task, Attempt, review or acceptance object.
+Memory uses dedicated controller V2 `memory_inference` principal and Contract 0.13 methods. It does not create controller Agent, binding, turn, command, Goal, automation run/action, workspace, native session, Task, Attempt, review or acceptance object.
 
-Richer software-agent work may use controller Agents when it genuinely needs tools/continuation. One bounded memory extraction must not expand into a workflow engine.
+Richer software-agent work may use controller Agents when it genuinely needs tools or continuation. One bounded memory extraction must not expand into a workflow engine.
 
 ### 2.3 Stable caller, rotating credential and global WriteId are distinct
 
@@ -158,7 +158,7 @@ Derived content cannot widen the strictest source it still reveals. Controller r
 
 Unavailable profile/capacity or disclosure mismatch is operational failure/waiting, not cognitive `no_change` and not processed coverage.
 
-### 2.5 Cleanup authority, backup dependencies and retention are distinct
+### 2.5 Cleanup authority, backup dependencies and publication state are distinct
 
 One call creates at most two private controller files:
 
@@ -177,7 +177,7 @@ inference.release(terminal_without_result)
 inference.release(abandon_for_erasure)
 ```
 
-A queued call may first receive caller `inference.cancel`. `abandon_for_erasure` fences future dispatch/settlement/publication before controlled-copy deletion.
+A queued call may first receive caller `inference.cancel`. `abandon_for_erasure` fences future dispatch, settlement and publication before controlled-copy deletion.
 
 Each admitted in-cut backup job is classified:
 
@@ -192,7 +192,14 @@ controller_dependent
   or unresolved cleanup/readback
 ```
 
-While any restorable backup marks a call `controller_dependent`, Memory blocks release that would remove required controller state/copies. Current Memory may copy/use the result, but cleanup stays pending. Backup retirement/replacement clears the fence.
+Before backup filesystem publication, Memory durably records a provisional dependency fence in the ordinary maintenance job. That fence names the backup candidate, expected manifest identity/digest and every dependent call.
+
+Release checks both retained manifests and unresolved provisional fences. `preparing` and `publication_unknown` fence dependencies exactly like a retained backup. A fence is cleared only after exact final-path reconciliation proves either:
+
+- the matching manifest is durably in the controlled backup set; or
+- publication definitely failed before final rename and the final path is absent.
+
+Rename-may-have-succeeded plus failed directory sync/readback remains `publication_unknown`; release stays blocked across restart.
 
 Controller-owner `inference.erase` is local break-glass for missing/disabled caller or emergency. Memory has no owner credential, cannot submit it and cannot report it complete before non-content owner readback.
 
@@ -334,7 +341,7 @@ Missing models, vectors or specialist tools cannot destroy source or prevent exa
 
 Observation records what source supplied, not universal truth. Claims, methods, explanations, predictions and project views are derived knowledge with exact source/revision handles.
 
-Rename, copy, conversion and export preserve separate identities plus relations. Equal bytes/similarity do not prove continuity or independent support.
+Rename, copy, conversion and export preserve separate identities plus relations. Equal bytes or similarity do not prove continuity or independent support.
 
 ### 4.5 Current revision and history are distinct
 
@@ -411,7 +418,7 @@ frozen sources + exact recipe + disclosure + precommitted WriteId
 → purpose-specific decode
 → atomic Memory publication or valid no-change
 → later consumer
-→ caller-authorized cleanup when no backup dependency remains
+→ caller-authorized cleanup when no retained/provisional backup dependency remains
 ```
 
 Store conflict replays retained result, not model call. Ambiguous provider outcome stays unknown. New WriteId is not recovery.
@@ -430,7 +437,7 @@ One attributable attempt/criterion contributes once. Replayed hooks/summaries ar
 
 ### 7.4 Recursive improvement
 
-Diagnose failed connected edge—capture, source selection, controller admission/execution/readback/retention/backup dependency/cleanup, decoding, publication, retrieval, delivery, use or applicability—and correct that edge. Do not multiply duplicate lessons or add global intelligence score.
+Diagnose failed connected edge—capture, source selection, controller admission/execution/readback/retention/backup dependency/publication/cleanup, decoding, publication, retrieval, delivery, use or applicability—and correct that edge. Do not multiply duplicate lessons or add global intelligence score.
 
 ## 8. Backup, rollback and external-work continuity
 
@@ -438,7 +445,9 @@ Application backup uses brief spool publication cut, canonical typed Store pages
 
 Before controller high-water, Memory pauses/drains single dispatch owner and classifies every created call ID as admitted, retired-not-admitted or unknown. Only admitted calls belong to controller-continuous external-work set.
 
-Every admitted in-cut call is then `controller_closed` or `controller_dependent`. A restorable backup records exact dependent calls and installs release fences until backup retirement/replacement. `retain_after_seq` remains post-cut denominator; it is not lowered for dependencies.
+Every admitted in-cut call is then `controller_closed` or `controller_dependent`. Before writing backup files, Memory publishes a provisional dependency fence in its ordinary maintenance job. That fence survives `rename succeeded / directory-sync-readback unknown` and blocks release until exact final-path reconciliation.
+
+A restorable backup records exact dependent calls and installs release fences until retirement/replacement. `retain_after_seq` remains post-cut denominator; it is not lowered for dependencies.
 
 For exact controller/client identity, backup records:
 
@@ -453,15 +462,15 @@ explicit authority/admission gaps
 
 Restore is exact rollback, not invented merge. `controller_closed` jobs restore from backup facts even when controller row pruned. `controller_dependent` jobs require exact call/copy. Retired ID never sends again.
 
-Post-cut calls are inventoried through fixed `(backup_high_water, inventory_high_water]`. Results are not adopted. Valid caller uses cancel/release-abandon after dependency checks; unavailable caller creates owner-action-required debt.
+Post-cut calls are inventoried through fixed `(backup_high_water, inventory_high_water]`. Results are not adopted. Valid caller uses cancel/release-abandon after retained/provisional dependency checks; unavailable caller creates owner-action-required debt.
 
-`history_gap`, caller/controller unavailability, admission unknown, missing dependent copy or identity reset keeps inference disabled. Base remains available. External-WriteId generator is not rolled back.
+`history_gap`, caller/controller unavailability, admission unknown, publication unknown, missing dependent copy or identity reset keeps inference disabled. Base remains available. External-WriteId generator is not rolled back.
 
 ## 9. Reliability, privacy and direct control
 
-Persist enough state to distinguish adjacent lifecycle states: accepted/staged/committed/unknown capture; prepared/emitted context; exact-read complete/paged/missing/damaged; inference prepared/admitted/retired-not-admitted/sending/settled/unknown/abandoned; controller-closed/dependent; result copied/decoded/published; per-copy cleanup; backup release fence; owner-action-required debt; privileged maintenance requested/quiesced/executing/selection-unknown/completed.
+Persist enough state to distinguish adjacent lifecycle states: accepted/staged/committed/unknown capture; prepared/emitted context; exact-read complete/paged/missing/damaged; inference prepared/admitted/retired-not-admitted/sending/settled/unknown/abandoned; controller-closed/dependent; result copied/decoded/published; per-copy cleanup; backup preparing/publication-unknown/published/aborted; release fence; owner-action-required debt; privileged maintenance requested/quiesced/executing/selection-unknown/completed.
 
-Acknowledgement is not completion. Heartbeat is not progress. Provider body is not decoded proposal. Published memory is not external success. Deletion fence/tombstone is not complete physical erase.
+Acknowledgement is not completion. Heartbeat is not progress. Provider body is not decoded proposal. Published memory is not external success. Deletion fence/tombstone is not complete physical erase. Backup rename without parent durability/readback is not published success and not permission to clear dependency fences.
 
 Secrets stay with owner:
 
@@ -484,6 +493,7 @@ Without demonstrated consumer and owner decision, V3 does not add:
 - truth/skill/outcome/packet registry;
 - general Governor/approval/proof platform;
 - actor/crate/service/manifest per concept;
+- a backup-pin service/table when ordinary maintenance job + manifest is sufficient;
 - runtime plugin/WASM/hot-generation machinery;
 - model judges, silent fallback or arbitrary provider extras;
 - generated inventories as permanent authorities;
@@ -494,7 +504,8 @@ Without demonstrated consumer and owner decision, V3 does not add:
 - observed earliest controller row presented as retention guarantee;
 - rollbackable/reusable external-WriteId generator;
 - first admission of absent old call from backup;
-- release of controller-dependent call while a restorable backup pins it;
+- release of a call pinned by retained or provisional backup dependency;
+- clearing publication-unknown fence without exact final-path reconciliation;
 - lowering monotonic retain cut to pin old dependency;
 - Memory impersonation of controller-owner erase;
 - deletion of pinned inventory membership without tombstone/cut advance.
@@ -520,7 +531,8 @@ stable caller + precommitted WriteId
 → exact result copy or typed no-result/unknown
 → decoded publication
 → later context consumer
-→ backup dependency-aware cleanup
+→ crash-safe backup dependency fence
+→ dependency-aware cleanup
 → backup admission closure and restart/rollback reconciliation
 ```
 
@@ -530,7 +542,7 @@ Implementation order:
 2. useful Base capture/replay/open;
 3. first qualified host/context path;
 4. controller #200 plus V2 L0/L1;
-5. Contract 0.12 text-inference P1a;
+5. Contract 0.13 text-inference P1a;
 6. credential rotation P1b;
 7. independent vectors/views/documents/Research/hosts;
 8. advanced curation after connected Base.
