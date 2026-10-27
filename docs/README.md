@@ -7,10 +7,10 @@ The owner retired V1/V2 Memory implementations as active product designs and sel
 | Need | Current V3 source |
 |---|---|
 | Stage, versions, reading order and proof ceiling | [v3/README.md](v3/README.md) |
-| Product purpose, ownership and invariants | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) — draft.14 |
-| Runtime, Store, maintenance and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.35 |
-| Reconstruction, retrieval, learning, backup publication/dependencies and revision algorithms | [v3/COGNITION.md](v3/COGNITION.md) — draft.18 |
-| Memory↔controller V2 boundary | [v3/INFERENCE-CONTRACT.md](v3/INFERENCE-CONTRACT.md) — Contract 0.13 |
+| Product purpose, ownership and invariants | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) — draft.15 |
+| Runtime, Store, maintenance and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.36 |
+| Reconstruction, retrieval, learning, rollback-safe backup dependencies and revision algorithms | [v3/COGNITION.md](v3/COGNITION.md) — draft.19 |
+| Memory↔controller V2 boundary | [v3/INFERENCE-CONTRACT.md](v3/INFERENCE-CONTRACT.md) — Contract 0.14 |
 | Active decisions, gaps, source coverage and queue | [v3/ANALYSIS-REGISTRY.md](v3/ANALYSIS-REGISTRY.md) |
 | Consolidated evidence, criticism and donor rationale | [v3/AUDIT.md](v3/AUDIT.md) |
 | Requirement/source dispositions | [v3/AUDIT-MAP.md](v3/AUDIT-MAP.md) |
@@ -32,15 +32,17 @@ It selects fresh local JSON-RPC + SQLite WAL V2 with global external ULID `Write
 
 Memory uses dedicated `memory_inference` principal, stable random installation client ID, monotonic token version, rollback-safe installation WriteId state, private call-owned input/result copies and admission-sequence restore inventory.
 
-Controlled backup closes controller admission before high-water: every created call ID is admitted, permanently retired as proven absent, or explicitly unknown. Every admitted in-cut call is `controller_closed` or `controller_dependent`.
+Controlled backup closes one controller-mutation owner before high-water: every created call ID is admitted, permanently retired as proven absent, or explicitly unknown. Every admitted in-cut call is `controller_closed` or `controller_dependent`.
 
-Before backup filesystem publication, an ordinary Memory maintenance job durably records a provisional dependency fence. `preparing` and `publication_unknown` block release exactly like retained backup manifests. A fence clears only after exact final-path and backup-set readback or a proven pre-rename failure with final-path absence.
+Before any backup part, Memory computes a canonical non-self-referential `backup_plan_digest` and durably publishes installation-scoped `backups/<id>/fence.json` outside rollback Store roots. Final manifest repeats the plan digest and actual inventories. A Store job mirrors status but is not authority.
 
-A dependent call cannot be released while any retained or provisional backup needs controller state/result/copy. `retain_after_seq` stays a monotonic post-cut denominator; it is not lowered for in-cut dependencies. Calls erased above cut keep bounded text-free membership tombstones until cut advances.
+`preparing` and `publication_unknown` installation fences block dependent-call release and pin post-cut retention at their high-water. They clear only through a valid matching manifest or a durable abort after exact final-manifest absence and partial cleanup. Exact Memory rollback cannot erase the fence.
+
+A dependent call cannot be released while any retained or unresolved provisional backup needs controller state/result/copy. `retain_after_seq` stays monotonic and is not lowered for in-cut dependencies. Calls erased above cut keep bounded text-free membership tombstones until cut advances.
 
 Caller cleanup uses cancel/release. Controller-owner erase is external break-glass; Memory cannot submit it and retains owner-action-required debt until observed readback.
 
-Old V1 hello, generic Operation/artifact ownership and submission-state paths are donor history. Controller issue #200 plus V2 L0/L1 are prerequisites for issue #199 and Contract 0.13 runtime implementation.
+Old V1 hello, generic Operation/artifact ownership and submission-state paths are donor history. Controller issue #200 plus V2 L0/L1 are prerequisites for issue #199 and Contract 0.14 runtime implementation.
 
 ## Retained V2 donor documentation
 
