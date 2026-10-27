@@ -2,22 +2,22 @@
 
 ## Current owner decision: coherent V3 design before runtime rewrite
 
-On 2026-10-18 the owner directed that V2 join V1 as an archived Memory donor and that V3 be designed from scratch before implementation. This direction supersedes old Memory documents as authority for the next implementation. It does not claim V3 code exists or that design text proves runtime behavior.
+On 2026-10-18 the owner directed that V2 join V1 as an archived Memory donor and that V3 be designed from scratch before implementation. This supersedes old Memory documents as authority for the next implementation. It does not claim V3 code exists or that design text proves runtime behavior.
 
 The synchronized V3 set is:
 
 | Surface | Current role |
 |---|---|
-| [Architecture draft.11](v3/ARCHITECTURE.md) | Product purpose, authority owners, Base, extensions and invariants |
-| [Implementation draft.32](v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation order |
-| [Cognition draft.15](v3/COGNITION.md) | Current-work reconstruction, retrieval, learning, retention and revision algorithms |
-| [Inference Contract 0.10](v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
+| [Architecture draft.12](v3/ARCHITECTURE.md) | Product purpose, authority owners, Base, extensions and invariants |
+| [Implementation draft.33](v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation order |
+| [Cognition draft.16](v3/COGNITION.md) | Reconstruction, retrieval, learning, backup admission closure and revision algorithms |
+| [Inference Contract 0.11](v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
 | [Active analysis registry](v3/ANALYSIS-REGISTRY.md) | Sole active decisions/gaps/source-coverage/work queue |
 | [V3 navigation](v3/README.md) | Reading order, current baseline and proof ceiling |
 | [V3 audit](v3/AUDIT.md), [source map](v3/AUDIT-MAP.md) | Evidence, criticism, donor analysis and stable source dispositions; not independent subsystem authority |
 | `docs/architecture/`, `docs/normative-pair.toml`, existing source/scripts/workstreams | Retained V2 donor surfaces; old status terms are historical |
 
-Architecture intent prevails over a conflicting lower-level mechanism. Implementation and Cognition agree with Architecture and Contract 0.10. Resolve a changed load-bearing mechanism in every affected owner document in the same work sequence; do not add an errata layer or second active contract.
+Architecture intent prevails over a conflicting lower-level mechanism. Implementation and Cognition agree with Architecture and Contract 0.11. Resolve a changed load-bearing mechanism in every affected owner document in the same work sequence; do not add an errata layer or second active contract.
 
 A new mechanism, budget, process count, database choice, credential path or evaluation threshold is not accepted because an agent wrote it. It needs a concrete caller, owner, durable result/unknown and consumer, plus appropriate evidence.
 
@@ -39,7 +39,10 @@ Therefore:
 
 - revision `e42c464d`, V1 roles/hello/Operation/artifacts and generic registration are donor evidence only;
 - no Memory implementation may add one-shot inference to the retired stack;
-- active boundary is Contract 0.10: dedicated `memory_inference`, stable random installation client ID, monotonic token version, `client.identity`, global pre-send WriteIds, rollback-safe generator state, minimal client/call state, private call-owned copies, guaranteed `retain_after_seq` and fixed-window restore inventory;
+- active boundary is Contract 0.11: dedicated `memory_inference`, stable random installation client ID, monotonic token version, `client.identity`, global pre-send WriteIds, rollback-safe generator state, minimal client/call state, private call-owned copies, guaranteed `retain_after_seq`, backup admission closure and fixed-window restore inventory;
+- a controlled backup includes admitted calls only; proven-absent IDs are permanently retired and unknown admission makes continuity incomplete;
+- caller cleanup uses cancel/release-abandon; controller-owner erase is external break-glass and cannot be submitted by Memory;
+- content erasure above the retention cut leaves bounded text-free membership tombstone until pinned backups retire and the cut advances;
 - controller issue #200 must repair binding-revision allocator/schema authority;
 - controller V2 L0/L1 must exist before issue #199 implements the Memory extension;
 - a missing V2 capability is a real dependency, not permission to revive V1.
@@ -65,7 +68,7 @@ The V2 sharded pair remains byte-identifiable evidence:
 
 `main` is repository integration authority. While issue #5324 and PR #5325 remain open, their `docs/v3/` branch files are current V3 working authority. Follow [AGENTS](../AGENTS.md), [START](../START.md) and [WORKFLOW](../WORKFLOW.md); independent review and required CI remain applicable.
 
-Source/workstream statuses inside the donor tree do not authorize V2 continuation. Do not resume the October audit factory or assign every unresolved V2 row as a V3 implementation task.
+Source/workstream statuses inside the donor tree do not authorize V2 continuation. Do not resume the October audit factory or assign every unresolved V2 row as a V3 task.
 
 The freeze preserves source/history without copying the project into another directory, closing every old issue, deleting user data or migrating a running installation. Those actions are outside this documentation change.
 
