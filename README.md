@@ -9,14 +9,14 @@ Eliot preserves exact experience, reconstructs current work, supplies applicable
 | Read | Purpose |
 |---|---|
 | [V3 navigation](docs/v3/README.md) | Current versions, construction and proof ceiling |
-| [Architecture draft.18](docs/v3/ARCHITECTURE.md) | Purpose, ownership, Base, schema/backup invariants |
-| [Implementation draft.39](docs/v3/IMPLEMENTATION.md) | Runtime, migration/query boundary, Windows/process, backup/rollback and sequence |
-| [Cognition draft.22](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning and failure diagnosis |
-| [Inference Contract 0.17](docs/v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller V2 boundary |
+| [Architecture draft.19](docs/v3/ARCHITECTURE.md) | Purpose, ownership, Base, schema/backup invariants |
+| [Implementation draft.40](docs/v3/IMPLEMENTATION.md) | Runtime, exact Store/query contract, Windows/process, backup/rollback and sequence |
+| [Cognition draft.23](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning and failure diagnosis |
+| [Inference Contract 0.18](docs/v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller V2 boundary |
 | [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, evidence and queue |
 | [Consolidated audit](docs/v3/AUDIT.md) | Donor evidence, criticism and rationale |
 
-Architecture 18, Implementation 39, Cognition 22 and Contract 0.17 describe one synchronized implementation target. Specification text, source presence, green build or receipt does not establish working behavior.
+Architecture 19, Implementation 40, Cognition 23 and Contract 0.18 describe one synchronized implementation target. Specification text, source presence, green build or receipt does not establish working behavior.
 
 Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
@@ -52,20 +52,22 @@ retained episode
 - one Rust codebase with supervisor, daemon and transient relay modes;
 - SurrealDB 3.3.4/RocksDB `sync=every` qualification target;
 - six Base `SCHEMAFULL` tables plus immutable blobs;
-- canonical string application IDs and explicit query DTOs;
-- migration bundle SHA-256 computed outside migration bytes, bound into metadata params and verified through `INFO`;
+- canonical string application IDs and fixed query DTOs;
+- schema-bundle identity covers runner protocol, wrapper template, ordered DDL and expected catalog;
+- plain `INFO FOR DB/TABLE` catalog readback; unstable `STRUCTURE` is forbidden;
+- scored FTS uses numbered match references and returns one bounded top-K snapshot, not a cross-call cursor;
 - daemon-owned controller-mutation and backup-set owners;
-- backup ID `b_<32hex>` and atomic staged-directory publication with `fence.json` already present at first final visibility;
+- backup ID `b_<32hex>` and atomic staged-directory publication with fence already present at first final visibility;
 - self-contained abort/retire tombstones;
-- daemon restore file lease; supervisor candidate process/root and cutover;
-- candidate discard on daemon/channel loss;
+- bounded streaming restore lease: directory/fence/manifest handles plus one verified part at a time;
+- supervisor candidate process/root and final cutover; candidate discard on daemon/channel loss;
 - exact rollback rather than invented merge.
 
 ## Controller boundary
 
 Current controller authority is `eliot-swarm-controller@613ea6b5ff6389c7629a988e271477ee45c9d2c1`; V2 remains specification-only.
 
-Issue #200 separates binding allocation, selected pointer and effect state. PR #201 fixes validator fixtures only. V2 L0/L1 and #200 must exist before issue #199 implements Contract 0.17. Never extend controller V1 for Memory inference.
+Issue #200 separates binding allocation, selected pointer and effect state. PR #201 fixes validator fixtures only. V2 L0/L1 and #200 must exist before issue #199 implements Contract 0.18. Never extend controller V1 for Memory inference.
 
 ## Version boundary
 
@@ -80,7 +82,7 @@ Follow [AGENTS.md](AGENTS.md), [WORKFLOW.md](WORKFLOW.md) and [Architecture auth
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
 
-Start with the [mandatory verified-reading protocol](docs/architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact paths and causal property. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. Stable `ELIOT_*` files are V2 compatibility maps, not task prompts.
+Start with the [mandatory verified-reading protocol](docs/architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for exact paths and causal property. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. Stable `ELIOT_*` files are V2 compatibility maps, not task prompts.
 <!-- eliot-doc-routing:end -->
 
 ## License
