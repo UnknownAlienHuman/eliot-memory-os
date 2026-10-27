@@ -1,6 +1,6 @@
 # Eliot Memory OS
 
-> **V3 is the current design authority.** V1 and V2 Memory implementations are archived donors. This documentation does not claim a V3 runtime exists.
+> **V3 is the current design authority.** V1 and V2 Memory implementations are archived donors. The documentation does not claim a V3 runtime exists.
 
 Eliot preserves exact experience, reconstructs current work, supplies applicable context before the next decision, learns bounded procedures from observed outcomes and revises mistaken memory without losing source history.
 
@@ -8,140 +8,81 @@ Eliot preserves exact experience, reconstructs current work, supplies applicable
 
 | Read | Purpose |
 |---|---|
-| [V3 navigation](docs/v3/README.md) | Current versions, reading order, selected construction and proof ceiling |
-| [Architecture draft.17](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
-| [Implementation draft.38](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
-| [Cognition draft.21](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning, terminal backup authority, restore leases and revision algorithms |
-| [Inference Contract 0.16](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
-| [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, source coverage and queue |
-| [Consolidated audit](docs/v3/AUDIT.md) | Evidence, criticism, donor analysis and rationale |
+| [V3 navigation](docs/v3/README.md) | Current versions, construction and proof ceiling |
+| [Architecture draft.18](docs/v3/ARCHITECTURE.md) | Purpose, ownership, Base, schema/backup invariants |
+| [Implementation draft.39](docs/v3/IMPLEMENTATION.md) | Runtime, migration/query boundary, Windows/process, backup/rollback and sequence |
+| [Cognition draft.22](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning and failure diagnosis |
+| [Inference Contract 0.17](docs/v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller V2 boundary |
+| [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, evidence and queue |
+| [Consolidated audit](docs/v3/AUDIT.md) | Donor evidence, criticism and rationale |
 
-Architecture 17, Implementation 38, Cognition 21 and Contract 0.16 describe one synchronized design. Source presence, specification text, green build or receipt does not establish working behavior.
+Architecture 18, Implementation 39, Cognition 22 and Contract 0.17 describe one synchronized implementation target. Specification text, source presence, green build or receipt does not establish working behavior.
 
 Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
-## Version boundary
+## Product boundary
 
-Existing Rust workspace, old architecture shards, scripts and workstream records describe **V2 Memory**. They remain selective donors; their checklists do not authorize continuing V2 implementation or importing its physical architecture into V3.
+Memory owns observations, revisions, context, provenance, finite learning jobs and outcome-linked methods. Hosts/controllers own goals, actions, Agent/task execution and user acceptance.
 
-- [V2 source snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105)
-- [V2 unfinished audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete)
-- [V1 donor snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7)
-
-[Architecture authority](docs/ARCHITECTURE_CONTRACT.md) records precedence. Active V3 owner documents define implementation target; audit explains evidence/alternatives without turning every idea into required subsystem.
-
-## Selected product boundary
-
-Memory owns durable observations, revisions, context, provenance, finite learning jobs and outcome-linked methods. Hosts/controllers own goals, actions, Agent/task execution and user acceptance.
-
-Useful Base comes first:
+Useful Base:
 
 ```text
 real host event
-→ exact source ownership in Store or durable spool
+→ Store ownership or durable spool
 → replay and restart
 → current-work reconstruction
 → actual context emission or explicit retrieval
 → exact source open
 ```
 
-First learning extension:
+First learning:
 
 ```text
 retained episode
-→ exact processing recipe
-→ one controller V2 call with precommitted global WriteId
+→ exact recipe
+→ one controller call with precommitted global WriteId
 → typed result or unknown
 → ordinary Memory revision
 → changed later context
-→ rollback-safe backup authority and dependency-aware cleanup
+→ rollback-safe dependency-aware cleanup
 ```
 
-Provider result does not grant Memory authority or prove external task completion.
+## Current physical decisions
 
-## Controller and backup boundary
+- one Rust codebase with supervisor, daemon and transient relay modes;
+- SurrealDB 3.3.4/RocksDB `sync=every` qualification target;
+- six Base `SCHEMAFULL` tables plus immutable blobs;
+- canonical string application IDs and explicit query DTOs;
+- migration bundle SHA-256 computed outside migration bytes, bound into metadata params and verified through `INFO`;
+- daemon-owned controller-mutation and backup-set owners;
+- backup ID `b_<32hex>` and atomic staged-directory publication with `fence.json` already present at first final visibility;
+- self-contained abort/retire tombstones;
+- daemon restore file lease; supervisor candidate process/root and cutover;
+- candidate discard on daemon/channel loss;
+- exact rollback rather than invented merge.
 
-Current inspected controller authority:
+## Controller boundary
 
-```text
-UnknownAlienHuman/eliot-swarm-controller
-main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
-merged PR #198
-```
+Current controller authority is `eliot-swarm-controller@613ea6b5ff6389c7629a988e271477ee45c9d2c1`; V2 remains specification-only.
 
-It selects fresh local JSON-RPC + SQLite WAL V2 with global external ULID `WriteId` receipts and treats old Rust/`swarm-client`/generic Operation runtime as V1 legacy pending deletion.
+Issue #200 separates binding allocation, selected pointer and effect state. PR #201 fixes validator fixtures only. V2 L0/L1 and #200 must exist before issue #199 implements Contract 0.17. Never extend controller V1 for Memory inference.
 
-Memory targets:
+## Version boundary
 
-```text
-principal_kind = memory_inference
-client_id      = memory:<random-stable-installation-id>
-token_version  = current credential version
-live call ID   = global WriteId + client_id + method + semantic payload
-```
+Existing Rust workspace, old architecture shards, scripts and workstream records describe V2 Memory. They remain selective donors, not authorization to continue V2 topology.
 
-Memory persists every caller mutation WriteId before send. One monotonic generator state lives outside rollback Store roots. Call, cancel, release and retention-advance IDs are all dispositioned at backup cut; an old backup never first-admits an absent ID.
+- [V2 source snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105)
+- [V2 unfinished audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete)
+- [V1 donor snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7)
 
-One controller-mutation owner serializes caller effects. One local backup-set owner allocates random non-reused backup IDs, scans installation records, owns terminal transitions, grants restore leases and orders physical cleanup. Neither is a public service or second database.
-
-Before backup files, Memory publishes a canonical-plan `fence.json` outside rollback Store roots. `abort.json` and `retire.json` are self-contained terminal tombstones after exact prerequisites. They remain terminal after content-bearing files are removed and prevent backup-ID reuse.
-
-```text
-valid standalone retire -> retired/non-restorable
-valid standalone abort  -> aborted-before-publish
-fence + matching manifest + no terminal -> published/restorable
-fence + no manifest/terminal            -> preparing/publication-unknown
-other ambiguity                           -> unresolved/fail closed
-```
-
-Published non-retired backups and unresolved fences pin dependent controller copies and post-cut retention. Retired/aborted generations do not pin, but surviving content remains cleanup debt.
-
-Restore holds an exact read lease and retained no-follow handles through candidate verification and final pre-cutover terminal-state recheck. Retirement, abort and cleanup wait. Restored Store maintenance rows are mirrors only and cannot create terminal records, clear pins or replay stale auxiliary effects.
-
-Controller registration owns `last_admission_seq` and guaranteed `retain_after_seq`. Fixed-window inventory below cut returns `history_gap`. Erased content above cut leaves bounded text-free membership tombstone until every backup pinning interval is terminal and cut advances.
-
-With valid caller, cleanup uses optional `inference.cancel` and `inference.release(...)`. Controller-owner `inference.erase` is local break-glass. Memory never receives owner authority and records owner-action-required debt until non-content owner readback.
-
-Exact details live only in [Contract 0.16](docs/v3/INFERENCE-CONTRACT.md).
-
-Controller issue #200 must repair binding-revision allocator/schema authority. V2 L0/L1 must then exist before issue #199 implements Memory inference. Do not patch legacy controller runtime.
-
-## Repository work
-
-Follow [AGENTS.md](AGENTS.md), [START.md](START.md) and [WORKFLOW.md](WORKFLOW.md). Work from current `main`, preserve unrelated changes, use one writer per mutable scope and obtain independent review before integration.
-
-Implementation sequence:
-
-```text
-write connected production code
-→ cargo fmt --check
-→ minimum relevant changed-package Clippy
-→ continue vertical path
-→ broad tests after connected product exists
-```
-
-A documentation edit calls for documentation consistency checks. Runtime proof must match actual runtime behavior.
-
-The [documentation map](docs/README.md) separates V3 authority from V2 donor references. [PROJECT_MAP](docs/PROJECT_MAP.md), [scripts](scripts/README.md), [workstream records](workstreams/ACTIVE.toml) and pinned Rust toolchain describe retained V2 tree, not V3 deployment requirements.
-
-## Related repositories
-
-| Repository | V3 relationship |
-|---|---|
-| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External Agent/task owner and Contract 0.16 one-shot inference boundary after controller #200 + V2 L0/L1 |
-| [eliot-search](https://github.com/UnknownAlienHuman/eliot-search) | Optional source preparation/retrieval adapter for concrete selected path |
-| [eliot-research](https://github.com/UnknownAlienHuman/eliot-research) | Optional external research/acquisition owner for concrete remaining gap |
-
-## V2 donor reading tools
-
-The generated block below routes retained V2 documentation. It does not certify V3 or replace current owner documents.
+Follow [AGENTS.md](AGENTS.md), [WORKFLOW.md](WORKFLOW.md) and [Architecture authority](docs/ARCHITECTURE_CONTRACT.md). Production code first; after coherent increments run formatting and minimum changed-package Clippy. Broad suites follow connected product.
 
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
 
-Start with the [mandatory verified-reading protocol](docs/architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact repository paths and causal property being changed. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+Start with the [mandatory verified-reading protocol](docs/architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact paths and causal property. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. Stable `ELIOT_*` files are V2 compatibility maps, not task prompts.
 <!-- eliot-doc-routing:end -->
 
 ## License
 
-Eliot is licensed under the MIT License — see [LICENSE](LICENSE). Third-party code and runtimes retain their own licenses; verify exact revision before reuse. Existing [dependency policy](docs/DEPENDENCY_POLICY.md) remains V2 reference until V3 decision explicitly adopts/revises it.
+MIT License. Third-party code and runtimes retain their own licenses; verify exact revisions before reuse.
