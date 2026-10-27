@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-26 · Architecture draft.12 / Implementation draft.33 / Cognition draft.16 / Inference Contract 0.11; controller authority `613ea6b5ff6389c7629a988e271477ee45c9d2c1`; активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-26 · Architecture draft.13 / Implementation draft.34 / Cognition draft.17 / Inference Contract 0.12; controller authority `613ea6b5ff6389c7629a988e271477ee45c9d2c1`; активный рабочий реестр, не runtime gate.**
 
 Это **единственный активный реестр** V3. Он хранит текущее решение, границу доказательства, оставшийся разрыв и следующий connected step. [AUDIT](AUDIT.md) и [AUDIT-MAP](AUDIT-MAP.md) сохраняют исходные доказательства и stable dispositions; новый проход обновляет этот файл, а не создаёт ещё один отчёт.
 
@@ -35,8 +35,8 @@
 |---|---|---|---|---|
 | R-123 | Current controller authority | `CHECKED` | Authority — `main@613ea6b5`, merged PR #198. V2 = fresh JSON-RPC + SQLite WAL + global external `WriteId`; current Rust/`swarm-client`/generic Operation stack — V1 legacy pending deletion. | Не добавлять Memory functionality в V1. |
 | R-130 | Controller roadmap status | `CHECKED` | `docs/roadmap.md` — единственный status tracker; L0.1–L1.11 все unchecked. PR #198 — specification only. | Controller реализует L0/L1 после #200. |
-| R-131 | Binding revision allocator/schema | `GAP`, `BLOCKED` | Issue #200: allocator, derived from selected pointer/revision-1 assumptions, collides after retained failed/unselected candidates. Affected: failed observe→control, cancelled initial launch, cancelled queued resume, failed/unknown first observe attach. Pointer-absent later revision conflicts with current supersedes CHECK. PR #201 fixes only fixtures. | Исправить core/API/config/decisions/schema validator before L0/L1. |
-| R-048 | `inference.text/embed` runtime | `BLOCKED` | Current V2 methods/runtime absent; issue #199 blocked on #200 + L0/L1. | Implement Contract 0.11 P1a only after foundation. |
+| R-131 | Binding revision allocator/schema | `GAP`, `BLOCKED` | Issue #200: allocator derived from selected pointer/revision-1 assumptions collides after retained failed/unselected candidates. Affected: failed observe→control, cancelled initial launch, cancelled queued resume, failed/unknown first observe attach. Pointer-absent later revision conflicts with current supersedes CHECK. PR #201 fixes only fixtures. | Исправить core/API/config/decisions/schema validator before L0/L1. |
+| R-048 | `inference.text/embed` runtime | `BLOCKED` | Current V2 methods/runtime absent; issue #199 blocked on #200 + L0/L1. | Implement Contract 0.12 P1a only after foundation. |
 
 ### 2.2 Memory inference contract
 
@@ -47,21 +47,22 @@
 | R-117 | Stable caller continuity | `CHECKED` design / `GAP` runtime | Stable `client_id = memory:<random-installation-id>` owns calls across token rotation and Memory rollback. | Pre/post-rotation old-call read/release. |
 | R-125 | Global `WriteId` call identity | `DECIDED` / `NOT IMPLEMENTED` | Live call identity = global ULID + exact client + method + canonical payload; call ID equals WriteId. | Receipt/call transaction. |
 | R-126 | Minimal V2 durable state | `DECIDED` / `NOT IMPLEMENTED` | Reuse `write_receipts`; add only `memory_inference_clients`, `inference_calls` and private call-owned files. | Schema/runner/copy lifecycle. |
-| R-132 | Guaranteed inference retention | `DECIDED` / `NOT IMPLEMENTED` | Normative guarantee is monotonic `retain_after_seq`, not observed earliest row. Registration owns `last_admission_seq` + cut; list before cut returns `history_gap`. | Implement high-water/list/retention.advance. |
+| R-132 | Guaranteed post-cut retention | `DECIDED` / `NOT IMPLEMENTED` | Monotonic `retain_after_seq` protects complete post-cut membership above minimum retained-backup high-water. It is not observed earliest row and is not lowered for in-cut dependencies. | Implement high-water/list/retention.advance. |
 | R-133 | Memory external WriteId generator | `DECIDED` / `NOT IMPLEMENTED` | One locked atomic installation-scoped monotonic ULID state outside rollback roots. Advance before job record/send and at least daemon floor/current monotonic time. | Implement Windows durable state and rollback cases. |
 | R-134 | Auxiliary mutation identity | `DECIDED` / `NOT IMPLEMENTED` | Cancel, release and retention advance each get durable pre-send caller WriteId. Proven-unsent auxiliary mutation is retired at backup cut. | Add fields/reconciliation path; no new table. |
 | R-135 | Private credential publication | `DECIDED` / `NOT IMPLEMENTED` | Controller-local owner publishes derived token only to admitted create-new/no-reparse private destination with ACL + file/parent durability. | Qualify install/reissue/lost-reply/path negatives. |
 | R-128 | Restore external-work inventory | `DECIDED` / `NOT IMPLEMENTED` | Backup stores high-water + retain cut; restore captures fixed `(backup_high_water, inventory_high_water]` membership and dispositions every out-of-target call. | Stable cursor/list + cleanup jobs. |
 | R-129 | Retention gap | `DECIDED` / `NOT IMPLEMENTED` | `backup_high_water < retain_after_seq` means `history_gap`; physical row presence is diagnostic only. | Implement and qualify. |
-| R-136 | Backup admission closure | `CHECKED` design / `NOT IMPLEMENTED` | `retain_after_seq` protects admitted calls only. Before high-water, one Memory dispatch owner is paused/drained and every created call ID becomes `admitted`, `retired_not_admitted` or `admission_unknown`. Old backup never first-admits an absent ID. | Implement dispatch barrier, exact absence/readback and retired-ID send denial. |
+| R-136 | Backup admission closure | `CHECKED` design / `NOT IMPLEMENTED` | Before high-water, one dispatch owner is paused/drained and every created call ID becomes `admitted`, `retired_not_admitted` or `admission_unknown`. Old backup never first-admits absent ID. | Implement barrier, exact absence/readback and retired-ID send denial. |
 | R-137 | Cleanup/erase authority | `CHECKED` design / `NOT IMPLEMENTED` | Valid caller uses optional cancel + `release(abandon_for_erasure)`. `inference.erase` is controller-owner-only break-glass; Memory records `owner_action_required` and later owner readback, never owner WriteId/effect. | Implement caller path, owner-action debt and denial tests. |
-| R-138 | Retention tombstone vs physical erasure | `DECIDED` / `NOT IMPLEMENTED` | Content/sensitive facts erase immediately, but calls above retain cut keep bounded text-free membership tombstone. Tombstone deletion requires retirement of every pinning backup and prior cut advance; otherwise erasure incomplete. | Add erased/abandoned tombstone state, inventory and cut-advance cases. |
+| R-138 | Retention tombstone vs physical erasure | `DECIDED` / `NOT IMPLEMENTED` | Content/sensitive facts erase immediately, but calls above retain cut keep bounded text-free membership tombstone. Tombstone deletion requires retirement of pinning backups and prior cut advance. | Add erased/abandoned tombstone state and inventory cases. |
+| R-139 | In-cut backup dependency release fence | `CHECKED` design / `NOT IMPLEMENTED` | Every admitted in-cut job is `controller_closed` or `controller_dependent`. Dependent calls/copies stay unreleased while any restorable backup needs them, even below current cut. Backup retirement clears fence. | Implement manifest dependency index/scan, pre-release recheck and restore/release cases. |
 
 ### 2.3 Normative synchronization
 
 | ID | Объект | Статус | Текущее решение / разрыв | Следующее действие |
 |---|---|---|---|---|
-| R-024 | Normative synchronization | `CHECKED` design | Architecture 12 / Implementation 33 / Cognition 16 / Contract 0.11 / V3 README / root README / docs map / architecture authority agree on controller `613ea6b5`, #200 prerequisite, rollback-safe WriteId state, admission closure, guaranteed retention, tombstones and cleanup authority. | Change all owner docs together when mechanism changes. |
+| R-024 | Normative synchronization | `CHECKED` design | Architecture 13 / Implementation 34 / Cognition 17 / Contract 0.12 / V3 README / root README / docs map / architecture authority agree on controller `613ea6b5`, admission closure, controller-closed/dependent state, release fences, post-cut retention, tombstones and cleanup authority. | Change all owner docs together when mechanism changes. |
 | R-076 | Base/Store synchronization | `CHECKED` design / `NOT IMPLEMENTED` | Host/capture/Store/Windows/backup physical baseline remains synchronized and independent of inference dependency. | Implement/qualify Base first. |
 
 ## 3. Product, Base и memory semantics
@@ -81,8 +82,8 @@
 | R-011 | Reuse/disclosure | `DECIDED` | Origin, reuse scope and disclosure independent. | Scoped queries/reduction. |
 | R-012 | Native hook capture | `CHECKED` design / `NOT IMPLEMENTED` | Finite Claude event profile. | Installed-build qualification. |
 | R-013 | Native context delivery | `CHECKED` design / `NOT IMPLEMENTED` | Actual packet crosses host boundary; prepared/emitted/use distinct. | Resume/compact/fork/subagent. |
-| R-019 | Backup/restore | `CHECKED` design / `NOT IMPLEMENTED` | Typed backup, brief spool cut, controller admission closure, exact rollback, guaranteed retention and fixed post-cut inventory; no invented row/result adoption. | Windows round-trip/safety/disaster/admission/history-gap. |
-| R-020 | Erasure/reappearance | `PARTIAL` | Monotonic fence + physical controlled-copy traversal + pinned non-content tombstones; provider effects external. | All roots/backups/spool/controller copies/tombstones. |
+| R-019 | Backup/restore | `CHECKED` design / `NOT IMPLEMENTED` | Typed backup, brief spool cut, admission/dependency closure, exact rollback, post-cut retention and fixed inventory; no invented row/result adoption. | Windows round-trip/safety/disaster/dependency/history-gap. |
+| R-020 | Erasure/reappearance | `PARTIAL` | Monotonic fence + controlled-copy traversal + dependent-backup invalidation + pinned non-content tombstones; provider effects external. | All roots/backups/spool/controller copies/tombstones. |
 | R-021 | Recursive improvement | `PARTIAL` | Diagnose concrete failed edge; no intelligence score. | Source→revision→later context. |
 | R-022 | Disagreement/anticipation | `CHECKED` design | Alternatives + grounds + cheapest distinguishing observation. | Ordinary records after Base. |
 | R-023 | Control/status/inbox | `DECIDED` | Daemon public control; supervisor closed privileged effects; status from readback. | Operation/readback paths. |
@@ -117,10 +118,12 @@
 | S-056 | Controller `main@613ea6b5`, merged PR #198 and roadmap | `CHECKED` | Current V2 authority; specification only; all L0/L1 unchecked. |
 | S-057 | Controller issue #200 + draft PR #201 + CI | `CHECKED` | Fixture fix green; allocator/pointer/schema defect remains. Additional launch/resume/first-observe cases recorded on owner issue. |
 | S-058 | Controller issue #199 vs Memory Contract 0.9 | `CHECKED` | `retain_after_seq` required; earliest-row wording insufficient. Owner comment records list/WriteId/credential-output gaps. |
-| S-059 | Memory Contract 0.10 | `SUPERSEDED` by 0.11 | Introduced current V2 retention and rollback-safe WriteId baseline; missed backup admission closure and erase authority. |
-| S-060 | Architecture 11 / Implementation 32 / Cognition 15 owner set | `SUPERSEDED` by current set | Synchronized Contract 0.10 only. |
-| S-061 | V2 receipt floor semantics + controller issue #199 comment `6431651331` + Contract 0.11 owner set | `CHECKED` design | Establishes absent-old-ID restore failure, caller/owner erase split and retention-tombstone requirement; no runtime. |
-| S-062 | Architecture 12 / Implementation 33 / Cognition 16 / Contract 0.11 + all entry points | `CHECKED` design | Current synchronized owner set; runtime not implied. |
+| S-059 | Memory Contract 0.10 | `SUPERSEDED` | Introduced current V2 retention and rollback-safe WriteId baseline; missed admission closure/authority. |
+| S-060 | Architecture 11 / Implementation 32 / Cognition 15 | `SUPERSEDED` | Synchronized Contract 0.10 only. |
+| S-061 | V2 receipt floor semantics + issue #199 comment `6431651331` + Contract 0.11 | `CHECKED` design / `SUPERSEDED` mechanism detail | Established absent-old-ID failure, caller/owner erase split and tombstones; treated all admitted in-cut calls as requiring controller row. |
+| S-062 | Architecture 12 / Implementation 33 / Cognition 16 / Contract 0.11 | `SUPERSEDED` | Synchronized admission/authority/tombstone boundary before dependency distinction. |
+| S-063 | Issue #199 comments `6431871018`/`6431878875` + Contract 0.12 owner set | `CHECKED` design | Establishes controller-closed/dependent split, backup release fences and unchanged monotonic post-cut retain cut; no runtime. |
+| S-064 | Architecture 13 / Implementation 34 / Cognition 17 / Contract 0.12 + entry points | `CHECKED` design | Current synchronized owner set; runtime not implied. |
 
 Existing source records S-001–S-055 remain historical evidence with their previous exact scope; no donor is qualified wholesale.
 
@@ -129,18 +132,18 @@ Existing source records S-001–S-055 remain historical evidence with their prev
 | Priority | Работа | Закрывает |
 |---|---|---|
 | P0 | Controller #200: allocator/schema/API/config/decision fix including cancelled launch/resume and pointer-absent first attach; merge only after validators prove named cases. | R-131, S-057 |
-| P0 | Keep issue #199 blocked until controller L0/L1 + #200; implement Contract 0.11 admission closure, caller cleanup, owner break-glass and tombstones without reviving V1. | R-048, R-126, R-132–R-138 |
+| P0 | Keep issue #199 blocked until controller L0/L1 + #200; implement Contract 0.12 admission/dependency closure, release fences, caller cleanup, owner break-glass and tombstones without reviving V1. | R-048, R-126, R-132–R-139 |
 | P1 | Memory Slice 0 physical qualification: Windows assets/roots/process/IPC/Surreal/Store/files/WriteId state/backup/rollback/erasure/rotation/shutdown. | R-002, R-006, R-019–R-020, R-071–R-116, R-133 |
 | P1 | Base Slice 1: event→Store/spool→replay→restart→exact open. | R-001–R-013, R-071–R-107 |
 | P1 | Base Slice 2: Claude relay, continuation, lexical retrieval, packet emission, notes/corrections/commitments and maintenance. | R-003–R-045 |
 | P1 | Controller V2 L0/L1 implementation under its roadmap. | R-130–R-131 |
-| P1 | P1a inference: principal, external WriteId state, one dispatch owner, admission classification, calls/copies/runner/read/caller-cleanup/retention/tombstones/inventory and one later context consumer. | R-047–R-057, R-117, R-124–R-138 |
+| P1 | P1a inference: principal, WriteId state, one dispatch owner, admission/dependency classification, calls/copies/runner/read/release fences/retention/tombstones/inventory and one later context consumer. | R-047–R-057, R-117, R-124–R-139 |
 | P2 | P1b rotation; embeddings; documents/views/Research/other hosts as independent increments. | R-015–R-018, R-031–R-032 |
 | Final | Broad deterministic/live/platform/load suites only after connected product. | R-049 |
 
 ## 8. CI state
 
-Memory PR #5325 remains documentation-only. The latest completed known gate before this continuation failed before MergeCompile:
+Memory PR #5325 remains documentation-only. Latest completed known gate before this continuation failed before MergeCompile:
 
 ```text
 base-owned workflow oracle       PASS
@@ -154,8 +157,8 @@ It also reported `surrealdb_provisioner = provision_failed`. No fabricated evide
 
 | Дата / commit | Изменение |
 |---|---|
-| 2026-10-26 / `abd2d046` | Architecture 10 / Implementation 31 / Cognition 14 / Contract 0.9 rebased from controller V1 to V2; brief spool cut and external-work inventory. |
-| 2026-10-26 / issue comments #200/#199 | Added allocator cases and retention/WriteId/credential-publication findings to controller owners. |
-| 2026-10-26 / `ec36adbb` | Contract 0.10: `retain_after_seq`, per-client allocator, stable list window, rollback-safe WriteId generator and auxiliary IDs. |
-| 2026-10-26 / `bedfd650`–`520c6e49` | Architecture 11 / Implementation 32 / Cognition 15 and active entry points synchronized with Contract 0.10. |
-| 2026-10-26 / `bb0e08e6`–current | Contract 0.11 + Architecture 12 / Implementation 33 / Cognition 16: backup admission closure, retired absent IDs, caller-vs-owner erase authority and pinned membership tombstones. |
+| 2026-10-26 / `abd2d046` | Architecture 10 / Implementation 31 / Cognition 14 / Contract 0.9 rebased from controller V1 to V2. |
+| 2026-10-26 / `ec36adbb` | Contract 0.10: `retain_after_seq`, per-client allocator, stable list window, rollback-safe WriteId generator. |
+| 2026-10-26 / `bedfd650`–`520c6e49` | Architecture 11 / Implementation 32 / Cognition 15 synchronized with Contract 0.10. |
+| 2026-10-26 / `bb0e08e6`–`60656166` | Contract 0.11 + Architecture 12 / Implementation 33 / Cognition 16: admission closure, caller-vs-owner authority and tombstones. |
+| 2026-10-26 / `44b373c4`–current | Contract 0.12 + Architecture 13 / Implementation 34 / Cognition 17: controller-closed/dependent split and backup release fences without lowering monotonic cut. |
