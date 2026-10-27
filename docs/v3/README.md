@@ -6,15 +6,15 @@ V1/V2 Memory implementations are donors. V3 is greenfield. Current `eliot-swarm-
 
 ## Reading order
 
-1. [Architecture draft.13](ARCHITECTURE.md) — product purpose, authority, Base, extensions and invariants.
-2. [Implementation draft.34](IMPLEMENTATION.md) — runtime, Store, Windows/process, durability, backup/rollback and implementation order.
-3. [Cognition draft.17](COGNITION.md) — reconstruction, retrieval, learning, backup dependency and revision algorithms.
-4. [Inference Contract 0.12](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
+1. [Architecture draft.14](ARCHITECTURE.md) — product purpose, authority, Base, extensions and invariants.
+2. [Implementation draft.35](IMPLEMENTATION.md) — runtime, Store, Windows/process, durability, backup/rollback and implementation order.
+3. [Cognition draft.18](COGNITION.md) — reconstruction, retrieval, learning, backup publication/dependency and revision algorithms.
+4. [Inference Contract 0.13](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
 5. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, decisions, gaps and queue.
 6. [Audit](AUDIT.md) — root causes, rejected machinery and evidence limits.
 7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for requirements and donors.
 
-Architecture 13, Implementation 34, Cognition 17, Contract 0.12 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
+Architecture 14, Implementation 35, Cognition 18, Contract 0.13 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
 
 None of these documents proves implemented runtime behavior.
 
@@ -141,7 +141,7 @@ This is still specification target. `docs/roadmap.md` is its sole status tracker
 
 Controller issue #200 blocks foundation correctness. Current binding allocation conflates selected pointer and next immutable revision. Draft PR #201 repairs fixtures but not allocator/schema semantics. Issue #199 owns later Memory extension and remains blocked on #200 and V2 L0/L1.
 
-## One-shot inference Contract 0.12
+## One-shot inference Contract 0.13
 
 Stable principal:
 
@@ -194,8 +194,6 @@ retired_not_admitted    exact healthy absence; old ID can never be sent
 admission_unknown       continuity incomplete
 ```
 
-A controller-continuous backup contains admitted calls only. Old backup never first-admits absent ID.
-
 Every admitted in-cut call is then:
 
 ```text
@@ -203,10 +201,40 @@ controller_closed
   backup is fully self-contained; controller row may later prune
 
 controller_dependent
-  backup still needs call state/result/copy/cleanup readback
+  backup still needs controller state/result/copy/cleanup readback
 ```
 
-While any restorable backup marks call `controller_dependent`, Memory blocks release that would remove required controller state/copies. This works even when call sequence is below current monotonic cut; do not lower `retain_after_seq`.
+Old backup never first-admits absent ID. `retain_after_seq` stays monotonic and is not lowered for in-cut dependencies.
+
+### Crash-safe publication fence
+
+Before writing backup parts or final manifest, Memory durably records a provisional maintenance fence with:
+
+```text
+backup candidate/generation
+expected final manifest identity + digest
+controller/client/high-water/cut
+exact controller-dependent calls
+publication_state = preparing
+```
+
+Release checks retained manifests and provisional fences. `preparing` and `publication_unknown` both block deletion of dependent controller state/copies.
+
+```text
+exact final manifest + parent durability/readback
+  -> publish into controlled backup set, then clear provisional fence
+
+definite pre-rename failure + exact final absence
+  -> aborted_before_publish, clear fence
+
+rename may have succeeded but sync/readback failed
+  -> publication_unknown, keep fence
+
+malformed/mismatch/ambiguity
+  -> keep fence and block release
+```
+
+Startup reconciles unresolved fences before any caller release or owner-cleanup handoff. A stale dependency index cannot authorize release; exact manifests plus unresolved maintenance jobs are authoritative.
 
 ### Cleanup authority
 
@@ -214,7 +242,7 @@ With valid caller:
 
 ```text
 queued call: optional inference.cancel
-then inference.release(...), subject to backup release fence
+then inference.release(...), subject to retained/provisional backup fences
 ```
 
 Controller-owner `inference.erase` is local break-glass. Memory has no owner credential, cannot submit it and records `owner_action_required` until non-content owner readback.
@@ -232,7 +260,7 @@ After rollback:
 - out-of-target results are not adopted;
 - valid caller uses dependency-aware cancel/release-abandon;
 - unavailable caller produces owner-action-required debt;
-- history gap, missing dependent copy or unavailable identity keeps inference disabled;
+- history gap, publication unknown, missing dependent copy or unavailable identity keeps inference disabled;
 - Base remains usable.
 
 Controller-local install/rotate publishes raw token only into admitted create-new/no-reparse restrictive-ACL private destination. Memory never receives controller owner authority.
@@ -259,7 +287,7 @@ Controller-local install/rotate publishes raw token only into admitted create-ne
 1. **Base Slice 1:** event → Store/spool → replay → restart → exact open.
 2. **Base Slice 2:** qualified Claude relay, continuation, lexical retrieval, actual context emission, notes/corrections/commitments and Base maintenance.
 3. **Controller #200 + V2 L0/L1:** repair specification/validator, then implement fresh foundation; never extend V1.
-4. **Inference P1a:** stable principal, WriteId state, single dispatch owner, admission/dependency classification, calls/private copies, text runner, dependency-aware cleanup, high-water/list/retention/tombstones, owner break-glass boundary and one result changing later context.
+4. **Inference P1a:** stable principal, WriteId state, single dispatch owner, admission/dependency classification, provisional publication fences, calls/private copies, text runner, dependency-aware cleanup, high-water/list/retention/tombstones, owner break-glass boundary and one result changing later context.
 5. **Inference P1b:** rotation, stale-session fence and delayed credential retirement.
 6. Independent embeddings, views, documents, Research and additional hosts.
 7. Advanced curation only after Base paths work.
