@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.18 · 2026-10-26 · normative algorithms used by V3.**
+**Revision 1.0-draft.19 · 2026-10-27 · normative algorithms used by V3.**
 
-[Architecture](ARCHITECTURE.md) owns product/authority invariants. [Implementation](IMPLEMENTATION.md) owns runtime and persistence. [Inference Contract 0.13](INFERENCE-CONTRACT.md) owns the sole Memory↔controller call boundary. This document defines reconstruction, retrieval, learning, revision and self-improvement algorithms.
+[Architecture](ARCHITECTURE.md) owns product/authority invariants. [Implementation](IMPLEMENTATION.md) owns runtime and persistence. [Inference Contract 0.14](INFERENCE-CONTRACT.md) owns the sole Memory↔controller call boundary. This document defines reconstruction, retrieval, learning, revision and self-improvement algorithms.
 
 Nothing here implies model-weight training. Initial learning changes external memory, processing methods, context selection and bounded configuration.
 
@@ -17,7 +17,7 @@ Base cognition works without controller inference:
 - deterministic applicability/grounds handling;
 - bounded context packing.
 
-Model-assisted learning waits for controller V2 issue #200, V2 L0/L1 and Contract 0.13 P1a. Missing inference never disables Base.
+Model-assisted learning waits for controller V2 issue #200, V2 L0/L1 and Contract 0.14 P1a. Missing inference never disables Base.
 
 ## 1. Observations, claims and revisions
 
@@ -299,7 +299,7 @@ During normal live recovery, prepared ID may still first-admit. During backup/re
 6. Retain malformed/partial transport facts without cognitive success.
 7. Publish accepted revisions atomically under expected revisions.
 8. Create release WriteId only after verified Memory copy or terminal no-result.
-9. Before sending release, re-evaluate retained backup manifests and unresolved provisional publication fences.
+9. Before sending release, scan valid retained backup manifests and unresolved installation-scoped backup fences.
 
 Store conflict replays retained decoded proposal/result, not inference.
 
@@ -316,7 +316,7 @@ operational_failed       admission/provider/readback failure, no cognitive body
 
 Profile unavailable/disallowed, disclosure mismatch, provider failure, no result, malformed output, truncation or omitted input is not successful no-change.
 
-### 9.5 Cleanup authority and backup release fences
+### 9.5 Cleanup authority and backup release/retention fences
 
 Cleanup is separate from cognitive outcome:
 
@@ -325,6 +325,8 @@ Cleanup is separate from cognitive outcome:
 - unresolved work selected for erasure → `abandon_for_erasure`.
 
 With valid caller, queued work may first receive `inference.cancel`, then caller `inference.release(...)`.
+
+One controller-mutation owner serializes call admission, cancel, release and retention advance. Backup closes/drains this owner before installing a plan fence, so cleanup/retention cannot pass a stale no-fence observation.
 
 For each admitted in-cut call, backup stores:
 
@@ -335,11 +337,13 @@ controller_dependent
 
 `controller_closed` means backup contains exact terminal Memory-owned result/no-result and no future controller settlement, copy, cleanup or readback is required.
 
-`controller_dependent` means backup still needs controller status, current/future result bytes or cleanup/readback. While any retained manifest **or unresolved provisional publication fence** has this state for the call, release remains pending even when current Memory already copied/used result.
+`controller_dependent` means backup still needs controller status, current/future result bytes or cleanup/readback. While any valid retained manifest **or unresolved installation-scoped fence** has this state for the call, release remains pending even when current Memory already copied/used result.
 
-A provisional fence is installed before backup filesystem publication. It remains active in `preparing` and `publication_unknown`. It clears only after exact final-path reconciliation proves a matching retained manifest or definite pre-rename failure with absence.
+An installation-scoped `fence.json` is published outside rollback Store roots before any backup part. It contains a canonical plan and `backup_plan_digest`; the digest excludes itself, publication state and later part/manifest digests. The final manifest repeats the plan digest and actual inventories. There is no precommitted digest of the final manifest inside Store data being backed up.
 
-Do not lower `retain_after_seq`; preservation comes from controller no-prune-unreleased rule.
+`preparing` and `publication_unknown` fences also pin post-cut retention at their recorded high-water. They clear only after exact installation-file reconciliation yields a valid matching manifest or durable abort after final-manifest absence and partial cleanup.
+
+Do not lower `retain_after_seq`; preservation comes from controller no-prune-unreleased rule for in-cut dependencies and the provisional/retained high-water denominator for post-cut inventory.
 
 Controller-owner `inference.erase` is local break-glass. Memory cannot call it. When caller cleanup unavailable, Memory records `owner_action_required` plus non-content call identity and waits for observed owner readback. Request alone is not effect.
 
@@ -409,33 +413,51 @@ Prediction records expected observation before action, conditions and available 
 
 Research starts from retained Memory/exact local sources. External acquisition answers concrete remaining gap. Store compact findings, alternatives, coverage and exact report/source handles. Failed request, completed-uninformative and useful-partial are different outcomes. Do not loop merely because uncertainty remains.
 
-## 14. Backup admission closure, dependency pins, publication and rollback
+## 14. Backup admission closure, plan fences, publication and rollback
 
-### 14.1 Admission and dependency cut
+### 14.1 Admission/dependency cut and canonical plan
 
 Before controlled backup:
 
-1. stop new controller-backed admission requests;
-2. pause/drain single controller-dispatch owner so no send races cut;
-3. persist every already-created call/cancel/release WriteId;
-4. authenticate exact controller/client identity;
-5. classify every call ID:
+1. stop new application mutations and controller-backed work;
+2. close/drain the single controller-mutation owner so no call/cancel/release/retention send races the cut;
+3. pause replay and reconcile active Store-write outcome;
+4. persist every already-created call/cancel/release WriteId;
+5. authenticate exact controller/client identity;
+6. classify every call ID:
    - exact call/readback → `admitted` + `admission_seq`;
    - exact healthy absence/no sender → `retired_not_admitted`, never send again;
    - unavailable/ambiguous → `admission_unknown`, continuity gap;
-6. reconcile created cancel/release from actual call state or retire proven-unsent mutation;
-7. classify every admitted call:
+7. reconcile created cancel/release from actual call state or retire proven-unsent mutation;
+8. classify every admitted call:
    - `controller_closed` if backup is fully self-contained and no controller state/copy remains required;
    - otherwise `controller_dependent`;
-8. record controller `high_water` and guaranteed `retain_after_seq`;
-9. durably record provisional backup dependency fence with expected manifest identity/digest and every dependent call;
-10. only then publish backup files.
+9. record controller `high_water` and guaranteed `retain_after_seq`;
+10. under brief spool lock capture exact spool cut/generation and immutable entry inventory, then release lock;
+11. construct a canonical immutable plan containing backup ID, expected final-manifest relative identity, selected root/schema/spool cut, controller/client/token/high-water/cut, admitted dependency classifications, retired attempts, strictest disclosure and explicit gaps;
+12. compute `backup_plan_digest` over explicit plan fields excluding its own digest, publication state and later page/part/manifest digests;
+13. durably publish and read back installation-scoped `backups/<id>/fence.json` outside rollback Store roots;
+14. only then publish backup parts and final manifest.
 
-Installation-scoped WriteId generator is not part of rollback backup.
+The final manifest repeats `backup_plan_digest` and actual page/blob/spool/deletion/config inventories/digests. It never requires a precommitted digest of itself. The Store maintenance row mirrors status but is not the rollback-safe authority.
+
+Installation-scoped WriteId generator and backup fences are not part of rollback Store backup.
 
 A controller-continuous backup contains admitted calls only. Local source/recipe intent may remain after retired attempt, but retired ID is not a call and does not pin retention.
 
-### 14.2 Publication state and reconciliation
+### 14.2 Publication records and reconciliation
+
+Controlled directory:
+
+```text
+backups/<backup-id>/
+  fence.json
+  parts/...
+  manifest.json
+  abort.json?
+```
+
+Derived states:
 
 ```text
 preparing
@@ -444,21 +466,23 @@ published
 aborted_before_publish
 ```
 
-- Matching final manifest with file + parent durability/readback → include in controlled backup set; clear provisional fence only after backup-set readback/dependency scan reproduces every call.
-- Definite pre-rename failure plus exact final-path absence → `aborted_before_publish`; clear fence.
-- Rename may have succeeded but directory sync/readback failed → `publication_unknown`; keep fence.
-- Malformed/mismatched/ambiguous final state → keep fence and block release.
+- Exact fence plus valid matching manifest with file/parent durability/readback → include in controlled retained backup set; plan/dependency sets must match.
+- Exact fence plus no valid final manifest, durable partial cleanup and matching create-new abort record → `aborted_before_publish`.
+- Fence with no valid manifest or abort → `preparing | publication_unknown`.
+- Malformed/mismatched/ambiguous record set → `publication_unknown`.
 
-Startup reconciles unresolved fences before any caller release or owner-cleanup handoff. Missing/stale dependency index cannot authorize release; scan exact manifests plus unresolved maintenance jobs or fail closed.
+Startup/restore/maintenance scans installation records before release, owner-cleanup handoff or retention advance. Missing/stale Store job/index cannot authorize cleanup; exact file scan or fail closed.
 
-### 14.3 Post-cut retention cut
+### 14.3 Post-cut retention denominator
 
 ```text
 required_retain_after_seq =
-  minimum high_water among every locally retained restorable backup
+  minimum high_water among:
+    valid locally retained restorable backups
+    unresolved preparing/publication_unknown fences
 ```
 
-After local backup set changes durably, create maintenance record with expected/new cut and precommitted retention WriteId, then call `inference.retention.advance`. Lost reply reuses same ID. Advance before backup-set readback is invalid; failure to advance is conservative.
+After controlled backup set changes durably, create maintenance record with expected/new cut and precommitted retention WriteId, then call `inference.retention.advance` through controller-mutation owner. Lost reply reuses same ID. Advance before installation-record readback is invalid; failure to advance is conservative.
 
 Do not lower monotonic cut for in-cut dependencies. They remain protected because release is fenced and controller cannot prune open/unreleased call/copies.
 
@@ -500,14 +524,14 @@ All new inference remains disabled until inventory completes and every row is di
 
 When backup is retired/replaced/non-restorable:
 
-1. durably publish/read back new controlled backup set;
-2. reconcile unresolved publication jobs;
-3. recompute dependent calls from remaining manifests/fences;
+1. durably publish/read back the new installation-scoped controlled backup set;
+2. reconcile unresolved fence/manifest/abort records;
+3. recompute dependent calls and high-water denominator from remaining manifests/fences;
 4. clear release fence only for calls with no remaining dependency;
-5. then allow pending caller release;
-6. advance post-cut retain cut separately according to remaining backup high-waters.
+5. permit pending caller release only after immediate recheck under mutation owner;
+6. advance post-cut retain cut separately according to remaining retained/provisional high-waters.
 
-Crash before release is conservative. Never release first and then discover a retained or possible dependency.
+Crash before release/advance is conservative. Never release or advance first and then discover a retained or possible dependency.
 
 ## 15. Forgetting and erasure
 
@@ -542,7 +566,8 @@ work binding/source selection
 controller identity/WriteId admission
 backup admission closure
 backup dependency classification
-backup publication reconciliation/release fence
+backup plan/fence publication
+backup publication reconciliation/release-retention fence
 profile/disclosure/capacity
 provider execution/readback
 retention/history inventory
@@ -578,8 +603,8 @@ stable caller + precommitted global WriteId
 → exact result or typed no-result/unknown
 → decoded revision or valid no-change
 → later context reads resulting revision
-→ publication-safe dependency fence
-→ dependency-aware caller cleanup
+→ rollback-safe installation-scoped plan fence
+→ dependency-aware release and retention
 → backup admission closure + restart/rollback reconciliation
 ```
 
@@ -588,12 +613,14 @@ Retention/backup evidence:
 ```text
 backup contains admitted calls only
 → every admitted call is controller-closed or dependent
-→ provisional fence exists before manifest publication
-→ rename/sync/readback unknown keeps dependency fenced
+→ canonical plan digest has no self-reference
+→ installation-scoped fence exists before backup parts
+→ rollback cannot erase unresolved fence authority
+→ rename/sync/readback unknown pins release and retention
 → dependent call remains unreleased even below current cut
 → fixed-window list complete above cut
 → controller-closed call restores without controller row
-→ backup retirement clears fence
+→ valid abort/retirement clears pins
 → explicit history_gap/owner debt when guarantees unavailable
 ```
 
