@@ -9,28 +9,28 @@ Eliot is a memory, understanding and learning system for people and AI agents. I
 | Read | Purpose |
 |---|---|
 | [V3 navigation](docs/v3/README.md) | Current versions, reading order, selected construction and proof ceiling |
-| [Architecture draft.10](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
-| [Implementation draft.31](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/restore and implementation sequence |
-| [Cognition draft.14](docs/v3/COGNITION.md) | Current-work reconstruction, retrieval, learning and revision algorithms |
-| [Inference Contract 0.9](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
+| [Architecture draft.11](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
+| [Implementation draft.32](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
+| [Cognition draft.15](docs/v3/COGNITION.md) | Current-work reconstruction, retrieval, learning, retention and revision algorithms |
+| [Inference Contract 0.10](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
 | [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, source coverage and queue |
 | [Consolidated audit](docs/v3/AUDIT.md) | Evidence, criticism, donor analysis and rationale |
 
-Architecture 10, Implementation 31, Cognition 14 and Contract 0.9 describe one design at increasing depth. Source presence, specification text, a green build or a receipt does not establish a working capability.
+Architecture 11, Implementation 32, Cognition 15 and Contract 0.10 describe one synchronized design at increasing depth. Source presence, specification text, a green build or a receipt does not establish a working capability.
 
 The current documentation task is [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324) and [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
 ## Version boundary
 
-The existing Rust workspace, old architecture shards, scripts and workstream records describe **V2**. They remain available for selective investigation and reuse; their checklists do not authorize continuing V2 implementation or importing its physical architecture into V3.
+The existing Rust workspace, old architecture shards, scripts and workstream records describe **V2 Memory**. They remain available for selective investigation and reuse; their checklists do not authorize continuing V2 implementation or importing its physical architecture into V3.
 
 - [V2 source snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105)
 - [V2 unfinished audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete)
 - [V1 donor snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7)
 
-This is a documentation-stage donor freeze. Old source bytes and issues remain available; data import, runtime replacement and code removal are later separately scoped work. The V2 `ACTIVE.toml` registry still contains its historical active values and is not a V3 authority.
+This is a documentation-stage donor freeze. Old source bytes and issues remain available; data import, runtime replacement and code removal are later separately scoped work. The V2 `ACTIVE.toml` registry retains historical values and is not V3 authority.
 
-[Architecture authority](docs/ARCHITECTURE_CONTRACT.md) records the precedence. The active V3 owner documents define the design; the Russian audit explains evidence and alternatives without turning every idea into a required subsystem.
+[Architecture authority](docs/ARCHITECTURE_CONTRACT.md) records precedence. Active V3 owner documents define the implementation target; the audit explains evidence and alternatives without turning every idea into a required subsystem.
 
 ## Selected product boundary
 
@@ -47,12 +47,12 @@ real host event
 → exact source open
 ```
 
-The first learning extension is:
+First learning extension:
 
 ```text
 retained episode
 → exact processing recipe
-→ one controller V2 call with a precommitted WriteId
+→ one controller V2 call with precommitted global WriteId
 → typed result or unknown
 → ordinary Memory revision
 → changed later context
@@ -63,33 +63,45 @@ A provider result does not grant Memory authority or demonstrate external task c
 
 ## Controller boundary
 
-The current inspected controller authority is `UnknownAlienHuman/eliot-swarm-controller@c8c0ee122c98a01be86bc5296a22a389662a1c89` from merged PR #197. It selects a fresh local JSON-RPC + SQLite WAL V2 with canonical external ULID `WriteId` receipts and treats the old Rust/`swarm-client`/Operation runtime as legacy pending deletion.
-
-Memory therefore targets:
+Current inspected controller authority:
 
 ```text
-principal = memory_inference
-client_id = memory:<stable-installation-id>
-token_version = current credential generation
-call identity = client_id + WriteId + method + semantic payload
+UnknownAlienHuman/eliot-swarm-controller
+main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
+merged PR #198
 ```
 
-Memory commits `WriteId` before first send. Lost reply, restart or restore reuses the same ID and exact bytes. There is no separately discovered Operation ID, V1 protocol-v2 hello or Memory submission ledger. Exact details live only in [Contract 0.9](docs/v3/INFERENCE-CONTRACT.md).
+It selects a fresh local JSON-RPC + SQLite WAL V2 with global external ULID `WriteId` receipts and treats the old Rust/`swarm-client`/Operation runtime as V1 legacy pending deletion.
 
-Controller V2 must implement its own L0/L1 foundation before the inference extension. Do not patch its legacy runtime to make Memory appear connected.
+Memory targets:
+
+```text
+principal_kind = memory_inference
+client_id      = memory:<random-stable-installation-id>
+token_version  = current credential version
+call identity  = global WriteId + client_id + method + semantic payload
+```
+
+Memory persists each controller mutation WriteId before send. Lost reply, restart or restore reuses the same ID and exact bytes. Cancel, release and retention advance have their own precommitted IDs. One monotonic generator state lives outside rollback Store roots.
+
+Controller registration owns `last_admission_seq` and guaranteed `retain_after_seq`. A physical `earliest_retained_seq` is diagnostic only. Restore pages a fixed `(after, through]` interval; reads below the guaranteed cut return `history_gap`, never a false empty set.
+
+Exact details live only in [Contract 0.10](docs/v3/INFERENCE-CONTRACT.md).
+
+Controller issue #200 must repair binding-revision allocator/schema authority. V2 L0/L1 must then exist before issue #199 can implement Memory inference. Do not patch legacy controller runtime to make Memory appear connected.
 
 ## Repository work
 
 Follow [AGENTS.md](AGENTS.md), [START.md](START.md) and [WORKFLOW.md](WORKFLOW.md). Work from current `main`, preserve unrelated changes, use one writer per mutable scope and obtain independent review before integration.
 
-For implementation, follow the owner’s sequence:
+Implementation sequence:
 
 ```text
 write connected production code
 → cargo fmt --check
-→ minimum relevant package build/Clippy
+→ minimum relevant changed-package Clippy
 → continue vertical path
-→ broad tests after the connected product exists
+→ broad tests after connected product exists
 ```
 
 A documentation edit calls for documentation consistency checks. Runtime proof must match actual runtime behavior.
@@ -100,13 +112,13 @@ The [documentation map](docs/README.md) separates current V3 authority from V2 d
 
 | Repository | V3 relationship |
 |---|---|
-| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External agent/task execution and the Contract 0.9 one-shot inference boundary after controller V2 L0/L1 exists |
+| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External agent/task owner and Contract 0.10 one-shot inference boundary after controller #200 + V2 L0/L1 |
 | [eliot-search](https://github.com/UnknownAlienHuman/eliot-search) | Optional source preparation/retrieval adapter for a concrete selected path |
 | [eliot-research](https://github.com/UnknownAlienHuman/eliot-research) | Optional external research/acquisition owner for a concrete remaining gap |
 
 ## V2 donor reading tools
 
-The generated block below routes retained V2 documentation. It does not certify V3 or replace the current owner documents.
+The generated block below routes retained V2 documentation. It does not certify V3 or replace current owner documents.
 
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
