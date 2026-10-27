@@ -7,10 +7,10 @@ The owner retired V1/V2 Memory implementations as active product designs and sel
 | Need | Current V3 source |
 |---|---|
 | Stage, versions, reading order and proof ceiling | [v3/README.md](v3/README.md) |
-| Product purpose, ownership and invariants | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) — draft.16 |
-| Runtime, Store, maintenance and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.37 |
-| Reconstruction, retrieval, learning, rollback-safe backup dependencies/retirement and revision algorithms | [v3/COGNITION.md](v3/COGNITION.md) — draft.20 |
-| Memory↔controller V2 boundary | [v3/INFERENCE-CONTRACT.md](v3/INFERENCE-CONTRACT.md) — Contract 0.15 |
+| Product purpose, ownership and invariants | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) — draft.17 |
+| Runtime, Store, maintenance and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.38 |
+| Reconstruction, retrieval, learning, terminal backup authority, restore leases and revision algorithms | [v3/COGNITION.md](v3/COGNITION.md) — draft.21 |
+| Memory↔controller V2 boundary | [v3/INFERENCE-CONTRACT.md](v3/INFERENCE-CONTRACT.md) — Contract 0.16 |
 | Active decisions, gaps, source coverage and queue | [v3/ANALYSIS-REGISTRY.md](v3/ANALYSIS-REGISTRY.md) |
 | Consolidated evidence, criticism and donor rationale | [v3/AUDIT.md](v3/AUDIT.md) |
 | Requirement/source dispositions | [v3/AUDIT-MAP.md](v3/AUDIT-MAP.md) |
@@ -19,7 +19,7 @@ The owner retired V1/V2 Memory implementations as active product designs and sel
 
 Read Architecture, Implementation, Cognition and Inference Contract together when changing a load-bearing V3 boundary. `ANALYSIS-REGISTRY.md` is the only active audit/work ledger. Consolidated audit is evidence/rationale, not another normative book or task generator.
 
-### Current controller boundary
+### Current controller and backup boundary
 
 Inspected authority:
 
@@ -32,19 +32,15 @@ It selects fresh local JSON-RPC + SQLite WAL V2 with global external ULID `Write
 
 Memory uses dedicated `memory_inference` principal, stable random installation client ID, monotonic token version, rollback-safe installation WriteId state, private call-owned input/result copies and admission-sequence restore inventory.
 
-Controlled backup closes one controller-mutation owner before high-water: every created call ID is admitted, permanently retired as proven absent, or explicitly unknown. Every admitted in-cut call is `controller_closed` or `controller_dependent`.
+Controlled backup closes one controller-mutation owner and dispositions every call/cancel/release/retention WriteId before high-water. Every admitted call is `controller_closed` or `controller_dependent`; an absent old call or auxiliary ID is never first-admitted from backup.
 
-Before any backup part, Memory computes a canonical non-self-referential `backup_plan_digest` and durably publishes installation-scoped `backups/<id>/fence.json` outside rollback Store roots. Final manifest repeats plan digest and actual inventories. Store job mirrors status but is not authority.
+One in-process backup-set owner allocates random non-reused backup IDs, scans installation records, owns terminal transitions, restore read leases and physical cleanup. It is not a new service/table.
 
-A published backup leaves the restorable set only after a create-new durable `retire.json` binds backup ID, plan digest and observed manifest digest. Deleting fence/manifest/parts is not retirement. `abort.json` applies only before publication; abort and retire are mutually exclusive.
+`fence.json` contains the canonical plan before backup parts. Self-contained `abort.json` and `retire.json` remain terminal after content cleanup. Published non-retired backups and unresolved fences pin release and retention; terminal generations do not pin but surviving files remain cleanup debt.
 
-Until retirement-marker readback succeeds, backup remains restorable and pins release/retention. After success, restore refuses it and pins may be recomputed. Content cleanup is later and retirement tombstone remains; retirement is not physical erasure.
+Restore holds retained no-follow handles through candidate verification and final pre-cutover terminal-state recheck. Retirement, abort and cleanup wait. Restored Store maintenance rows are mirrors only and cannot alter installation authority or replay stale auxiliary mutations.
 
-`preparing` and `publication_unknown` provisional fences block release and pin post-cut retention. A dependent call cannot be released while any published non-retired or unresolved provisional backup needs controller state/result/copy. `retain_after_seq` remains monotonic and is not lowered for in-cut dependencies. Calls erased above cut retain bounded text-free membership tombstones until cut advances.
-
-Caller cleanup uses cancel/release. Controller-owner erase is external break-glass; Memory cannot submit it and retains owner-action-required debt until observed readback.
-
-Old V1 hello, generic Operation/artifact ownership and submission-state paths are donor history. Controller issue #200 plus V2 L0/L1 are prerequisites for issue #199 and Contract 0.15 runtime implementation.
+Old V1 hello, generic Operation/artifact ownership and submission-state paths are donor history. Controller issue #200 plus V2 L0/L1 are prerequisites for issue #199 and Contract 0.16 runtime implementation.
 
 ## Retained V2 donor documentation
 
@@ -67,7 +63,7 @@ Generated routing block below applies only to donor surfaces. Its receipts attes
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
 
-Start with the [mandatory verified-reading protocol](architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact repository paths and causal property being changed. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not reading evidence. The stable `ELIOT_*` files are compatibility maps, not task prompts.
+Start with the [mandatory verified-reading protocol](architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for the exact repository paths and causal property being changed. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not comprehension or current runtime proof. The stable `ELIOT_*` files are compatibility maps, not task prompts.
 <!-- eliot-doc-routing:end -->
 
 ## Documentation checks and evidence
