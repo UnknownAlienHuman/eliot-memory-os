@@ -1,6 +1,6 @@
 # Eliot V3 — One-shot inference contract
 
-**Revision 0.15-draft · 2026-10-27 · shared Memory OS ↔ `eliot-swarm-controller` V2 boundary; not implemented.**
+**Revision 0.16-draft · 2026-10-27 · shared Memory OS ↔ `eliot-swarm-controller` V2 boundary; not implemented.**
 
 This is the sole normative contract for one-shot text and embedding execution. Memory owns semantic work; controller owns authenticated physical model execution and bounded temporary copies. The boundary does **not** create a controller Agent, native session, Goal, Task/Attempt/review workflow, automation run, script, generic service-account platform, second receipt store or hidden retry ladder.
 
@@ -34,8 +34,8 @@ Memory owns:
 - processing-method revision and disclosure reduction;
 - exact request bytes and every Memory-side external `WriteId`;
 - result verification/copy, cognitive decoding/publication and later consumer;
-- backup admission closure, dependency classification, installation-scoped publication/retirement records and release/retention fences;
-- its caller-authorized cancel/release requests.
+- backup admission closure, dependency classification, installation-scoped backup-set authority, restore leases and release/retention fences;
+- caller-authorized cancel/release requests and cut disposition of every auxiliary mutation.
 
 Controller owns:
 
@@ -86,18 +86,27 @@ controller_admission_seq when admitted
 controller_dependency_state
 profile/connection/adapter/destination snapshot
 result digest/length when present
-cancel WriteId when created
-release WriteId + disposition when created
+cancel WriteId + auxiliary state when created
+release WriteId + disposition + auxiliary state when created
+retention-advance WriteId + expected/new cut + auxiliary state when created
 per-copy cleanup state
 ```
 
-Admission state:
+Call admission state:
 
 ```text
 prepared
 admitted
 retired_not_admitted
 admission_unknown
+```
+
+Auxiliary mutation cut state:
+
+```text
+effect_observed
+retired_not_sent
+mutation_unknown
 ```
 
 Backup dependency state for an admitted call:
@@ -107,7 +116,7 @@ controller_closed
 controller_dependent
 ```
 
-`retired_not_admitted` is terminal for that call WriteId: exact healthy cut readback proved absence, and the ID can never be sent later. No backup contains raw token, token hash, routing key, provider credential or reusable verifier.
+`retired_not_admitted` is terminal for a call WriteId: exact healthy cut readback proved absence, and the ID can never be sent later. `retired_not_sent` is the same prohibition for an auxiliary mutation. No backup contains raw token, token hash, routing key, provider credential or reusable verifier.
 
 ## 3. Exact JSON-RPC surface
 
@@ -261,7 +270,7 @@ absent excessive future ID                 -> id_future
 
 After normal disconnect or daemon restart, Memory deliberately invokes the same method with the same retained WriteId and exact bytes. Controller returns the existing call or performs first admission. Provider-send uncertainty is retained call state, never permission to use another WriteId.
 
-**Restore is stricter:** an old backup never first-admits an absent call WriteId. Section 15 owns cut classification and restore behavior.
+**Restore is stricter:** an old backup never first-admits an absent call or auxiliary WriteId. Section 15 owns cut classification and restore behavior.
 
 ## 8. Minimal durable controller state
 
@@ -306,6 +315,8 @@ InferenceCall {
   state,
   native_request_id?,
   result digest/length/copy state?,
+  last_cancel_write_id?,
+  last_release_write_id?,
   observed model/usage/cost/account when supplied,
   terminal_code?,
   erased_tombstone?,
@@ -314,7 +325,7 @@ InferenceCall {
 }
 ```
 
-Raw input/result bytes, provider credentials and raw provider errors do not enter receipts/call rows.
+Raw input/result bytes, provider credentials and raw provider errors do not enter receipts/call rows. `inference.get` exposes the bounded non-secret cancel/release facts needed to reconcile auxiliary intent. Current `retain_after_seq` is the authoritative effect readback for retention advancement; no generic receipt-query API is required.
 
 ## 9. Profiles, destination and disclosure
 
@@ -370,7 +381,7 @@ verified pending result -> finish settlement
 abandoned               -> never dispatch/publish late result
 ```
 
-## 12. Caller cleanup, backup release fences and owner break-glass
+## 12. Caller cleanup, backup owners and owner break-glass
 
 `inference.get` returns bounded non-content status only to exact current `client_id`.
 
@@ -397,23 +408,18 @@ inference.release
 inference.retention.advance
 ```
 
-Backup closes and drains this owner before installing its plan fence. A release or retention advance cannot pass a stale “no fence” read while a new backup fence is being published.
+One in-process **backup-set owner** owns installation-scoped backup ID allocation, record scanning, fence/terminal transitions, restore leases and physical backup cleanup. It is a mutex/owner task plus retained OS handles, not a service, table or durable workflow engine.
 
-Normal cleanup with a valid caller:
+Pin-set transitions (`fence.json`, `abort.json`, `retire.json`) and controller release/retention decisions are ordered so no release or retention advance can pass a stale controlled-set snapshot. The controller-mutation owner is closed/drained before a new fence is published; terminal transitions complete under the backup-set owner before mutation sends are re-evaluated.
 
-```text
-queued call: optional inference.cancel
-then inference.release(...)
-```
+Before sending any release that could delete state or bytes, Memory obtains an exact controlled-set snapshot from the backup-set owner and checks:
 
-Before sending any release that could delete state or bytes, Memory scans both:
-
-1. every valid locally retained restorable backup manifest that has no valid retirement marker; and
+1. every valid locally retained restorable backup; and
 2. every unresolved installation-scoped provisional backup fence.
 
 If either marks the call `controller_dependent`, release is blocked and remains pending. Current Memory may copy/use a result, but controller state/copies needed by a backup candidate remain unreleased.
 
-Once all dependent backups retire, are replaced or become non-restorable, and every provisional publication/retirement outcome is durably reconciled, the release fence clears and ordinary cleanup may proceed. Erasure first retires and physically deletes or invalidates every dependent controlled backup/candidate, then uses caller abandon.
+Once all dependent backups retire or abort, every terminal transition is durably reconciled and no active restore lease exists, the release fence may clear. Erasure first retires/aborts and physically deletes every dependent controlled backup/candidate, then uses caller abandon.
 
 Controller-owner `inference.erase` is a **local break-glass path** for a missing/disabled caller or explicit emergency. Its WriteId is generated/submitted by controller owner, not Memory. Memory may retain bounded non-content `owner_action_required` and consume later owner readback, but cannot send owner mutation or claim it from request alone. If caller cleanup is unavailable and no owner result is observed, cleanup remains visible debt and rollback/erasure is incomplete.
 
@@ -471,25 +477,63 @@ new_retain_after_seq
 
 It only increases, checks expected current value and never exceeds admitted high-water. Same WriteId replay is exact; mismatch conflicts.
 
-## 14. Controlled backup-set lifecycle
+## 14. Installation-scoped controlled backup set
 
-For exact `controller_id + client_id`, the authoritative local set is derived from installation-scoped immutable records:
+One backup ID is a fixed-width random 128-bit value from the OS CSPRNG. The backup-set owner allocates it by creating the top-level backup directory/fence with no-replace semantics. It is never derived from rollback Store state, user content or wall-clock alone. Any existing directory, fence or terminal tombstone is a collision; the ID is never reused.
+
+Before any record access, the owner validates the backup directory and ancestors no-follow and retains exact handles. Unknown entry types, reparses or malformed records make that generation unresolved.
+
+### 14.1 Self-contained terminal markers
+
+`abort.json` and `retire.json` are immutable terminal tombstones after their creation prerequisites are validated.
+
+Common bounded fields:
 
 ```text
-valid fence + valid matching manifest + no valid retire marker
-  -> retained restorable backup
+format_version
+kind = aborted_before_publish | retired
+backup_id
+backup_plan_digest
+observed_fence_digest
+terminal_operation_id
+closed non-content reason_code
+```
 
-valid fence + valid matching manifest + valid retire marker
+`retire.json` additionally contains `observed_manifest_digest`. `terminal_operation_id` is deterministic from the operation kind plus backup/plan/manifest identity; retry never invents a second ID.
+
+Creation prerequisites:
+
+- abort: exact fence, no valid final manifest, no live writer/restore lease, partial parts deleted or quarantined, directory synced and final-manifest absence read back;
+- retire: exact valid published fence+manifest, no abort marker and no active restore lease.
+
+Once the marker is durably published and read back, it remains terminal even after fence/manifest/parts are later deleted. The terminal marker alone prevents restore and backup-ID reuse. Surviving authority files must match its recorded digests; mismatch, malformed marker or both terminal kinds is an integrity failure and remains fail-closed.
+
+Terminal markers are retained in the initial product. They are not physical-erasure receipts and contain no arbitrary user text.
+
+### 14.2 Derived states
+
+For exact `controller_id + client_id`, state is derived in this order:
+
+```text
+valid standalone retire tombstone
   -> retired non-restorable generation
 
-valid fence + no valid manifest + valid abort marker
+valid standalone abort tombstone
   -> aborted-before-publish candidate
 
-all malformed/mismatched/ambiguous combinations
+valid fence + valid matching manifest + no terminal marker
+  -> retained restorable backup
+
+valid fence + no valid manifest + no terminal marker
+  -> preparing | publication_unknown
+
+all malformed/mismatched/both-terminal/unknown combinations
   -> unresolved and conservatively pinned
 ```
 
-### 14.1 Post-cut retention denominator
+Retired and aborted tombstones do not pin release or retention. Any surviving content under them is physical-cleanup debt only. A terminal tombstone never becomes restorable because prerequisite files reappear.
+
+### 14.3 Post-cut retention denominator
 
 ```text
 required_retain_after_seq =
@@ -499,36 +543,28 @@ required_retain_after_seq =
       in preparing | publication_unknown
 ```
 
-Retired and aborted generations do not pin. If neither retained nor provisional backup remains, Memory may advance to a current durable continuity cut.
+If neither retained nor provisional backup remains, Memory may advance to a current durable continuity cut.
 
-### 14.2 Published-backup retirement
+### 14.4 Restore lease and maintenance ordering
 
-A valid published backup is never retired by deleting `manifest.json`, `fence.json` or parts in place. Retirement is one monotonic local operation:
+Restore is admitted only through the backup-set owner. It acquires one exact read lease over the chosen backup directory and retained no-follow handles to fence, manifest and required parts. Retirement, abort and physical cleanup for that backup wait until the lease ends.
 
-1. serialize through the backup-maintenance owner and require an exact valid published backup;
-2. create one immutable `retire.json` with backup ID, `backup_plan_digest`, observed final-manifest digest, local retirement operation ID/reason and format version;
-3. publish create-new/no-reparse with file and parent-directory durability and exact readback;
-4. only after matching readback exclude the backup from restore and from release/retention pin scans;
-5. recompute dependency and high-water denominators before caller release or retention advance;
-6. perform content-bearing part/manifest/fence cleanup later; retain the text-free retirement tombstone so backup ID cannot become restorable or be reused.
+The lease remains through candidate materialization, verification and the final pre-cutover terminal-record recheck. Then restore either completes selection cutover or abandons the disposable candidate. Process crash releases the lease; startup discards the candidate and re-derives backup state from installation records.
 
-`retire.json` is valid only for a previously valid matching manifest. It is mutually exclusive with `abort.json`. A preparing/publication-unknown candidate must reconcile or abort; it cannot retire.
+A backup may not retire while a restore lease exists, and a new restore lease is refused after a valid retire/abort tombstone. Initial scanning without a held lease is not restore authority.
 
-Retirement publication unknown leaves the backup retained and pinned. Repeated retirement is exact idempotent readback of the same marker, never overwrite or a second operation ID.
+### 14.5 Retention advance ordering
 
-Retirement is not physical erasure. If parts still contain erased scope, complete erasure remains incomplete until their exact deletion/durability is proved.
+After publication, terminal transition or physical cleanup changes are durably read back:
 
-### 14.3 Retention advance ordering
+1. derive the authoritative controlled set through the backup-set owner;
+2. recompute the desired cut from current installation records;
+3. persist a fresh Memory maintenance record with exact expected/new cut and retention-advance WriteId;
+4. send through the controller-mutation owner;
+5. reconcile lost reply from current cut readback;
+6. never lower cut after restoring older Memory state.
 
-After publication/retirement/abort or physical cleanup changes are durably read back:
-
-1. derive the authoritative controlled set from fence/manifest/abort/retire records;
-2. persist a Memory maintenance record with exact expected/new cut and retention-advance WriteId;
-3. send `inference.retention.advance` through the controller-mutation owner;
-4. reconcile lost reply with same WriteId;
-5. never lower cut after restoring older Memory state.
-
-Crash before advance is conservative. Advance before durable controlled-set readback is invalid. A newly retained or still-provisional backup below current cut is history-gapped and cannot silently join the restorable set.
+A restored pending retention intent is never sent merely because its Store row says prepared. It is reconciled or retired, then current desired state is recomputed. Crash before a fresh advance is conservative. Advance before durable controlled-set readback is invalid.
 
 In-cut dependencies do **not** lower this monotonic cut. They are protected by retained/provisional release fences and no-prune-unreleased behavior.
 
@@ -547,6 +583,7 @@ controller retain_after_seq
 all admitted in-cut call WriteIds + admission_seq + canonical identity
 per-call controller_closed | controller_dependent
 all retired_not_admitted local attempts
+all auxiliary mutation WriteIds + effect_observed | retired_not_sent | mutation_unknown
 known result/release/cleanup facts
 explicit admission/authority gaps
 ```
@@ -558,30 +595,34 @@ Before reading high-water, Memory:
 1. stops new application mutations and new controller-backed work;
 2. closes and drains the single controller-mutation owner so no call/cancel/release/retention send races the cut;
 3. pauses replay and reconciles the active item/Store-write unknown;
-4. persists every created call/cancel/release WriteId;
+4. persists every created call, cancel, release and retention-advance WriteId;
 5. authenticates exact controller/client identity;
 6. classifies every call WriteId:
    - `inference.get` proves one call → `admitted`, retain exact `admission_seq`;
    - exact healthy absence with no in-flight sender → `retired_not_admitted`, ID forbidden from later send;
    - unavailable/ambiguous readback → `admission_unknown`, controller continuity incomplete;
-7. reconciles created cancel/release from actual call state, or retires a proven-unsent auxiliary mutation;
+7. classifies every auxiliary WriteId from exact call/current-cut readback:
+   - intended effect already visible or superseded by a later safe effect → `effect_observed`;
+   - exact no-send under the drained owner → `retired_not_sent`, ID forbidden from later send;
+   - unavailable/ambiguous state → `mutation_unknown`, controller continuity incomplete;
 8. classifies every admitted call:
    - `controller_closed` only when backup contains exact terminal Memory-owned result/no-result, no future controller settlement/publication is possible, and no controller copy/cleanup/readback remains required;
    - otherwise `controller_dependent`;
 9. reads `high_water + retain_after_seq`;
 10. under the brief spool-publication lock captures the exact spool cut/generation and immutable entry inventory, then releases the lock;
-11. constructs a canonical immutable backup plan containing:
+11. obtains a fresh non-reused backup ID from the backup-set owner;
+12. constructs a canonical immutable backup plan containing:
     - format/schema version and backup ID;
     - expected final manifest relative identity;
     - selected root/selection/schema and spool-cut identity;
     - controller/client/token/high-water/retain-cut facts;
     - admitted calls, dependency states and exact dependent call IDs/sequences;
-    - retired attempts, strictest disclosure and explicit gaps;
-12. computes `backup_plan_digest` over that explicit field set **excluding** the digest field itself, publication state and every later page/part/manifest digest;
-13. durably publishes an installation-scoped create-new `fence.json` beneath the controlled backup directory, outside rollback Store roots, containing the canonical plan and `backup_plan_digest`;
-14. reads back the exact fence and only then begins publishing backup parts and final manifest.
+    - call and auxiliary cut dispositions, strictest disclosure and explicit gaps;
+13. computes `backup_plan_digest` over that explicit field set **excluding** the digest field itself, publication state and every later page/part/manifest digest;
+14. durably publishes an installation-scoped create-new `fence.json` beneath the controlled backup directory, outside rollback Store roots, containing the canonical plan and `backup_plan_digest`;
+15. reads back the exact fence and only then begins publishing backup parts and final manifest.
 
-The ordinary Memory maintenance/job row mirrors operation status for control/inbox, but it is not the sole release/retention authority and may be rolled back. The authoritative provisional fence is the installation-scoped file plus valid final/abort/retire records. No controller table or backup-pin service is added.
+The ordinary Memory maintenance/job row mirrors operation status for control/inbox, but it is not release/retention/restore authority and may be rolled back. Only a current-timeline control operation may allocate a new backup ID or publish a terminal marker.
 
 The final manifest contains the exact `backup_plan_digest` plus actual page/blob/spool/deletion/config inventories, counts and digests. It does **not** contain or require a precommitted digest of itself. The manifest byte digest is computed only after final publication/readback and may be stored as observed status/index data.
 
@@ -594,34 +635,23 @@ backups/<backup_id>/
   fence.json       # immutable canonical plan, published first
   parts/...        # immutable backup parts
   manifest.json    # immutable final manifest
-  abort.json?      # pre-publication abort only
-  retire.json?     # previously published backup made non-restorable
+  abort.json?      # self-contained pre-publication terminal tombstone
+  retire.json?     # self-contained published-backup retirement tombstone
 ```
 
-Derived publication states:
+The backup-set owner derives state by §14.2. Exact Memory rollback cannot remove this authority.
 
-```text
-preparing
-publication_unknown
-published
-aborted_before_publish
-retired
-```
+On startup or after restore, before the ordinary job runner is enabled:
 
-Publication/reconciliation rules:
+1. scan and validate installation-scoped backup records;
+2. rebuild the controlled-set snapshot and active restore leases;
+3. reconcile Store maintenance mirrors to observed installation state;
+4. mark unmatched/restored future-timeline mirrors `superseded_by_installation_state`;
+5. forbid those mirrors from creating fence/abort/retire records, clearing pins or sending retention/release mutations.
 
-- exact `fence.json` + valid final manifest whose `backup_plan_digest` and dependent-call set match + file/parent durability/readback + no retire marker → include in controlled retained backup set and derive `published`;
-- definite abandonment before a valid final manifest, followed by exact final-manifest absence, deletion/quarantine of partial parts, parent-directory durability and matching create-new `abort.json` → derive `aborted_before_publish`;
-- valid published backup + exact matching durable `retire.json` → derive `retired`, refuse restore and clear pins only after controlled-set readback;
-- fence exists with no valid matching manifest and no valid abort record → `preparing | publication_unknown`; keep every release/retention pin;
-- retirement marker absent/unknown/mismatched while a valid backup exists → keep backup published and pinned;
-- `abort.json` and `retire.json` together, or any malformed/mismatched/ambiguous record set → `publication_unknown` and fail closed.
+A stale/missing Store dependency index or maintenance row cannot authorize release, retirement, restore or retention advance. The installation-scoped WriteId generator is also not rolled back with Store root.
 
-Startup, restore and maintenance scan installation-scoped records before any `inference.release`, owner-cleanup handoff or `inference.retention.advance`. Exact Memory rollback cannot remove this authority. A stale/missing Store dependency index or maintenance row cannot authorize release, retirement or retention advance.
-
-The installation-scoped WriteId generator is also not rolled back with Store root.
-
-### 15.3 In-cut jobs after restore
+### 15.3 In-cut jobs and auxiliary mutations after restore
 
 ```text
 controller_closed
@@ -633,11 +663,26 @@ controller_dependent
   absence/mismatch is damaged/history_gap
 
 retired_not_admitted
-  never send old ID; optionally schedule fresh successor after inventory
+  never send old call ID; optionally schedule fresh successor after inventory
 
 admission_unknown
   hold; inference remains disabled
 ```
+
+For cancel/release/retention auxiliary IDs:
+
+```text
+effect_observed
+  retain the observed effect; never resend the old ID
+
+retired_not_sent
+  old ID remains forbidden from send
+
+mutation_unknown
+  hold controller maintenance/inference until exact readback
+```
+
+After post-cut inventory, a still-needed cancel/release is recomputed from current call state and current controlled-set pins. A still-needed retention advance is recomputed from the current installation backup set and controller cut. Any new mutation receives a fresh WriteId; an absent old auxiliary WriteId is never first-admitted from backup.
 
 Payload mismatch is `id_conflict`; unavailable caller holds without call.
 
@@ -650,9 +695,9 @@ inference.list(after = backup_high_water,
                through = inventory_high_water)
 ```
 
-Because every definitely absent cut attempt was retired, returned calls lie outside backup's admitted external-work set. Results are not adopted as cognition. With valid caller, cleanup uses caller cancel/release-abandon after backup/provisional dependency checks. Without caller, Memory records owner-action-required debt and waits for controller-local owner readback.
+Because every definitely absent cut attempt was retired, returned calls lie outside backup's admitted external-work set. Results are not adopted as cognition. With valid caller, cleanup uses caller cancel/release-abandon after controlled-set dependency checks. Without caller, Memory records owner-action-required debt and waits for controller-local owner readback.
 
-All new controller-backed inference stays disabled until inventory completes and every row is dispositioned. Base remains usable. `history_gap`, unavailable controller/caller, admission unknown, publication/retirement unknown or identity reset leaves `external_work_inventory_unavailable`; it never becomes false empty or complete rollback.
+All new controller-backed inference stays disabled until inventory completes and every row is dispositioned. Base remains usable. `history_gap`, unavailable controller/caller, admission unknown, auxiliary mutation unknown, publication/terminal-record unknown or identity reset leaves `external_work_inventory_unavailable`; it never becomes false empty or complete rollback.
 
 ## 16. Rotation and disable
 
@@ -682,12 +727,13 @@ Initial text adapter is a closed loopback-compatible OpenAI chat-completions sub
 6. get/range-read/cancel/release/high-water/list/retention-advance;
 7. erased tombstones plus non-disclosing owner break-glass;
 8. Memory WriteId generator and one controller-mutation owner;
-9. admission/dependency cut classification and canonical backup plan;
-10. installation-scoped provisional fence publication and startup/rollback reconciliation;
-11. published-backup retirement marker and controlled-set reconstruction;
-12. retained/provisional backup release and retention fences;
-13. one episode result copied, decoded, published, consumed later and eventually released;
-14. backup admission/high-water/retention/inventory round-trip.
+9. backup-set owner, non-reused backup IDs and restore leases;
+10. admission/dependency/auxiliary cut classification and canonical backup plan;
+11. installation-scoped provisional fence publication and startup/rollback reconciliation;
+12. self-contained abort/retire terminal tombstones and controlled-set reconstruction after content cleanup;
+13. retained/provisional backup release and retention fences;
+14. one episode result copied, decoded, published, consumed later and eventually released;
+15. backup admission/high-water/retention/inventory round-trip.
 
 ### P1b
 
@@ -705,22 +751,26 @@ Eventually prove:
 - global WriteId collision and floor/future behavior;
 - generator continuity across Memory rollback;
 - same live call WriteId before send/lost reply/restart;
-- backup cut admits, retires or gaps every created call ID before high-water;
-- one controller-mutation owner prevents release/retention race with fence installation;
-- retained backup never first-admits absent old call ID;
+- backup cut dispositions every call/cancel/release/retention WriteId before high-water;
+- one controller-mutation owner prevents release/retention race with fence/terminal transitions;
+- retained backup never first-admits absent old call or auxiliary ID;
 - controller-closed job restores without controller row;
 - controller-dependent job below current cut blocks release and restores exact row/result;
 - backup-plan digest has no self-reference and final manifest matches exact plan/dependency set;
 - exact rollback preserves unresolved provisional fence authority;
 - preparing/publication-unknown high-water pins retention as well as release;
+- backup ID allocation never reuses an existing directory or terminal tombstone;
+- standalone abort/retire marker remains terminal after fence/manifest/parts cleanup;
+- both terminal markers, malformed records or surviving digest mismatch fail closed;
+- restore lease blocks retirement/cleanup and final recheck precedes cutover;
+- crash during restore releases lease and discards candidate;
+- restored Store mirror cannot recreate/retire backup state or clear pins;
+- restored absent auxiliary mutation is never first-admitted;
+- retention target is recomputed from current installation records after rollback;
 - crash before fence, after fence, after spool cut, before manifest rename and after rename/parent-sync/readback reconciles from installation files;
-- valid durable abort clears pins only after exact manifest absence and partial-part cleanup;
+- valid durable abort clears pins only after exact manifest absence and partial-content cleanup;
 - valid retire marker is accepted only for exact published backup and excludes it from restore/pins;
-- crash after each retirement/cleanup step cannot create a false unpin or resurrect a retired backup;
-- abort and retire states are mutually exclusive;
-- backup ID cannot be reused after retirement tombstone;
-- physical cleanup after retirement does not masquerade as complete erasure;
-- auxiliary cancel/release/retention IDs and cut reconciliation;
+- physical cleanup after terminal transition does not masquerade as complete erasure;
 - per-client allocator exhaustion and no `MAX+1` derivation;
 - retain-after ordering, erased tombstone membership, history gap and stable paging;
 - caller `release(abandon_for_erasure)` versus owner-local break-glass authority;
@@ -746,16 +796,20 @@ Do not:
 - add a controller backup-pin service/table when installation records + ordinary maintenance status are sufficient;
 - store a precommitted final-manifest digest in Store data the manifest itself backs up;
 - make a rollback-local Store row the sole provisional publication authority;
-- retire a published backup by deleting fence/manifest/parts without a durable retirement marker;
+- make terminal abort/retire validity depend forever on content-bearing files that cleanup is allowed to delete;
+- restore without an exact backup read lease or retire/clean a leased backup;
+- derive/reuse backup IDs from rollback Store state;
+- let restored Store mirrors create installation records or clear pins;
+- first-admit an absent old call, cancel, release or retention WriteId from a backup;
+- retire a published backup by deleting fence/manifest/parts without a durable terminal marker;
 - reuse pre-publication `abort.json` as published-backup retirement;
 - derive admission sequence from retained rows;
 - use observed earliest row as retention guarantee;
 - roll back/reuse Memory WriteId generator;
-- first-admit absent old call from retained backup;
-- send a `retired_not_admitted` WriteId;
+- send a `retired_not_admitted` or `retired_not_sent` ID;
 - release a controller-dependent call while a retained/provisional backup fence pins it;
 - advance retention past a retained or preparing/publication-unknown backup high-water;
-- clear a publication/retirement unknown without exact installation-file reconciliation;
+- clear a publication/terminal unknown without exact installation-file reconciliation;
 - lower monotonic `retain_after_seq` to pin an in-cut dependency;
 - let Memory submit controller-owner erase or invent its receipt;
 - delete membership metadata above cut without tombstone or prior cut advance;
