@@ -7,14 +7,14 @@ V1/V2 Memory implementations are donors. V3 is greenfield. Current `eliot-swarm-
 ## Reading order
 
 1. [Architecture draft.19](ARCHITECTURE.md) — product purpose, authority, Base, schema/backup invariants.
-2. [Implementation draft.40](IMPLEMENTATION.md) — runtime, migration/query contract, Windows/process, backup/rollback and sequence.
+2. [Implementation draft.41](IMPLEMENTATION.md) — runtime, migration/query contract, Windows/process, backup/rollback and sequence.
 3. [Cognition draft.23](COGNITION.md) — reconstruction, retrieval, learning, backup authority and failure algorithms.
 4. [Inference Contract 0.18](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
 5. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, decisions, gaps and queue.
 6. [Audit](AUDIT.md) — root causes, rejected machinery and evidence limits.
 7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for requirements and donors.
 
-Architecture 19, Implementation 40, Cognition 23, Contract 0.18 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
+Architecture 19, Implementation 41, Cognition 23, Contract 0.18 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
 
 None of these documents proves implemented runtime behavior.
 
@@ -54,9 +54,11 @@ STRICT database
 six SCHEMAFULL tables
 ```
 
-Application IDs crossing JSON are canonical bounded strings; native Surreal record IDs remain internal. Every fixed query has an explicit projection and DTO. There is no generic `Value`, raw SurrealQL or `SELECT *` persistence boundary.
+Application IDs crossing JSON are canonical bounded strings; native Surreal record IDs remain internal. Base IDs are generated from 128 OS-random bits, retained before retryable writes and never treated as time order. Derived unique keys are domain-separated SHA-256 over length-prefixed components. Every fixed query has an explicit projection and DTO; direct work reconstruction uses explicit indexed workspace/task/actor/session fields rather than parsing `binding_json`.
 
 Migration bundle identity includes format version, runner protocol, exact wrapper template, ordered UTF-8/LF DDL assets and expected catalog template. Bound generation/digest values remain outside the preimage. Schema admission uses plain `INFO FOR DB` / `INFO FOR TABLE` maps, sorted by owned keys and compared as exact pinned-version canonical `DEFINE` strings. `INFO ... STRUCTURE` is not an API.
+
+Migration 0001 marks identities/creation facts read-only, uses closed literal states and enforces observation body XOR, validity ordering, claim/request tuple and job-slot invariants. Unique and ordinary indexes exist only for connected readers.
 
 Base FTS uses `blank,class` + `lowercase` and numbered match references when score is requested:
 
@@ -98,7 +100,7 @@ close/drain controller mutation
 
 Self-contained abort/retire tombstones remain terminal after content cleanup.
 
-Restore first admits finite part-count/per-part/total-byte/path limits. It keeps a logical lease plus final-directory/fence/manifest handles with read sharing only, then opens, verifies, copies and closes one part at a time. V3 never holds an unbounded handle set. Final terminal/manifest identity is rechecked before cutover.
+Restore first admits finite part-count/per-part/total-byte/path limits. It keeps a logical lease plus final-directory/parts-directory/fence/manifest handles with read sharing only, then opens, verifies, copies and closes one part at a time. V3 never holds an unbounded handle set. Final terminal/manifest identity is rechecked before cutover.
 
 Supervisor owns candidate process/root and final cutover. Daemon/channel loss forces candidate kill/reap/discard before another daemon or cutover.
 
@@ -116,9 +118,9 @@ Contract 0.18 uses stable `memory_inference` client ID, current token version, p
 
 ## Implementation order
 
-0. **Slice 0:** Windows/process/IPC/Surreal/Store, migration wrapper/catalog/query corpus, FTS score query, external-ID state, staged backup publication, bounded restore lease, rollback/erasure/rotation/shutdown.
+0. **Slice 0:** Windows/process/IPC/Surreal/Store, exact migration 0001 assertions/indexes/catalog/query corpus, FTS score query, external-ID state, staged backup publication, bounded restore lease, rollback/erasure/rotation/shutdown.
 1. **Base Slice 1:** event → Store/spool → replay → restart → exact open.
-2. **Base Slice 2:** qualified Claude relay, continuation, lexical top-K retrieval, actual context emission, notes/corrections/commitments and maintenance.
+2. **Base Slice 2:** qualified Claude relay, indexed continuation, lexical top-K retrieval, actual context emission, notes/corrections/commitments and maintenance.
 3. **Controller #200 + V2 L0/L1.**
 4. **Inference P1a:** stable caller, calls/copies/runner, cut/retention, backup integration and one result changing later context.
 5. **P1b/later:** rotation, embeddings, views, documents, Research and more hosts.
