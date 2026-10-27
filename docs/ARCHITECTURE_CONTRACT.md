@@ -8,16 +8,16 @@ The synchronized V3 set is:
 
 | Surface | Current role |
 |---|---|
-| [Architecture draft.15](v3/ARCHITECTURE.md) | Product purpose, authority owners, Base, extensions and invariants |
-| [Implementation draft.36](v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation order |
-| [Cognition draft.19](v3/COGNITION.md) | Reconstruction, retrieval, learning, rollback-safe backup dependencies and revision algorithms |
-| [Inference Contract 0.14](v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
+| [Architecture draft.16](v3/ARCHITECTURE.md) | Product purpose, authority owners, Base, extensions and invariants |
+| [Implementation draft.37](v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation order |
+| [Cognition draft.20](v3/COGNITION.md) | Reconstruction, retrieval, learning, rollback-safe backup dependencies/retirement and revision algorithms |
+| [Inference Contract 0.15](v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
 | [Active analysis registry](v3/ANALYSIS-REGISTRY.md) | Sole active decisions/gaps/source-coverage/work queue |
 | [V3 navigation](v3/README.md) | Reading order, current baseline and proof ceiling |
 | [V3 audit](v3/AUDIT.md), [source map](v3/AUDIT-MAP.md) | Evidence, criticism, donor analysis and stable source dispositions; not independent subsystem authority |
 | `docs/architecture/`, `docs/normative-pair.toml`, existing source/scripts/workstreams | Retained V2 donor surfaces; old status terms are historical |
 
-Architecture intent prevails over conflicting lower-level mechanism. Implementation and Cognition agree with Architecture and Contract 0.14. Resolve a changed load-bearing mechanism in every affected owner document in the same work sequence; do not add an errata layer or second active contract.
+Architecture intent prevails over conflicting lower-level mechanism. Implementation and Cognition agree with Architecture and Contract 0.15. Resolve a changed load-bearing mechanism in every affected owner document in the same work sequence; do not add an errata layer or second active contract.
 
 A new mechanism, budget, process count, database choice, credential path or evaluation threshold is not accepted because an agent wrote it. It needs a concrete caller, owner, durable result/unknown and consumer, plus appropriate evidence.
 
@@ -39,15 +39,18 @@ Therefore:
 
 - revision `e42c464d`, V1 roles/hello/Operation/artifacts and generic registration are donor evidence only;
 - no Memory implementation may add one-shot inference to retired stack;
-- active boundary is Contract 0.14: dedicated `memory_inference`, stable random installation client ID, monotonic token version, `client.identity`, global pre-send WriteIds, rollback-safe generator state, minimal client/call state, private call-owned copies, guaranteed `retain_after_seq`, backup admission/dependency closure, canonical backup-plan digest, installation-scoped provisional publication authority and fixed-window restore inventory;
+- active boundary is Contract 0.15: dedicated `memory_inference`, stable random installation client ID, monotonic token version, `client.identity`, global pre-send WriteIds, rollback-safe generator state, minimal client/call state, private call-owned copies, guaranteed `retain_after_seq`, backup admission/dependency closure, canonical plan digest, installation-scoped publication/retirement authority and fixed-window restore inventory;
 - controlled backup includes admitted calls only; proven-absent IDs are permanently retired and unknown admission makes continuity incomplete;
 - every admitted in-cut call is controller-closed or controller-dependent;
 - before backup parts, Memory closes one controller-mutation owner, captures exact cut, computes a non-self-referential plan digest and publishes `backups/<id>/fence.json` outside rollback Store roots;
 - final manifest repeats the plan digest plus actual inventories; no precommitted final-manifest digest appears inside Store data being backed up;
 - `preparing` and `publication_unknown` installation fences pin dependent-call release and post-cut retention across restart and exact rollback;
-- a fence clears only through a valid matching manifest or a durable abort after exact final-manifest absence and partial cleanup;
-- dependent call stays unreleased while any restorable or possible backup needs it;
-- monotonic retain cut protects post-cut membership and is constrained by retained and unresolved provisional backup high-waters; it is not lowered to pin old in-cut dependency;
+- a fence clears only through a valid matching manifest or durable pre-publication abort;
+- a published backup leaves the restorable set only after create-new durable `retire.json` binds backup/plan/manifest identity;
+- deleting manifest/fence/parts is not retirement, and pre-publication `abort.json` cannot be reused as retirement;
+- retirement marker clears restore/release/retention authority only after exact readback; content-bearing cleanup remains separate physical-erasure work;
+- dependent call stays unreleased while any published non-retired or unresolved provisional backup needs it;
+- monotonic retain cut protects post-cut membership and is constrained by published non-retired and unresolved provisional backup high-waters; it is not lowered to pin old in-cut dependency;
 - caller cleanup uses cancel/release; controller-owner erase is external break-glass and cannot be submitted by Memory;
 - content erasure above cut leaves bounded text-free membership tombstone until pinned backups retire and cut advances;
 - controller issue #200 must repair binding-revision allocator/schema authority;
