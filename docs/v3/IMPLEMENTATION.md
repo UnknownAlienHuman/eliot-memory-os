@@ -1,12 +1,12 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.38 · 2026-10-27 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.39 · 2026-10-27 · concrete design for the greenfield rewrite.**
 
-This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, Store and connected operations. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.16](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the sole active work ledger.
+This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, Store and connected operations. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.17](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the sole active work ledger.
 
-Nothing is implemented merely because it is specified. Build connected production slices in §15. Do not construct scaffolding for a later capability before its first real writer and consumer exist.
+Nothing is implemented merely because it is specified. Build connected production slices in §12. Do not construct scaffolding for a later capability before its first real writer and consumer exist.
 
-## 0. External prerequisites
+## 0. External prerequisite
 
 Current controller authority:
 
@@ -16,7 +16,7 @@ main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
 merged PR #198
 ```
 
-Controller V2 is still a specification target. Its roadmap L0.1–L1.11 is unchecked. Issue #200 must repair binding-revision allocation/schema authority before V2 implementation; draft PR #201 fixes only validator fixtures. Memory inference issue #199 remains blocked on #200 and controller L0/L1.
+Controller V2 remains a specification target. Issue #200 now owns separation of binding allocation, selected pointer and effect publication; draft PR #201 fixes fixtures only. V2 L0.1–L1.11 remain unchecked. Memory inference issue #199 stays blocked on #200 and V2 L0/L1.
 
 Memory Slice 0 and useful Base do not depend on controller V2.
 
@@ -24,11 +24,9 @@ Memory Slice 0 and useful Base do not depend on controller V2.
 
 ### 1.1 Process family
 
-Initial Windows profile uses one executable with modes:
-
 ```text
 eliot supervisor     privileged installation/process owner
-eliot daemon         Memory application owner
+eliot daemon         Memory application + backup-set owner
 eliot relay ...      transient host/CLI adapter
 ```
 
@@ -37,11 +35,13 @@ Owned process shape:
 ```text
 supervisor
 ├─ daemon
-└─ active SurrealDB child
-   └─ at most one isolated disposable restore candidate
+├─ active SurrealDB child
+└─ at most one isolated disposable restore candidate
 ```
 
-Supervisor owns process handles, executable/root identity, Store bootstrap credentials, migrations, Store-user rotation, candidate lifecycle and installation cutover. Daemon owns Memory semantics, Store Editor access, replay/jobs, backup cuts, retrieval/context and public control.
+Supervisor owns executable/root identity, child handles, Store bootstrap credentials, migrations, Store-user rotation, candidate process/root and final installation cutover.
+
+Daemon owns Memory semantics, Store Editor access, replay/jobs, controller-mutation serialization, backup IDs and installation records, restore file leases, context/retrieval and public control.
 
 ### 1.2 Installation layout
 
@@ -50,19 +50,18 @@ Supervisor owns process handles, executable/root identity, Store bootstrap crede
   config.toml
   installation.toml
   controller-write-id.state
-  data\
-    roots\
-      <root-id>\
-        db\
-        blobs\
+  data\roots\<root-id>\
+    db\
+    blobs\
   spool\
     pending\
     failed\
     tmp\
   deletions\
   backups\
-    <random-128-bit-backup-id>\
-      fence.json?
+    .tmp-<random>\            # pre-publication staging only
+    b_<32-lowercase-hex>\     # final generation
+      fence.json
       parts\
       manifest.json?
       abort.json?
@@ -70,15 +69,15 @@ Supervisor owns process handles, executable/root identity, Store bootstrap crede
   logs\
 ```
 
-Initial profile is one fixed local NTFS/ReFS volume. Installer validates protected current-user + LocalSystem DACL, rejects unexpected broad principals, network/removable roots and reparse traversal. Database, source bodies, spool and backups are plaintext application data protected by account/DACL/volume security. Initial Base claims no portable encrypted backup.
+The initial profile is one fixed local NTFS/ReFS volume. Installer validates a protected current-user + LocalSystem DACL, rejects broad principals, network/removable roots and reparse traversal. Database, source bodies, spool and backups are plaintext application data protected by account/DACL/volume security. Base claims no portable encrypted backup.
 
-`controller-write-id.state` and installation-scoped backup records live outside rollback Store roots. Exact Memory rollback cannot remove, regress or recreate them.
+`controller-write-id.state` and final backup records are outside rollback Store roots. Exact Memory rollback cannot regress or recreate them.
 
 ### 1.3 Configuration and mutable installation selection
 
-`config.toml` contains user configuration only: project/workspace binding, capture bounds/exclusions, host adapters, controller endpoint/credential reference, selected inference profiles, disclosure defaults, automatic-work mode and optional source tools. It is not a policy database, module catalogue or installation pointer.
+`config.toml` contains user configuration only: projects/workspaces, capture limits/exclusions, host adapters, controller endpoint/credential reference, inference profile names, disclosure defaults, automatic-work mode and optional source tools.
 
-Supervisor owns `installation.toml` under installation mutex:
+Supervisor owns `installation.toml` under the installation mutex:
 
 ```text
 selection_generation
@@ -98,97 +97,89 @@ current_store_owner_ref
 pending_store_owner_ref?
 previous_store_owner_ref?
 expected_memory_schema_generation
+expected_memory_schema_bundle_sha256
 maintenance_state
 ```
 
-At most one unretired previous root and one pending/previous credential per role. Another cutover or rotation waits until earlier generation retirement.
-
-`stable_memory_installation_id` is random and non-secret. It is not derived from path, root generation, username, executable or token.
+At most one unretired previous root and one pending/previous credential per role. Another cutover or rotation waits until the earlier generation is retired.
 
 ### 1.4 Startup sequence
 
 ```text
-supervisor validates selection + executable/root identities
-→ scans installation-scoped backup directories and terminal markers
-→ starts/adopts exact SurrealDB child
-→ reconciles bootstrap/credentials and runs checked migrations through Owner
+supervisor validates installation selection and executable/root identities
+→ starts/adopts exact active SurrealDB child
+→ reconciles bootstrap/credentials and applies checked migration bundle through Owner
 → creates inherited supervisor↔daemon channel
 → launches daemon suspended, verifies image and assigns Job
-→ sends non-secret Store descriptor + authoritative backup-set summary
+→ sends non-secret Store/process/schema descriptor
 → daemon independently admits root/process/listener/peer/Editor/schema/query path
-→ daemon reconciles Store maintenance mirrors against installation records
-→ daemon reconciles unresolved publication/terminal/retention state
+→ daemon removes/quarantines pre-publication backup temp directories under bounded rules
+→ daemon backup-set owner scans final backup directories and terminal markers
+→ daemon reconciles Store maintenance mirrors against installation authority
+→ daemon reconciles pending release/retention/publication state
 → daemon reports ready
 → supervisor allows relay endpoint publication
 ```
 
-No host capture reports `committed` before daemon admission. The ordinary job runner cannot execute backup/retention/release work before installation-scoped backup authority is scanned. No controller release or retention advance is sent while backup state is unresolved.
+No host capture reports `committed` before daemon admission. Ordinary jobs cannot run release, retention or backup transitions before backup authority is reconstructed.
 
-## 2. Windows identity, launch and custody
+## 2. Windows identity, custody and IPC
 
 ### 2.1 Retained executable and root leases
 
-Before owned child resumes:
+Before an owned child resumes:
 
-1. open executable, selected data root and relevant ancestors without following reparse points;
-2. verify regular file/directory identity, expected digest and DACL;
-3. deny write/delete or root-rename sharing where required;
-4. create child suspended with closed environment and exact inherited-handle list;
-5. compare actual child image/file identity;
-6. assign correct Job Object;
+1. open executable, selected root and relevant ancestors no-follow;
+2. verify regular identity, expected digest and DACL;
+3. deny write/delete or root-rename sharing as required;
+4. create child suspended with a fresh environment and exact inherited-handle list;
+5. compare child image/file identity;
+6. assign the correct Job Object;
 7. resume only after agreement.
 
-Executable/root leases remain through child lifetime. Path string, pre-launch digest or PID alone is not identity.
+Executable/root leases remain through child lifetime. Path, digest or PID alone is not identity.
 
-### 2.2 Job custody and shutdown
+### 2.2 Process custody and shutdown
 
-Supervisor owns one process-family Job with kill-on-close where appropriate. Process identity includes PID, creation time and retained handle. Graceful stop is attempted through owning protocol; bounded failure uses Job containment. Clean process exit is not Store durability receipt.
+Supervisor owns process handles and a process-family Job with kill-on-close where appropriate. Graceful stop is requested through the owning protocol; bounded failure uses Job containment. Clean exit is not Store durability proof.
 
-Candidate Store has isolated root, port, credentials and Job. It never shares live database files or listener.
+Candidate Store has an isolated root, dynamic port, credentials and process handle. It never shares active database files/listener.
 
-### 2.3 Closed child environments
+If daemon or inherited channel is lost while a candidate exists, supervisor kills, reaps and deletes/discards the candidate before another daemon starts or any cutover proceeds. Supervisor loss terminates owned children through the Job.
 
-Construct fresh environment blocks containing only required OS locale/path/certificate/temp facts plus exact child settings. Do not inherit arbitrary `SURREAL_*`, `RUST_LOG`, metrics, telemetry, slow-query, import or Postgres settings.
-
-Secrets go only to the narrow child that needs them and are removed after bootstrap. No secret enters argv or logs.
-
-## 3. IPC boundaries
-
-### 3.1 Relay→daemon named pipe
+### 2.3 Relay→daemon named pipe
 
 One installation-scoped Windows named pipe:
 
 - first instance only;
 - remote clients rejected;
 - DACL limited to expected user/System;
-- mutually attested process identities;
+- mutual process attestation;
 - one bounded versioned request and correlated response per transient connection;
 - finite deadlines, frame limit and connection cap.
 
 Relay verifies daemon PID/creation/session/image/file and supervisor Job membership. Daemon verifies relay PID/SID/creation/session/image. Retained handles bracket PID reuse.
 
-Same-account arbitrary malicious code is outside claimed boundary; accidental/stale/foreign-process confusion fails closed.
+### 2.4 Supervisor↔daemon inherited channel
 
-### 3.2 Supervisor↔daemon inherited channel
+Two anonymous one-way pipes form one private duplex channel. Only exact daemon ends are inherited via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; environment carries handle numbers and protocol generation, never secrets.
 
-Supervisor creates two anonymous one-way pipes and passes only exact daemon ends through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. Child environment carries handle values and protocol generation, never secrets.
-
-Closed frames:
+Closed frames include:
 
 ```text
 store_descriptor / daemon_ready
 maintenance_request / maintenance_result
+restore_candidate_prepare / restore_candidate_ready
+restore_cutover / candidate_discarded
 quiesce / quiesced / resume
 shutdown_ready / shutdown_complete
 ```
 
-Every exchange has operation ID and bounded typed payload. Daemon may name retained backup/config/credential identity; it cannot send raw SQL, argv, endpoint, arbitrary path or secret. Supervisor independently resolves named object.
+Every exchange has an exact operation ID and bounded typed payload. Restore/cutover frames carry backup ID, plan/manifest digests, candidate root ID and selection generation—not raw paths, SQL, argv, endpoint or secret.
 
-Channel loss is fail-closed. Before selection replacement, candidate is abandoned. After possible replacement, startup reads actual selection before another action.
+## 3. SurrealDB child and Store transport
 
-## 4. SurrealDB child and Store transport
-
-### 4.1 First qualification target
+### 3.1 First qualification target
 
 Pin exact SurrealDB 3.3.4 Windows artifact, commit, size and SHA-256. Selected profile:
 
@@ -208,285 +199,387 @@ surreal start <supervisor-derived-rocksdb-url>?sync=every
 
 No engine/version fallback. Origin is not WebSocket authorization.
 
-### 4.2 Listener and peer ownership
+### 3.2 Listener and peer ownership
 
-Supervisor reserves loopback port only to narrow bind race. Windows TCP tables prove listener owner. Before credentials, daemon opens raw TCP and proves established server peer belongs to retained Store process, then performs WebSocket upgrade on that stream.
+Supervisor reserves a loopback port only to narrow the bind race. Windows TCP tables must prove listener ownership. Before credentials, daemon opens raw TCP, proves the established peer belongs to the retained Store process, then performs WebSocket upgrade on that stream.
 
-Port, TCP success, `/health`, `/ready`, HTTP 200 or WebSocket 101 alone proves nothing.
+Port, connect, `/ready`, HTTP status or WebSocket 101 alone proves nothing.
 
-### 4.3 Root bootstrap and Store roles
+### 3.3 Root bootstrap and Store roles
 
 ```text
-empty Store starts once with retained root credential in child-only env
+empty Store starts once with one retained root credential in child-only env
 → root persistence may be unknown
 → child stops
-→ same Store restarts without root env
+→ same root restarts without root env
 → root authenticates on verified peer
-→ create NS + STRICT DB + database Owner + Editor with PASSHASH
-→ checked migrations through Owner
+→ create NS + STRICT DB + database Owner + Editor using PASSHASH
+→ apply checked migration bundle through Owner
 → close privileged sockets
 → root-free restart
 → daemon admits Editor
 ```
 
-Unknown bootstrap reuses same retained root secret. Root and Owner remain supervisor-only. Daemon receives Editor only. Plaintext password, auth header, verifier and raw auth error never enter logs/manifests/results.
+Unknown bootstrap reuses the same root secret. Root and Owner remain supervisor-only. Daemon receives Editor only. Plaintext password, auth header, verifier and raw auth error never enter logs/manifests/results.
 
-Credential rotation quiesces daemon, closes old sockets, changes PASSHASH through fresh privileged connection, reconciles unknown using pending/current secrets, publishes selection, restarts Store and requires fresh daemon admission. Password change alone does not revoke authenticated WebSocket.
+Credential rotation quiesces daemon, closes old sockets, changes PASSHASH through a fresh privileged connection, reconciles unknown using pending/current secrets, publishes selection, restarts Store and requires fresh daemon admission. Password change alone does not revoke an authenticated socket.
 
-### 4.4 Owned query-only WebSocket client
+### 3.4 Owned query-only WebSocket client
 
 One Tokio task owns each authenticated socket:
 
 - one in-flight exact request ID;
-- continuous control/data frame handling;
+- continuous control/data-frame handling;
 - Basic-authenticated upgrade with exact NS/DB headers;
-- `query` only; no RPC signin/use/version/ping dependency;
+- RPC `query` only;
 - finite frame/message/request deadlines.
 
-Caller cancellation drains exact response or closes socket. Timeout, close, wrong/late ID, malformed frame or protocol fault poisons it. Possible mutation send becomes `OUTCOME_UNKNOWN`; reconnect repeats peer/auth/schema admission and application readback.
+Caller cancellation drains the exact response or closes the socket. Timeout, close, wrong/late ID, malformed frame or protocol fault poisons it. A mutation possibly sent becomes `OUTCOME_UNKNOWN`; reconnect repeats peer/auth/schema admission and application identity readback before retry.
 
-### 4.5 Closed DTO wire format
+### 3.5 Closed DTO wire format
 
 JSON carries explicit operation DTOs only:
 
-- fixed projections/order;
 - bounded strings, signed integers, booleans and finite floats;
-- canonical application IDs;
+- canonical application IDs as strings;
 - integer time plus precision/uncertainty;
 - explicit optional state where `NONE` and `NULL` differ;
-- vectors with exact dimension/order/finite checks;
+- vectors with exact dimension/order and finite-value checks;
 - exact large bytes as blobs.
 
-No generic Surreal `Value`, `SELECT *`, broad CRUD, copied vendor CBOR tags or implicit native-type round-trip. Grammar-changing identifiers come from closed enums; ordinary data uses bound variables.
+Surreal native record IDs, UUID, datetime, decimal and duration never cross as implicit JSON-native application identity. No generic `Value`, `SELECT *`, broad CRUD, copied CBOR tags or user-supplied grammar exists.
 
-## 5. Physical Memory data model
+## 4. Migration 0001 and schema authority
 
-Use six `SCHEMAFULL` tables plus selected-root blobs. Add fields/indexes only with first real writer and reader.
+### 4.1 Migration bundle identity
 
-### 5.1 `stream`
-
-```text
-id, project, source_kind, source_native_id, workspace?, last_ingest_seq
-```
-
-Unique `(project, source_kind, source_native_id)`. Sequence orders one stream only.
-
-### 5.2 `observation`
+Migration assets are checked-in UTF-8 with LF endings and deterministic lexical order. Compute:
 
 ```text
-project, stream, event_key, sequence
-command_id?, native_event_key?
-occurrence_time + precision, receipt_time
-kind
-exact inline body or blob ref + length/digest
-bounded search excerpt
-locator
-work/task/resource binding
-source-supplied relations
-capture limitations/redactions
-disclosure
-packet/correction references
+schema_bundle_sha256 = SHA-256(
+  domain tag
+  + for each asset: relative path length/path + byte length/bytes
+)
 ```
 
-Unique `(project, stream, event_key)` and `(project, command_id)` where present. Equal bytes do not merge occurrences.
-
-### 5.3 `memory`
+The assets do **not** contain their own bundle digest literal. The supervisor runner supplies `generation` and computed digest as bound values to one fixed transactional wrapper:
 
 ```text
-id, project, kind, revision
-origin, reuse_scope, disclosure
-optional address + derived unique key
-content, search text, cues, aliases
-subject/aspect/perspective
-conditions/exceptions/selectors
-validity/limitations
-support/exposure/influence
-commitment state
-processing-method role/purpose
-vector/effective-space/representation when present
-timestamps
+BEGIN TRANSACTION;
+  <ordered DDL assets>
+  DEFINE PARAM OVERWRITE $eliot_schema_generation VALUE $bound_generation;
+  DEFINE PARAM OVERWRITE $eliot_schema_bundle_sha256 VALUE $bound_bundle_sha256;
+COMMIT TRANSACTION;
 ```
 
-### 5.4 `memory_history`
+Slice 0 must prove exact 3.3.4 bound-value and transactional DDL behavior. On transport/shutdown unknown:
 
-Previous revisions, unique `(item, revision)`. Version handles never fall forward.
+- exact params + exact `INFO FOR DB/TABLE` definitions → committed;
+- exact empty fresh candidate → retry same bundle;
+- any partial/mismatched state → fail closed; discard fresh candidate or require named migration repair on active root.
 
-### 5.5 `link`
+`IF NOT EXISTS` is not migration verification.
 
-Revision-aware source/target, relation kind, optional grounds group, locator and qualification. Grounds within one group are conjunctive; groups are alternatives; ungrouped support advisory; navigation carries no evidential Boolean meaning.
+### 4.2 Application identity
 
-### 5.6 `job`
-
-Finite background/application-maintenance work:
+Every externally addressable object has a bounded canonical string field independent of Surreal record ID:
 
 ```text
-id, project, purpose, target
-state, active/pending slot
-origin/cause
-due/attempt/retry/waiting reason
-frozen input members/ranges
-exact processing-method revision
-limits/disclosure/profile
-exact request blob/length/digest
-application result/coverage
-per-copy cleanup state
+stream_id       s_<26-crockford>
+observation_id  o_<26-crockford>
+memory_id       m_<26-crockford>
+link_id         l_<26-crockford>
+job_id          j_<26-crockford>
+command_id      c_<26-crockford> or host-native bounded identity
 ```
 
-Controller-backed fields:
+Exact grammar and maximum length are validated before Store calls. Native record IDs remain internal implementation detail. Queries bind the canonical string and return explicit projection.
+
+### 4.3 Six Base tables
+
+Migration 0001 defines six `TYPE NORMAL SCHEMAFULL PERMISSIONS NONE` tables. Base fields are introduced only with real writers/readers; later inference migrations extend `job`.
+
+#### `stream`
 
 ```text
-controller_id
-controller_client_id
-selected_token_version
-inference_write_id
-method + canonical semantic request identity
-controller_admission_state = prepared | admitted | retired_not_admitted | admission_unknown
-controller_admission_seq when admitted
-controller_dependency_state = controller_closed | controller_dependent
-profile/connection/adapter/destination snapshot
-result length/digest when known
-Memory result blob
-cancel_write_id? + effect_observed | retired_not_sent | mutation_unknown
-release_write_id? + release disposition + auxiliary state
-retention_write_id? + expected/new cut + auxiliary state
-input/result cleanup state
-external-work inventory status
-owner_action_required? + observed owner readback?
+stream_id: string
+project: string
+source_kind: string
+source_native_id: string
+workspace: option<string>
+last_ingest_seq: int
+created_at_ms: int
+updated_at_ms: int
+stream_unique_key: string
 ```
 
-A caller cleanup or retention advance is an ordinary finite job/maintenance record with exact expected state and its own precommitted WriteId. No new table or scheduler is needed.
-
-Backup publication/terminal state is mirrored in an ordinary maintenance job:
+#### `observation`
 
 ```text
-backup_candidate_id
-backup_plan_digest
-observed_fence_digest?
-observed_manifest_digest?
-terminal_operation_id?
-controller_id/client_id/high_water/retain_after_seq
-exact controller_dependent call ids/sequences
-publication_state = preparing | publication_unknown | published | aborted_before_publish | retired
-mirror_state = current | superseded_by_installation_state
+observation_id: string
+project: string
+stream_id: string
+event_key: string
+command_id: option<string>
+native_event_key: option<string>
+ingest_seq: int
+occurrence_time_ms: option<int>
+occurrence_precision: string
+receipt_time_ms: int
+kind: string
+body_inline: option<string>
+blob_ref: option<string>
+body_length: int
+body_sha256: string
+search_excerpt: string
+disclosure: string
+locator_json: string
+binding_json: string
+relations_json: string
+capture_limit_json: string
+created_at_ms: int
 ```
 
-This row is never authority and may be rolled back. Startup/restore reconcile it against installation-scoped records before job claims. A restored future-timeline mirror cannot create fence/abort/retire records, clear pins or send release/retention.
+Exactly one of `body_inline` or `blob_ref` is present, subject to the configured inline bound.
 
-Controller-owner erase is not a Memory mutation. Memory may retain non-content `owner_action_required` and later observed owner result; it never generates/submits owner erase WriteId.
-
-Never store raw controller token/hash/provider credential, V1 Operation ID, V1 credential ID/generation or `possible_send` ledger.
-
-Per-copy state:
+#### `memory`
 
 ```text
-not_created | retained | cleanup_pending | removed | already_absent | mismatch | unknown
+memory_id: string
+origin_project: string
+reuse_scope: string
+revision: int
+kind: string
+address_kind: option<string>
+address_key: option<string>
+address_unique_key: option<string>
+content: string
+search_text: string
+exact_cues: array<string>
+disclosure: string
+subject: option<string>
+aspect: option<string>
+perspective: option<string>
+conditions_json: string
+exceptions_json: string
+valid_from_ms: option<int>
+valid_until_ms: option<int>
+support_state: string
+exposure_state: string
+influence_state: string
+commitment_state: option<string>
+method_role: option<string>
+processing_purpose: option<string>
+created_at_ms: int
+updated_at_ms: int
 ```
 
-Aggregate cleanup derives from exact copies. One active + one coalesced successor per target; terminal history has no slot.
+#### `memory_history`
 
-### 5.7 Blobs, packets and locators
+Same semantic projection plus:
 
-Large exact bytes live under selected-root `blobs/`; rows keep opaque ref, length and digest. Publish before row commit. Packet is ordinary observation/blob plus links containing exact included revisions, rendered digest, budget and gaps.
+```text
+history_id: string
+memory_id: string
+revision: int
+replaced_at_ms: int
+```
 
-Locators claim only supplied precision. Dirty/untracked code is retained bytes/range, not HEAD alone.
+#### `link`
 
-## 6. Schema, migrations and transactions
+```text
+link_id: string
+source_kind: string
+source_id: string
+source_revision: option<int>
+target_kind: string
+target_id: string
+target_revision: option<int>
+relation_kind: string
+grounds_group: option<string>
+locator_json: string
+qualification_json: string
+created_at_ms: int
+```
 
-### 6.1 Migration owner
+#### `job`
 
-Supervisor Owner applies ordered checksummed migrations before daemon admission:
+```text
+job_id: string
+project: string
+purpose: string
+target_key: string
+state: string
+slot_key: option<string>
+origin: string
+cause_id: option<string>
+first_queued_at_ms: int
+due_at_ms: option<int>
+attempt: int
+waiting_reason: option<string>
+claim_owner: option<string>
+claim_until_ms: option<int>
+frozen_input_json: string
+method_id: option<string>
+method_revision: option<int>
+limits_json: string
+disclosure: string
+profile_name: option<string>
+request_blob_ref: option<string>
+request_length: option<int>
+request_sha256: option<string>
+result_json: string
+coverage_json: string
+cleanup_json: string
+created_at_ms: int
+updated_at_ms: int
+```
 
-- configured namespace + `STRICT` DB under `--no-defaults`;
-- six `SCHEMAFULL` tables and explicit fields;
-- narrowly named bounded `FLEXIBLE` metadata only with real reader;
-- occurrence/idempotency/address/history/job-slot indexes;
-- initial indexes synchronously;
-- no 2.x-only clauses.
+### 4.4 Indexes and analyzer
 
-`$eliot_schema_generation`, migration digests and `INFO FOR DB/TABLE` own admission. `IF NOT EXISTS` is not migration verification.
+Migration 0001 defines separate index kinds:
 
-### 6.2 Transaction rules
+```text
+DEFINE ANALYZER eliot_base_text TOKENIZERS blank,class FILTERS lowercase;
 
-One fixed query executes one complete transaction and every statement result is inspected.
+DEFINE INDEX observation_search ON observation
+  FIELDS search_excerpt FULLTEXT ANALYZER eliot_base_text BM25;
+
+DEFINE INDEX memory_search ON memory
+  FIELDS search_text FULLTEXT ANALYZER eliot_base_text BM25;
+```
+
+Unique/exact indexes include:
+
+```text
+stream.stream_id UNIQUE
+stream.stream_unique_key UNIQUE
+observation.observation_id UNIQUE
+observation(project,stream_id,event_key) UNIQUE
+observation(project,command_id) UNIQUE
+memory.memory_id UNIQUE
+memory.address_unique_key UNIQUE
+memory_history.history_id UNIQUE
+memory_history(memory_id,revision) UNIQUE
+link.link_id UNIQUE
+job.job_id UNIQUE
+job.slot_key UNIQUE
+```
+
+Surreal unique indexes ignore `NONE`/`NULL`, so optional `address_unique_key`, optional command identity and active/pending `slot_key` enforce conditional uniqueness without blocking unrelated rows. Slice 0 proves this on exact 3.3.4.
+
+### 4.5 Schema admission
+
+Supervisor and daemon compare:
+
+- `$eliot_schema_generation`;
+- `$eliot_schema_bundle_sha256`;
+- exact `INFO FOR DB` table/analyzer/param definitions;
+- exact `INFO FOR TABLE` fields and indexes for all six tables;
+- bounded typed write/read/delete probe through the production client.
+
+Any unknown extra owned field/index, missing definition, mismatched permissions/type or stale digest blocks mutation admission.
+
+## 5. Fixed query corpus
+
+Every operation is a checked-in fixed query with bound data and an explicit response DTO. Initial corpus:
+
+| Query | Required projection / continuation |
+|---|---|
+| `store_probe` | fixed probe ID, value and delete readback |
+| `stream_resolve_lock` | stream ID/key/last sequence with `FOR UPDATE` |
+| `capture_read_identity` | observation ID, binding, body length/digest |
+| `capture_insert` | complete transaction; no external I/O |
+| `memory_open_current` | exact current revision and state |
+| `memory_open_history` | exact `(memory_id,revision)` only |
+| `observation_open` | exact body/blob metadata and locator |
+| `relation_page` | stable `(relation_kind,link_id)` cursor |
+| `observation_lexical` | exact IDs + score + bounded excerpt, stable score/ID order |
+| `memory_lexical` | exact IDs + score + bounded text, stable score/ID order |
+| `job_claim_due` | eligible slot, frozen inputs and claim facts |
+| `backup_page_<table>` | canonical application-ID order and exclusive last-ID cursor |
+| `schema_readback` | exact params and catalog definitions |
+
+Lexical search uses fixed `@@` predicates, explicit projections and hard row/rendered-byte budgets. Search score ranks candidates only; it is not truth, support or applicability.
+
+No fixed query returns a generic row map. Every cursor binds exact query version, scope, object/revision and options.
+
+## 6. Transactions and durable files
+
+### 6.1 Store transaction rules
 
 - unique values own identity/cardinality;
 - controlling rows use `FOR UPDATE`;
-- stream sequence/current revision lock/recheck;
-- set-wide invariant uses deterministic sentinel/unique slot;
+- stream sequence and current revision are locked/rechecked;
+- a set-wide invariant uses a deterministic sentinel/unique slot;
 - nondeterministic `UPSERT` is not idempotency;
 - blobs publish before row transaction;
 - external calls never run inside Store transactions.
 
-Retry entire immutable transaction only for exact retryable conflict. Unknown transport/shutdown/fsync reconciles first. With `sync=every`, mutation may apply before fsync error reaches caller; error is not rollback proof.
+Retry an entire immutable transaction only for an exact retryable conflict. Unknown transport/shutdown/fsync reconciles first. With `sync=every`, an error is not rollback proof.
 
-## 7. Durable local files and external-ID state
+### 6.2 Immutable file publication
 
-### 7.1 Immutable no-replace publication
-
-For blobs, spool, deletion notices, backup fences/parts/manifests/terminal markers and immutable candidate artifacts:
-
-1. retain/validate parent no-follow;
-2. create same-directory temp with `CREATE_NEW`;
-3. write complete bounded bytes;
-4. flush file and close;
-5. no-replace `MoveFileExW(..., WRITE_THROUGH)`;
-6. flush parent directory;
-7. reopen and verify exact identity/length/digest.
-
-Existing exact final is prior success only after parent flush/readback. Different bytes conflict. Rename followed by failed sync/readback is post-commit unknown.
-
-### 7.2 Mutable installation selection
-
-Supervisor-only under installation mutex:
-
-1. read current and require expected generation;
-2. construct complete generation+1 record;
-3. write/flush temp;
-4. `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`;
-5. flush parent;
-6. exact no-follow readback.
-
-Possible replace with failed readback is `SELECTION_UNKNOWN`; startup classifies exact old, exact new or fail-closed unexpected. Previous root/credentials remain until explicit retirement.
-
-### 7.3 Controller WriteId state
+For blobs, spool, deletion notices, terminal records and immutable parts:
 
 ```text
-controller-write-id.state {
-  schema_version
-  controller_id
-  controller_client_id
-  last_ulid
-}
+same-directory CREATE_NEW temp
+→ complete bounded write
+→ file flush + close
+→ no-replace MoveFileExW WRITE_THROUGH
+→ parent-directory flush
+→ exact no-follow reopen/readback
 ```
 
-Under own cross-process mutex:
+Existing exact final is prior success only after parent flush/readback. Different bytes conflict. Rename followed by failed parent sync/readback is post-commit unknown.
 
-1. authenticate current controller identity and read floor/future-skew;
-2. read retained state and require matching controller/client;
-3. create monotonic canonical ULID after retained value and at least admitted floor/current monotonic time;
-4. replace state atomically with generation/digest/readback discipline;
-5. persist exact ID in owning job/maintenance record;
-6. only then send.
+### 6.3 Atomic final backup-directory publication
 
-Crash after state advance burns ID. Crash before job persistence must not send. Exact rollback never replaces this file. Total state loss is explicit continuity incident, not permission to reuse old semantics with new IDs.
+The final backup directory must not appear empty.
 
-### 7.4 Backup identifiers and terminal records
+1. generate 128 OS-random bits and encode `b_<32 lowercase hex>`;
+2. create one private same-parent temp directory;
+3. write canonical `fence.json` inside it;
+4. flush the fence file and temp directory;
+5. rename the directory without replacement to `backups/<id>` using write-through semantics;
+6. flush the `backups/` parent;
+7. open final directory/fence no-follow and verify exact identity/bytes/digest.
 
-The backup-set owner obtains 128 random bits from the OS CSPRNG and encodes one fixed-width non-secret backup ID. It attempts create-new top-level directory/fence publication. Any existing directory or terminal marker is a collision; generate another ID and never overwrite or reuse.
+Collision abandons the temp directory, allocates another ID and recomputes the plan before any part. Crash before final rename leaves non-restorable/non-pinning temp cleanup debt. A possibly committed rename with failed sync/readback becomes `publication_unknown`; reconciliation opens the final name and pins conservatively.
 
-Terminal operation IDs are deterministic from a closed domain tag plus backup ID, plan digest and, for retirement, manifest digest. A retry produces exact marker bytes; a different reason/payload conflicts rather than overwriting.
+### 6.4 Mutable installation and external-ID state
 
-`abort.json` and `retire.json` contain only bounded non-content fields and are self-contained terminal authority after creation prerequisites are proven. They remain after content-bearing files are removed.
+`installation.toml` and `controller-write-id.state` use separate expected-state replacement:
 
-## 8. Core application operations
+```text
+read exact old generation/identity
+→ write+flush same-directory temp
+→ replace with WRITE_THROUGH
+→ flush parent
+→ exact readback
+```
 
-### 8.1 `capture_event`
+Possible replacement with failed readback is unknown; never write another generation blindly. External-ID state loss is an explicit continuity incident.
 
-Relay builds one immutable command before IPC. After referenced blob publication, one Store transaction resolves/locks stream, reads command/event identities, returns identical replay, rejects changed bytes/binding, allocates sequence, inserts observation/relations and coalesces only implemented work. Matching post-commit readback is required for public `committed`.
+## 7. Core application operations
 
-Capture never calls model.
+### 7.1 `capture_event`
 
-### 8.2 Relay delivery and spool
+Relay builds one immutable command before IPC. After any body blob publication, one Store transaction:
+
+1. resolves or creates stream under unique identity;
+2. locks stream;
+3. reads command/event identities;
+4. returns identical replay;
+5. rejects changed bytes or binding;
+6. allocates stream sequence;
+7. inserts observation and source-supplied relations;
+8. coalesces only implemented follow-up work;
+9. commits.
+
+Matching post-commit readback is required for public `committed`. Capture never calls a model.
+
+### 7.2 Relay delivery and spool
 
 Private daemon result:
 
@@ -494,95 +587,109 @@ Private daemon result:
 committed | rejected | stage_required | unknown
 ```
 
-`stage_required` occurs before Store/blob ownership during quiesce. Relay publishes same command immutably on stage-required, daemon unavailable or uncertain direct result. Public `staged` requires durable exact file; otherwise `unknown`.
+`stage_required` occurs before Store/blob ownership during quiesce. Relay publishes the same command immutably on stage-required, unavailable daemon or uncertain direct result. Public `staged` requires durable exact file; otherwise `unknown`.
 
-One daemon replayer uses stable bounded batches, type/size/schema/ID/digest/deletion checks and same capture operation. Matching Store readback deletes pending with parent flush. Permanent corruption/rejection moves no-replace to failed. Transient failure retains and yields. Poison entry cannot starve queue.
+One daemon replayer processes stable bounded batches with type/size/schema/ID/digest/deletion checks and the same capture operation. Matching Store readback deletes pending with parent flush. Permanent corruption/rejection moves no-replace to failed. Transient failure retains and yields.
 
-Replay exposes pause/drain for backup, shutdown, erasure and cutover. Unresolved possible Store write blocks successful maintenance.
+Replay exposes pause/drain for backup, shutdown, erasure and cutover. An unresolved possible Store write blocks successful maintenance.
 
-### 8.3 `publish_memory_revision`
+### 7.3 Memory revision and exact open
 
-One transaction locks current, checks expected revision, copies old row to history, writes new current, adds revision-specific links, settles owning command/job, coalesces affected follow-up and commits. New IDs allocated once and retained before retry.
+`publish_memory_revision` locks current, verifies expected revision, copies history, writes new current, adds revision-specific links, settles owning command/job and commits atomically.
 
-### 8.4 Controller-mutation owner and backup-set owner
+`open` requires one exact handle and optional bounded range. It resolves current, exact history, observation/blob/range, converted representation or copied controller result. It returns exact identity, range/digest, state/limitations, relation descriptors, expansion handles and continuation. Historical handles never fall forward.
 
-Select only configured/enabled/eligible handlers. Waiting for idle/profile/disclosure/resume is not failure. Claim freezes finite sources, exact method revision, limits, disclosure and profile. Exact request bytes and call WriteId persist before controller I/O.
+### 7.4 Job claim
 
-One daemon controller-mutation owner is the only code permitted to send caller mutations across Memory→controller:
+Only configured/enabled/eligible handlers are claimed. Waiting for idle/profile/disclosure/resume is not failure. Claim freezes finite inputs, exact method revision, limits, disclosure and profile. Request bytes and external ID persist before controller I/O.
+
+## 8. First host and retrieval
+
+Initial Claude relay supports SessionStart, UserPromptSubmit, PostToolUse/Failure, Stop, SubagentStop, PostCompact and SessionEnd. Relay reads one bounded JSON object, builds one command, performs capture/spool, optionally requests context, emits one bounded host-compatible response and exits.
+
+Address current work before search. Candidate arms are independent: direct handles, work address, exact cues, lexical, compatible vectors, grounds/relations and eligible methods. Apply scope before arm limits and union before selection.
+
+Pack current work, corrections, commitments, methods with exceptions, episodes, dissent/checks and source handles. Omit misleading fragments; return qualified reduction/handle or explicit gap.
+
+## 9. Backup-set owner and backup lifecycle
+
+### 9.1 Owner and lock order
+
+Daemon owns one controller-mutation owner and one backup-set owner.
+
+New fence publication:
 
 ```text
-inference.text / inference.embed
-inference.cancel
-inference.release
-inference.retention.advance
+close + drain controller-mutation owner
+→ acquire backup-set write transition
+→ capture controller/spool cut and construct plan
+→ atomically publish/read back final backup directory + fence
+→ release backup-set transition
+→ reopen controller-mutation admission
 ```
 
-One backup-set owner owns backup IDs, installation-record scan, pin-set transitions, restore leases and physical backup cleanup. It retains no-follow directory/file handles and rejects reparse/unexpected entries.
+A release/retention send therefore cannot cross a newly visible fence. Abort/retire remove pins; stale pre-terminal snapshots are conservative.
 
-Backup closes/drains the controller-mutation owner before publishing a new fence. Abort/retire transitions finish under the backup-set owner before release/retention is re-evaluated. No mutation may pass a stale controlled-set snapshot.
+Backup-set owner retains no-follow directory/file handles, rejects reparse/unexpected entries and owns:
 
-Before `inference.release`, the mutation owner obtains a current backup-set snapshot and blocks release when any restorable backup or unresolved fence marks the call `controller_dependent`. The check repeats immediately before send.
+- backup ID allocation;
+- final record scan and state derivation;
+- fence/abort/retire transitions;
+- dependency snapshots;
+- restore read leases;
+- physical backup cleanup.
 
-Before `inference.retention.advance`, it computes the cut from current restorable backups and unresolved fences. A restored pending advance is not sent; current desired state is recomputed first.
+### 9.2 Backup plan and parts
 
-Restore obtains a read lease from the backup-set owner. Retirement/abort/cleanup for that backup wait through candidate verification and final pre-cutover recheck. Crash drops the lease and the candidate is discarded.
+Before high-water, every created call ID becomes `admitted`, `retired_not_admitted` or `admission_unknown`; every created cancel/release/retention ID becomes `effect_observed`, `retired_not_sent` or `mutation_unknown`. Every admitted call is `controller_closed` or `controller_dependent`.
 
-### 8.5 Exact `open`
+Canonical plan contains backup ID, expected manifest identity, root/schema/spool cut, controller/client/token/high-water/cut, admitted dependency states, retired attempts, strictest disclosure and gaps. `backup_plan_digest` excludes itself, publication state and later part/manifest digests.
 
-Require one nonempty handle. Resolve current item, exact history, observation/blob/range, converted representation, Research section/citation or copied controller result. Return requested/resolved identity, exact range/digest, state/limitations, revision-aware relation descriptors, expansion handles/cursor and explicit missing/forbidden/erased/damaged/unsupported disposition.
+After final fence publication, daemon pages every Base table in stable application-ID order, copies exact referenced blobs and cut spool/deletion/config entries, then publishes final manifest containing the plan digest and actual inventories/digests.
 
-Fixed cap without cursor is incomplete. Historical handles never fall forward. Coherent hydration uses one snapshot or revision fences.
+### 9.3 Terminal records
 
-## 9. First Claude host adapter
+```text
+valid standalone retire -> retired/non-restorable
+valid standalone abort  -> aborted-before-publish
+fence + matching manifest + no terminal -> published/restorable
+fence + no valid manifest/terminal      -> preparing/publication_unknown
+other malformed/mismatch/ambiguity      -> unresolved/fail closed
+```
 
-Initial events:
+Abort requires exact fence, no valid manifest, no live writer/restore lease, partial-content cleanup and final-manifest absence readback. Retire requires exact published fence+manifest, no abort and no active restore lease.
 
-| Event | Captured/returned behavior |
-|---|---|
-| SessionStart | session/work binding and actual continuation packet |
-| UserPromptSubmit | exact prompt and decision-time packet |
-| PostToolUse | tool ID/input/result/duration/resource binding |
-| PostToolUseFailure | tool ID/input/error/interruption facts |
-| Stop | main final host-supplied message |
-| SubagentStop | subagent identity/final/parent binding |
-| PostCompact | summary as derived representation |
-| SessionEnd | lifecycle boundary/reason |
+Terminal record is create-new, durable, bounded and self-contained. It remains after content cleanup and prevents restore/ID reuse. Terminalization is not erasure.
 
-Relay reads one bounded JSON object, builds one `CaptureCommand`, uses mutually attested pipe, attempts direct capture then spool, optionally requests context, emits one bounded host-compatible output and exits. Capture/context budgets are separate. Same command ID survives uncertainty.
+### 9.4 Restore lease and candidate
 
-Default enablement requires installed-version payload/output/timeout/fork/resume/compact/subagent qualification.
+Restore is admitted only through the daemon backup-set owner. It holds:
 
-## 10. Retrieval, context and source opening
+- a logical lease token bound to backup ID/plan/manifest;
+- retained no-follow handles to final directory, fence, manifest and required parts;
+- delete sharing denied for leased files;
+- a final terminal-state recheck immediately before cutover decision.
 
-Address current work before similarity search. Candidate arms are independent: direct handles, work address, exact cues, lexical, compatible vectors, grounds/relations and applicable methods. Apply project/work scope before arm limits and union before final selection.
+Daemon sends the supervisor a closed prepare intent. Supervisor creates and admits a fresh candidate Store from typed rows/blobs. Retirement, abort and cleanup wait for the lease.
 
-Rank relevance separately from support. Applicability is applicable/inapplicable/conditional-or-unknown. Pack current work, corrections, methods with exceptions, prior episode, dissent/checks and source handles. Omit misleading fragments; return qualified reduction/handle or explicit gap.
+At cutover daemon quiesces active writes/replay, freezes deletion/spool facts and closes active Store socket. Supervisor stops old Store, applies exact continuity merge, replaces installation selection and presents the selected candidate. Daemon independently admits it before resume.
 
-Retain rendered packet bytes and exact included revisions before host output. Prepared/emitted/associated/used remain separate observations/facts.
+Daemon/channel loss causes supervisor to terminate/reap/discard candidate before another daemon or cutover. A crash-released lease never authorizes cutover.
 
-## 11. Controller V2 adapter — Contract 0.16
+### 9.5 Exact rollback and external work
 
-### 11.1 Principal and identity admission
+Restore never writes into live root and never invents a merge of later Store rows. Healthy current Store first gets a safety backup; disaster mode records unavailable current inventory. Current deletion notices dominate backup. Current post-cut spool merges by exact command bytes/disposition. Previous root remains until explicit retirement.
+
+`controller_closed` jobs restore from backup facts. `controller_dependent` jobs require exact call/copy. A fixed post-cut interval is inventoried; results are not adopted. Missing caller creates owner-action debt. Any history gap, unknown auxiliary mutation, ambiguous terminal record or missing dependent copy keeps inference disabled while Base remains usable.
+
+## 10. Controller V2 adapter — Contract 0.17
+
+Principal:
 
 ```text
 principal_kind = memory_inference
 client_id = memory:<stable_memory_installation_id>
 ```
-
-`client.identity` must match installation selection:
-
-```text
-controller_id
-client_id
-principal kind
-token_version
-api_version
-WriteId floor/future-skew
-```
-
-No owner/Agent/automation/plugin/no-token fallback. Controller checks registration/version before every call; stale transport closes.
-
-### 11.2 Minimal API
 
 Reads:
 
@@ -594,7 +701,7 @@ inference.high_water
 inference.result.read
 ```
 
-Caller mutations, each with precommitted global WriteId:
+Caller mutations, each with precommitted global `WriteId`:
 
 ```text
 inference.text
@@ -606,228 +713,19 @@ inference.retention.advance
 
 Controller-local owner maintenance: client install/rotate/disable and non-disclosing break-glass erase. Memory cannot invoke owner maintenance.
 
-### 11.3 Live call lifecycle
+One bounded runner performs at most one provider attempt. Possible send followed by loss remains `unknown`; no hidden retry/fallback. Exact result is range-read, verified, copied to a Memory blob and decoded. Release is blocked while any final/provisional backup marks the call dependent.
 
-```text
-Memory persists exact request + call WriteId
-→ same method/ID/bytes sent
-→ controller first-admits or returns existing call
-→ one bounded provider attempt
-→ exact result private file when present
-→ Memory range-reads and verifies/copies
-→ cognitive decode/publication
-→ release only when no controlled backup dependency remains
-```
+Registration owns monotonic `last_admission_seq` and `retain_after_seq`. Fixed-window list below cut returns `history_gap`; erased content above cut retains bounded text-free membership tombstone until cut advancement.
 
-Possible provider send becomes `unknown`; never another attempt under new ID. Store conflict reuses retained result, not provider call.
+## 11. Erasure, rotation and observability
 
-Cancel, release and retention advance each have their own durable WriteId. At backup cut each becomes effect-observed, retired-not-sent or unknown. An old backup never first-admits an absent auxiliary ID.
+Physical erasure publishes a monotonic deletion notice, closes affected mutation/replay, reconciles possible effects, terminalizes and deletes dependent backups/candidates, uses caller cancel/release-abandon where available and deletes controlled rows/blobs/spool/previous roots/controller copies. Missing caller requires observed controller-owner break-glass. Terminal marker, deletion notice and membership tombstone are not physical deletion proof.
 
-### 11.4 Admission and retention
+Store credential rotation closes sockets and restarts Store. Controller caller rotation preserves stable client ID, fences stale token versions and delays previous-secret deletion until old-call read/release and restart readback.
 
-Controller registration owns:
+Status derives from actual facts: executable/root/DACL, process/channel/Store admission, schema generation/bundle digest, query health, capture/spool/replay, backup staging/fence/terminal/lease/candidate/cleanup, controller identity/WriteId/high-water/cut/tombstones, and cleanup/owner debt.
 
-```text
-last_admission_seq
-retain_after_seq
-```
-
-First admission transaction checks signed-64 exhaustion, increments sequence and inserts receipt/call. Never derive from retained rows.
-
-`inference.high_water` returns:
-
-```text
-high_water = last_admission_seq
-retain_after_seq
-observed_earliest_retained_seq?  # diagnostic only
-```
-
-`inference.list(after, through, cursor, limit)` fixes membership `(after, through]`. Cursor binds controller/client, bounds, API version and page shape. `after < retain_after_seq` returns `history_gap` even if rows remain.
-
-Erasing content for call above cut leaves bounded text-free membership tombstone until cut advancement.
-
-`inference.retention.advance` uses caller WriteId, expected current cut and monotonic new cut. It cannot exceed high-water/decrease. Restorable and unresolved provisional backups pin the post-cut denominator; in-cut dependencies remain unreleased and never lower the cut.
-
-### 11.5 Cleanup authority
-
-With valid caller:
-
-```text
-queued -> optional inference.cancel
-then inference.release(...), subject to current controlled backup set
-```
-
-Owner `inference.erase` is local break-glass only. Memory records `owner_action_required` and later non-content readback; it never creates/submits owner erase ID.
-
-### 11.6 Private credential publication
-
-Controller-local owner derives token and writes only to admitted private create-new/no-reparse destination with restrictive ACL, file/parent durability and exact readback. Memory receives credential reference/bundle, never owner token or routing key. Lost reply retries same owner WriteId and re-derives same token.
-
-## 12. Learning and cognition integration
-
-Group episodes by actual session/task/call/result relations. Freeze membership and selected/supplied/covered ranges. Normal job receives episode, feedback, small related set and exact recipe. It may create/revise, identify conflict/unknown or valid no-change.
-
-First enable stores real default processing method; upgrades do not overwrite edited revision. Automatic mode is off/idle/background; profile may deny automatic. New input coalesces one successor. Output must reach context/open/method consumer.
-
-Operational failure/no-result/malformed/truncated/omitted coverage is not cognitive no-change. Useful partial output records coverage. Cleanup state separate from cognitive result.
-
-## 13. Backup, rollback, retention, terminal state and erasure
-
-### 13.1 Admission/dependency/auxiliary closure and immutable plan fence
-
-1. stop new application mutations and controller-backed work;
-2. close/drain the controller-mutation owner and reconcile in-flight send/readback;
-3. pause replay and reconcile active item/Store-write unknowns;
-4. persist every created call/cancel/release/retention WriteId;
-5. authenticate exact controller caller;
-6. classify every call ID as admitted, retired-not-admitted or admission-unknown;
-7. classify every auxiliary ID as effect-observed, retired-not-sent or mutation-unknown from exact call/current-cut readback;
-8. classify every admitted call as controller-closed or controller-dependent;
-9. read `high_water + retain_after_seq` only after classification;
-10. under brief spool-publication lock capture exact spool cut/generation and immutable entry inventory; release lock;
-11. allocate a fresh non-reused backup ID through the backup-set owner;
-12. construct canonical backup plan over backup ID, expected manifest identity, selected root/schema/spool cut, controller/client/token/high-water/cut, admitted dependencies, call/auxiliary dispositions, disclosure and gaps;
-13. compute `backup_plan_digest` excluding its own field, publication state and later page/part/manifest digests;
-14. publish/read back installation-scoped create-new `fence.json` outside rollback Store roots;
-15. only then page Store/copy parts and publish final manifest.
-
-Final manifest repeats `backup_plan_digest` and actual inventories/digests. It never requires a precommitted digest of itself. Store maintenance row mirrors status only.
-
-### 13.2 Installation-scoped states and terminal tombstones
-
-```text
-backups/<backup-id>/
-  fence.json?
-  parts/...
-  manifest.json?
-  abort.json?
-  retire.json?
-```
-
-State order:
-
-```text
-valid standalone retire -> retired/non-restorable
-valid standalone abort  -> aborted-before-publish
-fence + matching manifest + no terminal -> published/restorable
-fence + no valid manifest/terminal      -> preparing/publication-unknown
-all malformed/mismatched/both-terminal  -> unresolved/fail closed
-```
-
-Abort/retire markers are self-contained terminal authority after creation prerequisites. They bind backup ID, plan/fence identity, deterministic terminal operation ID and closed reason code; retire also binds manifest digest. Later deletion of fence/manifest/parts does not invalidate terminal state. Surviving files that disagree are integrity failure.
-
-### 13.3 Post-cut retention denominator
-
-```text
-required_retain_after_seq =
-  minimum high_water among:
-    valid published non-retired restorable backups
-    unresolved preparing/publication-unknown fences
-```
-
-After controlled-set change is durable, recompute current desired cut, create a fresh maintenance record with expected/new cut and precommitted WriteId, then send. Restored pending retention intent is reconciled or retired, never blindly replayed. Crash before fresh advance is conservative.
-
-### 13.4 Published backup retirement and abort
-
-Retirement never deletes authoritative files first.
-
-1. require exact valid published backup, no active restore lease and serialize through backup-set owner;
-2. construct deterministic self-contained `retire.json`;
-3. publish create-new/no-reparse with file/parent durability and exact readback;
-4. only then mark generation non-restorable and exclude it from release/retention pin scans;
-5. recompute denominators;
-6. clean content-bearing parts/manifest/fence later; retain terminal tombstone.
-
-Abort is valid only before successful publication, after exact manifest absence, no live writer/restore lease and partial-content cleanup. It publishes a self-contained `abort.json`. Abort and retire are mutually exclusive. Unknown terminal publication leaves state unresolved and pinned.
-
-Terminal state is not physical erasure. Remaining content keeps erasure incomplete.
-
-### 13.5 Exact rollback and restore lease
-
-Restore never writes into live root or invents merge of later Store rows. Healthy current Store first receives safety backup; disaster mode records unavailable current inventory.
-
-The backup-set owner admits restore only for a valid published non-retired backup and returns a read lease with retained no-follow handles to fence, manifest and required parts. Retirement/abort/cleanup wait while the lease exists. Restore holds it through candidate materialization, verification and final pre-cutover terminal-record recheck.
-
-Build/verify a fresh candidate under supervisor Owner, apply migrations, restore typed rows/unfenced blobs, stage backup spool separately, compare config, restart/admit candidate under Editor, then quiesce active Store and cut over through expected-generation selection replacement. On crash the lease disappears and the disposable candidate is discarded.
-
-Current deletion notices dominate backup. Current post-cut spool merges by command ID/exact bytes/disposition. Failed never becomes pending. Previous root remains until explicit retirement.
-
-### 13.6 Restored controller work and maintenance mirrors
-
-In-cut restored calls:
-
-```text
-controller_closed
-  restore from backup facts; controller row may be absent
-
-controller_dependent
-  exact call and required copy must remain; absence/mismatch is damaged/history_gap
-
-retired_not_admitted
-  old call ID stays retired
-
-admission_unknown
-  hold with inference disabled
-```
-
-Auxiliary IDs:
-
-```text
-effect_observed     retain observed effect; never resend old ID
-retired_not_sent    never send old ID
-mutation_unknown    hold until exact readback
-```
-
-Before job claims, installation records supersede restored Store mirrors. A stale mirror is marked `superseded_by_installation_state` and cannot create terminal records, clear pins or send release/retention.
-
-After post-cut inventory, still-needed cancel/release is recomputed from current call and backup-set state. Retention target is recomputed from current installation records and controller cut. Any new mutation receives a fresh WriteId.
-
-### 13.7 Controller external-work inventory
-
-Capture inventory high-water and page:
-
-```text
-inference.list(
-  after = backup_high_water,
-  through = inventory_high_water
-)
-```
-
-Every returned post-cut call lies outside backup's admitted set. Do not adopt result as restored cognition. With valid caller, cleanup uses recomputed cancel/release-abandon after controlled-set checks. Without caller, create `owner_action_required` debt.
-
-New inference remains disabled until inventory completes and every row is dispositioned. `history_gap`, controller/caller unavailability, call/auxiliary unknown, publication/terminal-record unknown, missing dependent copy or identity reset leaves `external_work_inventory_unavailable`; Base remains usable.
-
-### 13.8 Erasure and retention tombstones
-
-Publish monotonic text-free deletion notice, close affected mutation/replay admission, drain possible writes, cancel/fence jobs/controller calls and delete controlled current rows/blobs/spool/previous roots/candidates/backups/controller copies.
-
-Before caller abandon or owner break-glass, terminalize and physically delete every controlled backup that marks the call dependent; otherwise erasure remains blocked/incomplete.
-
-Valid caller uses `inference.release(abandon_for_erasure)`. Owner break-glass is external/manual authority and complete only after observed readback.
-
-For controller call above `retain_after_seq`, content/sensitive facts delete immediately but bounded text-free membership tombstone remains until cut advancement. If even tombstone deletion required, retire every controlled backup pinning interval and advance cut first.
-
-Deletion fence/controller tombstone/backup terminal marker is not physical proof. Previous root/backup containing erased scope must be deleted wholly or erasure remains incomplete. Provider-held/off-machine copies are external.
-
-## 14. Control and observability
-
-Controls: status/open/configure/pause/cancel/correct/withdraw/erase/backup/restore/rotate/retire/shutdown.
-
-Status derives from actual facts:
-
-- executable/root/DACL/selection generation;
-- supervisor/daemon/channel/process/Store admission;
-- schema/query health and socket owner;
-- capture/stage/spool/replay;
-- controller mutation barrier, call/auxiliary cut dispositions and release/retention fences;
-- backup ID/fence/plan digest, restore lease, preparing/publication-unknown/published/aborted/retired state and physical cleanup debt;
-- restored mirror reconciliation and rollback divergence;
-- controller identity/token version/WriteId state/high-water/retain cut/inventory/tombstones;
-- job/result/publication, caller cleanup and owner-action-required debt.
-
-Do not equate request with effect, plan digest with manifest digest, backup scan with restore lease, Store mirror with installation authority, terminal marker with physical erasure, deletion fence/tombstone with physical erase, password change with session revocation, candidate verification with cutover or observed earliest row with guaranteed retention.
-
-## 15. Implementation sequence
+## 12. Implementation sequence
 
 Write production code first. After each coherent increment run:
 
@@ -838,9 +736,9 @@ cargo clippy -p <changed-package> --lib --bins -- -D warnings
 
 No broad campaign before connected product.
 
-### Slice 0 — physical/Store preflight
+### Slice 0 — physical, Store and schema preflight
 
-Qualify exact Windows binaries/root leases/DACL, Job custody, inherited channel, relay pipe, Surreal 3.3.4/RocksDB `sync=every`, listener/peer ownership, bootstrap roles, query-only DTO client, migrations/conflicts/fsync unknowns, immutable/mutable files, WriteId-state primitive, backup-set owner/IDs/terminal markers/restore leases, replay barrier, typed backup/rollback/erasure, Store credential revocation and bounded shutdown.
+Qualify exact Windows binaries/root leases/DACL, Job custody, inherited channel, relay pipe, SurrealDB 3.3.4/RocksDB `sync=every`, listener/peer ownership, bootstrap roles, query-only DTO client, migration 0001 bundle/params/INFO readback, conflicts/fsync unknowns, immutable/mutable files, external-ID state, staged backup-directory publication, daemon backup-set owner, self-contained terminal records, restore lease/candidate discard, rollback/erasure/rotation/shutdown.
 
 ### Slice 1 — useful persistence
 
@@ -854,20 +752,14 @@ real event
 
 ### Slice 2 — first host and useful Base
 
-Claude relay, continuation, lexical retrieval, actual packet emission, notes/corrections/commitments and Base backup/rollback/erase. Controller inference disabled.
+Qualified Claude relay, continuation, lexical retrieval, actual packet emission, notes/corrections/commitments and Base backup/rollback/erase. Controller inference disabled.
 
-### Controller dependency
+### Controller dependency and inference
 
-Controller issue #200, then V2 L0/L1 under its roadmap. Never extend V1.
+Controller issue #200, then V2 L0/L1. Never extend V1.
 
-### Inference P1a
-
-Stable caller, controller-local install, rollback-safe WriteId state, controller-mutation owner, backup-set owner, admission/dependency/auxiliary cut classification, canonical plan digest, installation-scoped fence/self-contained abort-retire records, restore lease, client/call/receipt/private-copy schema, text runner, controlled-set release+retention, erased tombstones, owner break-glass, one episode result changing later context and backup/restore inventory.
-
-### Inference P1b and later
-
-Token rotation/stale-session fence/delayed retirement; then embeddings, project views, documents, Research and additional hosts independently. Advanced curation only after connected Base paths.
+P1a implements stable caller, WriteId state, controller-mutation owner, calls/private copies/runner, admission/auxiliary cut, daemon backup-set integration, release/retention/list/tombstones and one episode result changing later context. P1b adds token rotation and delayed credential retirement.
 
 ### Final qualification
 
-After connected product: concurrency/restart/crash, Windows custody/IPC, Store durability, spool/backup/rollback/restore-lease/terminal-cleanup/erasure, host delivery, controller idempotency/cut dispositions/plan digest/release+retention fences/tombstones/history-gap/authority/rotation, provider uncertainty and load/retention campaigns.
+After connected product: concurrency/restart/crash, Windows custody/IPC, Store migration/durability, spool, exact-open pagination, lexical plans, backup publication/terminal/lease/cutover/erasure, controller idempotency/retention/authority/provider uncertainty and measured load/retention campaigns.
