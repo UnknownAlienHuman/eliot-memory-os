@@ -1,10 +1,10 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.15 · 2026-10-27 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.16 · 2026-10-27 · normative design for the greenfield rewrite.**
 
 V1/V2 Memory implementations are donors. V3 is a new implementation, not a compatibility migration. Current `eliot-swarm-controller` V2 is also a fresh implementation target; its existing V1 runtime is donor-only and must not receive new Memory functionality.
 
-This document owns product purpose, authority and invariants. [Implementation](IMPLEMENTATION.md) owns concrete runtime, Store and maintenance paths. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.14](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only active work ledger.
+This document owns product purpose, authority and invariants. [Implementation](IMPLEMENTATION.md) owns concrete runtime, Store and maintenance paths. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.15](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only active work ledger.
 
 ## 0. Current external dependency
 
@@ -72,7 +72,7 @@ Correct a harmful default at its owner instead of adding another exception, regi
 | Host event translation and supported context emission | Narrow host adapter/relay |
 | Observations, semantic revisions, retrieval, context, outcomes and finite Memory jobs | Memory daemon/application operations |
 | Application Store mutations, replay/jobs, backup cut and quiesce evidence | Memory daemon |
-| Installation selection, root/Owner credentials, migrations, Store lifecycle, backup fence files and restore cutover | Memory supervisor/installer |
+| Installation selection, root/Owner credentials, migrations, Store lifecycle, backup publication/retirement records and restore cutover | Memory supervisor/installer |
 | Interpretation, consolidation and method improvement | Memory learning handlers |
 | One-shot caller authentication, profiles, provider invocation/readback, `WriteId` receipts and temporary inference copies | Controller V2 |
 | Application persistence, indexes and transactions | SurrealDB through one private Memory Store |
@@ -97,7 +97,7 @@ exact input + profile + disclosure + finite limits + precommitted WriteId
 → exact visible body when present + bounded observed facts
 ```
 
-Memory uses dedicated controller V2 `memory_inference` principal and Contract 0.14 methods. It does not create controller Agent, binding, turn, command, Goal, automation run/action, workspace, native session, Task, Attempt, review or acceptance object.
+Memory uses dedicated controller V2 `memory_inference` principal and Contract 0.15 methods. It does not create controller Agent, binding, turn, command, Goal, automation run/action, workspace, native session, Task, Attempt, review or acceptance object.
 
 Richer software-agent work may use controller Agents when it genuinely needs tools or continuation. One bounded memory extraction must not expand into a workflow engine.
 
@@ -158,7 +158,7 @@ Derived content cannot widen the strictest source it still reveals. Controller r
 
 Unavailable profile/capacity or disclosure mismatch is operational failure/waiting, not cognitive `no_change` and not processed coverage.
 
-### 2.5 Cleanup authority, backup dependencies and publication state are distinct
+### 2.5 Cleanup authority, backup dependencies, publication and retirement are distinct
 
 One call creates at most two private controller files:
 
@@ -192,16 +192,22 @@ controller_dependent
   or unresolved cleanup/readback
 ```
 
-Before any backup part is written, Memory closes/drains the single controller-mutation owner, captures the exact spool/controller cut, computes a canonical backup-plan digest and durably publishes an installation-scoped create-new `fence.json` outside rollback Store roots. The plan digest excludes its own digest, publication state and later page/part/manifest digests. The final manifest repeats the plan digest and actual inventories; it never requires a precommitted digest of itself.
+Before any backup part, Memory closes/drains the single controller-mutation owner, captures the exact spool/controller cut, computes a canonical backup-plan digest and durably publishes an installation-scoped create-new `fence.json` outside rollback Store roots. The plan digest excludes its own digest, publication state and later page/part/manifest digests. Final manifest repeats the plan digest and actual inventories; it never requires a precommitted digest of itself.
 
-Release and retention scan both valid retained manifests and unresolved installation-scoped fences. `preparing` and `publication_unknown` pin dependencies exactly like a retained backup and also pin the post-cut retention denominator at their recorded high-water.
+Release and retention scan installation-scoped controlled-set records:
 
-A provisional fence is cleared only after exact installation-file reconciliation proves either:
+```text
+fence + valid manifest + no retire  -> published/restorable
+fence + valid manifest + retire     -> retired/non-restorable
+fence + no manifest + abort         -> aborted-before-publish
+other mismatch/ambiguity            -> unresolved/fail closed
+```
 
-- a matching final manifest is durably in the controlled backup set; or
-- no valid final manifest exists and a matching durable abort record follows exact partial cleanup.
+`preparing` and `publication_unknown` pin dependencies exactly like a retained backup and pin post-cut retention at their recorded high-water.
 
-Rename-may-have-succeeded plus failed directory sync/readback remains `publication_unknown`; release and retention advance stay blocked across Store rollback/restart. An ordinary Store maintenance row mirrors status but is not the sole authority.
+A published backup is retired only by create-new durable `retire.json` that binds backup ID, plan digest and observed manifest digest. Deleting manifest/fence/parts is not retirement. Until marker readback succeeds, the backup remains restorable and pinned. `abort.json` applies only before publication and is mutually exclusive with retirement.
+
+A retirement marker makes the generation non-restorable and permits release/retention recomputation, but it is not physical erasure. Content-bearing parts must still be deleted for complete erasure; the text-free retirement tombstone prevents backup-ID reuse or resurrection.
 
 Controller-owner `inference.erase` is local break-glass for missing/disabled caller or emergency. Memory has no owner credential, cannot submit it and cannot report it complete before non-content owner readback.
 
@@ -212,7 +218,7 @@ last_admission_seq
 retain_after_seq
 ```
 
-`retain_after_seq` guarantees post-cut membership above the cut. It is monotonic and is **not lowered** to pin in-cut dependencies; those remain protected because required calls/copies stay unreleased. Retained and unresolved provisional backups both constrain how far the cut may advance.
+`retain_after_seq` guarantees post-cut membership above the cut. It is monotonic and is **not lowered** to pin in-cut dependencies; those remain protected because required calls/copies stay unreleased. Retained backups and unresolved provisional fences both constrain how far the cut may advance; retired/aborted generations do not.
 
 Erasing content above cut leaves bounded text-free tombstone until cut advances beyond its sequence. If even tombstone must disappear, all controlled backups pinning interval retire and cut advances first; otherwise erasure remains incomplete.
 
@@ -225,7 +231,7 @@ Initial product is:
 - one private inherited supervisor↔daemon channel;
 - one private application Store and one active SurrealDB child;
 - at most one isolated restore candidate;
-- installation-scoped WriteId and backup-fence files outside rollback Store roots;
+- installation-scoped WriteId and backup fence/manifest/abort/retire records outside rollback Store roots;
 - ordinary internal modules;
 - optional outbound clients only when enabled.
 
@@ -377,9 +383,10 @@ Historical handle never falls forward. Current handle does not resurrect history
 | Reduce exposure | retrieve less while permitted history remains |
 | Withdraw influence | stop guidance in stated situation |
 | Supersede/refute | publish scoped replacement/contradiction |
-| Erase controlled scope | delete controlled source/derivatives/spool/backups/controller copies and retain only required anti-reintroduction/inventory tombstones |
+| Retire backup | make one previously published generation permanently non-restorable through durable marker; does not delete its content |
+| Erase controlled scope | delete controlled source/derivatives/spool/backups/controller copies and retain only required anti-reintroduction/inventory/retirement tombstones |
 
-Deletion fence or retained membership tombstone prevents false reintroduction/inventory claims but is not physical deletion proof. Provider-held copies/effects and exported off-machine backups remain external boundaries.
+Deletion fence, membership tombstone or backup retirement marker prevents false reintroduction/inventory/restore claims but is not physical deletion proof. Provider-held copies/effects and exported off-machine backups remain external boundaries.
 
 ## 5. Current work and decision context
 
@@ -440,7 +447,7 @@ One attributable attempt/criterion contributes once. Replayed hooks/summaries ar
 
 ### 7.4 Recursive improvement
 
-Diagnose failed connected edge—capture, source selection, controller admission/execution/readback/retention/backup dependency/publication/cleanup, decoding, publication, retrieval, delivery, use or applicability—and correct that edge. Do not multiply duplicate lessons or add global intelligence score.
+Diagnose failed connected edge—capture, source selection, controller admission/execution/readback/retention/backup dependency/publication/retirement/cleanup, decoding, publication, retrieval, delivery, use or applicability—and correct that edge. Do not multiply duplicate lessons or add global intelligence score.
 
 ## 8. Backup, rollback and external-work continuity
 
@@ -448,16 +455,11 @@ Application backup uses brief spool publication cut, canonical typed Store pages
 
 Before controller high-water, Memory closes/drains one controller-mutation owner and classifies every created call ID as admitted, retired-not-admitted or unknown. Only admitted calls belong to controller-continuous external-work set.
 
-Every admitted in-cut call is then `controller_closed` or `controller_dependent`. After the exact spool/controller cut, Memory computes a canonical immutable plan digest and publishes `backups/<id>/fence.json` outside rollback Store roots before any backup part. The plan digest has an explicit preimage and excludes itself, publication state and later part/manifest digests. The final manifest repeats the plan digest and actual inventories; no self-referential manifest digest exists.
+Every admitted in-cut call is then `controller_closed` or `controller_dependent`. After the exact spool/controller cut, Memory computes a canonical immutable plan digest and publishes `backups/<id>/fence.json` outside rollback Store roots before any backup part. The final manifest repeats the plan digest and actual inventories; no self-referential manifest digest exists.
 
-A valid retained manifest or unresolved fence both pin dependent-call release. `preparing` and `publication_unknown` also pin post-cut retention at their recorded high-water. A Store maintenance row mirrors status but rollback cannot remove the installation-scoped authority.
+A valid published non-retired manifest or unresolved fence both pin dependent-call release. `preparing` and `publication_unknown` also pin post-cut retention at their recorded high-water. Store maintenance rows mirror status only.
 
-A provisional fence clears only through one of two exact outcomes:
-
-- valid matching final manifest plus file/parent durability/readback; or
-- valid abort record after exact final-manifest absence and cleanup/quarantine of partial parts.
-
-Malformed or ambiguous records remain fenced.
+A published backup becomes non-restorable only after exact durable `retire.json` readback. Until then it remains retained and pinned. Retirement marker is mutually exclusive with pre-publication abort and remains as monotonic tombstone; deleting files is not retirement. Physical content cleanup is separate.
 
 For exact controller/client identity, every backup plan/manifest records:
 
@@ -471,19 +473,19 @@ spool cut identity
 strictest disclosure and explicit gaps
 ```
 
-Post-cut retention denominator is the minimum high-water among retained restorable backups and unresolved provisional fences. It is not lowered for old in-cut dependencies; those remain unreleased.
+Post-cut retention denominator is the minimum high-water among published non-retired restorable backups and unresolved provisional fences. It is not lowered for old in-cut dependencies; those remain unreleased.
 
-Restore is exact rollback, not invented merge. `controller_closed` jobs restore from backup facts even when controller row pruned. `controller_dependent` jobs require exact call/copy. Retired ID never sends again.
+Restore is exact rollback, not invented merge. Retired backups are rejected. `controller_closed` jobs restore from backup facts even when controller row pruned. `controller_dependent` jobs require exact call/copy. Retired call ID never sends again.
 
-Post-cut calls are inventoried through fixed `(backup_high_water, inventory_high_water]`. Results are not adopted. Valid caller uses cancel/release-abandon after retained/provisional dependency checks; unavailable caller creates owner-action-required debt.
+Post-cut calls are inventoried through fixed `(backup_high_water, inventory_high_water]`. Results are not adopted. Valid caller uses cancel/release-abandon after controlled-set dependency checks; unavailable caller creates owner-action-required debt.
 
-`history_gap`, caller/controller unavailability, admission unknown, publication unknown, missing dependent copy or identity reset keeps inference disabled. Base remains available. External-WriteId generator and installation-scoped backup fences are not rolled back.
+`history_gap`, caller/controller unavailability, admission unknown, publication/retirement unknown, missing dependent copy or identity reset keeps inference disabled. Base remains available. External-WriteId generator and installation-scoped backup records are not rolled back.
 
 ## 9. Reliability, privacy and direct control
 
-Persist enough state to distinguish adjacent lifecycle states: accepted/staged/committed/unknown capture; prepared/emitted context; exact-read complete/paged/missing/damaged; inference prepared/admitted/retired-not-admitted/sending/settled/unknown/abandoned; controller-closed/dependent; result copied/decoded/published; per-copy cleanup; backup preparing/publication-unknown/published/aborted; release and retention fences; owner-action-required debt; privileged maintenance requested/quiesced/executing/selection-unknown/completed.
+Persist enough state to distinguish adjacent lifecycle states: accepted/staged/committed/unknown capture; prepared/emitted context; exact-read complete/paged/missing/damaged; inference prepared/admitted/retired-not-admitted/sending/settled/unknown/abandoned; controller-closed/dependent; result copied/decoded/published; per-copy cleanup; backup preparing/publication-unknown/published/aborted/retired; release and retention fences; physical cleanup debt; owner-action-required debt; privileged maintenance requested/quiesced/executing/selection-unknown/completed.
 
-Acknowledgement is not completion. Heartbeat is not progress. Provider body is not decoded proposal. Published memory is not external success. Deletion fence/tombstone is not complete physical erase. Backup plan digest is not final manifest digest. Backup rename without parent durability/readback is not published success and not permission to clear dependency fences.
+Acknowledgement is not completion. Heartbeat is not progress. Provider body is not decoded proposal. Published memory is not external success. Backup plan digest is not final manifest digest. Backup rename without parent durability/readback is not published success. Retirement marker is not content erasure. File deletion is not a valid retirement protocol.
 
 Secrets stay with owner:
 
@@ -506,7 +508,7 @@ Without demonstrated consumer and owner decision, V3 does not add:
 - truth/skill/outcome/packet registry;
 - general Governor/approval/proof platform;
 - actor/crate/service/manifest per concept;
-- a controller backup-pin service/table when installation fence + ordinary maintenance status is sufficient;
+- a controller backup-pin service/table when installation records + ordinary maintenance status are sufficient;
 - runtime plugin/WASM/hot-generation machinery;
 - model judges, silent fallback or arbitrary provider extras;
 - generated inventories as permanent authorities;
@@ -518,10 +520,12 @@ Without demonstrated consumer and owner decision, V3 does not add:
 - rollbackable/reusable external-WriteId generator;
 - first admission of absent old call from backup;
 - release of a call pinned by retained or provisional backup dependency;
-- retention advance past a preparing/publication-unknown backup high-water;
-- precommitted final-manifest digest inside the Store data being backed up;
+- retention advance past a retained or preparing/publication-unknown backup high-water;
+- precommitted final-manifest digest inside Store data being backed up;
 - rollback-local Store row as sole provisional publication authority;
-- clearing publication-unknown fence without exact installation-file reconciliation;
+- deleting manifest/fence/parts as retirement;
+- using pre-publication abort marker as published-backup retirement;
+- clearing publication/retirement unknown without exact installation-file reconciliation;
 - lowering monotonic retain cut to pin old dependency;
 - Memory impersonation of controller-owner erase;
 - deletion of pinned inventory membership without tombstone/cut advance.
@@ -547,7 +551,8 @@ stable caller + precommitted WriteId
 → exact result copy or typed no-result/unknown
 → decoded publication
 → later context consumer
-→ crash-safe installation-scoped backup plan fence
+→ crash-safe installation-scoped plan fence
+→ durable retirement state when backup leaves controlled set
 → dependency-aware release and retention
 → backup admission closure and restart/rollback reconciliation
 ```
@@ -558,7 +563,7 @@ Implementation order:
 2. useful Base capture/replay/open;
 3. first qualified host/context path;
 4. controller #200 plus V2 L0/L1;
-5. Contract 0.14 text-inference P1a;
+5. Contract 0.15 text-inference P1a;
 6. credential rotation P1b;
 7. independent vectors/views/documents/Research/hosts;
 8. advanced curation after connected Base.
