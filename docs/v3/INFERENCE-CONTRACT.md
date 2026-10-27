@@ -1,158 +1,156 @@
 # Eliot V3 — One-shot inference contract
 
-**Revision 0.9-draft · 2026-10-26 · shared Memory OS ↔ `eliot-swarm-controller` V2 boundary; not implemented.**
+**Revision 0.10-draft · 2026-10-26 · shared Memory OS ↔ `eliot-swarm-controller` V2 boundary; not implemented.**
 
-This is the sole normative contract for one-shot text and embedding execution. It keeps Memory semantics in Memory and physical model execution in controller. It deliberately does **not** create a controller Agent, native session, Goal, Task/Attempt/review workflow, automation rule/run, generic service-client platform, second receipt store or hidden retry ladder.
+This is the sole normative contract for one-shot text and embedding execution. Memory owns semantic work; controller owns authenticated physical model execution and bounded temporary copies. The boundary does **not** create a controller Agent, native session, Goal, Task/Attempt/review workflow, automation run, script, generic service-account platform, second receipt store or hidden retry ladder.
 
-## 0. Authority and inspected baseline
+## 0. Current authority and prerequisites
 
-The current controller authority inspected for this revision is:
+The inspected controller authority for this revision is:
 
 ```text
 UnknownAlienHuman/eliot-swarm-controller
-main = c8c0ee122c98a01be86bc5296a22a389662a1c89
-merged PR #197
+main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
+merged PR #198
 ```
 
-That V2 specification selects local JSON-RPC, one SQLite WAL Store, canonical external ULID `WriteId` receipts, exact caller/custody classification and a fresh layered implementation. It declares the existing Rust/`swarm-client`/Operation stack to be V1 legacy pending deletion.
+That V2 specification selects local JSON-RPC, one SQLite WAL Store, canonical global ULID `WriteId` receipts and a fresh layered implementation. The existing Rust/`swarm-client`/generic Operation runtime is V1 legacy pending deletion and is a donor only.
 
-Therefore:
+Current prerequisites are explicit:
 
-- controller revision `e42c464d` and its `swarm-client`, roles, generic Operation table and artifact grants remain **donors only**;
-- no V3 implementation may add Memory inference to that retired V1 stack;
-- controller-specific names in older Memory Architecture/Implementation/Cognition text are superseded by this contract where they conflict;
-- controller V2 needs one explicit, narrow Memory inference extension after its L1 Store/API foundation exists.
+- controller V2 roadmap L0.1–L1.11 is still unimplemented;
+- controller issue #200 must repair binding-revision allocation and restore green schema validation before L0/L1 implementation;
+- PR #201 repairs only invalid validator fixtures and does not close the allocator defect;
+- controller issue #199 owns the future Memory extension after V2 L0/L1 and #200;
+- no Memory implementation may patch the retired V1 runtime to make this contract appear available.
 
-The contract prevents these failures:
+Source/design completion is not runtime qualification.
 
-1. implementing against a controller subsystem already selected for deletion;
-2. allowing Memory to enter the controller as owner, agent, project automation or generic writer;
-3. losing request identity when a reply is lost or Memory is restored;
-4. replaying a provider call after a possible send;
-5. persisting prompts, embedding input, provider secrets or raw client tokens in generic receipts/config/logs;
-6. treating token-file possession as authenticated identity without controller readback;
-7. exposing result bytes through owner cleanup authority;
-8. restoring an old Memory backup while silently ignoring controller calls admitted after that backup cut;
-9. creating another Task/Attempt/Operation or submission-state machine around one bounded model call.
+## 1. Ownership
 
-Memory owns the finite job, frozen sources, recipe, disclosure reduction, exact request bytes, decoding, publication and cognitive consumer. Controller owns caller authentication, static inference configuration, provider invocation/readback, `WriteId` idempotency, temporary controlled copies and non-content cleanup facts.
+Memory owns:
 
-## 1. Exact application surface
+- the finite job and its exact sources/coverage;
+- processing-method revision;
+- disclosure reduction;
+- exact request bytes and every Memory-side external `WriteId`;
+- result verification/copy;
+- cognitive decoding/publication;
+- later consumer;
+- backup/restore disposition of its jobs.
 
-Controller V2 adds one principal kind:
+Controller owns:
+
+- caller authentication and current credential fence;
+- static inference connection/profile configuration;
+- actual destination and disclosure admission;
+- global `WriteId` receipt semantics;
+- provider invocation/readback;
+- private input/result copies;
+- bounded call status, retention and cleanup facts.
+
+Controller owner may install/rotate/disable a Memory principal and erase exact calls without reading result bytes. It cannot adopt caller ownership or fabricate a Memory result.
+
+## 2. Principal and credential identity
+
+Controller adds one principal kind:
 
 ```text
 memory_inference
 ```
 
-One principal represents one stable Memory installation. It is not controller owner, an Agent routing principal, a project rule principal, script/action custody or a generic service account. Omitting or clearing its token never falls back to owner authority.
-
-Allowed JSON-RPC methods are exactly:
-
-```text
-reads:
-  client.identity
-  inference.get
-  inference.list             # own bounded non-content rows only
-  inference.high_water       # own monotonic admission sequence and retained floor
-  inference.result.read      # own retained result bytes only
-
-mutations, each with a canonical external WriteId:
-  inference.text
-  inference.embed
-  inference.cancel           # own queued call only
-  inference.release
-
-local owner maintenance, not callable as memory_inference:
-  memory.client.install
-  memory.client.rotate
-  memory.client.disable
-  inference.erase            # non-disclosing exact cleanup/abandonment
-```
-
-No call creates or reuses a controller Agent, generation, turn, command, Goal, rule activation, automation run/action, workspace, native harness session, Task, Requirement, Attempt, review, submission or acceptance object.
-
-`inference.list` is not a general Operation browser. It returns only this exact caller's bounded call identity, admission sequence, state, result-present flag and cleanup disposition. It never returns input/result bytes, prompts, provider errors or another caller's identity.
-
-## 2. Stable caller and credential identity
-
-The boundary has four distinct values:
-
-```text
-controller_id      stable non-secret identity of one controller data root
-client_id          stable Memory principal identity
-token_version      positive monotonic credential version
-raw token          current replaceable authentication material
-```
-
-For one Memory installation:
+One principal represents one stable Memory installation:
 
 ```text
 client_id = memory:<stable-memory-installation-id>
 ```
 
-`client_id` survives Memory daemon restart, Store-root cutover, exact rollback, backup restore and token rotation. It is not derived from PID, executable path, Memory data-root generation, backup generation, token digest, time or controller process boot.
+The installation ID is a random non-secret installation identity, not a path, username, PID, root generation, backup generation, executable digest or token digest.
 
-Call/result ownership is always `client_id`. `token_version` authenticates the current physical credential and never rewrites existing call ownership or `WriteId`.
+Distinct values:
 
-Changing `client_id` is principal migration. Initial V3 provides no migration/adoption path. Controller owner cannot relabel old calls to a new client, and Memory cannot recover by inventing a new caller.
+```text
+controller_id      stable non-secret identity of one controller data root
+client_id          stable logical Memory caller and call owner
+token_version      positive monotonic current credential version
+raw token          replaceable authentication material
+```
+
+`client_id` survives daemon restart, Memory Store cutover, exact rollback, backup restore and token rotation. Existing calls remain owned by `client_id`; rotation changes only authentication material. Changing `client_id` is unsupported principal migration.
 
 Every controller-backed Memory job retains, without secrets:
 
 ```text
 controller_id
 controller_client_id
-selected token_version
+selected_token_version
 inference_write_id
-method + canonical bounded request identity
+method + canonical semantic request identity
 controller admission_seq when known
 profile/connection/adapter/destination snapshot
 result digest/length when present
-release/cleanup WriteId and per-copy disposition
+cancel WriteId when created
+release WriteId + disposition when created
+per-copy cleanup state
 ```
 
-The Memory backup never contains the raw token, controller `routing.key`, token hash, provider credential or reusable verifier.
+No backup contains the raw token, token hash, controller routing key, provider credential or reusable verifier.
 
-## 3. Provisioning and rotation owner
+## 3. Exact JSON-RPC surface
+
+Authenticated `memory_inference` reads:
+
+```text
+client.identity
+inference.get
+inference.list
+inference.high_water
+inference.result.read
+```
+
+Authenticated mutations, each with a precommitted global external `WriteId`:
+
+```text
+inference.text
+inference.embed                 # after the connected text path
+inference.cancel                # own queued call only
+inference.release
+inference.retention.advance
+```
+
+Controller-local owner maintenance, never callable as `memory_inference`:
+
+```text
+memory.client.install
+memory.client.rotate
+memory.client.disable
+inference.erase                 # non-disclosing exact cleanup/abandonment
+```
+
+No call creates/reuses a controller Agent, generation, binding, turn, command, Goal, rule activation, automation action, workspace, native harness session, Task, Attempt, review, submission or acceptance object.
+
+## 4. Provisioning and private credential publication
 
 Memory never receives controller owner authority or direct controller Store access.
 
-Provisioning is a controller-local owner command, conceptually:
+A controller-local owner command installs/rotates one principal through the normal owner `WriteId` path. It:
 
-```text
-eliot memory-client install \
-  --client-id memory:<installation-id> \
-  --credential-out <absolute-private-create-new-path> \
-  --id <owner-write-id>
+1. resolves the current controller data root and stable `controller_id`;
+2. commits one exact registration/version transition;
+3. derives the raw Memory token with a dedicated domain tag from controller-private routing key + `client_id` + `token_version`;
+4. stores only version/hash in SQLite;
+5. publishes the raw token only into a create-new private credential bundle;
+6. returns bounded non-secret identity/readback.
 
-eliot memory-client rotate \
-  --client-id memory:<installation-id> \
-  --expected-version <n> \
-  --credential-out <absolute-private-create-new-path> \
-  --id <owner-write-id>
-```
+The credential destination is presentation, not registration identity. It must be under an explicitly admitted private directory/handle, with no reparse traversal, restrictive DACL, create-new semantics, file and parent-directory durability and exact readback. Arbitrary absolute-path write authority is not exposed. Raw token never enters argv, SQLite, receipt result, logs, diagnostics or status.
 
-The command:
+Lost install/rotate reply retries the same owner `WriteId`; controller re-derives the same token. Missing/mismatched routing key blocks issue/reissue. An already presented retained token may still verify against its hash for bounded cleanup/readback, matching V2 routing-key failure semantics.
 
-1. resolves the current controller data root and its stable `controller_id`;
-2. uses controller owner admission locally; it never sends owner authority to Memory;
-3. commits one exact `memory_inference` registration/update through the normal V2 `WriteId` receipt path;
-4. derives the raw token with a domain-separated keyed function over controller private `routing.key`, `client_id` and `token_version`;
-5. stores only the version and token hash in SQLite;
-6. writes a create-new private credential bundle containing `controller_id`, `client_id`, `token_version` and raw token;
-7. never writes raw token to SQLite, receipt result, argv, logs, diagnostics or status.
+## 5. Connection identity and current-version fence
 
-Because the token is deterministically re-derived from private `routing.key` and the committed version, a lost install/rotate reply does not require a pending secret bundle or replacement token. Retrying the same owner `WriteId` returns the same registration and re-derives the same token. A different semantic payload under that ID is `id_conflict`.
+Memory uses the controller V2 JSON-RPC transport implementation. It does not use MCP, spawn the general CLI per application call, copy framing code or use retired `swarm-client`.
 
-A missing/mismatched controller `routing.key` blocks install, rotate and token reissue. Existing presented tokens may still verify against their stored hashes for bounded readback/cleanup, matching controller V2 routing-key failure semantics.
-
-`memory.client.rotate` atomically increments `token_version` once and preserves `client_id` and every existing call. Another rotation is refused while Memory installation selection still has unresolved pending/previous credential publication.
-
-## 4. Connection identity and per-request fence
-
-Memory uses the pinned controller V2 JSON-RPC client/transport implementation. It does not use MCP, spawn the general-purpose CLI for application calls, copy framing code or connect to the retired `swarm-client` protocol.
-
-Before any application mutation, Memory performs `client.identity` over the authenticated connection. The closed result is:
+Authenticated `client.identity` returns:
 
 ```text
 controller_id
@@ -164,44 +162,67 @@ write_id_floor_ms
 write_id_future_skew_ms
 ```
 
-Memory requires exact equality with installation selection and the supplied credential bundle. Missing, unknown or malformed fields fail closed. Mismatch closes the connection before `inference.text/embed` and yields a typed local failure such as:
+Memory requires exact equality with installation selection and credential bundle before any application call. Missing/malformed/mismatched fields close the connection with a typed failure.
+
+Before **every** Memory read/mutation, controller reloads registration and requires:
 
 ```text
-CONTROLLER_ID_MISMATCH
-CALLER_IDENTITY_UNAVAILABLE
-TOKEN_VERSION_MISMATCH
-API_VERSION_UNSUPPORTED
-```
-
-Possessing a credential file is not proof that the connected daemon authenticated it.
-
-Before **every** Memory-client read or mutation, controller reloads the registration and requires:
-
-```text
-registration exists
-registration.principal == memory_inference
-registration.disabled == false
+registration exists and is enabled
+principal kind == memory_inference
 principal.client_id == registration.client_id
 principal.token_version == registration.token_version
 presented token matches current hash
-live peer classification is not ambiguous
+peer classification is not ambiguous
 ```
 
-An old authenticated transport evaluated after rotation receives `credential_stale`; client and server close it after the terminal response. New version may read/release pre-rotation calls because ownership is the stable `client_id`.
+A stale authenticated connection receives `credential_stale` and closes after the terminal response. The new token version may read/release pre-rotation calls because ownership is stable `client_id`.
 
-The no-token owner fallback and Agent/project tokens are never accepted for this surface.
+## 6. Installation-scoped external WriteId generator
 
-## 5. `WriteId` is the inference call identity
-
-Memory generates a canonical ULID `WriteId` **and commits it to the Memory job before the first send**. The controller call identity is:
+V2 external `WriteId` is a **global** canonical 26-character ULID, not a per-principal namespace. Memory therefore owns one locked atomic generator state outside selected/rollback Store roots, for example:
 
 ```text
-(client_id, write_id, method, canonical semantic payload)
+controller-write-id.state {
+  controller_id
+  client_id
+  last_ulid
+}
 ```
 
-For `inference.text/embed`, the call ID equals `write_id`. There is no separately discovered Operation ID and no Memory-side `possible_send`/`proven_no_send` state.
+Generation order:
 
-Canonical semantic payload contains only behavior-changing bounded fields:
+1. authenticate `client.identity` and observe controller floor/future-skew bounds;
+2. lock the state file;
+3. generate a monotonic ULID strictly after the retained local value and with timestamp at least the admitted daemon floor/current monotonic time;
+4. atomically publish and read back the new generator state;
+5. persist that exact WriteId in the owning Memory job/maintenance record;
+6. only then send the controller mutation.
+
+A crash after generator advancement but before job commit merely burns an ID. A job may never be sent with an ID that was not durably retained. Exact Memory rollback does not roll this installation-scoped state backward.
+
+This rule applies to:
+
+```text
+inference.text/embed
+inference.cancel
+inference.release
+inference.retention.advance
+```
+
+A total installation-state loss is a declared continuity gap: reinitialize only after exact controller identity/floor readback; never reuse a retained job's semantic request under a newly invented ID.
+
+## 7. Inference call identity and replay
+
+Memory commits the call `WriteId` and exact request bytes/digest before first send. Call identity is:
+
+```text
+WriteId globally unique
++ principal = client_id
++ method
++ canonical semantic payload digest
+```
+
+Canonical payload contains only behavior-changing bounded fields:
 
 ```text
 method
@@ -209,36 +230,35 @@ profile name
 origin = explicit | automatic
 disclosure = local_only | external_allowed
 input digest + exact byte length
-response format / embedding role
+response/embedding role
 finite output/time/batch limits
 ```
 
-It excludes JSON-RPC request id, connection metadata, wait/display options and client timeout.
+It excludes transport request ID, connection metadata, pager/display options, client timeout and wait duration.
 
-Normal V2 receipt rules apply:
-
-```text
-same WriteId + same caller/method/payload -> return current original call
-same WriteId + different semantic payload -> id_conflict
-absent old/below-floor WriteId            -> id_expired
-absent excessive-future WriteId           -> id_future
-valid absent WriteId                      -> first admission only
-```
-
-After disconnect or restore, Memory deliberately invokes the same method with the same retained `WriteId` and exact bytes. Controller either returns the existing call or performs the first admission. It never creates a second provider attempt for an already admitted call.
-
-Provider-send uncertainty is a state of the retained inference call, not permission to use another `WriteId`.
-
-## 6. Minimal durable controller state
-
-Controller reuses V2 `write_receipts` and adds only the state that the new product edge actually owns:
+Normal V2 rules:
 
 ```text
-memory_inference_clients   one current scoped registration per Memory installation
-inference_calls            one durable one-shot call/result/cleanup row
+existing ID + same principal/method/payload -> original/current call
+existing ID + any mismatch                 -> id_conflict
+valid absent ID                            -> first admission only
+absent below retained floor/window         -> id_expired
+absent excessive future ID                 -> id_future
 ```
 
-It does not force inference into `commands`, Agent turns, automation runs/actions or generic nonsecret artifact storage.
+After disconnect/restart/restore, Memory deliberately invokes the same method with the same retained WriteId and exact bytes. Controller returns the existing call or performs first admission. There is no separately discovered Operation ID and no Memory `possible_send/proven_no_send` ledger.
+
+Provider-send uncertainty is retained call state, never permission to use another WriteId.
+
+## 8. Minimal durable controller state
+
+Reuse V2 `write_receipts`. Add only:
+
+```text
+memory_inference_clients
+inference_calls
+private call-owned inference_input/result files
+```
 
 Conceptual registration:
 
@@ -248,10 +268,14 @@ MemoryInferenceClient {
   token_version,
   token_hash,
   disabled,
+  last_admission_seq,
+  retain_after_seq,
   created_at,
   updated_at
 }
 ```
+
+`last_admission_seq` and `retain_after_seq` begin at 0. On first admission, one transaction checks signed-64 exhaustion, increments `last_admission_seq`, inserts receipt/call and retains the allocated sequence. Never derive sequence from `MAX(inference_calls)` after pruning.
 
 Conceptual call:
 
@@ -262,67 +286,35 @@ InferenceCall {
   caller_id,
   method,
   canonical_payload_digest,
-  profile/connection/adapter digests,
-  actual_destination,
+  frozen profile/connection/adapter/destination,
   origin,
   disclosure,
-  input_digest/input_length/input_copy_state,
+  input digest/length/copy state,
   state,
   native_request_id?,
-  result_digest/result_length/result_copy_state?,
-  observed_model?, usage/cost/account facts when actually supplied,
+  result digest/length/copy state?,
+  observed model/usage/cost/account when supplied,
   terminal_code?,
-  created_at, updated_at
+  created_at,
+  updated_at
 }
 ```
 
-`admission_seq` is a positive monotonic per-client controller sequence allocated in the same transaction as first admission. It is used only for bounded backup/restore inventory; it is not a scheduler, semantic ordering or evidence score.
+Raw input/result bytes, provider credentials and raw provider errors do not enter receipts/call rows.
 
-Raw input/result bytes, provider credentials and raw provider error bodies do not enter `write_receipts` or `inference_calls`.
+## 9. Profiles, destination and disclosure
 
-## 7. Connections, profiles and disclosure
+Controller owns static `InferenceConnection` and `InferenceProfile` records distinct from Agent harness profiles.
 
-Controller owns static inference configuration distinct from harness profiles:
+Connection owns versioned adapter/transport, canonical endpoint, named private provider credential reference, `actual_destination = local|external` and explicit transport-security behavior.
 
-```text
-InferenceConnection {
-  name,
-  adapter/transport version,
-  canonical endpoint,
-  named private provider-credential reference,
-  actual_destination = local | external,
-  explicit transport-security behavior
-}
+Profile owns connection/digest, requested model, automatic-use permission, finite input/output/time/concurrency/batch limits and supported response formats.
 
-InferenceProfile {
-  name,
-  adapter version,
-  connection reference/digest,
-  requested model,
-  allow_automatic,
-  finite input/output/time/concurrency/batch limits,
-  supported response formats
-}
-```
+A loopback gateway forwarding to cloud is external. Memory chooses a profile name only. It cannot supply arbitrary endpoint, headers, provider extras, fallback or retry ladder.
 
-A loopback gateway that forwards to cloud is `external`. Endpoint locality is not destination proof. Provider secrets resolve in controller memory only after caller/profile admission and never enter Memory, config projections, call receipts, logs or result metadata.
+Memory reduces contributing material to `local_only|external_allowed`; derived content cannot widen a stricter source it still reveals. Controller resolves actual destination and checks disclosure before provider I/O. Unavailable profile/capacity or mismatch is operational failure/waiting, not cognitive no-change.
 
-Memory chooses a profile name only. It cannot construct arbitrary endpoints, headers, query parameters, provider extras, fallback models or retry ladders.
-
-Memory reduces supplied material to:
-
-```text
-local_only
-external_allowed
-```
-
-Derived content cannot widen the strictest source it still reveals. Controller resolves the actual connection and validates disclosure at admission. Protected content is not silently removed to make an external route pass.
-
-Unavailable profile/connection/capacity or disclosure mismatch is an operational waiting/rejection/failure. It is not cognitive `no_change` and does not mark source coverage complete.
-
-Reconfiguration affects new first admissions only. An admitted call retains exact non-secret behavior digests and destination.
-
-## 8. Controlled input and result copies
+## 10. Controlled input/result copies
 
 One call creates at most:
 
@@ -331,127 +323,50 @@ inference_input
 inference_result
 ```
 
-Both are private controller files under deterministic call-owned internal identities. They are not generic V2 `artifacts/`, because that store is defined for bounded nonsecret immutable configuration snapshots.
+They are private deterministic call-owned files, not generic nonsecret artifacts.
 
-### Input admission
+For a valid absent call WriteId, controller validates caller/profile/disclosure/limits, durably publishes exact input without replacement, then rechecks receipt and atomically inserts receipt + queued call. Orphan files are non-dispatchable cleanup material. Committed call with missing/mismatched input is `damaged`.
 
-For a valid absent `WriteId`, controller:
+A visible result is written as one bounded private envelope, durably published and verified before transactional settlement. Restart may finish settlement from an exact pending envelope. Settled row with missing/mismatched result is `damaged`.
 
-1. validates current client/token, profile, disclosure, format, limits and capacity;
-2. writes exact accepted input to a create-new private temporary file;
-3. flushes file, publishes without replacement, flushes parent directory and reopens exact bytes/digest;
-4. rechecks the receipt inside the single-writer transaction, then atomically inserts the external receipt and queued `InferenceCall` referencing digest/length/internal copy identity;
-5. if a concurrent exact replay won, returns that call and removes only its unreferenced duplicate staging file; a payload conflict never replaces either file;
-6. returns the call state.
-
-An orphan file without a committed call is cleanup material and is never dispatchable. A committed call with missing/mismatched input is `damaged`, never reconstructed from receipt JSON.
-
-### Result publication
-
-When a visible response body exists, controller writes one bounded private result envelope containing exact body plus bounded nonsecret response facts, flushes/publishes/verifies it, then settles the call transactionally. Restart may finish settlement from an exact verified pending result envelope. A settled row with missing/mismatched result is `damaged`.
-
-Per-copy state is:
+Per-copy state:
 
 ```text
 not_created | retained | cleanup_pending | removed | already_absent | mismatch | unknown
 ```
 
-Aggregate cleanup is derived and cannot hide a remaining copy:
+Aggregate cleanup is derived: `retained | cleanup_pending | cleanup_incomplete | released`.
+
+## 11. Bounded runner and provider uncertainty
+
+One internal bounded runner:
+
+1. selects eligible queued call under frozen profile concurrency;
+2. verifies exact input/current registration/frozen profile;
+3. CAS `queued -> sending` before provider I/O;
+4. performs at most one provider attempt;
+5. retains native request/readback identity when available;
+6. publishes exact result when present and settles bounded facts;
+7. never performs hidden retry, redirect or fallback.
+
+Possible provider send followed by ambiguous loss becomes `unknown` unless exact native readback resolves it. Restart rules:
 
 ```text
-retained | cleanup_pending | cleanup_incomplete | released
+queued + verified input -> eligible once
+sending/accepted        -> exact readback or unknown
+verified pending result -> finish settlement
+abandoned               -> never dispatch/publish late result
 ```
 
-No content-bearing diagnostic is logged. Provider-safe terminal codes may be retained without result bytes. Raw provider errors are not automatically Memory content.
+## 12. Read, cancel, release and owner erasure
 
-## 9. Request and result shapes
+`inference.get` returns bounded non-content status only to exact current `client_id`.
 
-Initial API frame remains below the controller V2 4 MiB transport maximum; profiles impose a smaller finite input limit. Larger streaming/upload protocols are later work, not an implicit fallback.
+`inference.result.read` requires exact ownership, current credential, retained matching result and bounded range. It returns exact bytes plus offset/length/digest; never another call/result.
 
-### 9.1 `inference.text`
+`inference.cancel` has its own precommitted WriteId and can cancel only exact caller's queued call before sending. After possible provider I/O it cannot prove non-execution.
 
-Conceptual request:
-
-```json
-{
-  "write_id": "canonical-ulid-created-by-memory",
-  "profile": "memory-text-default",
-  "origin": "explicit",
-  "disclosure": "local_only",
-  "prompt": "exact UTF-8 prompt",
-  "prompt_sha256": "lowercase-sha256",
-  "max_output_tokens": 4096,
-  "response_format": "json_object"
-}
-```
-
-Validation recomputes exact prompt digest/length. `response_format` is a closed enum. `origin=automatic` requires profile permission.
-
-### 9.2 `inference.embed`
-
-Conceptual request:
-
-```json
-{
-  "write_id": "canonical-ulid-created-by-memory",
-  "profile": "memory-vector-default",
-  "origin": "automatic",
-  "disclosure": "external_allowed",
-  "role": "document",
-  "inputs": [
-    {"input_key": "memory:abc@7", "text": "...", "text_sha256": "..."}
-  ]
-}
-```
-
-`role = query | document` maps through the selected adapter's declared task parameter/prefix. Canonical result contains one exact result/error per input key and one effective vector-space identity: profile digest, observed model, dimensions and role.
-
-Missing, duplicate or unresolvable positions, inconsistent dimensions, non-finite values or shifted assignment fail. Controller never repairs with zero vectors.
-
-## 10. Bounded runner and provider uncertainty
-
-One bounded controller runner consumes queued inference calls. It is an internal owner, not an automation rule or Agent.
-
-1. select an eligible queued call under frozen profile concurrency;
-2. verify exact input copy, current client registration and frozen profile/connection;
-3. compare-and-set `queued → sending` before provider I/O;
-4. perform at most one provider attempt outside the SQLite transaction;
-5. retain native request/readback identity when the adapter supplies it;
-6. publish exact result when present and settle bounded facts;
-7. wake readers and continue finite work.
-
-Possible provider send followed by timeout, process loss or ambiguous transport becomes `unknown` unless the adapter's exact native readback resolves it. It is never redispatched because Memory repeats the admission `WriteId`.
-
-Restart rules:
-
-```text
-queued + verified input       -> eligible once
-sending/native accepted       -> exact native readback or unknown
-verified pending result       -> finish settlement
-abandoned                     -> never dispatch or publish late result
-```
-
-No adapter performs hidden retry, redirect or fallback. A native provider idempotency key may be used only when its exact semantics are qualified; it does not weaken controller `WriteId` ownership.
-
-## 11. Read, cancel, release and erasure authority
-
-`inference.get` returns bounded non-content status only to the exact current `client_id`. Missing usage/cost/account facts remain unknown.
-
-`inference.result.read` requires:
-
-```text
-call belongs to current client_id
-call is settled/partial with exact result digest/length
-current token_version is valid
-result copy is retained and not released
-requested range is bounded
-```
-
-It returns exact range bytes plus offset/length/digest metadata. It never falls forward to another call/result.
-
-`inference.cancel` is an external mutation with its own `WriteId` and succeeds only for the exact caller's queued call before `sending`. After provider I/O may have begun, cancellation cannot prove non-execution and does not rewrite the call to failed.
-
-`inference.release` is an external idempotent mutation over one exact call with one of:
+`inference.release` has its own precommitted WriteId and one disposition:
 
 ```text
 memory_copy_verified
@@ -459,172 +374,194 @@ terminal_without_result
 abandon_for_erasure
 ```
 
-- `memory_copy_verified`: Memory has durably copied and verified exact result bytes.
-- `terminal_without_result`: call is terminal and no future result can appear.
-- `abandon_for_erasure`: fence queued/sending/unknown settlement/publication before controlled-copy deletion.
+Controller verifies deterministic file provenance/identity/digest, exact deletion and parent-directory durability. Missing exact file becomes `already_absent`; mismatch blocks deletion; partial cleanup remains visible/retryable.
 
-For every expected file, controller verifies call provenance, deterministic internal location, regular-file/no-reparse identity, digest/length where present, exact deletion and parent-directory durability. Missing exact file becomes `already_absent`; mismatch blocks deletion. Partial cleanup remains visible/retryable.
+Controller owner `inference.erase` accepts exact non-content caller/call/range identity, fences future dispatch/settlement/publication and returns cleanup facts only. Owner cannot read result bytes or adopt caller ownership.
 
-Controller owner may invoke `inference.erase` over exact caller/call identities or a bounded admission-sequence range. It returns only non-content disposition/cleanup facts. Owner cannot call `inference.result.read`, adopt caller ownership or fabricate a Memory result through this branch.
+Out-of-target restore cleanup uses an ordinary durable Memory cleanup job/record containing exact call identity and its cancel/release/erase WriteId before send. Lost cleanup replies replay the same ID; no unrecorded cleanup effect is created.
 
-Provider non-execution, provider-side deletion, billing reversal and remote retention are never claimed from local cleanup.
+## 13. Guaranteed retention and bounded inventory
 
-## 12. Memory backup, rollback and external-work inventory
+`retain_after_seq` is the controller's **guaranteed completeness cut**, not merely the earliest row currently present.
 
-A Memory backup retains:
+Meaning:
+
+```text
+every call with admission_seq > retain_after_seq
+must retain bounded non-content metadata
+```
+
+Calls at/below the cut may be pruned only when terminal, every local copy is released/absent, no open effect/readback remains and receipt/FK rules permit deletion. Open/unknown/unreleased calls are never pruned merely because they are below the cut.
+
+`inference.high_water` returns:
+
+```text
+high_water = last_admission_seq
+retain_after_seq
+observed_earliest_retained_seq?   # diagnostic only
+```
+
+Observed earliest physical row is not a restore guarantee.
+
+`inference.list` captures one immutable membership bound:
+
+```text
+after_admission_seq
+through_admission_seq <= authenticated high_water
+cursor?
+limit
+```
+
+The cursor binds controller/client identity, after/through bounds, API version and page shape. State may change during paging; membership `(after, through]` cannot. If `after_admission_seq < retain_after_seq`, return `history_gap` even when some older rows happen to remain.
+
+`inference.retention.advance` is a normal receipted mutation:
+
+```text
+write_id
+expected_retain_after_seq
+new_retain_after_seq
+```
+
+It only increases, checks expected current value and never exceeds admitted high-water. Same WriteId replay is exact; mismatch conflicts.
+
+## 14. Backup-set retention lifecycle
+
+For exact `controller_id + client_id`, Memory computes:
+
+```text
+required_retain_after_seq =
+  minimum controller high_water among every locally retained restorable backup
+```
+
+If no restorable backup remains, Memory may advance to a current durable continuity cut.
+
+Rules:
+
+1. publish/retire the local backup generation durably and read back the resulting controlled backup set;
+2. persist a Memory maintenance record with exact expected/new cut and retention-advance WriteId;
+3. send `inference.retention.advance`;
+4. reconcile lost reply with the same WriteId;
+5. never lower the cut after restoring older Memory state.
+
+Crash before advance is conservative. Advancing before durable backup-set readback is invalid. A newly retained backup whose high-water is below current `retain_after_seq` is not controller-continuous and must be rejected or marked with explicit `history_gap` risk.
+
+Portable/off-machine copies are outside initial controlled backup ownership and do not pin controller retention unless a future explicit registration protocol is added.
+
+## 15. Memory backup and rollback
+
+A controlled Memory backup records:
 
 ```text
 controller_id
 controller_client_id
 selected token_version
-controller inference high-water admission_seq at the backup cut
-all in-cut job WriteIds and canonical request identities
+controller high_water
+controller retain_after_seq
+all in-cut job WriteIds/canonical identities
 known result/release/cleanup facts
 ```
 
-Before taking that cut, Memory:
+Before the cut, Memory stops new controller admissions, persists every created WriteId, reconciles active submission/readback to a typed state, authenticates exact caller and reads high-water/retention.
 
-1. stops new controller-backed admissions;
-2. persists every already-created inference `WriteId` in its job rows;
-3. reconciles its active submission/readback step to a typed state;
-4. authenticates exact client identity;
-5. reads `inference.high_water {high_water, earliest_retained_seq}` and records both values in the backup manifest.
+The installation-scoped WriteId generator state is not rolled back with the Store root.
 
-The high-water is meaningful only for the exact `controller_id + client_id`. It is not inferred from ULID time. Controller never prunes open, unknown or unreleased calls. When it prunes terminal released call rows/receipts, it advances `earliest_retained_seq` so an old restore receives an explicit gap rather than a false empty inventory.
+### In-cut jobs
 
-### Restore of in-cut jobs
-
-After exact identity authentication, every retained job retries/reads by the same `WriteId`:
+After restore, each retained job uses the same WriteId/exact bytes:
 
 ```text
-same call exists  -> return/read/release original call
-call absent and WriteId still admissible -> first admission using exact retained bytes
-payload mismatch  -> id_conflict
-caller unavailable -> hold job; no call
+same call exists -> read/cancel/release original
+valid absent call -> first admission
+payload mismatch -> id_conflict
+caller unavailable -> hold; no call
 ```
 
-There is no unknown call ID.
+### Post-cut calls
 
-### Calls admitted after the backup cut
-
-A rollback may discard Memory rows for calls admitted after the recorded high-water while those calls/results/copies still exist in controller. Before any new automatic inference after restore, Memory pages:
+Memory captures one inventory `through_admission_seq = current high_water`, then pages:
 
 ```text
-inference.list(after_admission_seq = backup_high_water)
+inference.list(after = backup_high_water, through = inventory_high_water)
 ```
 
-If `backup_high_water < earliest_retained_seq - 1`, the read returns `history_gap`; restore must not treat that as an empty set.
+Every returned call is out of target. Its result is not adopted as cognition without exact restored job/source/publication mapping. Each call must become terminal/released or explicitly abandoned/erased with durable local disposition. Unknown provider effects remain unknown.
 
-Every returned call is **out of target**. Restore does not adopt its result as cognitive output because the restored Store lacks the exact job/source/publication mapping. Each call must become terminal and released, or be explicitly abandoned/erased with visible cleanup debt. Unknown possible provider effects remain unknown.
+All new controller-backed inference stays disabled until the inventory is complete and every row is dispositioned. Base capture/retrieval remains usable.
 
-All new controller-backed admissions stay disabled until this bounded inventory is complete and empty or every row has an explicit retained disposition. Base capture/retrieval may resume without inference.
+`history_gap`, unavailable controller/caller or identity reset leaves `external_work_inventory_unavailable`; it never becomes an empty set or complete rollback claim.
 
-If controller identity, caller credential or this inventory is unavailable, restore records `external_work_inventory_unavailable`, leaves inference disabled and does not claim complete rollback/erasure. A new caller, reset controller data root or owner assertion cannot silently clear the debt.
+## 16. Rotation and disable
 
-This rule closes the disaster-restore case where current Memory Store is unreadable: the backup's controller high-water, not the lost current Store, defines the external continuity denominator.
+Memory selection keeps at most current, pending and one unretired previous credential reference for exact controller/client/version. Another rotation waits.
 
-## 13. Credential rotation reconciliation
+Unknown rotate/file result retries the same owner WriteId and re-derives the same token. Pending identity must authenticate and read a pre-rotation call under unchanged client_id before selection promotion. Old authenticated transports are fenced by current-version checks. Previous credential retires only after daemon reconnect, old-call read/release and restart/readback.
 
-Memory installation selection keeps at most one current, one pending and one unretired previous credential reference, each bound to exact `controller_id/client_id/token_version`. Another rotation is refused until pending/previous is resolved.
+Disabling a client is separate. It blocks new calls and must explicitly disposition queued/unknown calls/copies; it is not rotation.
 
-After an unknown rotate/write-file result:
+## 17. Initial request shapes and adapters
 
-1. retry the same controller owner `WriteId`; registration returns the same committed version;
-2. re-derive the same token and write/verify the pending credential path without replacement;
-3. authenticate pending and require exact `client.identity`;
-4. read one pre-rotation call under the same `client_id`;
-5. atomically publish pending→current and current→previous in Memory installation selection;
-6. reconnect daemon and prove old call read/release;
-7. retire previous credential file only in a later explicit cleanup step.
+`inference.text` uses one bounded exact UTF-8 prompt, digest/length, profile, origin, disclosure, closed response format and finite output/time limits.
 
-If pending/current observations disagree, neither authenticates, selection is unreadable or old call ownership changes, rotation remains incomplete and both references are retained.
+`inference.embed` later uses bounded keyed inputs and one result/error per input key, with exact effective vector-space identity, count/index/dimension/order and finite-value checks. No zero-vector repair.
 
-Disabling a client is a separate authority transition. It blocks new reads/mutations and must explicitly disposition queued/unknown calls/copies; it is not token rotation.
+Initial text adapter is a closed loopback-compatible OpenAI chat-completions subset: one model, one user message, admitted max tokens and optional typed JSON-object format. No tools, streaming, temperature, stop list, arbitrary fields, ambient proxy, redirects, hidden retry or fallback. Loopback does not prove local destination. Direct HTTPS is later and separately qualified.
 
-## 14. Initial provider adapters
+## 18. Implementation order
 
-Initial text adapter is a closed loopback-compatible OpenAI chat-completions subset:
+### P1a — after controller V2 L0/L1 and #200
 
-```text
-openai_chat_completions_loopback_v1
-POST <base>/chat/completions
-Content-Type: application/json
-Accept: application/json
-optional Bearer from named private connection reference
-```
+1. stable controller identity;
+2. client registration with `last_admission_seq` and `retain_after_seq`;
+3. `client.identity` and current-version fence;
+4. connection/profile/disclosure admission;
+5. global WriteId-backed `inference.text`, call-owned input/result and bounded runner;
+6. get/range-read/cancel/release/high-water/list/retention-advance and non-disclosing erase;
+7. Memory installation-scoped WriteId generator and durable auxiliary mutation IDs;
+8. one episode result copied, decoded, published, consumed later and released;
+9. backup high-water/retention/inventory round-trip.
 
-Request body contains only model, one exact user message, admitted `max_tokens` and typed `json_object` format when selected. No tools, streaming, temperature, stop list, arbitrary fields, environment proxy, redirects, hidden retry or fallback model.
+### P1b
 
-Response requires bounded JSON and one usable `choices[0].message.content`. Length finish is partial, never complete. Tool-only, content-free or unsupported multimodal output fails. Usage/cost/account remain unknown when absent.
-
-Initial embedding adapter is a closed `openai_embeddings_loopback_v1` subset with exact count/index/dimension/finite-value checks.
-
-Loopback does not prove local destination. Direct HTTPS is a later separately qualified adapter with pinned TLS behavior, no ambient proxy/redirect and the same no-replay/copy lifecycle.
-
-## 15. Implementation increments
-
-Do not make full rotation or embeddings a prerequisite for first useful learning.
-
-### P1a — controller V2 foundation and connected text inference
-
-After controller V2 L1 Store/API exists:
-
-1. add stable `controller_id` if absent;
-2. add the exact `memory_inference` client registration and scoped token derivation;
-3. add `client.identity` and per-method current-version fence;
-4. add inference connections/profiles and disclosure admission;
-5. add `write_receipts`-backed `inference.text`, `inference_calls`, controlled input/result copies and bounded runner;
-6. add get/range-read/cancel/release/high-water/list and non-disclosing owner erase;
-7. connect one Memory adapter and one episode-learning result to a later context consumer;
-8. prove same-WriteId lost reply, restart, result copy/release and restore high-water inventory.
-
-### P1b — credential rotation
-
-Then add install/rotate lost-reply reconciliation, stale transport reaping, pending/current/previous selection and delayed previous-file retirement.
+Install/rotate lost-reply reconciliation, stale transport reaping, pending/current/previous selection and delayed retirement.
 
 ### Later
 
-- `inference.embed` and vector-space identity;
-- direct HTTPS adapter;
-- richer native provider readback where real providers expose it;
-- larger streamed payload protocol only after measured need.
+Embeddings, direct HTTPS, richer provider readback and larger streaming payloads only after measured need.
 
-## 16. Required verification
+## 19. Required verification
 
-Source review, schema execution and Clippy are not runtime qualification. The connected boundary must eventually prove at least:
+Eventually prove:
 
-- exact current controller V2 implementation revision and API schema;
-- client install retry, token-file loss/reissue, rotation and stale transport denial;
-- no owner/Agent/automation fallback for missing or invalid Memory token;
-- same `WriteId` before send, lost reply, daemon restart and Memory restore;
-- `id_conflict`, expired/future ID and receipt retention behavior;
-- input file before provider I/O; orphan/missing/mismatch cases;
-- queued→sending crash and possible-send→unknown with no second provider call;
-- pending/settled result crash and bounded range read;
-- result-byte denial to owner erase path;
-- independent input/result cleanup and partial cleanup retry;
+- exact controller V2 implementation revision and #200 closure;
+- global WriteId collision and floor/future behavior;
+- generator continuity across Memory rollback;
+- same call WriteId before send/lost reply/restart/restore;
+- auxiliary cancel/release/retention IDs before send;
+- per-client admission allocator exhaustion and no `MAX+1` derivation;
+- retain-after advance ordering, history gap and stable list paging;
+- install/reissue/rotation with safe private credential publication;
+- no owner/Agent/automation fallback;
+- input copy before provider I/O and orphan/damaged cases;
+- queued→sending crash and possible-send→unknown without second provider attempt;
+- result settlement/range read and owner result-byte denial;
+- independent input/result cleanup and partial retry;
 - profile/destination/disclosure/capacity denial before provider I/O;
-- backup high-water, in-cut readback and post-cut out-of-target inventory;
-- controller unavailable during disaster restore leaves inference disabled, Base usable;
-- embedding count/index/dimension/finite-value negatives;
-- provider adapter has no redirect, ambient proxy, retry or fallback.
+- backup in-cut replay, post-cut inventory and out-of-target cleanup records;
+- controller unavailable/history gap leaves inference disabled while Base remains useful.
 
-## 17. Frozen non-goals
+## 20. Frozen non-goals
 
 Do not:
 
-- implement this contract in retired controller V1 code;
-- revive `swarm-client`, Manager/Operator roles or generic Operation/artifact grants for Memory;
-- route one-shot inference through Agent commands, Goals, automation runs/actions, scripts, MCP or CLI subprocesses;
-- let no-token owner fallback authenticate Memory;
-- store raw Memory or provider tokens in SQLite, receipts, logs or backups;
-- trust a credential file without `client.identity` readback;
-- use a new `WriteId` after an uncertain submission;
-- infer call ordering from ULID timestamps instead of controller admission sequence;
-- put content-bearing prompts/results in generic nonsecret controller artifacts;
-- retry a possible provider effect;
-- adopt post-backup results into restored cognition without exact job/source mapping;
-- resume automatic inference while post-cut controller inventory is unresolved;
-- let owner erase read result bytes or relabel caller ownership;
-- treat local controlled-copy deletion as provider-side deletion/non-execution/no-charge;
-- add a generic service-client framework, Task engine, workflow DB or proof ceremony for this one edge.
+- implement this in controller V1;
+- use controller Agent/Goal/automation/script/MCP/CLI subprocess per inference call;
+- accept owner/Agent/no-token fallback;
+- invent another Operation/Task/submission ledger;
+- derive admission sequence from retained rows;
+- use observed earliest row as a retention guarantee;
+- roll back/reuse the Memory WriteId generator;
+- generate unrecorded cancel/release/cleanup IDs after a failure;
+- store raw tokens/provider secrets/prompts/results in receipts/logs/generic artifacts;
+- expose result bytes to owner erase;
+- retry/redirect/fallback provider calls after possible send;
+- claim provider-side deletion/non-execution from local cleanup.
