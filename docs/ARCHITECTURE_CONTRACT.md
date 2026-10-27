@@ -9,7 +9,7 @@ Current synchronized V3 set:
 | Surface | Role |
 |---|---|
 | [Architecture draft.19](v3/ARCHITECTURE.md) | Purpose, authority, Base and invariants |
-| [Implementation draft.41](v3/IMPLEMENTATION.md) | Runtime, Store/schema/query, maintenance and order |
+| [Implementation draft.42](v3/IMPLEMENTATION.md) | Runtime, exact SurrealDB 3.3.4 Store/schema/query boundary, maintenance and order |
 | [Cognition draft.23](v3/COGNITION.md) | Reconstruction, retrieval, learning and failure algorithms |
 | [Inference Contract 0.18](v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller boundary |
 | [Active registry](v3/ANALYSIS-REGISTRY.md) | Sole current decisions/gaps/source/queue ledger |
@@ -45,9 +45,13 @@ Therefore:
 
 Initial Store target is SurrealDB 3.3.4/RocksDB `sync=every`, one query-only authenticated client, a `STRICT` database and six Base `SCHEMAFULL` tables.
 
-Application IDs crossing JSON are canonical strings generated from OS randomness; derived unique keys are domain-separated length-prefixed hashes. Direct continuation uses explicit indexed work-address columns. Migration 0001 uses read-only identities, closed literal states and cross-field assertions for body, validity, claim, request and slot invariants. Queries are fixed and explicitly projected.
+Application IDs crossing JSON are canonical strings generated from OS randomness; derived unique keys are domain-separated length-prefixed hashes. Direct continuation uses explicit indexed work-address columns. Queries are fixed and explicitly projected.
 
-Schema bundle identity includes runner protocol, wrapper template, ordered DDL and expected catalog. Schema admission uses plain `INFO FOR DB/TABLE` maps and forbids unstable `STRUCTURE`. Scored FTS uses numbered match references and one bounded top-K snapshot per call.
+Exact tag source/tests establish selected clause/type grammar, `READONLY` create/same/change behavior, row-local ASSERT evaluation, UNIQUE skipping of tuples containing `NONE` or `NULL`, persisted-PARAM rollback, plain INFO maps and numbered FTS score/index behavior. V3 canonically writes `NONE`, not `NULL`, for absent conditional keys. `READONLY` is a changed-value guard, not an identity generator.
+
+This evidence does not qualify the complete V3 migration wrapper. Bound metadata through the production WebSocket client, all table/field/analyzer/index rollback points, concurrent uniqueness, every expected catalog string, representative reader plans and Windows/RocksDB durability remain Slice 0.
+
+Schema bundle identity includes runner protocol, wrapper template, ordered DDL and expected catalog. Schema admission uses plain `INFO FOR DB/TABLE` maps and forbids `STRUCTURE`. Scored FTS uses numbered match references and one bounded top-K snapshot per call.
 
 ## Donor identity
 
