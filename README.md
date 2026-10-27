@@ -9,14 +9,14 @@ Eliot preserves exact experience, reconstructs current work, supplies applicable
 | Read | Purpose |
 |---|---|
 | [V3 navigation](docs/v3/README.md) | Current versions, reading order, selected construction and proof ceiling |
-| [Architecture draft.13](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
-| [Implementation draft.34](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
-| [Cognition draft.17](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning, backup dependencies and revision algorithms |
-| [Inference Contract 0.12](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
+| [Architecture draft.14](docs/v3/ARCHITECTURE.md) | Product purpose, ownership, Base, extensions and invariants |
+| [Implementation draft.35](docs/v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation sequence |
+| [Cognition draft.18](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning, backup publication/dependencies and revision algorithms |
+| [Inference Contract 0.13](docs/v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
 | [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, source coverage and queue |
 | [Consolidated audit](docs/v3/AUDIT.md) | Evidence, criticism, donor analysis and rationale |
 
-Architecture 13, Implementation 34, Cognition 17 and Contract 0.12 describe one synchronized design. Source presence, specification text, green build or receipt does not establish working behavior.
+Architecture 14, Implementation 35, Cognition 18 and Contract 0.13 describe one synchronized design. Source presence, specification text, green build or receipt does not establish working behavior.
 
 Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
 
@@ -54,7 +54,7 @@ retained episode
 → typed result or unknown
 → ordinary Memory revision
 → changed later context
-→ dependency-aware cleanup
+→ crash-safe dependency fence and cleanup
 ```
 
 Provider result does not grant Memory authority or prove external task completion.
@@ -97,13 +97,15 @@ controller_closed       backup is self-contained
 controller_dependent    backup still needs controller state/result/copy/readback
 ```
 
-Old backup never first-admits absent call ID. While any restorable backup marks a call dependent, Memory blocks release that would remove required controller state/copies. `retain_after_seq` remains a monotonic post-cut denominator and is not lowered for these dependencies.
+Before backup files are published, Memory durably records a provisional dependency fence naming expected manifest identity/digest and every dependent call. `preparing` and `publication_unknown` block release exactly like a retained backup. A rename that may have succeeded but lacks directory-sync/readback cannot clear the fence.
+
+Old backup never first-admits absent call ID. While any retained or provisional backup marks a call dependent, Memory blocks release that would remove required controller state/copies. `retain_after_seq` remains a monotonic post-cut denominator and is not lowered for these dependencies.
 
 Controller registration owns `last_admission_seq` and guaranteed `retain_after_seq`. Fixed-window inventory below cut returns `history_gap`. Erased content above cut leaves bounded text-free membership tombstone until every backup pinning interval is retired and cut advances.
 
 With valid caller, cleanup uses optional `inference.cancel` and `inference.release(...)`. Controller-owner `inference.erase` is local break-glass. Memory never receives owner authority and records owner-action-required debt until non-content owner readback.
 
-Exact details live only in [Contract 0.12](docs/v3/INFERENCE-CONTRACT.md).
+Exact details live only in [Contract 0.13](docs/v3/INFERENCE-CONTRACT.md).
 
 Controller issue #200 must repair binding-revision allocator/schema authority. V2 L0/L1 must then exist before issue #199 implements Memory inference. Do not patch legacy controller runtime.
 
@@ -129,7 +131,7 @@ The [documentation map](docs/README.md) separates V3 authority from V2 donor ref
 
 | Repository | V3 relationship |
 |---|---|
-| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External Agent/task owner and Contract 0.12 one-shot inference boundary after controller #200 + V2 L0/L1 |
+| [eliot-swarm-controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller) | External Agent/task owner and Contract 0.13 one-shot inference boundary after controller #200 + V2 L0/L1 |
 | [eliot-search](https://github.com/UnknownAlienHuman/eliot-search) | Optional source preparation/retrieval adapter for concrete selected path |
 | [eliot-research](https://github.com/UnknownAlienHuman/eliot-research) | Optional external research/acquisition owner for concrete remaining gap |
 
