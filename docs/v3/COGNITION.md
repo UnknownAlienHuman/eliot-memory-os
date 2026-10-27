@@ -1,8 +1,8 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.17 · 2026-10-26 · normative algorithms used by V3.**
+**Revision 1.0-draft.18 · 2026-10-26 · normative algorithms used by V3.**
 
-[Architecture](ARCHITECTURE.md) owns product/authority invariants. [Implementation](IMPLEMENTATION.md) owns runtime and persistence. [Inference Contract 0.12](INFERENCE-CONTRACT.md) owns the sole Memory↔controller call boundary. This document defines reconstruction, retrieval, learning, revision and self-improvement algorithms.
+[Architecture](ARCHITECTURE.md) owns product/authority invariants. [Implementation](IMPLEMENTATION.md) owns runtime and persistence. [Inference Contract 0.13](INFERENCE-CONTRACT.md) owns the sole Memory↔controller call boundary. This document defines reconstruction, retrieval, learning, revision and self-improvement algorithms.
 
 Nothing here implies model-weight training. Initial learning changes external memory, processing methods, context selection and bounded configuration.
 
@@ -17,7 +17,7 @@ Base cognition works without controller inference:
 - deterministic applicability/grounds handling;
 - bounded context packing.
 
-Model-assisted learning waits for controller V2 issue #200, V2 L0/L1 and Contract 0.12 P1a. Missing inference never disables Base.
+Model-assisted learning waits for controller V2 issue #200, V2 L0/L1 and Contract 0.13 P1a. Missing inference never disables Base.
 
 ## 1. Observations, claims and revisions
 
@@ -299,7 +299,7 @@ During normal live recovery, prepared ID may still first-admit. During backup/re
 6. Retain malformed/partial transport facts without cognitive success.
 7. Publish accepted revisions atomically under expected revisions.
 8. Create release WriteId only after verified Memory copy or terminal no-result.
-9. Before sending release, re-evaluate retained backup dependencies.
+9. Before sending release, re-evaluate retained backup manifests and unresolved provisional publication fences.
 
 Store conflict replays retained decoded proposal/result, not inference.
 
@@ -335,7 +335,11 @@ controller_dependent
 
 `controller_closed` means backup contains exact terminal Memory-owned result/no-result and no future controller settlement, copy, cleanup or readback is required.
 
-`controller_dependent` means backup still needs controller status, current/future result bytes or cleanup/readback. While any restorable backup has this state for the call, release remains pending even when current Memory already copied/used result. Do not lower `retain_after_seq`; preservation comes from controller no-prune-unreleased rule.
+`controller_dependent` means backup still needs controller status, current/future result bytes or cleanup/readback. While any retained manifest **or unresolved provisional publication fence** has this state for the call, release remains pending even when current Memory already copied/used result.
+
+A provisional fence is installed before backup filesystem publication. It remains active in `preparing` and `publication_unknown`. It clears only after exact final-path reconciliation proves a matching retained manifest or definite pre-rename failure with absence.
+
+Do not lower `retain_after_seq`; preservation comes from controller no-prune-unreleased rule.
 
 Controller-owner `inference.erase` is local break-glass. Memory cannot call it. When caller cleanup unavailable, Memory records `owner_action_required` plus non-content call identity and waits for observed owner readback. Request alone is not effect.
 
@@ -405,7 +409,7 @@ Prediction records expected observation before action, conditions and available 
 
 Research starts from retained Memory/exact local sources. External acquisition answers concrete remaining gap. Store compact findings, alternatives, coverage and exact report/source handles. Failed request, completed-uninformative and useful-partial are different outcomes. Do not loop merely because uncertainty remains.
 
-## 14. Backup admission closure, dependency pins, retention and rollback
+## 14. Backup admission closure, dependency pins, publication and rollback
 
 ### 14.1 Admission and dependency cut
 
@@ -423,14 +427,31 @@ Before controlled backup:
 7. classify every admitted call:
    - `controller_closed` if backup is fully self-contained and no controller state/copy remains required;
    - otherwise `controller_dependent`;
-8. only then record controller `high_water` and guaranteed `retain_after_seq`;
-9. freeze Store/spool facts through Implementation's brief cut.
+8. record controller `high_water` and guaranteed `retain_after_seq`;
+9. durably record provisional backup dependency fence with expected manifest identity/digest and every dependent call;
+10. only then publish backup files.
 
 Installation-scoped WriteId generator is not part of rollback backup.
 
 A controller-continuous backup contains admitted calls only. Local source/recipe intent may remain after retired attempt, but retired ID is not a call and does not pin retention.
 
-### 14.2 Post-cut retention cut
+### 14.2 Publication state and reconciliation
+
+```text
+preparing
+publication_unknown
+published
+aborted_before_publish
+```
+
+- Matching final manifest with file + parent durability/readback → include in controlled backup set; clear provisional fence only after backup-set readback/dependency scan reproduces every call.
+- Definite pre-rename failure plus exact final-path absence → `aborted_before_publish`; clear fence.
+- Rename may have succeeded but directory sync/readback failed → `publication_unknown`; keep fence.
+- Malformed/mismatched/ambiguous final state → keep fence and block release.
+
+Startup reconciles unresolved fences before any caller release or owner-cleanup handoff. Missing/stale dependency index cannot authorize release; scan exact manifests plus unresolved maintenance jobs or fail closed.
+
+### 14.3 Post-cut retention cut
 
 ```text
 required_retain_after_seq =
@@ -441,7 +462,7 @@ After local backup set changes durably, create maintenance record with expected/
 
 Do not lower monotonic cut for in-cut dependencies. They remain protected because release is fenced and controller cannot prune open/unreleased call/copies.
 
-### 14.3 In-cut jobs after restore
+### 14.4 In-cut jobs after restore
 
 ```text
 controller_closed
@@ -460,7 +481,7 @@ admission_unknown
 
 Old backup never first-admits absent call ID.
 
-### 14.4 Post-cut calls
+### 14.5 Post-cut calls
 
 Capture one inventory high-water and page fixed interval:
 
@@ -471,21 +492,22 @@ inference.list(after = backup_high_water,
 
 Cursor binds controller/client, bounds, API version and page shape. If backup high-water below `retain_after_seq`, return `history_gap`; physical presence of some rows does not make interval complete.
 
-Because absent cut attempts were retired, returned calls are outside backup's admitted set. Do not adopt results. With valid caller, use cancel/release-abandon after dependency check. Without caller, retain owner-action-required debt until controller-local owner readback.
+Because absent cut attempts were retired, returned calls are outside backup's admitted set. Do not adopt results. With valid caller, use cancel/release-abandon after retained/provisional dependency check. Without caller, retain owner-action-required debt until controller-local owner readback.
 
-All new inference remains disabled until inventory completes and every row is dispositioned. Base remains usable. Controller/caller unavailability, admission unknown, missing dependent copy or history gap produces `external_work_inventory_unavailable`, never false empty or complete rollback.
+All new inference remains disabled until inventory completes and every row is dispositioned. Base remains usable. Controller/caller unavailability, admission unknown, publication unknown, missing dependent copy or history gap produces `external_work_inventory_unavailable`, never false empty or complete rollback.
 
-### 14.5 Backup retirement and release
+### 14.6 Backup retirement and release
 
 When backup is retired/replaced/non-restorable:
 
 1. durably publish/read back new controlled backup set;
-2. recompute dependent calls from remaining manifests;
-3. clear release fence only for calls with no remaining dependency;
-4. then allow pending caller release;
-5. advance post-cut retain cut separately according to remaining backup high-waters.
+2. reconcile unresolved publication jobs;
+3. recompute dependent calls from remaining manifests/fences;
+4. clear release fence only for calls with no remaining dependency;
+5. then allow pending caller release;
+6. advance post-cut retain cut separately according to remaining backup high-waters.
 
-Crash before release is conservative. Never release first and then discover a retained dependency.
+Crash before release is conservative. Never release first and then discover a retained or possible dependency.
 
 ## 15. Forgetting and erasure
 
@@ -497,7 +519,7 @@ Physical erasure:
 2. close affected mutation/replay admission;
 3. reconcile active Store/replay/controller effects;
 4. cancel/fence pending jobs;
-5. delete/invalidate every controlled backup marked controller-dependent for affected call;
+5. delete/invalidate every retained or provisional controlled backup marked controller-dependent for affected call;
 6. use caller cancel/release-abandon when caller valid;
 7. otherwise record owner-action-required and wait for observed break-glass result;
 8. delete current rows/blobs/spool/packet/job copies;
@@ -519,7 +541,8 @@ Store/spool durability
 work binding/source selection
 controller identity/WriteId admission
 backup admission closure
-backup dependency classification/release fence
+backup dependency classification
+backup publication reconciliation/release fence
 profile/disclosure/capacity
 provider execution/readback
 retention/history inventory
@@ -555,6 +578,7 @@ stable caller + precommitted global WriteId
 → exact result or typed no-result/unknown
 → decoded revision or valid no-change
 → later context reads resulting revision
+→ publication-safe dependency fence
 → dependency-aware caller cleanup
 → backup admission closure + restart/rollback reconciliation
 ```
@@ -564,6 +588,8 @@ Retention/backup evidence:
 ```text
 backup contains admitted calls only
 → every admitted call is controller-closed or dependent
+→ provisional fence exists before manifest publication
+→ rename/sync/readback unknown keeps dependency fenced
 → dependent call remains unreleased even below current cut
 → fixed-window list complete above cut
 → controller-closed call restores without controller row
