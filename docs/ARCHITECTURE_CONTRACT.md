@@ -9,7 +9,7 @@ Current synchronized V3 set:
 | Surface | Role |
 |---|---|
 | [Architecture draft.19](v3/ARCHITECTURE.md) | Purpose, authority, Base and invariants |
-| [Implementation draft.40](v3/IMPLEMENTATION.md) | Runtime, Store/schema/query, maintenance and order |
+| [Implementation draft.41](v3/IMPLEMENTATION.md) | Runtime, Store/schema/query, maintenance and order |
 | [Cognition draft.23](v3/COGNITION.md) | Reconstruction, retrieval, learning and failure algorithms |
 | [Inference Contract 0.18](v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller boundary |
 | [Active registry](v3/ANALYSIS-REGISTRY.md) | Sole current decisions/gaps/source/queue ledger |
@@ -38,14 +38,16 @@ Therefore:
 - supervisor owns candidate process/root and final cutover;
 - final backup directory first appears through atomic directory rename with exact fence already inside;
 - self-contained abort/retire tombstones remain terminal after cleanup;
-- restore admits finite part limits, retains directory/fence/manifest with read sharing only and streams one verified part at a time;
+- restore admits finite part limits, retains directory/parts/fence/manifest with read sharing only and streams one verified part at a time;
 - daemon/channel loss forces candidate discard before restart/cutover;
 - Store maintenance rows are mirrors only;
 - missing controller capability is a dependency, not permission to revive V1.
 
 Initial Store target is SurrealDB 3.3.4/RocksDB `sync=every`, one query-only authenticated client, a `STRICT` database and six Base `SCHEMAFULL` tables.
 
-Application IDs crossing JSON are canonical strings; Surreal record IDs remain internal. Queries are fixed and explicitly projected. Schema bundle identity includes runner protocol, wrapper template, ordered DDL and expected catalog. Schema admission uses plain `INFO FOR DB/TABLE` maps and forbids unstable `STRUCTURE`. Scored FTS uses numbered match references and one bounded top-K snapshot per call.
+Application IDs crossing JSON are canonical strings generated from OS randomness; derived unique keys are domain-separated length-prefixed hashes. Direct continuation uses explicit indexed work-address columns. Migration 0001 uses read-only identities, closed literal states and cross-field assertions for body, validity, claim, request and slot invariants. Queries are fixed and explicitly projected.
+
+Schema bundle identity includes runner protocol, wrapper template, ordered DDL and expected catalog. Schema admission uses plain `INFO FOR DB/TABLE` maps and forbids unstable `STRUCTURE`. Scored FTS uses numbered match references and one bounded top-K snapshot per call.
 
 ## Donor identity
 
