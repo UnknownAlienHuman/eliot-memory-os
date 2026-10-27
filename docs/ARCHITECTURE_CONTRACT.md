@@ -1,87 +1,56 @@
 # Architecture authority and version boundary
 
-## Current owner decision: coherent V3 design before runtime rewrite
+## Current owner decision
 
-On 2026-10-18 the owner directed that V2 join V1 as archived Memory donor and that V3 be designed from scratch before implementation. This supersedes old Memory documents as authority for next implementation. It does not claim V3 code exists or that design text proves runtime behavior.
+On 2026-10-18 the owner directed that V2 join V1 as an archived Memory donor and that V3 be designed from scratch before implementation. This supersedes old Memory documents as authority for the next implementation. It does not claim V3 code exists.
 
-The synchronized V3 set is:
+Current synchronized V3 set:
 
-| Surface | Current role |
+| Surface | Role |
 |---|---|
-| [Architecture draft.17](v3/ARCHITECTURE.md) | Product purpose, authority owners, Base, extensions and invariants |
-| [Implementation draft.38](v3/IMPLEMENTATION.md) | Runtime, Store, Windows/process, durability, backup/rollback and implementation order |
-| [Cognition draft.21](v3/COGNITION.md) | Reconstruction, retrieval, learning, terminal backup authority, restore leases and revision algorithms |
-| [Inference Contract 0.16](v3/INFERENCE-CONTRACT.md) | Sole normative Memory↔controller V2 boundary |
-| [Active analysis registry](v3/ANALYSIS-REGISTRY.md) | Sole active decisions/gaps/source-coverage/work queue |
-| [V3 navigation](v3/README.md) | Reading order, current baseline and proof ceiling |
-| [V3 audit](v3/AUDIT.md), [source map](v3/AUDIT-MAP.md) | Evidence, criticism, donor analysis and stable source dispositions; not independent subsystem authority |
-| `docs/architecture/`, `docs/normative-pair.toml`, existing source/scripts/workstreams | Retained V2 donor surfaces; old status terms are historical |
+| [Architecture draft.18](v3/ARCHITECTURE.md) | Purpose, authority, Base and invariants |
+| [Implementation draft.39](v3/IMPLEMENTATION.md) | Runtime, Store/schema, maintenance and implementation order |
+| [Cognition draft.22](v3/COGNITION.md) | Reconstruction, retrieval, learning and failure algorithms |
+| [Inference Contract 0.17](v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller boundary |
+| [Active registry](v3/ANALYSIS-REGISTRY.md) | Sole current decisions/gaps/source/queue ledger |
+| [V3 audit and source map](v3/AUDIT.md), [AUDIT-MAP](v3/AUDIT-MAP.md) | Evidence, criticism and donor dispositions |
 
-Architecture intent prevails over conflicting lower-level mechanism. Implementation and Cognition agree with Architecture and Contract 0.16. Resolve a changed load-bearing mechanism in every affected owner document in the same work sequence; do not add an errata layer or second active contract.
+Architecture intent prevails over conflicting lower-level mechanism. Resolve a changed load-bearing mechanism in every affected owner document; do not add an errata layer or second contract.
 
-A new mechanism, budget, process count, database choice, credential path or evaluation threshold is not accepted because an agent wrote it. It needs a concrete caller, owner, durable result/unknown and consumer, plus appropriate evidence.
+A mechanism, threshold, process, database or credential path is accepted only with a real caller, owner, durable result/unknown and consumer plus appropriate evidence. Synchronized prose establishes an implementation target, not working behavior.
 
-There is no V3 adoption digest or product acceptance receipt in this revision. Do not generate one by relabelling the V2 pair. Synchronized V3 documents establish implementation target; they do not establish completed code, model integration, learning, backup, recovery or runtime qualification.
+## Current controller and backup boundary
 
-## Controller and backup authority boundary
-
-Current inspected controller authority:
+Controller authority:
 
 ```text
-UnknownAlienHuman/eliot-swarm-controller
-main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
-merged PR #198
+eliot-swarm-controller@613ea6b5ff6389c7629a988e271477ee45c9d2c1
 ```
 
-That V2 specification selects fresh local JSON-RPC + SQLite WAL with global external ULID `WriteId` receipts and treats existing Rust/`swarm-client`/generic Operation runtime as V1 legacy pending deletion.
+It selects fresh V2 JSON-RPC + SQLite WAL and treats the old runtime as legacy.
 
 Therefore:
 
-- revision `e42c464d`, V1 roles/hello/Operation/artifacts and generic registration are donor evidence only;
-- no Memory implementation may add one-shot inference to retired stack;
-- active boundary is Contract 0.16: dedicated `memory_inference`, stable installation client ID, monotonic token version, global pre-send WriteIds, rollback-safe generator state, minimal call/private-copy state, guaranteed `retain_after_seq`, call+auxiliary cut dispositions and fixed-window restore inventory;
-- one local controller-mutation owner serializes call/cancel/release/retention effects;
-- one local backup-set owner allocates random non-reused backup IDs, scans installation records, owns terminal transitions, restore leases and physical cleanup; it is not a public service or second Store;
-- controlled backup contains admitted calls only; proven-absent call IDs and auxiliary IDs are permanently retired, while unknown state blocks inference maintenance;
-- every admitted in-cut call is controller-closed or controller-dependent;
-- canonical `backup_plan_digest` has no self-reference and installation-scoped `fence.json` is published before parts;
-- self-contained `abort.json` and `retire.json` remain terminal after content-bearing files are deleted, prevent backup-ID reuse and are distinct from physical erasure;
-- malformed/both-terminal/contradictory records fail closed;
-- restore requires an exact read lease through candidate verification and final pre-cutover terminal-state recheck; retirement/abort/cleanup wait;
-- published non-retired backups and unresolved fences pin release and post-cut retention;
-- monotonic retain cut is never lowered to pin an old in-cut dependency;
-- restored Store maintenance rows are status mirrors only and cannot create terminal records, clear pins or replay old auxiliary WriteIds;
-- caller cleanup uses cancel/release; controller-owner erase is external break-glass and cannot be submitted by Memory;
-- content erasure above cut leaves bounded text-free membership tombstone until pinning backups are terminal and cut advances;
-- controller issue #200 must repair binding-revision allocator/schema authority;
-- controller V2 L0/L1 must exist before issue #199 implements Memory extension;
-- missing V2 capability is a real dependency, not permission to revive V1.
+- issue #200 must separate monotonic binding allocation, selected current pointer and effect publication;
+- candidate admission never moves the pointer; launch/resume publish the target pointer with dispatch, while first observe/control/detach move it only after an exact effect;
+- controller V2 L0/L1 must exist before issue #199 implements Contract 0.17;
+- Memory daemon owns controller-mutation and backup-set owners;
+- supervisor owns the candidate process/root and final installation cutover;
+- a final backup directory first appears through atomic directory rename with exact `fence.json` already inside;
+- self-contained abort/retire tombstones remain terminal after content cleanup;
+- restore requires daemon-held no-follow file handles through the final pre-cutover recheck;
+- daemon/channel loss forces candidate discard before restart or cutover;
+- Store maintenance rows are mirrors only;
+- missing controller capability is a real dependency, not permission to revive V1.
 
-Controller roadmap is sole status tracker. At this authority revision L0.1–L1.11 are unchecked. Controller PR #201 repairs schema-validator fixtures but does not close #200 allocator semantics.
+## Store/schema boundary
 
-## V2 archival identity
+Initial Store target is SurrealDB 3.3.4/RocksDB `sync=every`, one query-only authenticated client, a `STRICT` database and six Base `SCHEMAFULL` tables.
 
-Retained V2 baseline: [5aac094834fb5635921b550c821cb933a1196105](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105). Incomplete audit materials: [audit-2026-10-16-incomplete](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete). V1 donor snapshot: [b5c84d4e53292dbc8996917c63448d5ee96c4bc7](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7).
+Application IDs crossing JSON are canonical strings; Surreal record IDs remain internal. Queries are fixed and explicitly projected. Migration bundle SHA-256 is computed outside migration bytes, supplied as bound metadata and verified with exact catalog readback. The migration cannot contain its own digest literal.
 
-The V2 sharded pair remains byte-identifiable evidence:
+## Donor identity
 
-| V2 document | Manifest/index | Historical revision | Reconstructed SHA-256 |
-|---|---|---|---|
-| Architecture | [manifest](architecture/architecture/manifest.json), [index](architecture/architecture/README.md) | `4.5-draft`, `2026-08-28` | `A3C5B2028D9DF89A53CD565F8FF493484BE74078E4EFD7B534C0F1C3169577C7` |
-| Implementation | [manifest](architecture/implementation/manifest.json), [index](architecture/implementation/README.md) | `0.29-draft`, `2026-08-28` | `EAD4CEFF2DB254E4202C8FA7AE167225A6F65B720C222075ADA61FC45FC407A4` |
+V2 baseline: `5aac094834fb5635921b550c821cb933a1196105`. V1 donor: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. The V2 normative pair and routing tools remain donor evidence only.
 
-[normative-pair.toml](normative-pair.toml) records V2 pair key `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`. Earlier monolith digests/adoption history remain in baseline V2 authority contract; they are not merged into V3 authority.
-
-[ELIOT_ARCHITECTURE.md](architecture/ELIOT_ARCHITECTURE.md) and [ELIOT_IMPLEMENTATION.md](architecture/ELIOT_IMPLEMENTATION.md) are V2 compatibility maps. Use [reading protocol](architecture/READING_PROTOCOL.md), [routes](architecture/ROUTES.md) and [handle index](architecture/HANDLE_INDEX.md) when investigating exact donor fragments. A route is navigation, not comprehension or current runtime proof.
-
-## Working and evidence rules
-
-`main` is repository integration authority. While issue #5324 and PR #5325 remain open, their `docs/v3/` branch files are current V3 working authority. Follow [AGENTS](../AGENTS.md), [START](../START.md) and [WORKFLOW](../WORKFLOW.md); independent review and required CI remain applicable.
-
-Source/workstream statuses inside donor tree do not authorize V2 continuation. Do not resume October audit factory or assign every unresolved V2 row as V3 task.
-
-Freeze preserves source/history without copying project into another directory, closing every old issue, deleting user data or migrating running installation. Those actions are outside this documentation change.
-
-V2 ACTIVE registry and validators remain unchanged, including historical active values. This is human-directed version boundary, not machine-registry transition; retaining donor bytes does not override current task scope.
-
-Current source, dependencies, build diagnostics, actual runtime observations and evaluated outcomes establish only properties they demonstrate. Drafts, reports, compilation, line counts, tests or CI status do not establish working cognitive loop or accepted product.
+While issue #5324 and PR #5325 remain open, their branch `docs/v3/` files are current working authority. Follow [AGENTS](../AGENTS.md) and [WORKFLOW](../WORKFLOW.md). Independent review and required CI remain applicable.
