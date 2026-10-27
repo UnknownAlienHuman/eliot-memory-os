@@ -2,44 +2,34 @@
 
 **Layered Base and additive extensions · 2026-10-26 · normative design, not implemented code.**
 
-V1/V2 Memory implementations are donors. V3 is a greenfield implementation. Current `eliot-swarm-controller` V2 is also a fresh implementation target; its existing V1 runtime is a donor and must not receive new Memory functionality.
+V1/V2 Memory implementations are donors. V3 is a greenfield implementation. Current `eliot-swarm-controller` V2 is also a fresh implementation target; its existing V1 runtime is donor-only.
 
 ## Reading order
 
-1. [Architecture draft.10](ARCHITECTURE.md) — product purpose, authority owners, Base, extensions and invariants.
-2. [Implementation draft.31](IMPLEMENTATION.md) — runtime, Store, Windows/process, durability, backup/restore and implementation sequence.
-3. [Cognition draft.14](COGNITION.md) — current-work reconstruction, retrieval, learning and revision algorithms.
+1. [Architecture draft.11](ARCHITECTURE.md) — product purpose, authority, Base, extensions and invariants.
+2. [Implementation draft.32](IMPLEMENTATION.md) — runtime, Store, Windows/process, durability, backup/rollback and implementation order.
+3. [Cognition draft.15](COGNITION.md) — current-work reconstruction, retrieval, learning, retention and revision algorithms.
 4. [Inference Contract 0.10](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
-5. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, decisions, remaining gaps and exact queue.
+5. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, current decisions, exact gaps and queue.
 6. [Audit](AUDIT.md) — root causes, rejected machinery and evidence limits.
 7. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for original requirements and donors.
 
-`ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology. Do not create another V3 report, task catalogue, gate database or errata authority.
+Architecture 11, Implementation 32, Cognition 15, Contract 0.10 and this README describe one synchronized design at increasing depth. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another V3 report, task catalogue, gate database or errata authority.
 
-### Current synchronization state
+None of these documents proves implemented runtime behavior.
 
-Contract 0.10 and the registry use the current controller authority and corrected retention/WriteId design. Architecture 10, Implementation 31 and Cognition 14 still contain a few Contract 0.9 names (`c8c0ee1`, `earliest_retained_seq` and missing installation WriteId-state/auxiliary mutation fields). Registry R-024 is therefore `PARTIAL`; those existing owner documents must be updated in place before coding inference. Base/Store design is unaffected and remains independently implementable.
+## Selected construction and authority
 
-## Product construction
+One local Rust package/codebase provides supervisor, daemon and transient relay modes. One active external SurrealDB child owns persistence; one isolated disposable candidate may exist during restore.
 
-One local Rust package/codebase provides:
+- **Daemon:** application operations, Editor-authenticated Store mutations, replay/jobs, backup cuts, context/retrieval and public control.
+- **Supervisor/installer:** executable/root/process identity, root/Owner credentials, migrations, Store lifecycle, credential rotation and installation cutover.
+- **Controller V2:** one-shot caller authentication, model profiles, provider execution/readback, global `WriteId` receipts and private temporary inference copies.
+- **Host/controller:** user task/action execution and acceptance.
 
-```text
-eliot supervisor
-eliot daemon
-eliot relay ...
-```
+Root/Owner material never enters the daemon. The inherited supervisor channel carries only closed typed maintenance intent/result—never arbitrary SQL, argv, endpoint, path or secret. A request/acknowledgement is not completion; exact process, credential, Store and selection readback own the result.
 
-One active external SurrealDB child owns persistence; one isolated disposable candidate may exist during restore qualification. Ordinary modules provide boundaries. A new process/crate/table exists only for a real independent owner, deployment, failure or stored-state boundary.
-
-Authority:
-
-- daemon — application operations, Editor-authenticated Store mutations, replay/jobs, backup cut, context/retrieval and public control;
-- supervisor/installer — executable/root/process identity, root/Owner credentials, migrations, Store lifecycle, credential rotation and installation cutover;
-- controller V2 — one-shot caller authentication, model profiles, physical provider execution/readback and private temporary inference copies;
-- host/controller — user task/action execution and acceptance.
-
-Base works without controller inference, vectors, converter or Research. It captures real events, retains exact sources, supports notes/corrections/commitments, reconstructs current work, supplies lexical/exact context and reopens exact sources after restart.
+Base captures real events, preserves notes/corrections/commitments, supplies exact/lexical context and reopens exact sources after restart. It starts without inference, vectors, converter or Research. Extensions reuse the same records/jobs/revisions/context; there is no second Lite/Full memory engine.
 
 ## Connected completion criterion
 
@@ -53,11 +43,11 @@ real caller
 → restart/recovery where relevant
 ```
 
-Types, ports, fixtures, receipts, issue count, branches, reports and compilation alone are intermediate evidence.
+Types, ports, fixtures, receipts, reports, branches and compilation alone are intermediate evidence.
 
 ## Store and local durability baseline
 
-Selected first qualification target:
+First qualification target:
 
 ```text
 SurrealDB 3.3.4
@@ -68,22 +58,20 @@ STRICT database
 six SCHEMAFULL application tables
 ```
 
-The current Rust SDK is not baseline: its exact version raises MSRV/license/dependency questions and does not justify linking the engine when a bounded remote client suffices.
-
-Store admission requires the conjunction of:
+Store admission requires:
 
 ```text
 exact executable/root identity
 → owned child/listener/established peer
 → upstream readiness
-→ Editor Basic authentication
+→ Editor authentication
 → healthy one-owner socket
 → query-only denial matrix
-→ schema generation/definition verification
-→ typed production-client write/read/delete
+→ schema/definition verification
+→ typed write/read/delete through production client
 ```
 
-A path, PID, port, HTTP status, WebSocket 101 or clean process exit is not admission or durability proof.
+A path, PID, port, HTTP status, WebSocket 101 or clean process exit is not admission/durability proof.
 
 Immutable local publication:
 
@@ -95,11 +83,11 @@ create-new same-directory temp
 → exact reopen/readback
 ```
 
-Mutable `installation.toml` is a separate supervisor-only expected-generation replacement with exact old/new/unknown reconciliation. It is not implemented through the immutable primitive.
+Mutable `installation.toml` and `controller-write-id.state` are separate expected-state replacements with exact old/new/unknown reconciliation. The external-WriteId state lives outside rollback Store roots.
 
 ## Host capture, spool and context
 
-First host profile: bounded Claude Code relay for:
+First host: bounded Claude Code relay for:
 
 ```text
 SessionStart
@@ -112,39 +100,53 @@ PostCompact
 SessionEnd
 ```
 
-One immutable `CaptureCommand` is built before IPC. Native/command identity identifies occurrence; content digest verifies bytes and never merges separate occurrences.
+One immutable `CaptureCommand` exists before IPC. Native/command identity identifies occurrence; digest verifies bytes.
 
-Public capture outcomes:
+```text
+same command → daemon capture → matching Store readback → committed
+stage_required/unavailable/uncertain → exact durable pending file → staged
+staged command → daemon replay → Store readback → pending removed
+```
+
+Public results:
 
 - `committed` — Store readback matched;
-- `staged` — exact command is durably present in pending spool;
-- `unknown` — neither ownership can be established;
-- `rejected` — deterministic failure before ownership transfer.
+- `staged` — exact pending command is durable;
+- `unknown` — neither ownership established;
+- `rejected` — deterministic pre-ownership failure.
 
-Private `stage_required` during backup/shutdown/erasure means “relay must durably stage”, not rejection.
+`stage_required` is private flow control during quiesce, never rejection.
 
-`SessionStart`/`UserPromptSubmit` return actual rendered context. “Event spooled” is status, not context. Packet prepared/emitted/action-associated/actually-used remain distinct.
+`SessionStart`/`UserPromptSubmit` return actual packet content. “Event spooled” is status. Packet prepared, emitted, action-associated and actually used remain distinct.
+
+## Exact open
+
+One exact handle/locator plus optional bounded range. Never rerun search/conversion/Research/inference for a historical handle. Result states requested/resolved identity, range/digest, revision/representation, material limits/gaps, relation descriptors, cursor and exact missing/forbidden/erased/damaged/unsupported disposition.
+
+Historical handle never falls forward. Fixed caps need continuation.
 
 ## Backup, rollback and erasure
 
 Surreal HTTP export/import and startup import are not application backup owners.
 
-Memory backup:
+Backup uses a brief exact spool cut:
 
-1. stops Store mutations and new replay;
-2. reconciles active replay and Store-write unknowns;
-3. holds the cross-process spool publication lock only for one exact inventory/generation cut;
-4. releases it so relay continues post-cut staging;
-5. writes canonical typed pages for six tables plus selected-root blobs, deletion notices, cut pending/failed spool and sanitized config;
-6. publishes a manifest with exact counts/digests/gaps.
+```text
+stop Store mutations/replay
+→ reconcile active replay
+→ hold publication lock only for inventory/generation cut
+→ release lock
+→ relay continues post-cut staging
+→ copy exact immutable cut entries
+```
 
-Restore is exact rollback to one backup cut, not an invented merge of later Store rows. A healthy current Store first receives a safety backup; previous root remains until explicit retirement. Current deletion notices dominate backup content. Current post-cut spool merges by exact command bytes/disposition; failed never becomes pending.
+It publishes canonical typed pages over six tables, selected-root blobs, deletion notices, cut pending/failed spool and sanitized config. Manifest owns completion.
 
-Deletion fence prevents reintroduction but is not physical-erasure proof. Controlled previous roots/candidates/backups containing erased scope must be wholly deleted or erasure remains incomplete. Off-machine copies are outside initial controlled scope.
+Restore is exact rollback to one backup cut, not an invented merge of later Store rows. Healthy current Store first gets a safety backup; previous root remains until retirement. Current deletion notices dominate backup content; current post-cut spool merges by exact command bytes/disposition.
+
+Deletion fence prevents reintroduction but is not physical-erasure proof. A controlled previous root/candidate/backup containing erased scope is deleted wholly or erasure remains incomplete. Off-machine copies are external.
 
 ## Current controller V2 authority
-
-Inspected authority:
 
 ```text
 UnknownAlienHuman/eliot-swarm-controller
@@ -152,20 +154,20 @@ main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
 merged PR #198
 ```
 
-This is a specification target. `docs/roadmap.md` is its sole status tracker and all L0.1–L1.11 items remain unchecked.
+This is still a specification target. `docs/roadmap.md` is its sole status tracker; L0.1–L1.11 remain unchecked.
 
-Controller issue #200 is an active foundation blocker. Current binding allocation conflates current pointer with next immutable revision. In addition to failed observe→control, cancelled initial launch, cancelled queued resume and failed/unknown first observe attach can reuse/collide with already allocated revisions. PR #201 repairs validator fixtures only; it does not close allocator/schema semantics.
+Controller issue #200 blocks foundation correctness. Current binding allocation conflates current pointer and next immutable revision. Affected paths include failed observe→control, cancelled initial launch, cancelled queued resume and failed/unknown first observe attach. Draft PR #201 repairs invalid fixtures and is green, but does not close allocator/schema semantics.
 
-Controller issue #199 owns the later scoped Memory one-shot extension and remains blocked on V2 L0/L1 plus #200.
+Controller issue #199 owns the later Memory extension and remains blocked on #200 and V2 L0/L1.
 
 ## One-shot inference Contract 0.10
 
-One stable principal per Memory installation:
+Stable principal:
 
 ```text
 principal_kind = memory_inference
-client_id = memory:<random-stable-installation-id>
-token_version = monotonic credential version
+client_id      = memory:<random-stable-installation-id>
+token_version  = current physical credential version
 ```
 
 No owner, Agent, automation, plugin or no-token fallback.
@@ -173,15 +175,15 @@ No owner, Agent, automation, plugin or no-token fallback.
 Every controller mutation uses a global canonical ULID `WriteId` persisted before send. Call identity:
 
 ```text
-WriteId
+WriteId globally unique
 + client_id
 + method
 + canonical semantic payload
 ```
 
-Same identity returns the original/current call; mismatch is `id_conflict`; valid absent ID is first admission. There is no separate Operation ID or submission ledger.
+Same identity returns original/current call; mismatch is `id_conflict`; valid absent ID is first admission. No separate Operation ID/submission ledger.
 
-Memory keeps one locked atomic external-WriteId generator state outside rollback Store roots. Rollback does not restore/reuse old generator state. Cancel, release and retention advance also receive durable pre-send WriteIds.
+Memory owns one locked atomic external-WriteId generator outside rollback Store roots. Cancel, release and retention advance also receive durable pre-send IDs. Out-of-target cleanup after restore uses an ordinary durable maintenance/job record with exact mutation ID.
 
 Minimal controller state:
 
@@ -199,60 +201,54 @@ last_admission_seq
 retain_after_seq
 ```
 
-`retain_after_seq` is the guaranteed restore-completeness cut. `earliest_retained_seq` may be diagnostic but is not a guarantee. `inference.list(after, through)` has stable membership and returns `history_gap` whenever `after < retain_after_seq`, even if some rows still happen to exist.
+`retain_after_seq` is the guaranteed completeness cut. An observed earliest retained row is diagnostic only. `inference.list(after, through)` has fixed membership and returns `history_gap` whenever `after < retain_after_seq`.
 
-Memory advances retention only after durable readback of its controlled backup-set change. The required cut is the minimum controller high-water among every locally retained restorable backup for the exact controller/client identity.
+Memory computes required retention as the minimum controller high-water among every locally retained restorable backup for the exact controller/client identity. It advances the cut only after the local backup-set change is durably published/read back, through receipted `inference.retention.advance`.
 
 After rollback:
 
-- in-cut jobs use their same WriteIds;
-- post-cut calls are inventoried through one fixed high-water;
-- out-of-target results are not adopted as cognition;
-- each call is terminal/released or explicitly abandoned/erased through a durable cleanup record;
-- new controller inference remains disabled until inventory is complete;
-- Base remains available.
+- in-cut jobs use the same WriteIds;
+- one fixed post-cut interval is inventoried by admission sequence;
+- out-of-target results are not adopted without exact restored mapping;
+- every out-of-target call receives terminal/release/abandon disposition through a durable cleanup record;
+- history gap or unavailable caller/controller keeps inference disabled;
+- Base remains usable.
+
+Controller-local install/rotate publishes raw token only into an admitted create-new/no-reparse restrictive-ACL private destination. Memory never receives controller owner authority.
 
 ## Preserved goals, minimal mechanisms
 
 | Goal | V3 minimum | Rejected default machinery |
 |---|---|---|
-| Resume work | Stable work address + retained observations | Universal Understanding State/checkpoint platform |
-| Preserve source | Observation + exact blob/range + handles | Truth/Evidence registry and promotion ladder |
-| Correct memory | Current revision + history + grounds | Global truth score/correction subsystem |
-| Avoid repeated failure | Scoped negative memory or method revision | FailureFingerprint/quarantine platform |
-| Deliver context | Direct current-work + lexical + optional vectors + bounded packet | Context service/packet database |
-| Learn | Finite Memory job + exact recipe + one-shot call + later consumer | Permanent Dreamer/Task lifecycle |
+| Resume | Stable work address + observations + direct reconstruction | Universal state/checkpoint platform |
+| Source/provenance | Observation + exact blob/range + handles | Truth/evidence promotion service |
+| Correction | Current revision + history + grounds | Global truth score/ladder |
+| Avoid repeats | Scoped negative memory/method revision | Failure-fingerprint platform |
+| Context | Direct current-work + lexical + optional vectors + bounded packet | Context service/packet database |
+| Learning | Finite Memory job + exact recipe + one-shot call + later consumer | Permanent Dreamer/Task lifecycle |
 | Optional capability | Internal connected vertical increment | Crate/process/manifest per noun |
 | Privacy | Disclosure + actual send-owner check + finite copy cleanup | General Governor/approval platform |
 | Recovery | One Store + spool + supervisor + typed backup/exact rollback | Recovery DB/global identity graph |
+| Authority | Daemon application owner + narrow privileged boundary | Public supervisor API |
 | Development | One issue/branch/integrator + terminal overlap disposition | Work-unit DB/agent scheduler |
 
 ## Implementation order
 
-0. **Memory Slice 0:** exact Windows executable/root/process/IPC/Surreal/Store/file/backup/rollback/erasure/rotation/shutdown qualification.
-1. **Base Slice 1:** real event → Store or spool → replay → restart → exact open.
-2. **Base Slice 2:** qualified Claude relay, continuation, lexical retrieval, actual packet emission, notes/corrections/commitments and Base maintenance.
-3. **Controller V2 L0/L1 + issue #200:** build the new foundation; do not extend V1.
-4. **Inference P1a:** stable Memory principal, external WriteId state, receipts/calls/private copies, text runner, get/read/cancel/release/high-water/list/retention, one episode result changing later context.
-5. **Inference P1b:** token rotation, stale-session fence and delayed credential retirement.
-6. Independent embeddings, project views, documents, Research and additional hosts.
+0. **Memory Slice 0:** exact Windows executable/root/process/IPC/Surreal/Store/file/WriteId-state/backup/rollback/erasure/rotation/shutdown qualification.
+1. **Base Slice 1:** event → Store/spool → replay → restart → exact open.
+2. **Base Slice 2:** qualified Claude relay, continuation, lexical retrieval, actual context emission, notes/corrections/commitments and Base maintenance.
+3. **Controller #200 + V2 L0/L1:** repair specification/validator, then implement fresh foundation; never extend V1.
+4. **Inference P1a:** stable principal, rollback-safe WriteId state, receipts/client/calls/private copies, text runner, read/cancel/release/high-water/list/retention and one result changing later context.
+5. **Inference P1b:** rotation, stale-session fence and delayed credential retirement.
+6. Independent embeddings, views, documents, Research and additional hosts.
 7. Advanced curation only after Base paths work.
 
-Production code first. Run `cargo fmt --check` and minimum relevant changed-package Clippy after coherent increments. Broad deterministic/live/platform/load campaigns follow the connected product.
-
-## Current open work
-
-The active queue is in [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md). Immediate work:
-
-1. synchronize Architecture/Implementation/Cognition and root entry points with Contract 0.10;
-2. close controller #200 without hiding the pointer-absent/cancelled-candidate cases;
-3. keep issue #199 blocked until V2 L0/L1 exists;
-4. implement/qualify Memory Slice 0 and useful Base independently of controller inference.
+Production code first. Run `cargo fmt --check` and minimum changed-package Clippy after coherent increments. Broad deterministic/live/platform/load campaigns follow connected product.
 
 ## Evidence limits
 
 Source/design evidence is not runtime qualification. No Windows Store, host capture, controller V2 foundation or inference runtime is implemented by these documents.
 
-Memory PR #5325 currently fails before MergeCompile because machine-readable documentation evidence is absent; the same run also reports SurrealDB provisioner input failure. No fabricated evidence block is accepted.
+Memory PR #5325 currently lacks genuine machine-generated documentation evidence and independent approval; the latest previous completed run also reported SurrealDB provisioner failure. No fabricated evidence block is accepted.
 
 Full release ZIP and `ELIOT-WORK-SYSTEM-REPORT-2026-10-14.md` remain unavailable as readable source material. Donor conclusions apply only to exact paths/revisions recorded in the registry.
