@@ -1,10 +1,29 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.10 · 2026-10-26 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.11 · 2026-10-26 · normative design for the greenfield rewrite.**
 
-V1/V2 Memory implementations are donors. V3 is a new implementation, not a compatibility migration. The current `eliot-swarm-controller` V2 is also a fresh build; its V1 runtime is a donor and must not receive new Memory functionality.
+V1/V2 Memory implementations are donors. V3 is a new implementation, not a compatibility migration. The current `eliot-swarm-controller` V2 is also a fresh implementation target; its existing V1 runtime is donor-only and must not receive new Memory functionality.
 
-This document defines product purpose, ownership and invariants. [Implementation](IMPLEMENTATION.md) defines the runtime, Store and maintenance paths. [Cognition](COGNITION.md) defines algorithms. [One-shot inference contract](INFERENCE-CONTRACT.md) is the sole normative Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only active work ledger.
+This document owns product purpose, authority and invariants. [Implementation](IMPLEMENTATION.md) owns the concrete Memory runtime, Store and maintenance paths. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.10](INFERENCE-CONTRACT.md) is the sole normative Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only active work ledger.
+
+## 0. Current external dependency
+
+The inspected controller authority is:
+
+```text
+UnknownAlienHuman/eliot-swarm-controller
+main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
+merged PR #198
+```
+
+It selects a fresh local JSON-RPC + SQLite WAL V2 with global external ULID `WriteId` receipts. Its roadmap is the sole implementation tracker and every L0.1–L1.11 item remains unchecked.
+
+Memory inference therefore has two explicit prerequisites:
+
+1. controller issue #200 repairs binding-revision allocation/schema authority;
+2. controller V2 L0/L1 exists before the scoped Memory extension in issue #199.
+
+Base Memory implementation does not wait for those prerequisites.
 
 ## 1. Product purpose
 
@@ -16,7 +35,7 @@ observe what happened
 → reconstruct current work
 → supply applicable context
 → a person or external agent acts
-→ observe result
+→ observe the result
 → revise memory or method
 → use that revision later
 ```
@@ -25,174 +44,158 @@ A searchable archive is necessary but insufficient. Product value is visible whe
 
 - restores interrupted work without inventing state;
 - prevents known failed approaches from silently returning;
-- exposes relevant constraints, counterexamples and unknowns before action;
+- exposes material constraints, exceptions, counterexamples and unknowns before action;
 - turns observed outcomes into later changes in guidance;
 - keeps original sources openable and corrections reversible;
-- remains useful when optional models, vectors or specialist tools are unavailable.
+- remains useful when controller inference, vectors or specialist tools are unavailable.
 
-A mechanism enters V3 only after its real caller, owner, retained result or typed unknown and consumer are named. A type, port, receipt, fixture, report, issue, serializer or passing shape check is not product behavior by itself.
+A mechanism enters V3 only after its real caller, owner, retained result or typed unknown and consumer are named. A type, port, receipt, fixture, report, issue or passing serializer is not product behavior by itself.
 
-The unit of completion is:
+The unit of completion is one connected edge:
 
 ```text
 shipped caller
 → owning operation
 → durable result or typed unknown
 → actual consumer/readback
-→ restart/recovery
+→ restart/recovery where relevant
 ```
 
-Correct a repeatedly harmful default at its owner instead of adding an exception layer.
+Correct a harmful default at its owner instead of adding another exception, registry or receipt layer.
 
-## 2. Ownership and boundaries
+## 2. Ownership and authority
 
 | Responsibility | Owner |
 |---|---|
 | User goal, permissions and acceptance of external work | Human and host/controller |
-| Agent sessions, tools, task execution and swarm orchestration | Host/controller |
-| Host event translation and host-supported context emission | Narrow host adapter/relay |
-| Observations, revisions, retrieval, context, source links, outcomes and finite Memory jobs | Memory daemon/application operations |
+| Agent sessions, tools, task execution and orchestration | Host/controller |
+| Host event translation and supported context emission | Narrow host adapter/relay |
+| Observations, semantic revisions, retrieval, context, outcomes and finite Memory jobs | Memory daemon/application operations |
 | Application Store mutations, replay/jobs, backup cut and quiesce evidence | Memory daemon |
-| Installation selection, root/Owner credentials, migrations, DB-user rotation, Store lifecycle and restore cutover | Supervisor/installer outside daemon failure domain |
+| Installation selection, root/Owner credentials, migrations, Store lifecycle and restore cutover | Memory supervisor/installer |
 | Interpretation, consolidation and method improvement | Memory learning handlers |
-| One-shot caller authentication, profiles, provider invocation/readback, `WriteId` receipts and temporary inference copies | `eliot-swarm-controller` V2 |
-| Persistence, indexes and transactions | SurrealDB through one private Memory Store |
+| One-shot caller authentication, profiles, provider invocation/readback, `WriteId` receipts and temporary inference copies | Controller V2 |
+| Application persistence, indexes and transactions | SurrealDB through one private Memory Store |
 | Code/document/source translation | Narrow configured adapters/tools |
 | External research execution and large corpora | Eliot Research or another configured research system |
-| Detection and containment of daemon/process-family failure | Supervisor |
 
-Public `control` reaches the daemon first. A privileged effect—root/Owner use, migration, user rotation, SurrealDB process action or installation cutover—crosses one private inherited supervisor channel as a closed typed intent. Supervisor independently resolves approved resources and secret references; it never accepts arbitrary SQL, argv, endpoint, path or secret from that channel. Daemon never receives root or Owner credentials.
+Public control reaches the daemon. A privileged effect—root/Owner use, migration, DB-user rotation, SurrealDB process action or installation cutover—crosses one private inherited supervisor channel as a closed typed intent. The supervisor independently resolves approved resources and secret references. It never accepts arbitrary SQL, argv, endpoint, path or secret from the daemon. The daemon never receives root or Owner credentials.
 
-Memory may link an external task/action/result, but it does **not** become another task manager, acceptance authority, permission engine, swarm controller or research platform.
-
-A host adapter translates native events and emits context through a real host boundary. It does not invent memory semantics, claim Store ownership before readback or replace source bytes with a lossy status record.
+Memory may link an external task, action and result, but it does **not** become another task manager, acceptance authority, permission engine, swarm controller or research platform.
 
 ### 2.1 Dreamer is a role, not a process
 
-**Dreamer** means model-assisted interpretation for one finite Memory job. It is not a permanent daemon, model vendor, special database, separate scheduler or second canonical writer.
+**Dreamer** means model-assisted interpretation for one finite Memory job. It is not a permanent daemon, provider, special database, scheduler or second canonical writer.
 
-A learning handler freezes finite input plus one processing-method revision, builds an exact request, calls the configured controller boundary outside the Store transaction, verifies and copies the exact result when present, decodes a purpose-specific response and publishes ordinary Memory revisions. Deterministic reducers and embeddings do not become Dreamer jobs merely because they compute.
+A learning handler freezes finite input and an exact processing-method revision, builds an exact request, calls the configured controller boundary outside the Store transaction, verifies/copies a result when present, decodes one purpose-specific response and publishes ordinary Memory revisions.
 
-### 2.2 One-shot inference is not agent orchestration
+### 2.2 One-shot inference is not Agent orchestration
 
 The semantic operation is:
 
 ```text
 exact input + profile + disclosure + finite limits + precommitted WriteId
 → complete | partial | failed | unknown
-→ exact body when present + requested/observed execution facts
+→ exact visible body when present + bounded observed facts
 ```
 
-Memory uses the dedicated controller V2 `memory_inference` principal and narrow JSON-RPC methods from Contract 0.9. It does not create a controller Agent, generation, turn, command, Goal, automation run/action, workspace, native harness session, Task, Requirement, Attempt, review or acceptance object.
+Memory uses the dedicated controller V2 `memory_inference` principal and the methods in Contract 0.10. It does not create a controller Agent, binding, turn, command, Goal, automation run/action, workspace, native session, Task, Attempt, review or acceptance object.
 
-Richer software-agent work may use controller Agents when it genuinely needs tools, continuation or orchestration. One memory extraction must not expand into a workflow engine.
+Richer software-agent work may use controller Agents when it genuinely needs tools and continuation. One bounded memory extraction must not expand into a workflow engine.
 
-### 2.3 Caller identity and `WriteId` are separate
+### 2.3 Stable caller, rotating credential and global WriteId are different identities
 
-One Memory installation owns one stable non-secret controller caller:
+One Memory installation owns one stable caller:
 
 ```text
-client_id = memory:<stable-installation-id>
+client_id = memory:<random-stable-installation-id>
 ```
 
-A positive `token_version` authenticates the current physical credential; it never owns or renames calls. `client_id` survives Memory restart, Store-root cutover, exact rollback and token rotation. Changing it is unsupported principal migration.
+`token_version` authenticates the current physical credential. It never owns or renames calls. `client_id` survives Memory restart, Store-root cutover, exact rollback and token rotation. Changing it is unsupported principal migration.
 
-Memory commits the canonical ULID `WriteId` and exact request bytes/digest before first send. Call identity is:
+Memory owns one monotonic global-ULID generator state outside rollback Store roots. It durably advances the generator, persists each exact mutation `WriteId` in the owning job/maintenance record, and only then sends the call.
+
+This applies to:
 
 ```text
-(client_id, WriteId, method, canonical semantic payload)
+inference.text / inference.embed
+inference.cancel
+inference.release
+inference.retention.advance
 ```
 
-Lost reply, restart or restore repeats the same ID and exact bytes. The same identity returns the original call/current state; changed payload conflicts; a valid absent ID creates the first admission. There is no separately discovered Operation ID and no Memory submission ledger.
-
-### 2.4 Connection/profile and disclosure have different owners
-
-Controller configuration owns:
+Inference call identity is:
 
 ```text
-InferenceConnection
-  adapter/transport version
-  canonical endpoint
-  private provider credential reference
-  actual_destination = local | external
-
-InferenceProfile
-  connection reference/digest
-  requested model
-  automatic-use permission
-  finite input/output/time/concurrency/batch limits
-  supported response formats
+WriteId globally unique
++ client_id
++ method
++ canonical semantic payload
 ```
 
-A loopback gateway forwarding to cloud is `external`. Memory selects a profile name only; it does not receive provider secrets or construct arbitrary headers, endpoints, extras or fallback ladders.
+Lost reply, restart or restore repeats the same ID and exact bytes. Matching identity returns the original/current call; mismatch conflicts; a valid absent ID performs first admission. There is no separately discovered Operation ID or Memory submission ledger.
 
-Memory reduces supplied material to:
+### 2.4 Profiles and disclosure belong at the actual send owner
+
+Controller owns versioned `InferenceConnection` and `InferenceProfile` configuration: endpoint/transport, private provider credential reference, actual destination, requested model, automatic-use permission and finite limits.
+
+Memory chooses a profile name and reduces supplied material to:
 
 ```text
 local_only
 external_allowed
 ```
 
-Derived content cannot widen the strictest source it still reveals. Controller resolves actual destination and checks disclosure at admission. Protected content is not silently removed to make an external route pass.
+Derived content cannot widen the strictest source it still reveals. Controller resolves the actual destination and checks disclosure before provider I/O. A loopback gateway forwarding to cloud is external. Memory cannot construct arbitrary endpoints, headers, extras, retries or fallback ladders.
 
-Unavailable profile, connection, capacity or disclosure mismatch is operational waiting/rejection/failure, not cognitive no-change and not processed coverage.
+Unavailable profile/capacity or disclosure mismatch is operational failure/waiting, not cognitive `no_change` and not processed coverage.
 
-### 2.5 Controlled request/result copies have finite lifetime
+### 2.5 Controlled inference copies and retention are finite, explicit state
 
-One call creates at most two private controller copies:
+One call creates at most two private controller files:
 
 ```text
 inference_input
 inference_result
 ```
 
-They are call-owned private files, not generic controller artifacts or receipts. Controller stages exact input before provider I/O, performs at most one provider attempt, retains exact visible result when present and exposes bounded exact-caller range reads.
+They are call-owned private files, not generic artifacts or receipt content. Controller performs at most one provider attempt. Possible-send loss becomes retained `unknown`, never automatic redispatch.
 
-Successful path:
+Memory verifies/copies exact result bytes before `inference.release(memory_copy_verified)`. Terminal calls without results use `terminal_without_result`. Erasure of unresolved calls uses `abandon_for_erasure`, which fences future dispatch, settlement and publication before local cleanup.
 
-1. Memory reads result ranges;
-2. verifies length and digest;
-3. durably copies the body into its job/blob;
-4. calls `inference.release(memory_copy_verified)`.
+Input and result cleanup are tracked independently. Owner erase may act on non-content call provenance but cannot read result bytes or adopt caller ownership. Provider-side execution, retention and billing remain external facts.
 
-Terminal no-result uses `terminal_without_result`. Erasure of unresolved work uses `abandon_for_erasure`, which fences future dispatch, settlement and publication before controlled-copy deletion. Cleanup tracks input and result independently; an aggregate `released` state cannot hide a remaining or mismatched copy.
+Controller registration owns:
 
-Controller owner may erase exact calls using non-content provenance but cannot read result bytes, adopt caller ownership or fabricate a Memory result. Provider-side execution, retention and billing remain external facts.
+```text
+last_admission_seq
+retain_after_seq
+```
 
-### 2.6 User intent and factual reports remain distinct
-
-The user owns goals and preferences, not infallibility about external facts. Preserve intent changes as intent. Preserve factual assertions with source, conditions and counterevidence. Generated continuation, learned method or retrieved suggestion cannot silently replace the user's goal, relax criteria or grant execution authority.
+`retain_after_seq` is the guaranteed completeness cut: call metadata above it remains retained. An observed earliest physical row is diagnostic only. Memory advances the cut only after its controlled backup-set change is durably published/read back.
 
 ## 3. Product shape
-
-The initial product supports several configured projects concurrently. Project-local state remains scoped; explicitly reusable methods may be considered across selected projects.
 
 The initial product is:
 
 - one Rust package/codebase;
 - one executable with supervisor, daemon and transient relay modes;
-- one private inherited supervisor↔daemon channel with no public endpoint;
-- one private SurrealDB application Store;
-- one Store server child;
+- one private inherited supervisor↔daemon channel;
+- one private application Store and one active SurrealDB child;
+- at most one isolated restore candidate;
 - ordinary internal modules;
 - optional outbound clients only when enabled.
 
-A new process is justified only by a real external runtime or failure boundary. A new crate, table or registry is justified only by an actual dependency, deployment or independently owned-state boundary. A noun is not an instruction to create a service.
+A new process, crate, table or registry is justified only by a real independently owned state, dependency, deployment or failure boundary. A noun in documentation is not an instruction to build a service.
 
-One stored mutable state has one application mutation owner. Dashboards, packets, scores, maps and status reports are views unless they own independent state.
+### 3.1 Four responsibility layers, not four process tiers
 
-### 3.1 Layers remain; pass-through machinery does not
+1. domain values and pure transformations;
+2. application operations;
+3. external I/O adapters;
+4. surfaces/runtime composition.
 
-Keep four responsibility layers:
-
-1. **domain and pure transformations** — values, comparison, reduction and packing over supplied inputs;
-2. **application operations** — capture, revision, retrieval, learning and control;
-3. **external I/O** — Store, host, controller inference, document and Research adapters;
-4. **surfaces/runtime** — CLI, hooks, process startup and composition.
-
-These are dependency boundaries, not four processes or a compulsory `interface → facade → service → repository` chain. Internal calls use typed Rust values. Serialization belongs only at actual storage, process or network boundaries. Add a trait only where a real interchangeable I/O boundary exists.
-
-An extension is a vertical capability across the layers it actually uses. It adds a real writer/handler and consumer to existing operations; it does not build a miniature platform with its own scheduler, database, context compiler and supervisor.
+Internal calls use typed Rust values. Serialization belongs at actual Store/process/network boundaries. Add a trait only for a real interchangeable I/O boundary.
 
 ### 3.2 Useful Base, then additive capabilities
 
@@ -203,34 +206,28 @@ An extension is a vertical capability across the layers it actually uses. It add
 - notes, corrections and commitments with history;
 - exact and lexical retrieval;
 - addressed current-work reconstruction;
-- actual context emission through a supported host boundary;
+- actual context delivery at a supported host boundary;
 - exact source opening;
 - restart, spool, local backup/exact rollback and controlled erasure;
 - direct status and control.
 
-The first learning extension closes one connected loop:
+The first learning extension closes one loop:
 
 ```text
 retained episode
 → exact processing recipe
 → one controller V2 inference call
-→ typed create/revise/no-change/partial/error result
+→ typed create/revise/no-change/partial/error
 → ordinary Memory revision
 → changed later context
 → controller copies released or explicit cleanup debt
 ```
 
-A terminal no-result call may close cleanup without fabricating cognitive no-change.
+Vectors, project views, documents, Research and additional hosts are independent increments. They reuse the same records, finite jobs, revision publication, context and maintenance paths. There is no separate Lite/Full memory engine.
 
-Vectors, project understanding, documents, Research, more hosts and richer cognition are independent increments. They reuse the same records, finite jobs, revision publication, context assembly and maintenance path. There is no second Lite/Full memory engine.
+### 3.3 First host is a narrow relay
 
-Optional means optional in construction, startup and execution. A failed or disabled extension cannot disable capture, exact reads or source opening. Disabling a producer stops new work without deleting readable retained knowledge.
-
-### 3.3 First host profile is a narrow relay
-
-The first host profile is one Claude Code hook relay because it exposes real lifecycle, user-prompt, tool-result and final-response boundaries. Claude-specific JSON remains adapter input; it does not become the Memory domain model.
-
-Initial event set:
+The first profile is one Claude Code hook relay with a finite event set:
 
 ```text
 SessionStart
@@ -243,369 +240,255 @@ PostCompact
 SessionEnd
 ```
 
-`SessionStart` and `UserPromptSubmit` are decision-time context boundaries. `Stop` and `SubagentStop` retain the host-supplied final response when available. `PostCompact` is a derived representation, not replacement source truth.
+Claude JSON is adapter input, not the Memory domain model. `SessionStart` and `UserPromptSubmit` are context boundaries. `Stop`/`SubagentStop` retain host-supplied final responses. `PostCompact` is a derived representation, not replacement truth.
 
-`PreToolUse`, permission and finish enforcement are outside Base. Negative memory is advisory by default. A later host guard is explicit, narrow and opt-in.
+`PreToolUse`, permission and finish enforcement are outside Base. Negative memory is advisory by default. Any later guard is explicit and opt-in.
 
-The installed host version and emitted payloads must be qualified during implementation. Public documentation is design input, not proof of the installed runtime.
+### 3.4 Direct capture and spool share one operation
 
-### 3.4 Capture and spool share one ownership operation
-
-The relay builds one complete bounded `CaptureCommand` before IPC. Direct delivery and replay use the same command and idempotency identity.
+The relay builds one immutable bounded `CaptureCommand` before IPC. Direct delivery and replay use the same command ID and bytes.
 
 ```text
-exact CaptureCommand
+command
 → daemon capture
-→ Store identity/digest readback
+→ matching Store readback
 → committed
 
-no safe daemon ownership
-→ exact durable publication to pending spool
+no established daemon ownership
+→ durable pending publication
 → staged
-→ daemon replays the same capture operation
+→ daemon replays same capture
 → Store readback
 → pending body removed
 ```
 
 There is no successful `forwarded` state without Store readback and no `staged` state before file plus parent-directory durability and exact reopen.
 
-The spool is a transport-recovery queue, not a second memory database. The daemon is the sole replayer. Corrupt or permanently rejected entries move to a failed area with bounded non-content diagnostics; successful replay removes the content-bearing pending file.
+The spool is a transport-recovery queue, not another memory database. One daemon replayer owns it. Corrupt/permanently rejected entries move to bounded failed quarantine; successful replay removes the content-bearing pending entry.
 
-Durable publication means create-new same-directory temporary regular file, complete write, file flush, no-replace rename, parent-directory flush and exact reopen. A direct write to the final path is not a durable queue contract.
+### 3.5 Context handoff is a real host effect
 
-Capture remains useful when context or optional learning fails. Context failure does not roll back committed source.
+A packet is useful only when rendered bytes cross a supported host boundary. “Event spooled” is status, not context. A local file or packet ID is not delivery.
 
-### 3.5 Backup uses a brief spool cut, not a long publication lock
-
-Backup must not hold the cross-process spool publication lock while paging Store rows or copying backup bytes. The selected contract is:
-
-1. daemon stops new Store mutations and replay, then reconciles the active replay item;
-2. acquire the publication lock only long enough to capture or rotate one exact bounded spool inventory/generation cut;
-3. release the lock;
-4. relay continues publishing post-cut entries separately;
-5. backup copies only the immutable identities and digests recorded in the cut;
-6. a missing or mismatched cut entry fails the backup instead of being silently omitted.
-
-This preserves capture availability during a long backup while keeping the backup denominator exact.
-
-### 3.6 Context handoff is a real host effect
-
-A context packet is useful only when rendered bytes cross a supported host boundary. “Event spooled” is status, not context. A local file or packet ID is not delivery.
-
-The packet is retained as ordinary observation/blob/link data: rendered digest, budget, gaps and exact included revisions. Keep distinct:
+Retain packet bytes/digest, budget, gaps and exact included revisions as ordinary observation/blob/link data. Keep distinct:
 
 ```text
 prepared
-emitted through the host contract
+emitted
 associated with a later action when observable
-actually used or influential: usually unknown
+actually used/influential: usually unknown
 ```
-
-Failure to emit leaves explicit retrieval and source opening available. The host receives a specific gap rather than fabricated empty success.
-
-### 3.7 Privileged lifecycle is one inherited boundary
-
-Supervisor and daemon are different failure and authority domains, so they use one real internal boundary. Supervisor creates it before daemon launch and passes only exact handles to the child. It is not a named public endpoint, plugin protocol or general administration API.
-
-Closed frames include:
-
-```text
-store_descriptor / daemon_ready
-maintenance_request / maintenance_result
-quiesce / quiesced / resume
-shutdown_ready / shutdown_complete
-```
-
-One operation ID correlates each finite exchange. Daemon may name an already retained backup, credential or configuration identity; it cannot submit raw SQL, executable arguments, endpoint, arbitrary path or secret. Supervisor reopens and validates the referenced object itself.
-
-Daemon owns application admission and produces quiesce facts: replay stopped, active replay reconciled, Store writes settled or unknown, socket closure and exact spool/deletion/controller cuts. Supervisor owns privileged execution and installation selection. Neither side reports completion from acknowledgement alone; result comes from Store, credential, process or selection readback.
-
-Channel loss is fail-closed. Before cutover, a lost daemon abandons the candidate. After possible selection replacement, startup reads actual selection before another action.
-
-Immutable blobs, spool entries, deletion notices and backup generations are no-replace publications. Mutable installation selection is supervisor-only expected-generation replacement with parent-directory durability, exact readback and explicit unknown reconciliation. Previous root remains until deliberate retirement.
 
 ## 4. Identity and memory invariants
 
-### 4.1 Project, workspace, work identity and environment are different
+### 4.1 Work identity is not environment state
 
-A project is a configured work scope; it need not be Git. A workspace identifies one working instance. A task or actor/session address identifies continuing work. Path, branch, commit, resource version and time describe changing environment.
+Project/workspace plus actual host task identity—or narrow actor/session fallback—addresses continuing work. Path, branch, commit, resource version and time describe environment.
 
-Therefore:
+A branch switch does not erase a goal. A result from checkout B does not establish checkout A. Fork/transfer retain explicit relations. Late results keep issue-time binding. Unknown association limits claims but does not block source preservation.
 
-- branch switch does not erase goal or commitment;
-- a result from checkout B does not establish checkout A’s condition;
-- fork and explicit transfer retain relations instead of renaming work;
-- late result keeps the binding captured when issued;
-- unknown association limits claims but does not block source preservation.
+### 4.2 Occurrence identity is not content equality
 
-There is no universal workspace generation whose mismatch disables an entire project.
-
-### 4.2 Occurrence identity and content equality are different
-
-A real occurrence is identified by the strongest native event identity plus bound host/session/task/resource scope. When the host supplies no unique key, relay command ID is occurrence and replay key.
-
-A digest verifies bytes. It does not merge two occurrences merely because their text is equal and is not a logical source ID unless the object is explicitly content-addressed.
-
-Replay of one command returns its prior result. Different occurrence with identical bytes remains a different observation.
+Use the strongest native event key plus bound host/session/task/resource scope. When absent, relay command ID is occurrence/replay key. Digest verifies bytes; it does not merge equal events or become a logical source ID by default.
 
 ### 4.3 Preserve accepted source before interpretation
 
-Capture exclusions run before ownership transfer. Accepted content is retained exactly within its declared bound, inline or as immutable blob. Extracted text, normalized fields and excerpts are projections, not replacement source truth.
+Capture exclusions/redactions run before ownership transfer and remain explicit. Accepted material is retained exactly within its declared bound, inline or as immutable blob. Extracted text, normalized fields and excerpts are projections.
 
-A generic key-name sanitizer cannot silently remove URLs, endpoints, paths, final messages or source locators. Secret exclusions/redactions are explicit, narrow and recorded as capture limitations. Host truncation or omission remains visible.
+Missing models, vectors or specialist tools cannot destroy source or prevent exact readback.
 
-Missing model, vector, project view or external service cannot destroy captured source or prevent exact readback.
+### 4.4 Source, representation and claim are distinct
 
-### 4.4 Source, representation and claim are different
+An observation records what a source supplied, not universal truth. Claims, methods, explanations, predictions and project views are derived knowledge with exact source/revision handles.
 
-An observation records what a source supplied, not that every statement is true. Claim, explanation, method, prediction and project view are derived knowledge.
+Rename, copy, conversion and export preserve separate identities plus relations. Equal bytes or similarity do not prove continuity or independent support.
 
-Derived knowledge retains exact source handles/revisions. Retrieval does not strengthen support. Model-generated IDs are not evidence. Exact names, versions, values, negations, limitations and counterexamples travel with useful summaries.
+### 4.5 Current revision and history are distinct
 
-Source object, version and transformed representation have different identities. Rename, copy, conversion, crop and export retain explicit relations. Similarity or equal bytes do not prove identity, continuity or independent support.
+Corrections create revisions. Historical evidence remains openable. Incompatible alternatives may coexist. Removing a successor does not restore its predecessor automatically. Occurrence time, stated validity, receipt time and editorial time answer different questions.
 
-### 4.5 Current value and history are different
+### 4.6 Origin, reuse and disclosure are distinct
 
-Corrections create revisions. Historical evidence remains openable after current applicability changes. Incompatible alternatives may coexist. Removing a successor does not automatically restore its predecessor.
-
-Occurrence time, stated validity, receipt time and editorial revision time answer different questions. Late import or new summary is not a fresh world observation.
-
-### 4.6 Origin, reuse scope and disclosure are different
-
-Every item retains origin. Reusable methods separately state where they may be considered. Reuse never erases origin, conditions, counterexamples or disclosure limits.
-
-Permission to consider a method elsewhere does not prove workspace, task or version conditions and does not authorize sending supporting source to a model.
-
-A generalized method may be `external_allowed` while a supporting episode remains `local_only` only when generalized content no longer contains or reveals protected material.
+Every item retains origin. Reuse scope says where a method may be considered. Disclosure says where its supplied content may travel. Reuse never widens disclosure or proves applicability to another workspace/version/task.
 
 ### 4.7 Grounds are explicit enough to revise
 
-A conclusion may depend on all members of one required group, one of several alternative groups, advisory support, or navigation links with no evidential meaning.
+A conclusion may depend on all links in one required group, one of several alternative groups, advisory support, or navigation with no evidential meaning. Citation count is not Boolean logic. Cycles supply no independent support.
 
-Eliot does not infer Boolean meaning from citation count. Unknown composition remains unknown. A material source change triggers targeted reconsideration, not whole-graph proof before every read. Cycles supply no independent support.
+Targeted source change triggers bounded reconsideration, not whole-graph proof before ordinary recall.
 
-### 4.8 Support, exposure and influence are separate
+### 4.8 Support, exposure and influence are distinct
 
-Existence, support, retrieval exposure and advisory influence answer different questions. A frequently retrieved item is not thereby verified. An archived observation is not false. An untested hypothesis can be useful conditionally. Known refutation accompanies affected guidance rather than becoming a universal score.
+Existence, support, retrieval exposure and advisory influence answer different questions. Frequent retrieval does not verify truth. Rarity does not refute. Known contradiction travels with affected guidance rather than collapsing into one score.
 
-### 4.9 Exact open is not broad retrieval
+### 4.9 Exact `open` is not broad retrieval
 
-`open` requires one nonempty exact handle or source locator and optional bounded range. Search/context may suggest handles; only `open` resolves one.
+`open` requires one nonempty exact handle/locator and optional bounded range. It reports requested and resolved identity, representation/revision, returned range/digest, current/history state, capture gaps, material qualifications, relation descriptors, expansion handles and cursor.
 
-Resolution preserves identity:
-
-- current semantic handle → current revision or explicit absent/withdrawn/erased;
-- version handle → exact historical revision or explicit missing/damaged, never current fallback;
-- observation/source handle → retained accepted body/blob and actual locator;
-- representation handle → exact transformation and relation to original, never silent reconversion.
-
-Every exact read states requested/resolved identity, returned range/digest, current/history state, capture gaps, conditions/limitations, relation descriptors, expansion handles and next cursor where more material exists.
-
-Empty exact selector never means broad project read. A fixed cap without continuation is incomplete coverage. Cursor binds exact object, revision, representation and options; units are explicit.
-
-Opening one claim/method need not load every neighbor body, but it cannot hide material grounds, contradictions, replacements, exceptions or outcomes. Return bounded revision-aware relation descriptors and expansion handles.
+A historical handle never falls forward. A current handle does not resurrect history. Empty selector never means broad project read. Fixed truncation without continuation is an explicit incomplete gap.
 
 ### 4.10 Forgetting is not one operation
 
 | Operation | Meaning |
 |---|---|
-| Reduce exposure | Show less often while permitted history remains |
-| Withdraw influence | Stop guidance in a stated situation |
-| Supersede/refute | Publish scoped replacement or contradiction |
-| Erase scope | Remove controlled source/derivatives, staged data, controlled backups and every created controller inference copy |
+| Reduce exposure | retrieve less while permitted history remains |
+| Withdraw influence | stop guidance in a stated situation |
+| Supersede/refute | publish scoped replacement/contradiction |
+| Erase controlled scope | delete controlled source/derivatives/spool/backups/controller copies and retain fences |
 
-Already delivered provider copies/effects are an external boundary. Restore cannot silently revive a known deletion. Erasure of unresolved inference requires explicit abandonment and cannot prove provider-side non-execution or deletion.
+A deletion fence prevents reintroduction but is not physical deletion proof. Provider-held copies/effects and exported off-machine backups remain external boundaries.
 
 ## 5. Current work and decision context
 
-Current work is addressed before similarity search.
-
-When the host supplies a usable task/session identity, Eliot opens the continuation directly, merges relevant later observations and only then retrieves related experience. A branch/workspace alone does not distinguish every concurrent task. A cancelled or superseded direction does not become current because it is semantically similar.
+Address current work before similarity search. Open the direct continuation, merge relevant later observations, then retrieve related experience.
 
 A decision packet contains only material that can change the next action:
 
-- current goal and criteria;
-- current plan, progress and open commitments;
+- goal and criteria;
+- plan/progress/open commitments;
 - exact constraints and corrections;
-- applicable or conditional methods;
-- relevant prior episodes and exceptions;
-- dissent, uncertainty and missing checks;
+- applicable or conditional methods plus exceptions;
+- relevant prior episodes;
+- dissent, unknowns and missing checks;
 - source handles.
 
-Exact values and qualifications travel together. A high-ranked method cannot crowd out its own exception. Prefer one concise qualified unit or explicit omission plus expansion handle over a misleading fragment.
+Exact values and qualifications travel together. Prefer concise qualified units or explicit omission/handle over misleading fragments. Useful recall must not depend solely on an agent remembering to ask: the first host uses `SessionStart` and `UserPromptSubmit`.
 
-Useful recall must not depend solely on an agent remembering to ask. The first Claude host uses `SessionStart` and `UserPromptSubmit` as delivery boundaries. A host without push hooks may pull at its next supported boundary.
-
-Prepared context is not handoff; handoff is not use; use is not success. Do not wake a stopped agent merely for bookkeeping. Advice and enforcement are separate; negative memory is advisory by default.
+Advice and enforcement remain separate.
 
 ## 6. Understanding
 
-A project view is a reconstructible, revisable answer to a useful question over an examined scope: purpose, boundaries, responsibilities, consumers, rationale, failed approaches or intended-versus-observed discrepancy.
+A project view is a revisable answer to one useful question over an examined scope: purpose, boundaries, responsibilities, consumers, rationale, failed approaches or intended-versus-observed discrepancy.
 
-Exact structure comes from sources/tools. Semantic explanation may use a learning handler. Intended behavior, observed implementation and inferred explanation stay distinct.
+Exact structure comes from sources/tools; semantic explanation may use a learning handler. Intended behavior, observed implementation and inferred explanation remain distinguishable.
 
-Understanding is incremental: exact facts immediately; bounded orientation job; affected-view refresh only; complete-set claim invalidated by a new consumer; failed refresh leaves prior qualified view plus direct source access. It is not a compulsory pyramid, onboarding ceremony or self-model registry.
+Project understanding is incremental. First contact returns available exact facts; bounded orientation creates useful views; changes refresh affected views only; failed refresh leaves prior qualified view and direct source open available.
+
+No compulsory pyramid, onboarding ceremony or separate self-model registry is selected.
 
 ## 7. Learning and self-improvement
-
-Learning changes external memory, methods, context construction and selected configurable strategies; it does not require model-weight training.
-
-Once purpose/profile are configured, Eliot may interpret selected episodes, publish provisional lessons and revise methods through the ordinary write path. Reversible suggestions do not require votes or promotion ceremonies. They cannot change permissions, user goals or external acceptance.
 
 ### 7.1 One Memory job owns the semantic loop
 
 ```text
-frozen sources + recipe + disclosure + saved WriteId/request
-→ authenticated controller V2 call
-→ private input + inference_calls row
-→ at most one provider attempt
-→ private result when present
-→ Memory range read + digest/length verification + durable copy
-→ purpose decoder
-→ atomic publication or valid no-change
+frozen sources + exact recipe + disclosure + precommitted WriteId
+→ controller first admission or exact replay
+→ one bounded provider attempt
+→ exact result copy when present
+→ purpose-specific decode
+→ atomic Memory publication or valid no-change
 → later consumer
-→ release/cleanup
+→ release/cleanup with its own precommitted WriteId
 ```
 
-Terminal no-result produces no cognitive body or no-change, but may close cleanup. Store conflict replays retained result, not provider call. Ambiguous provider effect remains unknown. A new `WriteId` is not recovery.
+Store conflict replays the retained result, not the model call. Ambiguous provider outcome stays unknown. A new WriteId is not recovery.
 
-Controller owns authentication, configuration, provider execution/readback and temporary copies; it does not own Memory job, source coverage, decoding or publication.
+### 7.2 No-change, partial and cleanup
 
-### 7.2 Model-independent cognitive contract
+No-change is valid only after cognitive work completes on the supplied input. Profile rejection, no result, malformed output, truncation, omitted input or unresolved execution is not no-change.
 
-Processing method and result schema define the cognitive operation. Profile selects versioned adapter/connection/model; interface compatibility does not guarantee equal quality.
-
-Retain profile/connection/adapter digests, actual destination, requested/observed model, finish/limits/usage/cost when supplied and unknown fields as unknown. Cleanup states remain separate from cognitive result.
-
-A text job consumes the exact processing-method revision. Embeddings consume the selected profile. Deterministic reducers need neither. A proposal changes behavior only when a real consumer reads it.
+Useful partial output retains exact coverage. Cleanup outcome is separate from cognitive outcome: useful learning may remain cleanup-incomplete, and a failed request may clean up successfully without producing knowledge.
 
 ### 7.3 Outcome attribution
 
-Retain exact method revision offered or used where correlatable. Otherwise preserve the episode without invented attribution. Distinguish offered, handed off, action observed, adherence inferred or unknown, outcome observed and comparative benefit supported or unknown.
+Where correlation exists, retain exact method revision offered/used and observed criterion outcome. Otherwise preserve the episode without invented attribution. Distinguish offered, handed off, action observed, adherence unknown/inferred and comparative benefit supported/unknown.
 
-One attributable attempt/criterion contributes once. Replay or summary is not independent success. Missing correlation limits evaluation but not capture or provisional learning.
+One attributable attempt/criterion contributes once. Replayed hooks/summaries are not independent successes.
 
-### 7.4 No-change, partial and cleanup
+### 7.4 Recursive improvement
 
-No-change is valid only for cognitive work completed on supplied input. Unavailable/disallowed profile, admission rejection, provider failure, no result, malformed output, truncation, unresolved execution or omitted input are not successful no-change.
+Diagnose the failed connected edge—capture, source selection, controller admission/execution/readback/retention/cleanup, decoding, publication, retrieval, delivery, use or applicability—and correct that edge. Do not multiply duplicate lessons or add a global intelligence score.
 
-Useful partial output may retain exact coverage. Cleanup outcome is separate: a failed request may clean successfully without learning; a useful result may remain cleanup-incomplete while Memory safely uses a verified copy.
+## 8. Backup, rollback and external-work continuity
 
-### 7.5 Recursive improvement
+Application backup uses a brief spool publication cut, canonical typed Store pages, exact selected-root blobs, deletion notices, cut pending/failed spool and sanitized config. The manifest owns completion.
 
-Diagnose the failed connected edge: capture, selection, admission, provider execution, readback, cleanup, decode, publication, retrieval, delivery, use, applicability or method quality. Correct that edge instead of multiplying lessons or adding a global intelligence score.
+For the exact controller/client identity, a backup records:
 
-Within repeatable work, Propose–Probe–Compose is optional. Baseline/no-change remains valid. A candidate is not automatically better. Irreversible effects are not repeated merely for comparison.
+```text
+controller high_water
+controller retain_after_seq
+all in-cut job WriteIds and request identities
+known result/release/cleanup facts
+```
 
-## 8. Disagreement, prediction, research and commitments
+Memory computes the required controller retention cut from every locally retained restorable backup and advances it only after durable backup-set readback.
 
-Disagreement belongs to question, scope and time. Preserve alternatives and grounds, then identify the cheapest useful distinguishing observation. A panel or vote is not default. Unresolved disagreement need not block unrelated work; a provisional choice records rationale and reconsideration trigger.
+Restore is exact rollback, not an invented merge of later Store rows. In-cut jobs reuse the same WriteIds. Post-cut controller calls are inventoried through one fixed `(backup_high_water, inventory_high_water]` interval. Their results are not adopted without exact restored job/source/publication mapping. Every out-of-target call receives a durable terminal/release/abandon disposition.
 
-A prediction states the expected observation before action, conditions and available check. Static dependency, co-change and causal explanation are not interchangeable.
+`history_gap`, caller/controller unavailability or identity reset keeps inference disabled. Base capture/retrieval remains available. The installation-scoped external-WriteId generator is not rolled back.
 
-Research begins with available memory and exact local sources. External acquisition addresses a concrete remaining gap. Eliot Research owns execution/corpora; Memory stores compact findings, alternatives, coverage and exact handles. Failed request, uninformative completion and useful partial answer are distinct outcomes.
+## 9. Reliability, privacy and direct control
 
-Commitments and problems are retained state, not notifications. Showing, acknowledging or passing a due date does not resolve them. Resolution follows a matching observed event or explicit owner change.
+Persist enough state to distinguish adjacent lifecycle states: accepted/staged/committed/unknown capture; prepared/emitted context; exact-read complete/paged/missing/damaged; inference waiting/admitted/sending/settled/unknown/abandoned; result copied/decoded/published; input/result cleanup independently; privileged maintenance requested/quiesced/executing/selection-unknown/completed.
 
-## 9. Reliability, backup/restore, privacy and control
+Acknowledgement is not completion. Heartbeat is not progress. Provider body is not decoded proposal. Published memory is not external success. Deletion fence is not physical erase.
 
-Persist enough to distinguish capture rejected/staged/committed/unknown; context prepared/emitted/action-associated/use unknown; exact read complete/paged/missing/forbidden/erased/damaged; inference waiting/admitted/queued/sending/unknown/result copied/decoded/applied; per-copy cleanup; privileged maintenance/quiesce/cutover/selection state.
+Secrets stay with their owner:
 
-Acknowledgement is not completion. Heartbeat is not progress. Provider body is not a decoded proposal. Proposal is not published memory. Published memory is not external success. Cleanup success is not cognitive success.
+- controller owns provider credentials and Memory caller token issuance;
+- Memory supervisor owns Store root/Owner references;
+- daemon receives only Store Editor and the current Memory controller credential reference;
+- Memory jobs/backups retain non-secret call identities only.
 
-External I/O never runs inside a Store transaction. Unknown effects reconcile through saved identity and native readback, never a new request ID.
-
-### 9.1 Backup and exact rollback
-
-Backup is an application-owned coherent typed cut. It records six tables, selected-root blobs, deletion notices, sanitized config, exact spool cut and controller inference cut. Manifest owns completeness. Surreal export/import and startup import are not selected.
-
-Backup locks spool publication only for the short inventory/generation cut. Long table reads and file copies occur after lock release while post-cut relay staging continues separately.
-
-Restore is exact rollback, not merge of later Store rows. A healthy current Store first gets a safety backup. Previous root stays until explicit retirement. Only deletion continuity and exact spool continuity auto-merge.
-
-Before backup, Memory stops new inference admissions, persists every `WriteId` and records controller per-client `high_water` plus `earliest_retained_seq`. Restore reconciles in-cut jobs by the same WriteIds and inventories calls after the cut. Out-of-target results are not adopted without the lost exact job/source mapping. A retention gap is `history_gap`, never empty. All new inference stays disabled until inventory is complete and dispositioned; Base may resume independently.
-
-If controller identity, caller credential or inventory is unavailable, restore records `external_work_inventory_unavailable`, keeps inference disabled and does not claim complete rollback or erasure.
-
-### 9.2 Privacy and erasure
-
-Secrets stay in their owner: controller owns provider/client derivation secret; supervisor owns root/Owner references; daemon gets Editor plus non-secret descriptors. Raw tokens and provider secrets never enter Memory Store/backup or controller receipts/logs.
-
-Physical erasure traverses Memory source/derivatives/spool/backups and controller call copies. A late result cannot reintroduce erased material through an abandoned call. Complete erasure is not reported while a controlled copy remains or mismatches. Provider-side deletion requires an actual provider guarantee.
-
-### 9.3 Direct control
-
-Daemon external surface provides status/inbox, inspect/open, configure, pause/resume/cancel, correct/withdraw/erase, backup/restore and shutdown. It reports operation ID immediately and delegates only closed privileged effects to supervisor.
-
-Status exposes ownership, spool/context/open gaps, profile/destination issues, unknown inference, post-restore inventory/history gap, maintenance/quiesce/cutover state and exact per-copy cleanup debt.
+Direct control provides status/open/configure/pause/cancel/correct/withdraw/erase/backup/restore/rotate/retire/shutdown. Status is derived from actual Store/process/spool/controller/readback facts.
 
 ## 10. Explicit non-goals
 
-V3 does not add without demonstrated consumer and owner decision:
+Without a demonstrated consumer and owner decision, V3 does not add:
 
-- public supervisor API or generic administration bus;
-- arbitrary commands, paths, SQL or secrets over privileged channel;
-- second task/workflow engine inside Memory;
-- duplicated provider/credential/router stack;
-- controller V1 `swarm-client`, Manager/Operator or Operation/artifact surface;
-- Agent, Goal, automation or script route for one-shot inference;
-- old Governor/portfolio/capability platform;
-- permanent Dreamer process/model loop;
-- second semantic/vector database;
-- truth/skill/outcome/packet registry;
-- universal policy/approval/proof platform;
-- route-classifier model or silent fallback;
-- arbitrary provider fields;
-- internal broker/event bus;
-- actor/crate/contract/service per concept;
-- per-helper lifecycle/proof/promotion manifests;
-- runtime plugins, WASM or hot-generation machinery;
-- global workspace fences before capture/read;
-- full-graph verification before recall;
-- mandatory model judge;
-- success-shaped stubs or generated inventories;
-- aggregate cleanup hiding a remaining copy;
+- a public supervisor API or generic administration bus;
+- arbitrary SQL/path/argv/secret over the inherited channel;
+- a second task manager, workflow engine, semantic DB or provider stack;
+- controller Agent/Goal/automation/script/MCP for one-shot inference;
+- a permanent Dreamer process;
+- a truth/skill/outcome/packet registry;
+- a general Governor/approval/proof platform;
+- an actor/crate/service/manifest per concept;
+- runtime plugin/WASM/hot-generation machinery;
+- model judges, silent fallback or arbitrary provider extras;
+- generated inventories as permanent authorities;
+- generic JSON/CBOR vendor-protocol reimplementation;
 - content hash as occurrence identity;
-- empty exact selector as broad read;
-- fixed relation truncation presented as complete;
-- service-status text presented as context.
+- aggregate cleanup hiding retained copies;
+- backup rollback presented as current-state merge;
+- observed earliest controller row presented as a retention guarantee;
+- a rollbackable/reusable external-WriteId generator.
 
-## 11. Product evidence
+## 11. Product evidence and implementation order
 
-A capability exists only with:
-
-```text
-real input
-→ owning operation
-→ retained result or typed unknown
-→ actual consumer
-→ observable effect
-→ restart/readback where relevant
-```
-
-Minimum Base evidence:
+Base minimum evidence:
 
 ```text
-real host event in session A
-→ committed observation or durable staged command
+real host event
+→ committed Store observation or durable staged command
 → replay when staged
 → restart
-→ exact continuation/context in session B
-→ actual host emission or explicit retrieval
-→ exact source open with revision/range/digest
+→ actual continuation/context or explicit retrieval
+→ exact source open
 ```
 
-Minimum learning evidence:
+Inference minimum evidence:
 
 ```text
-retained episode
-→ saved request + precommitted WriteId
-→ one controller provider attempt/result-or-unknown
-→ verified Memory copy and typed decode
-→ atomic revision/no-change/partial
-→ changed later context
-→ exact release/cleanup state
-→ restart readback
+stable caller + precommitted WriteId
+→ one admitted call / at most one provider attempt
+→ exact result copy or typed no-result/unknown
+→ decoded publication
+→ later context consumer
+→ exact release/cleanup
+→ restart/rollback reconciliation
 ```
 
-Minimum restore evidence includes the brief spool cut, candidate qualification, selection replacement/readback, daemon re-admission, same-WriteId in-cut reconciliation, post-cut controller inventory or explicit history gap and no new inference until continuity is dispositioned.
+Implementation order:
+
+1. Memory Slice 0 physical/Store/backup qualification;
+2. useful Base capture/replay/open;
+3. first qualified host/context path;
+4. controller #200 plus V2 L0/L1;
+5. Contract 0.10 text-inference P1a;
+6. credential rotation P1b;
+7. independent vectors/views/documents/Research/hosts;
+8. advanced curation after connected Base.
+
+Production code comes first. Run formatting and the minimum changed-package Clippy after coherent code increments. Broad qualification follows the connected product.
