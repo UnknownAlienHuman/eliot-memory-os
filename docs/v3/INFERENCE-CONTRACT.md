@@ -1,8 +1,8 @@
 # Eliot V3 — One-shot inference contract
 
-**Revision 0.17-draft · 2026-10-27 · shared Memory OS ↔ `eliot-swarm-controller` V2 boundary; not implemented.**
+**Revision 0.18-draft · 2026-10-27 · shared Memory OS ↔ `eliot-swarm-controller` V2 boundary; not implemented.**
 
-This is the sole normative contract for one-shot text and embedding execution. Memory owns semantic work; controller owns authenticated physical model execution and bounded temporary copies. The boundary does not create a controller Agent, native session, Goal, Task/Attempt/review workflow, automation run, script, generic service-account platform, second receipt store or hidden retry ladder.
+This is the sole normative contract for one-shot text and embedding execution. Memory owns semantic work; controller owns authenticated physical model execution and bounded temporary copies. The boundary does not create a controller Agent, native session, Goal, Task/Attempt workflow, automation run, script, generic service-account platform, second receipt store or retry ladder.
 
 ## 0. Authority and prerequisites
 
@@ -14,51 +14,34 @@ main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
 merged PR #198
 ```
 
-Controller V2 is specification-only. Issue #200 now owns separation of binding allocation, selected pointer and effect publication; PR #201 is fixture-only. Issue #199 owns this later extension after #200 and V2 L0/L1. No implementation may patch controller V1 to make this contract appear available.
+Controller V2 is specification-only. Issue #200 owns separation of binding allocation, selected pointer and effect publication; PR #201 is fixture-only. Issue #199 owns this extension after #200 and V2 L0/L1. No implementation may patch controller V1 to make this contract appear available.
 
 ## 1. Ownership
 
 Memory daemon owns:
 
 - finite job, exact sources and coverage;
-- processing-method revision and disclosure reduction;
-- exact request bytes and every Memory-side external `WriteId`;
-- result verification/copy, cognitive decoding/publication and later consumer;
+- recipe revision and disclosure reduction;
+- exact request bytes and Memory-side external `WriteId`s;
+- result verification/copy, decode/publication and later consumer;
 - one controller-mutation owner;
-- one backup-set owner, backup IDs, installation records, restore file leases and cleanup;
+- one backup-set owner, backup IDs, installation records, bounded restore leases and cleanup;
 - backup cut classification and release/retention fences;
 - caller-authorized cancel/release requests.
 
-Memory supervisor owns:
+Memory supervisor owns executable/root/process custody, disposable candidate Store process/root and final installation cutover. It never owns backup-file interpretation.
 
-- executable/root/process custody;
-- disposable candidate Store process/root;
-- final installation-selection cutover;
-- candidate termination/discard after daemon/channel loss.
-
-Controller owns:
-
-- caller authentication and current-credential fence;
-- inference connections/profiles and actual destination;
-- global `WriteId` receipt semantics;
-- provider invocation/readback;
-- private input/result copies;
-- call status, retention, erased tombstones and cleanup facts.
+Controller owns caller authentication, profiles/actual destination, global `WriteId` receipts, provider invocation/readback, private input/result copies, call status, retention, membership tombstones and cleanup facts.
 
 Controller owner may install/rotate/disable a Memory principal and perform non-disclosing break-glass erase. Memory never receives owner authority.
 
-## 2. Principal, credential and identity
+## 2. Principal, credential and identities
 
-Controller adds one principal kind:
-
-```text
-memory_inference
-```
-
-One stable Memory installation maps to:
+One stable principal represents one Memory installation:
 
 ```text
-client_id = memory:<stable-memory-installation-id>
+principal_kind = memory_inference
+client_id      = memory:<stable-memory-installation-id>
 ```
 
 Distinct values:
@@ -72,7 +55,7 @@ raw token
 
 `client_id` survives Memory restart, Store cutover, rollback and token rotation. Changing it is unsupported principal migration.
 
-Every controller-backed job retains, without secrets:
+Each controller-backed job retains, without secrets:
 
 ```text
 controller_id
@@ -89,28 +72,22 @@ cancel/release/retention WriteIds and auxiliary states
 per-copy cleanup state
 ```
 
-Call admission state:
+Call admission:
 
 ```text
-prepared
-admitted
-retired_not_admitted
-admission_unknown
+prepared | admitted | retired_not_admitted | admission_unknown
 ```
 
 Auxiliary cut state:
 
 ```text
-effect_observed
-retired_not_sent
-mutation_unknown
+effect_observed | retired_not_sent | mutation_unknown
 ```
 
-Backup dependency state:
+Backup dependency:
 
 ```text
-controller_closed
-controller_dependent
+controller_closed | controller_dependent
 ```
 
 A retired ID can never be sent later.
@@ -148,15 +125,11 @@ inference.erase                 # non-disclosing break-glass
 
 No method creates or reuses Agent, generation, binding, turn, command, Goal, automation, workspace, native session, Task, Attempt, review or acceptance objects.
 
-## 4. Provisioning and credential publication
+## 4. Provisioning and connection identity
 
-A controller-local owner command installs or rotates one principal through the normal owner `WriteId` path. It resolves `controller_id`, commits one exact registration/version transition, derives the raw token from private routing key + client ID + token version under a dedicated domain tag, stores only version/hash and publishes the raw token into one admitted private credential bundle.
+Controller-local owner install/rotate uses the normal owner `WriteId` path. It commits one exact registration/version transition, derives the raw Memory token under a dedicated domain tag from the private routing key + client ID + token version, stores only version/hash and publishes the raw token into one admitted private credential bundle.
 
-The destination is beneath an admitted private directory/handle, no-reparse, restrictive ACL, create-new, file/parent durable and exact-read-back. Arbitrary path write authority is not exposed. Raw token never enters argv, SQLite, receipt result, logs, diagnostics or status.
-
-Lost install/rotate reply retries the same owner WriteId and re-derives the same token. Missing/mismatched routing key blocks issue/reissue.
-
-## 5. Connection identity and stale-credential fence
+The destination is no-reparse, restrictive-ACL, create-new, file/parent durable and exact-read-back. Raw token never enters argv, SQLite, receipt result, logs, diagnostics or status. Lost reply retries the same owner WriteId and re-derives the same token.
 
 `client.identity` returns:
 
@@ -170,13 +143,13 @@ write_id_floor_ms
 write_id_future_skew_ms
 ```
 
-Memory requires exact equality with installation selection and credential bundle before any application call.
+Memory requires exact equality with installation selection and credential bundle before application calls.
 
-Before every read or mutation, controller reloads registration and requires current enabled principal, exact client ID, exact token version/current hash and unambiguous peer classification. Stale connection receives `credential_stale` and closes after terminal response. A new token version may read/release old calls because ownership is stable client ID.
+Before every read or mutation, controller reloads current registration and checks enabled principal, exact client ID, exact token version/current hash and unambiguous peer classification. A stale connection receives `credential_stale` and closes after the terminal response.
 
-## 6. Installation-scoped external WriteId generator
+## 5. External WriteId state and live replay
 
-External `WriteId` is a globally unique canonical 26-character ULID. Memory owns one locked atomic state outside rollback Store roots:
+Memory owns one locked atomic state outside rollback Store roots:
 
 ```text
 controller-write-id.state {
@@ -196,17 +169,15 @@ Generation order:
 5. persist exact ID in the owning job/maintenance record;
 6. only then send.
 
-Crash after advancement burns an ID. Crash before job persistence must not send. Rollback never rolls the file backward. Total state loss is a continuity incident, not permission to replay old jobs under invented IDs.
+Crash after advancement burns an ID. Crash before job persistence must not send. Rollback never rolls the file backward. Total state loss is a continuity incident.
 
-## 7. Live call identity and replay
-
-Memory persists exact request bytes/digest and call WriteId before first send.
+Live call identity is:
 
 ```text
-call identity = WriteId + client_id + method + canonical semantic payload digest
+WriteId + client_id + method + canonical semantic payload digest
 ```
 
-Canonical payload contains profile, origin, disclosure, input digest/length, response role and finite limits. It excludes transport request ID, pager, wait and client timeout.
+Canonical payload contains behavior-changing fields only: profile, origin, disclosure, input digest/length, response role and finite limits.
 
 ```text
 existing ID + same identity -> original/current call
@@ -216,9 +187,9 @@ absent below floor/window   -> id_expired
 absent excessive future ID  -> id_future
 ```
 
-Normal disconnect/restart deliberately repeats the same method, ID and bytes. Provider-send uncertainty remains retained call state. Restore is stricter: an old backup never first-admits an absent call or auxiliary ID.
+Normal disconnect/restart repeats the same method, ID and bytes. Provider-send uncertainty remains retained call state. Restore never first-admits an absent old call or auxiliary ID.
 
-## 8. Minimal controller state
+## 6. Minimal controller state and runner
 
 Reuse V2 `write_receipts`. Add only:
 
@@ -228,84 +199,35 @@ inference_calls
 private call-owned inference_input/result files
 ```
 
-Client registration owns:
+Registration owns monotonic `last_admission_seq` and `retain_after_seq`. First admission checks signed-64 exhaustion, increments the allocator and inserts receipt/call in one transaction. Never derive sequence from retained rows.
 
-```text
-last_admission_seq
-retain_after_seq
-```
+Exact input is durably published before provider I/O. One bounded runner verifies input/current registration/profile, CASes `queued -> sending`, performs at most one provider attempt, retains native readback identity when available, publishes exact result when present and never performs hidden retry, redirect or fallback.
 
-Both begin at zero. First admission transaction checks signed-64 exhaustion, increments `last_admission_seq`, inserts receipt/call and retains the allocated sequence. Never derive it from retained rows.
+Possible send followed by loss becomes `unknown` unless native readback resolves it.
 
-Call row contains WriteId, admission sequence, caller, method, payload digest, frozen profile/connection/adapter/destination, origin/disclosure, input/result metadata/copy states, native request ID when available, last cancel/release identities, terminal code/tombstone and timestamps. Raw input/result/provider error/credentials never enter rows or receipts.
-
-## 9. Profiles, destination and disclosure
-
-Controller owns static `InferenceConnection` and `InferenceProfile` records distinct from Agent profiles. Connection owns adapter/transport, endpoint, provider credential reference and actual destination. Profile owns connection/digest, requested model, automatic-use permission, finite limits and formats.
-
-A loopback gateway forwarding to cloud is external. Memory chooses a profile name only. It cannot supply arbitrary endpoint, headers, extras, retries or fallback.
-
-Memory reduces contributing material to `local_only | external_allowed`. Controller resolves actual destination and checks disclosure before provider I/O. Mismatch or unavailable capacity is operational failure/waiting, not cognitive no-change.
-
-## 10. Controlled input/result copies
-
-One call creates at most:
-
-```text
-inference_input
-inference_result
-```
-
-They are private deterministic call-owned files, not generic artifacts.
-
-For valid absent live ID, controller validates caller/profile/disclosure/limits, durably publishes exact input without replacement, rechecks receipt and atomically inserts receipt + queued call. Orphan input is non-dispatchable cleanup material. A committed row with missing/mismatched input is damaged.
-
-Visible result is one bounded private envelope durably published and verified before settlement. Restart may finish settlement from exact pending envelope. Missing/mismatched settled result is damaged.
-
-Per-copy state:
+Each call creates at most `inference_input` and `inference_result`. Per-copy state:
 
 ```text
 not_created | retained | cleanup_pending | removed | already_absent | mismatch | unknown
 ```
 
-## 11. Runner and provider uncertainty
+Raw input/result/provider errors/credentials never enter receipts or call rows.
 
-One bounded runner:
+## 7. Profiles, destination and disclosure
 
-1. selects eligible queued call under frozen profile concurrency;
-2. verifies input/current registration/profile;
-3. CAS `queued -> sending` before provider I/O;
-4. performs at most one provider attempt;
-5. retains native request/readback identity when available;
-6. publishes exact result when present and settles bounded facts;
-7. never performs hidden retry, redirect or fallback.
+Controller owns static `InferenceConnection` and `InferenceProfile` records. Connection owns adapter/transport, endpoint, provider credential reference and actual destination. Profile owns connection/digest, requested model, automatic-use permission, finite limits and formats.
 
-Possible provider send followed by loss becomes `unknown` unless exact native readback resolves it.
+A loopback gateway forwarding to cloud is external. Memory selects a profile name only. It cannot provide arbitrary endpoint, headers, extras, retries or fallback.
 
-## 12. Controller-mutation and backup-set owners
+Memory reduces contributing material to `local_only | external_allowed`; derived content cannot widen a stricter source it still reveals. Controller checks destination/disclosure before provider I/O. Mismatch or unavailable capacity is operational failure/waiting, not cognitive no-change.
 
-One daemon controller-mutation owner serializes:
+## 8. Controller-mutation and backup-set owners
 
-```text
-inference.text / inference.embed
-inference.cancel
-inference.release
-inference.retention.advance
-```
+One daemon controller-mutation owner serializes call, cancel, release and retention advance.
 
-One daemon backup-set owner owns:
+One daemon backup-set owner owns backup ID allocation, final backup directory publication, installation-record scan/state derivation, fence/abort/retire transitions, dependency snapshots, bounded restore leases and physical backup cleanup. It is an in-process owner task with retained OS handles, not another service or table.
 
-- backup ID allocation;
-- final backup directory publication;
-- installation record scan and state derivation;
-- fence/abort/retire transitions;
-- controller-dependency snapshots;
-- restore read leases;
-- physical backup cleanup.
-
-It is an in-process mutex/owner task with retained OS handles, not another service, Store table or workflow engine.
-
-A new fence uses strict order:
+New fence lock order:
 
 ```text
 close and drain controller-mutation owner
@@ -315,9 +237,9 @@ close and drain controller-mutation owner
 → reopen mutation admission
 ```
 
-Therefore no release or retention advance can pass a stale “no fence” read. Terminal transitions remove pins; stale pre-terminal reads are conservative.
+No release or retention advance can cross a newly visible fence. Terminal transitions remove pins, so stale pre-terminal observations are conservative.
 
-## 13. Backup IDs and atomic first visibility
+## 9. Backup IDs and atomic first visibility
 
 Backup ID grammar:
 
@@ -325,44 +247,42 @@ Backup ID grammar:
 b_<32 lowercase hexadecimal characters>
 ```
 
-It is generated from 128 OS-random bits. It is never derived from Store rollback state or wall clock and never reused after a final fence or terminal marker.
+It is generated from 128 OS-random bits and never derived from Store rollback state or wall clock.
 
 Before any part:
 
 1. build canonical backup plan and digest;
-2. create one private same-parent temp directory;
+2. create a private same-parent temp directory;
 3. write canonical `fence.json` inside;
 4. flush fence file and temp directory;
-5. atomically no-replace rename temp directory to `backups/<id>` with write-through semantics;
+5. no-replace atomically rename the directory to `backups/<id>` with write-through semantics;
 6. flush `backups/` parent;
-7. reopen final directory/fence no-follow and verify exact bytes/digest.
+7. reopen final directory/fence no-follow and verify exact identity/bytes/digest.
 
 Final directory first becomes visible with authoritative fence already inside.
 
 - collision: discard temp, generate a new ID and recompute plan;
-- crash before final rename: temp staging is non-restorable/non-pinning cleanup debt;
-- possible rename with failed sync/readback: `publication_unknown`; reconciliation opens final name and pins conservatively;
-- no reservation row/file/service is added.
+- crash before rename: temp staging is non-restorable/non-pinning cleanup debt;
+- possible rename with failed sync/readback: `publication_unknown`; reconciliation opens the final name and pins conservatively;
+- a final fence or terminal marker permanently consumes the ID.
 
-## 14. Backup cut, plan and terminal records
+## 10. Backup cut, plan and terminal records
 
 Before high-water, Memory stops new controller-backed work, drains controller mutation, pauses replay and dispositions every created call/cancel/release/retention ID.
 
-Every admitted call is classified:
+Every admitted call is:
 
 ```text
 controller_closed
   backup contains every terminal Memory-owned fact/body it needs,
   no future settlement/publication is possible,
-  no controller copy/readback/cleanup remains required
+  no controller copy/readback/cleanup remains
 
 controller_dependent
-  backup still needs controller state, current/future result bytes or cleanup/readback
+  backup still needs controller state, result/copy or cleanup/readback
 ```
 
-Canonical plan includes backup ID, expected manifest identity, root/schema/spool cut, controller/client/token/high-water/retain-cut, admitted calls/dependencies, retired attempts, disclosure and gaps. `backup_plan_digest` excludes itself, publication state and later page/part/manifest digests.
-
-Final manifest repeats plan digest plus actual typed table/blob/spool/deletion/config inventories and digests.
+Canonical plan includes backup ID, expected manifest identity, root/schema/spool cut, controller/client/token/high-water/retain-cut, admitted calls/dependencies, retired attempts, disclosure and gaps. `backup_plan_digest` excludes itself, publication state and later part/manifest digests. Final manifest repeats it plus actual inventories/digests.
 
 Terminal records are create-new, durable and self-contained:
 
@@ -389,11 +309,11 @@ fence + no valid manifest/terminal      -> preparing/publication_unknown
 other malformed/mismatch/ambiguity      -> unresolved/fail closed
 ```
 
-Terminal marker remains after content cleanup, prevents restore/ID reuse and is not physical erasure.
+Terminalization is not erasure.
 
-## 15. Release, retention and erasure authority
+## 11. Release, retention and erasure
 
-`inference.cancel` can cancel only caller's queued call before sending. `inference.release` has one disposition:
+`inference.cancel` applies only to the caller's queued call before sending. `inference.release` disposition is:
 
 ```text
 memory_copy_verified
@@ -405,25 +325,43 @@ Before release, mutation owner obtains a current backup-set snapshot and recheck
 
 Controller-owner `inference.erase` is local non-disclosing break-glass. Memory cannot submit it and records owner-action debt until readback.
 
-`retain_after_seq` guarantees complete membership above the cut. Calls at/below cut may prune only when terminal, every copy released/absent and no readback remains. Open/unknown/unreleased calls never prune merely because below cut.
+`retain_after_seq` guarantees complete membership above the cut. Calls at/below cut may prune only when terminal, copies released/absent and no readback remains. Open/unknown/unreleased calls never prune merely because they are below cut.
 
-Required cut is the minimum high-water among published non-retired backups and unresolved preparing/publication-unknown fences. In-cut dependencies do not lower the monotonic cut; they stay unreleased. Content erasure above cut leaves bounded text-free membership tombstone until cut advances.
+Required cut is the minimum high-water among published non-retired backups and unresolved preparing/publication-unknown fences. In-cut dependencies remain unreleased rather than lowering the monotonic cut. Erasing content above cut leaves a bounded text-free membership tombstone until cut advances.
 
-## 16. Restore lease and candidate custody
+## 12. Bounded restore lease and candidate custody
 
-Restore is admitted only by daemon backup-set owner. It obtains:
+Restore is admitted only by daemon backup-set owner. Before candidate work it validates finite manifest limits:
 
-- exact logical lease bound to backup ID/plan/manifest;
-- retained no-follow handle to final directory;
-- retained no-follow handles to fence, manifest and required parts;
-- delete sharing denied for leased files;
-- final terminal-record recheck immediately before cutover decision.
+```text
+part_count <= configured hard maximum
+part_bytes <= per-part maximum
+total_part_bytes <= total restore maximum
+all relative paths canonical and unique
+```
 
-Retirement, abort and cleanup wait. Supervisor receives only closed backup identity/digests and candidate/cutover intent. It owns candidate process/root but not backup file authority.
+The lease holds for the whole restore:
 
-Daemon/channel loss while candidate exists requires supervisor to terminate, reap and discard candidate before a new daemon starts or cutover proceeds. Supervisor loss is contained by its Job. A scan without a held lease is not restore authority.
+- one logical lease bound to backup ID/plan/manifest;
+- a no-follow handle to the final directory;
+- no-follow handles to `fence.json` and `manifest.json`;
+- share mode `FILE_SHARE_READ` only for those retained handles, denying write/delete/rename opens;
+- a final terminal-record and manifest-identity recheck immediately before cutover decision.
 
-## 17. Restore and stale mirrors
+It does **not** retain a handle for every part. Parts are streamed in deterministic manifest order:
+
+1. open one part no-follow with read access and `FILE_SHARE_READ` only;
+2. verify regular-file identity, canonical relative path, exact length and digest;
+3. copy and verify it into the candidate;
+4. close the part handle before opening the next part.
+
+The daemon owner prevents its own retirement/cleanup while leased; the active part handle prevents replacement during read; digest verification detects pre-open substitution. This closes the race without an unbounded kernel-handle set.
+
+Supervisor receives only closed backup identity/digests and candidate/cutover intent. It owns candidate process/root, not backup-file authority.
+
+Daemon/channel loss while candidate exists requires supervisor to terminate, reap and discard candidate before another daemon starts or cutover proceeds. Supervisor loss is contained by its Job. A scan without a held lease is not restore authority.
+
+## 13. Restore and stale mirrors
 
 In-cut restored jobs:
 
@@ -434,66 +372,75 @@ retired_not_admitted    never send old ID
 admission_unknown       hold; inference disabled
 ```
 
-Capture one inventory high-water and page fixed interval `(backup_high_water, inventory_high_water]`. Returned post-cut calls are outside restored cognition. Valid caller uses dependency-aware cleanup; missing caller creates owner-action debt.
+Capture one inventory high-water and page fixed interval `(backup_high_water, inventory_high_water]`. Post-cut results are outside restored cognition. Valid caller uses dependency-aware cleanup; missing caller creates owner-action debt.
 
-Before ordinary job claims, daemon scans installation records, reconstructs backup set/leases, reconciles Store maintenance mirrors and marks future-timeline/unmatched rows `superseded_by_installation_state`. Such rows cannot create fence/terminal records, clear pins or send old release/retention effects.
+Before ordinary job claims, daemon scans installation records, reconstructs backup state, reconciles Store maintenance mirrors and marks future-timeline/unmatched rows `superseded_by_installation_state`. Such rows cannot create terminal records, clear pins or send old release/retention effects.
 
-Any history gap, unknown auxiliary mutation, terminal ambiguity, missing dependent copy or identity reset leaves inference disabled while Base remains usable.
+Any history gap, unknown auxiliary mutation, terminal ambiguity, limit violation, missing dependent copy or identity reset leaves inference disabled while Base remains usable.
 
-## 18. Rotation and request shapes
+## 14. Store/query compatibility required by Memory
 
-Memory selection keeps current, pending and at most one previous credential for exact controller/client/version. Unknown rotation retries same owner WriteId and token derivation. Pending identity must authenticate and read a pre-rotation call before promotion. Previous secret retires only after reconnect, old-call read/release and restart readback.
+Although controller does not own Memory Store, the consumer contract relies on three exact Memory-side facts:
+
+1. BM25 score queries use numbered match references:
+
+```text
+WHERE search_text @0@ $query
+SELECT ..., search::score(0) AS score
+ORDER BY score DESC, canonical_id ASC
+LIMIT $hard_limit
+```
+
+A zero BM25 score is a valid match. Base lexical retrieval is one bounded top-K snapshot per call, not a durable page cursor across corpus changes.
+
+2. Schema admission uses plain `INFO FOR DB` / `INFO FOR TABLE` maps. `STRUCTURE` is forbidden because it is an internal unstable output. Memory parses owned maps, sorts keys and compares exact pinned-version server-canonical `DEFINE` strings; raw JSON object byte order is irrelevant.
+
+3. Schema-bundle identity includes a runner protocol version and exact transactional wrapper template in addition to ordered DDL assets. Bound generation/digest values are outside the preimage, avoiding self-reference.
+
+These requirements prevent restore/inference consumers from relying on an ambiguous Memory Store schema or lexical continuation.
+
+## 15. Rotation and request shape
+
+Memory selection keeps current, pending and at most one previous credential for exact controller/client/version. Unknown rotation retries the same owner WriteId and token derivation. Pending identity must authenticate and read a pre-rotation call before promotion. Previous secret retires only after reconnect, old-call read/release and restart readback.
 
 Initial `inference.text` accepts one bounded exact UTF-8 prompt, digest/length, profile, origin, disclosure, closed response format and finite output/time limits.
 
-Initial adapter is a closed loopback-compatible OpenAI chat-completions subset: one model, one user message, admitted max tokens and optional JSON-object format. No tools, streaming, arbitrary fields, ambient proxy, redirect, hidden retry or fallback. Loopback does not prove local destination.
+Initial adapter is a closed loopback-compatible OpenAI chat-completions subset: one model, one user message, admitted max tokens and optional JSON-object format. No tools, streaming, arbitrary fields, ambient proxy, redirects, hidden retry or fallback. Loopback does not prove local destination.
 
-## 19. Implementation order and evidence
+## 16. Implementation order and evidence
 
 P1a begins only after controller #200 and V2 L0/L1:
 
-1. stable controller identity and scoped client registration;
+1. stable controller identity and scoped registration;
 2. identity/current-token fence;
-3. static profile/destination/disclosure admission;
+3. profile/destination/disclosure admission;
 4. WriteId-backed text call and private copies;
 5. get/read/cancel/release/high-water/list/retention;
 6. tombstones and owner break-glass;
 7. Memory external-ID state and mutation owner;
-8. daemon backup-set owner, atomic final fence publication and terminal records;
+8. daemon backup-set owner, atomic first fence and terminal records;
 9. call/auxiliary cut and dependency classification;
-10. restore lease/candidate crash custody and stale-mirror reconciliation;
-11. one episode result copied, decoded, consumed later and eventually released.
+10. bounded restore lease/candidate crash custody and stale-mirror reconciliation;
+11. one episode result copied, decoded, consumed later and released.
 
-P1b adds install/rotate lost-reply reconciliation, stale-session reaping and delayed previous-secret retirement. Embeddings and direct HTTPS are later independent increments.
+P1b adds install/rotate lost-reply reconciliation, stale-session reaping and delayed previous-secret retirement. Embeddings and direct HTTPS are later increments.
 
-Required evidence includes:
+Required evidence includes same-ID live replay, one provider attempt, cut disposition for every external mutation, final directory never visible without fence, pre-rename temp never pins, post-rename unknown pins after reconciliation, terminal marker survives cleanup, bounded part streaming under finite limits, restore lease blocks retirement/deletion, daemon loss discards candidate, dependent call remains unreleased, fixed inventory returns history gap below cut, exact-caller result access and one episode revision changing later context.
 
-- same live call ID before send/lost reply/restart;
-- no second provider attempt after possible send;
-- every external mutation has cut disposition;
-- final backup directory never appears without fence;
-- pre-rename temp never pins;
-- post-rename unknown pins after reconciliation;
-- terminal marker remains authoritative after content cleanup;
-- restore lease blocks retirement/deletion and final recheck precedes cutover;
-- daemon loss discards candidate before restart/cutover;
-- dependent call remains unreleased even below current cut;
-- fixed inventory returns history gap below retain cut;
-- result bytes are exact-caller only;
-- one real episode revision changes later context after restart.
-
-## 20. Frozen non-goals
+## 17. Frozen non-goals
 
 Do not:
 
-- implement this in controller V1;
+- implement in controller V1;
 - use Agent/Goal/automation/script/MCP/CLI subprocess per call;
 - accept owner/Agent/no-token fallback;
 - invent another Operation/Task/submission ledger;
 - add a controller backup-pin service/table;
 - derive backup IDs or WriteIds from rollback Store state;
-- create an empty final backup directory as reservation;
-- make terminal marker depend forever on files cleanup deletes;
+- create an empty final backup directory;
+- retain unbounded part handles for restore;
+- use unstable `INFO ... STRUCTURE` as schema API;
+- expose a lexical cursor whose BM25 corpus snapshot is not retained;
 - restore without a held lease;
 - let Store mirrors create installation authority;
 - first-admit absent old IDs from backup;
