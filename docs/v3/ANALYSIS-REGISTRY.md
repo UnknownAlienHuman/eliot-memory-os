@@ -1,171 +1,156 @@
 # Eliot V3 — реестр анализа
 
-**Статус на 2026-10-27 · опубликованная нормативная база Architecture draft.17 / Implementation draft.38 / Cognition draft.21 / Inference Contract 0.16; новые R-147–R-150 ещё требуют синхронизации owner-docs; controller authority `613ea6b5ff6389c7629a988e271477ee45c9d2c1`; активный рабочий реестр, не runtime gate.**
+**Статус на 2026-10-27 · Architecture draft.18 / Implementation draft.39 / Cognition draft.22 / Inference Contract 0.17; controller authority `613ea6b5ff6389c7629a988e271477ee45c9d2c1`; активный рабочий реестр, не runtime gate.**
 
-Это **единственный активный реестр** V3. Он хранит текущее решение, границу доказательства, оставшийся разрыв и следующий connected step. [AUDIT](AUDIT.md) и [AUDIT-MAP](AUDIT-MAP.md) сохраняют исходные доказательства и stable dispositions; новый проход обновляет этот файл, а не создаёт ещё один отчёт.
+Это **единственный активный реестр** V3. Он хранит текущее решение, границу доказательства, оставшийся разрыв и следующий connected step. [AUDIT](AUDIT.md) и [AUDIT-MAP](AUDIT-MAP.md) сохраняют доказательства и стабильные dispositions; Git history хранит подробную хронологию.
 
 ## 1. Статусы и правила
 
 | Статус | Значение |
 |---|---|
-| `CHECKED` | Указанный source/design scope прочитан и вывод согласован. Не означает работающий runtime. |
-| `DECIDED` | Для V3 выбрано решение; код или живой прогон отсутствует. |
-| `PARTIAL` | Проверена часть connected edge; остаётся материальный непроверенный участок. |
+| `CHECKED` | Указанный source/design scope прочитан и вывод согласован. Не означает runtime. |
+| `DECIDED` | Решение выбрано; код/живой прогон отсутствует. |
+| `PARTIAL` | Проверена часть connected edge. |
 | `GAP` | В caller→owner→result/unknown→consumer пути отсутствует связь. |
 | `OPEN` | Нужно решение или чтение источника. |
-| `BLOCKED` | Требуемый predecessor/источник недоступен или не реализован. |
+| `BLOCKED` | Не реализован predecessor или недоступен источник. |
 | `NOT SELECTED` | Механизм не нужен выбранной конструкции. |
-| `NOT QUALIFIED` | Артефакт найден, но требуемый живой прогон не выполнен. |
-| `SUPERSEDED` | Решение относилось к прежнему baseline и заменено current authority. |
+| `NOT QUALIFIED` | Артефакт найден, но живой прогон отсутствует. |
+| `SUPERSEDED` | Решение заменено текущей authority. |
 
 Правила:
 
 - README, DTO, fixture, receipt, CI или compilation не дают runtime `CHECKED`;
 - `IMPLEMENTED` появляется только после real input→operation→durable result/typed unknown→consumer→restart/readback;
 - новый механизм не вводится без named caller, owner, result/unknown и consumer;
-- controller V1 используется только как явно названный donor;
-- Memory inference реализуется только поверх current controller V2 после его foundation;
-- Git history хранит подробную хронологию; этот файл хранит текущее состояние.
+- controller V1 — donor only;
+- Memory inference реализуется только поверх current controller V2;
+- один реестр, один current contract, никаких параллельных task/report databases.
 
-## 2. Критические текущие факты
-
-### 2.1 Controller V2 authority и blockers
+## 2. Controller V2 authority и blockers
 
 | ID | Объект | Статус | Текущее решение / разрыв | Следующее действие |
 |---|---|---|---|---|
-| R-123 | Current controller authority | `CHECKED` | Authority — `main@613ea6b5`, merged PR #198. V2 = fresh JSON-RPC + SQLite WAL + global external `WriteId`; current Rust/`swarm-client`/generic Operation stack — V1 legacy pending deletion. | Не добавлять Memory functionality в V1. |
-| R-130 | Controller roadmap status | `CHECKED` | `docs/roadmap.md` — единственный status tracker; L0.1–L1.11 все unchecked. PR #198 — specification only. | Controller реализует L0/L1 после #200. |
-| R-131 | Binding allocator, pointer и effect boundary | `CHECKED` design / `BLOCKED` runtime | Issue #200 теперь разделяет monotonic per-generation allocation, selected current pointer и native effect. Candidate admission не двигает pointer. Launch/resume публикуют target pointer только атомарно с dispatch/generation transition; pre-dispatch cancel оставляет pointer absent. First observe создаёт pointer после exact attach; control/detach двигают его после exact effect. `supersedes_revision` означает captured selected pointer и может быть `NULL` при revision > 1. Allocator нельзя восстанавливать из pointer/MAX и нельзя снижать при pruning. PR #201 исправляет только fixtures. | Изменить core/API/config/decisions/schema validator и доказать 18 acceptance cases issue #200 до L0/L1. |
-| R-048 | `inference.text/embed` runtime | `BLOCKED` | Current V2 methods/runtime absent; issue #199 blocked on #200 + L0/L1. | Реализовать current Contract только после foundation. |
+| R-123 | Current controller authority | `CHECKED` | `main@613ea6b5`, merged PR #198. V2 = fresh JSON-RPC + SQLite WAL + global external `WriteId`; старый runtime legacy. | Не добавлять Memory в V1. |
+| R-130 | Roadmap status | `CHECKED` | `docs/roadmap.md` — sole tracker; L0.1–L1.11 unchecked. | Реализовать foundation после #200. |
+| R-131 | Binding allocator/pointer/effect | `CHECKED` design / `BLOCKED` runtime | Issue #200 разделяет per-generation allocator, selected pointer и native effect. Candidate admission pointer не двигает. Launch/resume публикуют target pointer с dispatch/generation transition; first observe/control/detach — после exact effect. `supersedes_revision` = captured selected pointer и может быть NULL при revision>1. Allocator не выводится из pointer/MAX и переживает pruning. PR #201 — fixture-only. | Изменить core/API/config/decisions/schema validator и доказать 18 named cases. |
+| R-048 | `inference.text/embed` runtime | `BLOCKED` | V2 methods/runtime отсутствуют; issue #199 blocked on #200 + L0/L1. | Contract 0.17 P1a после foundation. |
 
-### 2.2 Memory inference contract
-
-| ID | Объект | Статус | Текущее решение / разрыв | Следующее действие |
-|---|---|---|---|---|
-| R-047 | One-shot ownership | `CHECKED` design / `NOT IMPLEMENTED` | Memory owns semantic job/source/recipe/decode/publication; controller owns authenticated physical call/readback/copies. | P1a after V2 foundation. |
-| R-053 | Narrow caller | `DECIDED` / `NOT IMPLEMENTED` | Dedicated `memory_inference`; no owner, Agent, automation, plugin or no-token fallback. | Registration + denial matrix. |
-| R-117 | Stable caller continuity | `CHECKED` design / `GAP` runtime | Stable `client_id = memory:<random-installation-id>` owns calls across token rotation and Memory rollback. | Pre/post-rotation old-call read/release. |
-| R-125 | Global `WriteId` call identity | `DECIDED` / `NOT IMPLEMENTED` | Live call identity = global ULID + exact client + method + canonical payload; call ID equals WriteId. | Receipt/call transaction. |
-| R-126 | Minimal V2 durable state | `DECIDED` / `NOT IMPLEMENTED` | Reuse `write_receipts`; add only `memory_inference_clients`, `inference_calls` and private call-owned files. | Schema/runner/copy lifecycle. |
-| R-132 | Guaranteed post-cut retention | `DECIDED` / `NOT IMPLEMENTED` | Monotonic `retain_after_seq` protects complete post-cut membership above minimum high-water of published non-retired backups and unresolved provisional fences. It is not observed earliest row and is not lowered for in-cut dependencies. | Implement high-water/list/retention.advance and controlled-set scan. |
-| R-133 | Memory external WriteId generator | `DECIDED` / `NOT IMPLEMENTED` | One locked atomic installation-scoped monotonic ULID state outside rollback roots. Advance before job record/send and at least daemon floor/current monotonic time. | Implement Windows durable state, identity mismatch, lost-state and rollback cases. |
-| R-134 | Auxiliary mutation identity | `DECIDED` / `NOT IMPLEMENTED` | Cancel, release and retention advance each get durable pre-send caller WriteId. | Add fields/readback path; no generic receipt-query API or new table. |
-| R-135 | Private credential publication | `DECIDED` / `NOT IMPLEMENTED` | Controller-local owner publishes derived token only to admitted create-new/no-reparse private destination with ACL + file/parent durability. | Qualify install/reissue/lost-reply/path negatives. |
-| R-128 | Restore external-work inventory | `DECIDED` / `NOT IMPLEMENTED` | Backup stores high-water + retain cut; restore captures fixed `(backup_high_water, inventory_high_water]` membership and dispositions every out-of-target call. | Stable cursor/list + cleanup jobs. |
-| R-129 | Retention gap | `DECIDED` / `NOT IMPLEMENTED` | `backup_high_water < retain_after_seq` means `history_gap`; physical row presence is diagnostic only. | Implement and qualify. |
-| R-136 | Backup admission closure | `CHECKED` design / `NOT IMPLEMENTED` | Before high-water, one controller-mutation owner is closed/drained. Call IDs and auxiliary IDs receive exact cut dispositions; release/retention cannot race controlled-set changes. | Implement barrier/readback, retired-ID send denial and mutation serialization. |
-| R-137 | Cleanup/erase authority | `CHECKED` design / `NOT IMPLEMENTED` | Valid caller uses optional cancel + `release(abandon_for_erasure)`. `inference.erase` is controller-owner-only break-glass; Memory records `owner_action_required` and later owner readback, never owner WriteId/effect. | Implement caller path, owner-action debt and denial tests. |
-| R-138 | Retention tombstone vs physical erasure | `DECIDED` / `NOT IMPLEMENTED` | Content/sensitive facts erase immediately, but calls above retain cut keep bounded text-free membership tombstone. Tombstone deletion requires terminalization of pinning backups and prior cut advance. | Add erased/abandoned tombstone state and inventory cases. |
-| R-139 | In-cut backup dependency release fence | `CHECKED` design / `NOT IMPLEMENTED` | Every admitted in-cut job is `controller_closed` or `controller_dependent`. Dependent calls/copies stay unreleased while any restorable/provisional backup needs them. | Implement controlled-set dependency scan, pre-release recheck and restore/release cases. |
-| R-140 | Contract 0.13 provisional fence | `SUPERSEDED` by R-141/R-142 | Final-manifest digest in rollback-local Store job created self-reference and rollback authority loss. | Do not implement 0.13 shape. |
-| R-141 | Canonical backup plan digest | `CHECKED` design / `NOT IMPLEMENTED` | Precommit `backup_plan_digest` over explicit immutable plan fields excluding digest itself, publication state and later part/manifest digests. Final manifest repeats plan digest plus actual inventories. | Implement canonical plan codec, digest/readback and mismatch cases. |
-| R-142 | Rollback-safe provisional authority | `CHECKED` principle / `PARTIAL` physical publication | Installation-scoped fence before parts remains selected; ambiguity pins release/retention. Contract 0.16 leaves an empty-final-directory crash window between directory creation and `fence.json`. | Replace with R-148 staged-directory publication. |
-| R-143 | Monotonic published-backup retirement | `CHECKED` principle / `SUPERSEDED` terminal-shape detail | Published backup leaves restorable set through durable retire marker, distinct from abort/erase. | Use R-144 current terminal semantics. |
-| R-144 | Self-contained terminal backup tombstones | `CHECKED` design / `NOT IMPLEMENTED` | `abort.json`/`retire.json` bind backup/plan/fence identity and deterministic operation; retire also binds manifest digest. After prerequisites/readback they remain terminal after content cleanup. Both/malformed/contradictory records fail closed. | Implement codecs, prerequisite checks, standalone restart scan and cleanup cases. |
-| R-145 | Backup-set owner, ID and restore lease | `CHECKED` principle / `PARTIAL` process owner | One owner/lease is required, but Contract 0.16 did not assign it to daemon or supervisor. That left controller-release serialization and candidate-custody crash behavior physically unowned. | Apply R-147/R-149 and synchronize owner docs. |
-| R-146 | Auxiliary cut and rollback mirror fence | `CHECKED` design / `NOT IMPLEMENTED` | Every cancel/release/retention ID is `effect_observed|retired_not_sent|mutation_unknown`. Old backup never first-admits absent auxiliary ID. Current effects are recomputed after inventory; restored Store mirrors are status-only and cannot mutate installation state or clear pins. | Implement fields, startup reconciliation, stale-mirror supersession and fresh-ID recomputation. |
-| R-147 | Concrete backup-set process owner and lock order | `DECIDED` / `NOT IMPLEMENTED` | Daemon owns backup-set owner, installation-record transitions, restore leases and physical cleanup because it also owns controller-mutation serialization and public backup control. Supervisor owns disposable candidate process/root and final cutover. New fence order: close+drain mutation owner → publish/read back fence under backup-set owner → reopen mutation admission. Terminal transitions only remove pins, so stale pre-terminal reads are conservative. | Update Architecture/Implementation/Cognition/Contract; add typed lease/candidate-discard frames and deadlock/crash cases. |
-| R-148 | Atomic final backup-directory publication | `DECIDED` / `NOT IMPLEMENTED` | Canonical ID is `b_` + 32 lowercase hex chars from 128 OS-random bits. Build `fence.json` in a same-parent private temp directory, flush file+directory, no-replace rename directory to final ID, flush parent and exact readback. Pre-rename temp is non-restorable/non-pinning cleanup debt; post-rename sync/readback failure is publication unknown and pins after reconciliation. No empty final directory or reservation service. | Synchronize Contract and qualify directory rename/collision/temp cleanup/post-rename unknown on Windows. |
-| R-149 | Restore lease physical enforcement | `DECIDED` / `NOT IMPLEMENTED` | Daemon lease retains no-follow directory/fence/manifest/part handles with delete sharing denied and holds final terminal-state recheck through cutover decision. Daemon/channel loss makes supervisor kill/reap/discard candidate before another daemon or cutover; supervisor loss is contained by Job. | Add inherited-channel protocol and forced crash matrix. |
-
-### 2.3 Store schema/migration authority
-
-| ID | Объект | Статус | Текущее решение / разрыв | Следующее действие |
-|---|---|---|---|---|
-| R-006 | Six Memory tables and migration 0001 | `CHECKED` conceptual model / `GAP` executable contract | Six primary tables are selected, but exact field types, canonical string IDs, analyzer/index definitions, schema metadata wrapper and fixed query DTOs are not yet written. Implementation cannot begin from names alone. | Specify 0001 schema bundle and query corpus before Slice 0 code. |
-| R-150 | Non-self-referential schema bundle authority | `DECIDED` / `NOT IMPLEMENTED` | Do not embed a migration file's own digest literal inside the bytes being hashed. Compute SHA-256 over exact ordered UTF-8/LF migration assets; runner supplies resulting bundle digest as a bound value in a fixed transactional metadata wrapper. Persist `$eliot_schema_generation` and `$eliot_schema_bundle_sha256`, then compare exact pinned-version `INFO FOR DB/TABLE` definitions. Unknown outcome: exact committed readback, exact empty retry, otherwise fail closed/discard fresh candidate. | Verify bound value in `DEFINE PARAM`, DDL transaction/rollback and INFO normalization on exact 3.3.4. |
-| R-151 | JSON-safe application identity and query boundary | `DECIDED` / `NOT IMPLEMENTED` | Wire/application identities are bounded canonical strings in explicit fields; Surreal native record IDs stay internal because JSON cannot round-trip Thing/UUID/datetime/decimal safely. Fixed queries select by indexed string identity and explicit projection; no `SELECT *`, `type::thing` or generic Value codec. | Freeze ID grammar, field types, DTOs and exact-open/query continuations. |
-| R-152 | Base lexical index | `DECIDED` / `NOT IMPLEMENTED` | Migration 0001 must define a multilingual-neutral analyzer (`blank,class` + `lowercase`) and separate FULLTEXT indexes for `observation.search_excerpt` and `memory.search_text`; exact/unique indexes remain separate kinds. Lexical query uses fixed `@@` projection/order/limit and does not become semantic truth. | Confirm exact 3.3.4 analyzer/index syntax and ranking/cursor query. |
-| R-153 | Optional unique keys | `CHECKED` source / `NOT IMPLEMENTED` | Surreal unique indexes ignore `NONE`/`NULL`; derived `address_unique_key` and active/pending job slot can therefore enforce conditional uniqueness without blocking unaddressed/terminal rows. | Add exact VALUE expressions and concurrency cases to 0001. |
-
-### 2.4 Normative synchronization
-
-| ID | Объект | Статус | Текущее решение / разрыв | Следующее действие |
-|---|---|---|---|---|
-| R-024 | Normative synchronization | `PARTIAL` | Published Architecture 17 / Implementation 38 / Cognition 21 / Contract 0.16 agree with each other, but do not yet contain selected R-147–R-153 corrections. Registry and controller issues are ahead of owner docs. | Publish one synchronized next revision; do not report design set as fully current before then. |
-| R-076 | Base/Store synchronization | `PARTIAL` design / `NOT IMPLEMENTED` | Existing Host/Store/Windows baseline remains coherent, but exact migration/query contract and backup-owner publication boundary are still open. | Close R-147–R-153, then return CHECKED. |
-
-## 3. Product, Base и memory semantics
+## 3. Product и Base
 
 | ID | Объект | Статус | Решение / разрыв | Следующее действие |
 |---|---|---|---|---|
-| R-001 | Product ownership | `CHECKED` design | Host/controller external work; Memory daemon semantics/state; supervisor privileged process/candidate/cutover effects. | Не возвращать Task/provider stack в Memory. |
-| R-002 | Process family / idle drain | `DECIDED` / `NOT IMPLEMENTED` | Supervisor + daemon + active Store + max one candidate; retained identities; finite drain. | Slice 0 process/IPC/shutdown. |
-| R-003 | Continuation address | `DECIDED` | Project/workspace + task or actor/session; path/branch/HEAD are environment. | Fork/two-workspace/late-result cases. |
-| R-004 | Context packet identity | `CHECKED` design / `NOT IMPLEMENTED` | Rendered bytes/digest + exact revisions + gaps in ordinary data. | Real host emission/readback. |
-| R-005 | Structured correction | `DECIDED` | Correction observation + revision/history + saved result atomically. | Conflict/replay/readback. |
-| R-007 | Current/history | `DECIDED` | Exact version handles; no fall-forward or predecessor resurrection. | Publication/restart readback. |
+| R-001 | Product ownership | `CHECKED` design | Host/controller владеет внешней работой; daemon — Memory semantics; supervisor — privileged Store process/candidate/cutover. | Не возвращать Task/provider stack в Memory. |
+| R-002 | Process family | `DECIDED` / `NOT IMPLEMENTED` | Supervisor + daemon + active Store + max one disposable candidate; retained identities and finite drain. | Slice 0. |
+| R-003 | Continuation address | `DECIDED` | Project/workspace + task or actor/session; path/branch/HEAD = environment. | Fork/two-workspace/late-result. |
+| R-004 | Context packet | `CHECKED` design / `NOT IMPLEMENTED` | Exact rendered bytes/digest/revisions/gaps; prepared/emitted/use distinct. | Real host emission/readback. |
+| R-005 | Structured correction | `DECIDED` | Observation + history/current revision + result atomically. | Conflict/replay/readback. |
+| R-006 | Six Base tables | `CHECKED` design / `NOT IMPLEMENTED` | `stream`, `observation`, `memory`, `memory_history`, `link`, `job`; exact Base fields, string application IDs, fixed DTO queries and migration 0001 selected. | Write assets/query corpus and live-qualify. |
+| R-007 | Current/history | `DECIDED` | Exact version handles; no fall-forward/resurrection. | Publication/restart readback. |
 | R-008 | Compound grounds | `PARTIAL` | Required groups, alternatives and advisory support separated. | Reducer/cycle/erase/concurrency. |
-| R-009 | Retrieval arms / packing | `PARTIAL` | Exact/address/lexical/vector/relation arms independent. | Real plans/limits/noise/exceptions. |
-| R-010 | Processing-method consumer | `DECIDED` | Job freezes recipe revision; later consumer must read result. | Changed later context. |
-| R-011 | Reuse/disclosure | `DECIDED` | Origin, reuse scope and disclosure independent. | Scoped queries/reduction. |
-| R-012 | Native hook capture | `CHECKED` design / `NOT IMPLEMENTED` | Finite Claude event profile. | Installed-build qualification. |
-| R-013 | Native context delivery | `CHECKED` design / `NOT IMPLEMENTED` | Actual packet crosses host boundary; prepared/emitted/use distinct. | Resume/compact/fork/subagent. |
-| R-019 | Backup/restore | `PARTIAL` design / `NOT IMPLEMENTED` | Typed backup, brief cut, call+auxiliary closure, plan, terminal authority, exact rollback and inventory are selected; physical owner and final-directory publication await owner-doc sync. | Publish R-147–R-149 and run Windows round-trip later. |
-| R-020 | Erasure/reappearance | `PARTIAL` | Monotonic deletion fence + controlled-copy traversal + terminalization/physical cleanup + pinned tombstones; provider effects external. | All roots/backups/spool/controller copies/tombstones. |
+| R-009 | Retrieval arms | `PARTIAL` | Direct/address/exact/lexical/vector/relation arms independent. | Real plans/limits/noise/exceptions. |
+| R-010 | Method consumer | `DECIDED` | Job freezes recipe revision; output must reach later context/open/request. | Before/after product effect. |
+| R-011 | Reuse/disclosure | `DECIDED` | Origin, reuse and disclosure independent. | Scoped queries/reduction. |
+| R-012 | Claude capture | `CHECKED` design / `NOT IMPLEMENTED` | Finite event profile. | Installed-build qualification. |
+| R-013 | Context delivery | `CHECKED` design / `NOT IMPLEMENTED` | Actual content crosses host boundary. | Resume/compact/fork/subagent. |
+| R-019 | Backup/restore | `CHECKED` design / `NOT IMPLEMENTED` | Typed backup, exact controller/spool cut, atomic fence-directory visibility, terminal tombstones, daemon lease, supervisor candidate/cutover, exact rollback and fixed post-cut inventory. | Windows round-trip/crash matrix. |
+| R-020 | Erasure | `PARTIAL` | Deletion fence + controlled-copy traversal + terminalization/physical cleanup + membership tombstones; provider effects external. | All roots/backups/spool/controller copies. |
 | R-021 | Recursive improvement | `PARTIAL` | Diagnose concrete failed edge; no intelligence score. | Source→revision→later context. |
-| R-022 | Disagreement/anticipation | `CHECKED` design | Alternatives + grounds + cheapest distinguishing observation. | Ordinary records after Base. |
-| R-023 | Control/status/inbox | `DECIDED` | Daemon public control; supervisor closed privileged effects; status from readback. | Operation/readback paths. |
-| R-025 | Interpretation triggers | `DECIDED` | New committed input/correction/question; bookkeeping does not self-trigger. | Inspect enqueue callers. |
+| R-022 | Disagreement | `CHECKED` design | Alternatives + grounds + cheapest distinguishing observation. | Ordinary records after Base. |
+| R-023 | Control/status | `DECIDED` | Daemon public control; supervisor closed privileged effects; status from readback. | Operation/readback paths. |
+| R-025 | Interpretation triggers | `DECIDED` | New committed input/correction/question only. | Inspect enqueue callers. |
 | R-026 | Active/pending jobs | `DECIDED` | One active + one coalesced successor; waiting ≠ retry. | Arrival/shutdown modes. |
-| R-028–R-045 | Learning/retrieval/history details | `DECIDED` or `PARTIAL` | Recipe bootstrap, attribution, coverage, useful Base, vectors, commitments, source continuity, bounded reads, curation/split/forgetting and typed episode result remain selected. | Implement after Base prerequisites; no new platform. |
+| R-028–R-045 | Learning/retrieval/history details | `DECIDED` or `PARTIAL` | Recipe bootstrap, attribution, coverage, vectors, commitments, bounded reads, consolidation/split/forgetting and typed result remain selected. | Implement after Base prerequisites. |
 
-## 4. Store, Windows и backup audit
+## 4. Store, schema и Windows
 
 | ID | Объект | Статус | Решение / разрыв | Следующее действие |
 |---|---|---|---|---|
-| R-071–R-081 | Legacy Base/packet/exact-open audit | `CHECKED` selected paths | V2 Memory forwarder/spool/packet/broad-read defects identified; V3 uses one immutable command, real replay, host packet and exact handle/cursor. | Base Slices 1–2. |
+| R-071–R-081 | Legacy Base/packet/open audit | `CHECKED` selected paths | V2 forwarder/spool/packet/broad-read defects identified; V3 uses one immutable command, real replay, host packet and exact cursors. | Base Slices 1–2. |
 | R-082 | SurrealDB Rust SDK | `NOT SELECTED` baseline | SDK/MSRV/license/dependency cost does not fit baseline; bounded remote client selected. | Reconsider only with exact preflight. |
-| R-083 | SurrealDB Windows identity | `CHECKED` release identity / `NOT QUALIFIED` runtime | Exact 3.3.4 asset/tag/size/SHA retained. | Download/hash/PE/signature/live Slice 0. |
-| R-084–R-100 | Store transport/schema/durability | `CHECKED` design / `NOT IMPLEMENTED` | Query-only authenticated WS, dedicated owner, strict schema, conflicts, no-replace files, root/bootstrap/roles/readiness, sync=every, closed env and explicit DTOs. | Slice 0 live qualification plus R-150–R-153. |
-| R-101/R-107 | Backup cut and replay barrier | `CHECKED` design / `NOT IMPLEMENTED` | Brief publication cut, active replay drain, exact typed pages, deletion/spool continuity. | Crash/in-flight/mismatch cases. |
-| R-102–R-106 | Endpoint/IPC/launch ownership | `CHECKED` donor/design / `NOT IMPLEMENTED` | Origin not auth; listener+peer owner; mutually attested relay pipe; retained executable/root identity; cancellation-safe socket owner. | Windows implementation. |
-| R-108–R-116 | Privileged lifecycle/rollback/ACL/rotation | `CHECKED` design / `NOT IMPLEMENTED` | Inherited supervisor channel, expected-generation selection, exact rollback, controlled roots/backups, session revocation and previous-generation backpressure. | Add daemon-owned backup lease/candidate-discard protocol, then Slice 0. |
+| R-083 | SurrealDB Windows identity | `CHECKED` release identity / `NOT QUALIFIED` | Exact 3.3.4 asset/tag/size/SHA retained. | Download/hash/PE/signature/live run. |
+| R-084–R-100 | Store transport/durability | `CHECKED` design / `NOT IMPLEMENTED` | Peer-verified query-only WS, dedicated owner, strict schema, conflicts, no-replace files, bootstrap/roles/readiness, `sync=every`, closed env and DTOs. | Slice 0. |
+| R-101/R-107 | Backup cut/replay barrier | `CHECKED` design / `NOT IMPLEMENTED` | Brief spool cut, active replay drain, typed pages, deletion/spool continuity. | Crash/in-flight/mismatch. |
+| R-102–R-106 | Endpoint/IPC/launch | `CHECKED` donor/design / `NOT IMPLEMENTED` | Origin not auth; listener+peer owner; mutual relay attestation; retained executable/root identity; cancellation-safe socket owner. | Windows implementation. |
+| R-108–R-116 | Privileged lifecycle/rollback/ACL/rotation | `CHECKED` design / `NOT IMPLEMENTED` | Inherited supervisor channel, expected-generation selection, exact rollback, controlled roots/backups, session revocation and generation backpressure. | Slice 0. |
+| R-150 | Schema bundle authority | `CHECKED` design / `NOT IMPLEMENTED` | SHA-256 over ordered UTF-8/LF assets; digest outside assets; runner binds generation/digest in one fixed transaction; exact params + `INFO FOR DB/TABLE` readback. Unknown partial state fails closed. | Prove bound param/DDL transaction/INFO on exact 3.3.4. |
+| R-151 | JSON-safe application/query boundary | `CHECKED` design / `NOT IMPLEMENTED` | Canonical string IDs in explicit fields; native record IDs internal; fixed query projections/DTOs; no `SELECT *`, `type::thing` or generic codec. | Freeze exact grammars and query assets. |
+| R-152 | Base lexical index | `CHECKED` design / `NOT IMPLEMENTED` | Analyzer `blank,class` + `lowercase`; separate FULLTEXT indexes on observation excerpt and memory text; lexical score is retrieval only. | Qualify exact 3.3.4 syntax/query/cursor. |
+| R-153 | Optional unique keys | `CHECKED` source/design / `NOT IMPLEMENTED` | UNIQUE ignores NONE/NULL; optional address/command/slot keys enforce conditional uniqueness. | Exact expressions/concurrency cases. |
 
-## 5. Development-system findings
+## 5. Inference, backup authority и retention
 
-| ID | Объект | Статус | Текущее решение |
+| ID | Объект | Статус | Текущее решение / разрыв | Следующее действие |
+|---|---|---|---|---|
+| R-047 | One-shot ownership | `CHECKED` design / `NOT IMPLEMENTED` | Memory owns semantic job; controller owns authenticated physical call/copies. | P1a. |
+| R-053 | Narrow caller | `DECIDED` / `NOT IMPLEMENTED` | Dedicated `memory_inference`; no owner/Agent/automation/plugin fallback. | Registration/denial matrix. |
+| R-117 | Stable caller | `CHECKED` design / `GAP` runtime | Stable client ID owns calls across rotation/rollback. | Old-call read/release after rotation. |
+| R-125 | Global WriteId | `DECIDED` / `NOT IMPLEMENTED` | ID + client + method + canonical payload; same-ID live replay. | Receipt/call transaction. |
+| R-126 | Minimal durable state | `DECIDED` / `NOT IMPLEMENTED` | Reuse receipts; add client/call rows and private call-owned files only. | Schema/runner. |
+| R-128/R-129 | Restore inventory/history gap | `DECIDED` / `NOT IMPLEMENTED` | Fixed `(backup_high_water,inventory_high_water]`; below retain cut = history gap. | Stable list/cursor/cleanup. |
+| R-132 | Guaranteed retention | `DECIDED` / `NOT IMPLEMENTED` | Monotonic retain cut constrained by published non-retired backups and unresolved fences; not observed earliest row. | high-water/list/advance. |
+| R-133 | External-ID state | `DECIDED` / `NOT IMPLEMENTED` | Atomic monotonic installation file outside rollback roots; advance before job/send. | Windows state-loss/rollback cases. |
+| R-134 | Auxiliary mutation identity | `DECIDED` / `NOT IMPLEMENTED` | Cancel/release/retention each has durable pre-send ID and cut state. | Readback/recompute. |
+| R-135 | Private credential publication | `DECIDED` / `NOT IMPLEMENTED` | Controller-local owner writes token only to admitted private durable destination. | Install/rotate negatives. |
+| R-136 | Admission/auxiliary cut | `CHECKED` design / `NOT IMPLEMENTED` | Drain mutation owner; disposition every call and auxiliary ID before high-water. | Barrier/readback/send denial. |
+| R-137 | Cleanup authority | `CHECKED` design / `NOT IMPLEMENTED` | Caller cancel/release; owner-only break-glass; Memory records debt. | Caller/owner cases. |
+| R-138 | Membership tombstone | `DECIDED` / `NOT IMPLEMENTED` | Content can erase above cut; bounded membership remains until cut advance. | Inventory/erase cases. |
+| R-139 | In-cut dependency fence | `CHECKED` design / `NOT IMPLEMENTED` | Every admitted call closed/dependent; dependent copies stay unreleased while pinned. | Pre-release recheck/restore. |
+| R-141 | Canonical plan digest | `CHECKED` design / `NOT IMPLEMENTED` | Digest excludes itself, publication state and later parts/manifest. | Codec/mismatch cases. |
+| R-144 | Self-contained terminal tombstones | `CHECKED` design / `NOT IMPLEMENTED` | Abort/retire remain terminal after cleanup; malformed/both/mismatch fail closed. | Codecs/prerequisites/restart. |
+| R-147 | Concrete process owner/lock order | `CHECKED` design / `NOT IMPLEMENTED` | Daemon owns mutation + backup-set owners; supervisor owns candidate/cutover. New fence closes mutation, publishes final fence, then reopens. | Owner task/channel/crash cases. |
+| R-148 | Atomic final backup-directory publication | `CHECKED` design / `NOT IMPLEMENTED` | `b_<32hex>`; temp directory with fence → flush → no-replace rename → parent flush/readback. Pre-rename temp non-pinning; post-rename unknown pins. | Windows directory-rename/collision matrix. |
+| R-149 | Restore lease enforcement | `CHECKED` design / `NOT IMPLEMENTED` | Daemon retains no-follow directory/fence/manifest/part handles with delete sharing denied through final recheck. Daemon/channel loss forces candidate discard. | Forced crash/delete-race cases. |
+
+## 6. Development-system findings
+
+| ID | Объект | Статус | Решение |
 |---|---|---|---|
-| R-058–R-067 | Delivery collapse / bureaucracy | `CHECKED` | Connected behavior is denominator; one ledger/integrator; cheap preflight; no crate/process/object family per noun; replace superseded authority. |
-| R-049 | Verification order | `DECIDED` | Production code first; fmt + minimum changed-package Clippy after coherent increments; broad suite after connected product. |
-| R-059 | Append-only authority | `CHECKED` design | Replace stale active text in-place; no errata/report layer. |
+| R-058–R-067 | Delivery collapse/bureaucracy | `CHECKED` | Connected behavior is denominator; one ledger/integrator; cheap preflight; no object family per noun; replace superseded authority. |
+| R-049 | Verification order | `DECIDED` | Production code first; fmt + minimum changed-package Clippy after coherent increments; broad suites after connected product. |
+| R-059 | Append-only authority | `CHECKED` | Replace stale active text; no errata/report layer. |
 
-## 6. Source coverage added in current passes
+## 7. Normative synchronization
+
+| ID | Объект | Статус | Решение |
+|---|---|---|---|
+| R-024 | Normative synchronization | `CHECKED` design | Architecture 18 / Implementation 39 / Cognition 22 / Contract 0.17 / V3 README agree on concrete backup owner, atomic first visibility, lease/candidate crash custody, schema bundle, IDs, query DTOs and lexical indexes. |
+| R-076 | Base/Store synchronization | `CHECKED` design / `NOT IMPLEMENTED` | Host/capture/Store/Windows/schema/backup baseline synchronized and independent of inference availability. |
+
+## 8. Source coverage added in current passes
 
 | ID | Источник | Статус | Граница вывода |
 |---|---|---|---|
-| S-056 | Controller `main@613ea6b5`, merged PR #198 and roadmap | `CHECKED` | Current V2 authority; specification only; all L0/L1 unchecked. |
-| S-057 | Controller issue #200 + draft PR #201 + exact core/API/config/schema validator | `CHECKED` | Issue body now owns allocator/pointer/effect separation, nullable selected predecessor, allocator retention and 18 acceptance cases. PR #201 remains fixture-only. |
-| S-058 | Controller issue #199 vs Memory inference contracts | `CHECKED` | Current cross-repository owner issue; implementation remains blocked. |
-| S-059–S-070 | Contracts 0.10–0.15 and synchronized owner sets | `SUPERSEDED` mechanism details | Historical stages established retention, WriteId, admission closure, dependency split, plan digest and terminal retirement; current authority is 0.16 plus new findings below. |
-| S-071 | Issue #199 comment 6435580371 + Contract 0.16 | `CHECKED` design / `SUPERSEDED` owner/publication detail | Established self-contained terminals, random IDs, abstract backup-set owner/restore lease and auxiliary cut; did not assign process owner or close pre-fence directory window. |
-| S-072 | Architecture 17 / Implementation 38 / Cognition 21 / Contract 0.16 + V3 navigation | `CHECKED` published set / `PARTIAL` current design | Published files agree with each other but precede R-147–R-153. |
-| S-073 | Controller issue #200 body updated 2026-10-27 | `CHECKED` design | Exact selected allocator, pointer publication, supersedes semantics, retention and acceptance matrix. |
-| S-074 | Controller issue #199 comment 6437047065 | `CHECKED` design | Selects daemon backup-set owner, mutation-owner lock order, supervisor candidate custody, crash discard and staged-directory fence publication. |
-| S-075 | SurrealDB official 3.x DEFINE INDEX/PARAM/INFO docs | `CHECKED` public source / `NOT QUALIFIED` runtime | UNIQUE ignores NONE/NULL; FULLTEXT and analyzer syntax; OVERWRITE params and INFO catalog are available. Exact 3.3.4 live behavior remains Slice 0 qualification. |
-| S-076 | V2 migration runner and Surreal adapter schema donors | `CHECKED` selected paths / `NOT SELECTED` wholesale | Donors show checksum and schema patterns but not the V3 fixed DTO/query/migration authority. |
+| S-056 | Controller `main@613ea6b5`, PR #198, roadmap | `CHECKED` | V2 authority; specification only; L0/L1 unchecked. |
+| S-057/S-073 | Controller issue #200, PR #201, core/API/config/schema validator | `CHECKED` | Current issue body owns allocator/pointer/effect separation and 18 acceptance cases; PR #201 fixture-only. |
+| S-058 | Controller issue #199 | `CHECKED` | Current cross-repository inference owner; blocked. |
+| S-059–S-070 | Contracts 0.10–0.15 and owner sets | `SUPERSEDED` details | Historical stages established retention, IDs, cut, dependency, plan and retirement. |
+| S-071/S-072 | Contract 0.16 and owner set | `SUPERSEDED` physical-owner detail | Established self-contained terminals and abstract owner/lease; omitted concrete process owner and atomic first directory visibility. |
+| S-074 | Issue #199 comment `6437047065` | `CHECKED` | Selects daemon owner, lock order, supervisor candidate custody, crash discard and staged-directory publication. |
+| S-075 | Official SurrealDB DEFINE INDEX/ANALYZER/PARAM/INFO docs | `CHECKED` public source / `NOT QUALIFIED` runtime | Syntax and NONE/NULL unique behavior; exact 3.3.4 live proof remains Slice 0. |
+| S-076 | V2 migration/schema donors | `CHECKED` selected paths / `NOT SELECTED` wholesale | Useful checksum/schema patterns; not V3 authority. |
+| S-077 | Architecture 18 / Implementation 39 / Cognition 22 / Contract 0.17 + entrypoints | `CHECKED` design | Current synchronized owner set; runtime not implied. |
 
-Existing source records S-001–S-055 remain historical evidence with their previous exact scope; no donor is qualified wholesale.
+Existing S-001–S-055 remain historical evidence with their recorded exact scope; no donor is qualified wholesale.
 
-## 7. Current queue
+## 9. Current queue
 
 | Priority | Работа | Закрывает |
 |---|---|---|
-| P0 | Synchronize Architecture/Implementation/Cognition/Contract/README with R-147–R-153; return R-024/R-076 to CHECKED only after exact readback. | R-024, R-076, R-142, R-145, R-147–R-153 |
-| P0 | Controller #200: implement allocator/schema/API/config/decision correction and merge only after named acceptance cases. | R-131, S-057, S-073 |
-| P0 | Keep issue #199 blocked until controller L0/L1 + #200; implement next synchronized contract without reviving V1. | R-048, R-126, R-132–R-149 |
-| P1 | Specify migration 0001: exact IDs/types/analyzer/indexes/schema bundle metadata and fixed query DTO corpus. | R-006, R-150–R-153 |
-| P1 | Memory Slice 0 physical qualification: Windows assets/roots/process/IPC/Surreal/Store/files/WriteId state/backup-set owner/terminal records/restore lease/rollback/erasure/rotation/shutdown. | R-002, R-006, R-019–R-020, R-071–R-116, R-133, R-141–R-153 |
+| P0 | Controller #200 implementation and validator acceptance. | R-131 |
+| P0 | Keep issue #199 blocked until #200 + V2 L0/L1; never revive V1. | R-048, R-123, R-130 |
+| P1 | Write migration 0001/query assets exactly as Implementation 39, then live-qualify 3.3.4 behavior. | R-006, R-150–R-153 |
+| P1 | Slice 0 Windows/process/IPC/Store/schema/files/external-ID/backup-owner/terminal/lease/rollback/rotation/shutdown. | R-002, R-019–R-020, R-083–R-116, R-133, R-141, R-144, R-147–R-153 |
 | P1 | Base Slice 1: event→Store/spool→replay→restart→exact open. | R-001–R-013, R-071–R-107 |
 | P1 | Base Slice 2: Claude relay, continuation, lexical retrieval, packet emission, notes/corrections/commitments and maintenance. | R-003–R-045 |
-| P1 | Controller V2 L0/L1 implementation under its roadmap. | R-130–R-131 |
-| P1 | P1a inference after foundation: principal, WriteId state, mutation owner, daemon backup-set owner, call+auxiliary cut, staged fence/terminal records, restore lease, calls/copies/runner/release+retention/tombstones/inventory and later context consumer. | R-047–R-057, R-117, R-124–R-149 |
-| P2 | P1b rotation; embeddings; documents/views/Research/other hosts as independent increments. | R-015–R-018, R-031–R-032 |
-| Final | Broad deterministic/live/platform/load suites only after connected product. | R-049 |
+| P1 | Controller V2 L0/L1. | R-130–R-131 |
+| P1 | Inference P1a after foundation. | R-047–R-057, R-117, R-125–R-149 |
+| P2 | Rotation, embeddings, documents/views/Research/other hosts. | R-015–R-018, R-031–R-032 |
+| Final | Broad deterministic/live/platform/load suites after connected product. | R-049 |
 
-## 8. CI state
+## 10. CI state
 
-Memory PR #5325 remains documentation-only. Latest completed gate failed before MergeCompile:
+PR #5325 remains documentation-only. Latest completed known gate failed before MergeCompile:
 
 ```text
 base-owned workflow oracle       PASS
@@ -173,16 +158,12 @@ shared documentation evidence   FAIL: EMPTY_DOCUMENTATION_EVIDENCE
 MergeCompile                     SKIPPED
 ```
 
-It also reported `surrealdb_provisioner = provision_failed`. No fabricated evidence block is accepted. CI failure is not runtime/design proof and does not alter implementation order.
+It also reported `surrealdb_provisioner = provision_failed`. No fabricated evidence block is accepted. CI status is not design/runtime proof.
 
-## 9. Последние изменения
+## 11. Последний проход
 
-| Дата / commit | Изменение |
+| Дата / baseline | Изменение |
 |---|---|
-| 2026-10-26 / `abd2d046` | Architecture 10 / Implementation 31 / Cognition 14 / Contract 0.9 rebased from controller V1 to V2. |
-| 2026-10-26 / `ec36adbb`–`520c6e49` | Contract 0.10 and owner docs: retention, stable inventory and rollback-safe WriteId baseline. |
-| 2026-10-26 / `bb0e08e6`–`64655bca` | Contracts 0.11–0.12 and owner docs: admission/authority/tombstones and closed/dependent split. |
-| 2026-10-26 / `510632ac`–`7516edb9` | Contracts 0.13–0.14 and owner docs: provisional fence corrected to canonical plan and rollback-safe pins. |
-| 2026-10-27 / `13fa04ef`–`8d58c5e1` | Contract 0.15 + owner docs: retire marker distinct from abort/physical cleanup. |
-| 2026-10-27 / `2df00a69`–`7a18948d` | Contract 0.16 + Architecture 17 / Implementation 38 / Cognition 21: self-contained terminals, abstract backup-set owner, restore lease and auxiliary cut. |
-| 2026-10-27 / issue updates + current registry commit | Issue #200 corrected to allocator/pointer/effect model; issue #199 records daemon owner and staged-directory publication; R-147–R-153 queued for synchronized next revision. |
+| 2026-10-27 / `7a18948d` | Contract 0.16: self-contained terminals, abstract backup owner/lease and auxiliary cut. |
+| 2026-10-27 / `a08cbf1b` | Registry exposed concrete owner, atomic directory and schema-authority gaps. |
+| 2026-10-27 / current synchronized set | Architecture 18 / Implementation 39 / Cognition 22 / Contract 0.17: daemon backup owner, staged final fence visibility, candidate crash custody, migration 0001 and fixed query boundary. |
