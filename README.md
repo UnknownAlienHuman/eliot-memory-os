@@ -1,88 +1,53 @@
 # Eliot Memory OS
 
-> **V3 is the current design authority.** V1 and V2 Memory implementations are archived donors. The documentation does not claim a V3 runtime exists.
+> **V3 is a working design, not a released runtime.** The documentation is being
+> refined in [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325)
+> for [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324).
+> V1/V2 Memory source is retained as donor material.
 
-Eliot preserves exact experience, reconstructs current work, supplies applicable context before the next decision, learns bounded procedures from observed outcomes and revises mistaken memory without losing source history.
+Eliot preserves experience, reconstructs current work and supplies applicable
+context for the next decision. It learns from observed outcomes and corrects
+memory while retaining source history. Hosts/controllers own task execution,
+permissions and acceptance; Memory is not another agent orchestrator.
 
-## Start with V3
+## Work starts here
 
-| Read | Purpose |
+| Need | Read |
 |---|---|
-| [V3 navigation](docs/v3/README.md) | Current versions, construction and proof ceiling |
-| [Architecture draft.19](docs/v3/ARCHITECTURE.md) | Purpose, ownership, Base, schema/backup invariants |
-| [Implementation draft.42](docs/v3/IMPLEMENTATION.md) | Runtime, exact SurrealDB 3.3.4 Store/schema/query contract, Windows/process, backup/rollback and sequence |
-| [Cognition draft.23](docs/v3/COGNITION.md) | Reconstruction, retrieval, learning and failure diagnosis |
-| [Inference Contract 0.18](docs/v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller V2 boundary |
-| [Active analysis registry](docs/v3/ANALYSIS-REGISTRY.md) | Current decisions, gaps, evidence and queue |
-| [Consolidated audit](docs/v3/AUDIT.md) | Donor evidence, criticism and rationale |
+| Agent instructions | [AGENTS.md](AGENTS.md) |
+| Find the relevant contract section | [V3 task map](docs/v3/README.md#task-routes) |
+| Continue the documentation update | [Existing stages and findings](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages) |
+| Version and document ownership | [Architecture authority](docs/ARCHITECTURE_CONTRACT.md) |
+| Branches, worktrees, checks and integration | [WORKFLOW.md](WORKFLOW.md) |
 
-Architecture 19, Implementation 42, Cognition 23 and Contract 0.18 describe one synchronized implementation target. Specification text, source presence, upstream tests, green build or receipt do not establish working behavior.
+The first useful path is host event → durable capture or spool → replay/restart →
+current-work context or retrieval → exact source open. Optional model-assisted
+learning must later change an actual Memory revision consumed by that same path.
+Base does not depend on controller inference.
 
-Current work: [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324), [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325).
+Read only the task's owning sections. The audit explains evidence and rejected
+mechanisms; it is not required context for every edit. Current findings and
+external dependency observations belong in the registry, not copied status lists
+in every README. Documentation, source presence and a green build are not runtime
+qualification.
 
-## Product boundary
+## Donors and related projects
 
-Memory owns observations, revisions, context, provenance, finite learning jobs and outcome-linked methods. Hosts/controllers own goals, actions, Agent/task execution and user acceptance.
+[V2 snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105)
+and [V1 snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7)
+are historical references. Existing Cargo packages and V2 workstream `active`
+values do not establish V3 support. The [documentation map](docs/README.md)
+separates current design from donor navigation.
 
-Useful Base:
+[Eliot Search](https://github.com/UnknownAlienHuman/eliot-search),
+[Eliot Research](https://github.com/UnknownAlienHuman/eliot-research) and the
+[swarm controller](https://github.com/UnknownAlienHuman/eliot-swarm-controller)
+own their implementations and roadmaps. Do not mirror them here.
 
-```text
-real host event
-→ Store ownership or durable spool
-→ replay and restart
-→ current-work reconstruction
-→ actual context emission or explicit retrieval
-→ exact source open
-```
+## Retained V2 reading only
 
-First learning:
-
-```text
-retained episode
-→ exact recipe
-→ one controller call with precommitted global WriteId
-→ typed result or unknown
-→ ordinary Memory revision
-→ changed later context
-→ rollback-safe dependency-aware cleanup
-```
-
-## Current physical decisions
-
-- one Rust codebase with supervisor, daemon and transient relay modes;
-- SurrealDB 3.3.4/RocksDB `sync=every` qualification target;
-- six Base `SCHEMAFULL` tables plus immutable blobs;
-- canonical OS-random application IDs, domain-separated derived keys and fixed query DTOs;
-- explicit indexed workspace/task/actor/session projection for direct continuation;
-- `READONLY` as changed-value guard, never identity generator;
-- canonical `NONE` absence for conditional unique keys; no `NULL` in those fields;
-- row-local ASSERT defense plus operation-owned replay/digest/cross-row invariants;
-- schema-bundle identity covering runner protocol, wrapper, ordered DDL and expected catalog;
-- plain `INFO FOR DB/TABLE` catalog readback; `STRUCTURE` forbidden;
-- exact-tag evidence for field grammar, PARAM rollback, conditional uniqueness and numbered FTS, with complete wrapper/concurrency/runtime still Slice 0;
-- scored FTS as one bounded top-K statement snapshot, not a cross-call cursor;
-- daemon-owned controller-mutation and backup-set owners;
-- atomic backup-directory first visibility with fence already present;
-- self-contained abort/retire tombstones;
-- bounded streaming restore lease with one verified part at a time;
-- supervisor candidate process/root and final cutover; candidate discard on daemon/channel loss;
-- exact rollback rather than invented merge.
-
-## Controller boundary
-
-Current controller authority is `eliot-swarm-controller@613ea6b5ff6389c7629a988e271477ee45c9d2c1`; V2 remains specification-only.
-
-Issue #200 separates binding allocation, selected pointer and effect state. PR #201 fixes validator fixtures only. V2 L0/L1 and #200 must exist before issue #199 implements Contract 0.18. Never extend controller V1 for Memory inference.
-
-## Version boundary
-
-Existing Rust workspace, old architecture shards, scripts and workstream records describe V2 Memory. They remain selective donors, not authorization to continue V2 topology.
-
-- [V2 source snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/5aac094834fb5635921b550c821cb933a1196105)
-- [V2 unfinished audit release](https://github.com/UnknownAlienHuman/eliot-memory-os/releases/tag/audit-2026-10-16-incomplete)
-- [V1 donor snapshot](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/b5c84d4e53292dbc8996917c63448d5ee96c4bc7)
-
-Follow [AGENTS.md](AGENTS.md), [WORKFLOW.md](WORKFLOW.md) and [Architecture authority](docs/ARCHITECTURE_CONTRACT.md). Production code first; after coherent increments run formatting and minimum changed-package Clippy. Broad suites follow connected product.
+The generated block below is for explicitly assigned retained V2 edits. V3 work
+uses the task-scoped instructions above; existing merge checks still apply.
 
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
@@ -92,4 +57,4 @@ Start with the [mandatory verified-reading protocol](docs/architecture/READING_P
 
 ## License
 
-MIT License. Third-party code and runtimes retain their own licenses; verify exact revisions before reuse.
+[MIT](LICENSE). Third-party code and runtimes retain their own licenses.

@@ -1,46 +1,32 @@
 # Documentation map
 
-## Current work: V3 design
+[V3 task routes](v3/README.md#task-routes) select the sections needed for a change.
+[Documentation stages](v3/ANALYSIS-REGISTRY.md#documentation-stages) select what
+needs correction next. Do not preload all owner documents or the audit.
 
-V1/V2 Memory implementations are archived donors. V3 is a fresh implementation target; these documents are design authority, not runtime evidence.
-
-| Need | Current V3 source |
+| Surface | Owns |
 |---|---|
-| Reading order and proof ceiling | [v3/README.md](v3/README.md) |
-| Product purpose, authority and invariants | [v3/ARCHITECTURE.md](v3/ARCHITECTURE.md) — draft.19 |
-| Runtime, exact SurrealDB 3.3.4 Store/schema/query contract and implementation order | [v3/IMPLEMENTATION.md](v3/IMPLEMENTATION.md) — draft.42 |
-| Reconstruction, retrieval and learning algorithms | [v3/COGNITION.md](v3/COGNITION.md) — draft.23 |
-| Memory↔controller V2 boundary | [v3/INFERENCE-CONTRACT.md](v3/INFERENCE-CONTRACT.md) — Contract 0.18 |
-| Active decisions, gaps and queue | [v3/ANALYSIS-REGISTRY.md](v3/ANALYSIS-REGISTRY.md) |
-| Evidence and donor rationale | [v3/AUDIT.md](v3/AUDIT.md), [v3/AUDIT-MAP.md](v3/AUDIT-MAP.md) |
-| Version precedence | [ARCHITECTURE_CONTRACT.md](ARCHITECTURE_CONTRACT.md) |
+| [Architecture authority](ARCHITECTURE_CONTRACT.md) | Version boundary and document precedence |
+| [Architecture](v3/ARCHITECTURE.md) | Product purpose and invariants |
+| [Implementation](v3/IMPLEMENTATION.md) | Runtime, data, operations and implementation order |
+| [Cognition](v3/COGNITION.md) | Reconstruction, retrieval and learning algorithms |
+| [Inference contract](v3/INFERENCE-CONTRACT.md) | Proposed Memory/controller boundary; compatibility needs reconciliation |
+| [Existing registry](v3/ANALYSIS-REGISTRY.md) | Current findings, evidence limits and next work |
+| [Audit](v3/AUDIT.md) / [source map](v3/AUDIT-MAP.md) | Rationale, requirement coverage and donor evidence; consult on demand |
+| [Store candidates](v3/store/README.md) | Subordinate design assets, not qualified runtime |
 
-Read Architecture, Implementation, Cognition and Inference Contract together for a load-bearing boundary. `ANALYSIS-REGISTRY.md` is the only active audit/work ledger.
-
-### Current load-bearing decisions
-
-- daemon owns application state, controller-mutation serialization, backup-set transitions and bounded restore leases;
-- supervisor owns privileged Store lifecycle, candidate process/root and final cutover;
-- final backup directory first appears with a durable canonical fence already inside;
-- terminal abort/retire records remain authoritative after content cleanup;
-- restore retains directory/fence/manifest handles and streams one verified part at a time under finite limits;
-- Base IDs are canonical OS-random values; derived keys are domain-separated length-prefixed hashes;
-- direct continuation uses explicit indexed work-address columns rather than parsing `binding_json`;
-- `READONLY` guards later changed values but does not generate identity;
-- conditional unique-key absence is canonically `NONE`; `NULL` is not written there;
-- row-local ASSERT checks are defense in depth while replay, digest and cross-row invariants remain operation-owned;
-- migration bundle identity includes runner protocol, wrapper template, DDL and expected catalog;
-- exact tag tests prove selected field/PARAM/INFO/FTS/unique behavior but do not prove the complete V3 wrapper or runtime;
-- schema admission compares plain `INFO` maps, never `STRUCTURE` or raw JSON order;
-- scored FTS uses numbered match references and bounded top-K snapshots, not durable lexical cursors;
-- controller issue #200 separates allocation, selected pointer and native effect;
-- issue #199 remains blocked on #200 and V2 L0/L1.
+An index links to the owning rule; it does not repeat it. Keep revision metadata
+in owner documents and dated external observations in the registry. A conflict
+is fixed in the owners, not by appending a new equally authoritative document.
 
 ## Retained V2 donor documentation
 
-The remaining `docs/architecture/`, `docs/normative-pair.toml`, source, scripts and workstream records describe V2. Their status words are historical unless a current V3 owner document explicitly adopts a bounded property.
+`architecture/`, `normative-pair.toml`, [PROJECT_MAP](PROJECT_MAP.md),
+[code navigation](CODE_NAVIGATION.md) and old workstreams describe the retained
+V2 checkout. Their historical status words do not establish V3 support.
 
-Use the verified-reading protocol for donor fragments. A donor receipt does not certify V3 design or runtime.
+The following generated block applies only to explicitly assigned retained V2
+edits. V3 prose uses direct task-scoped reading; required CI is not waived.
 
 <!-- eliot-doc-routing:start -->
 ## Documentation entry point
@@ -48,4 +34,4 @@ Use the verified-reading protocol for donor fragments. A donor receipt does not 
 Start with the [mandatory verified-reading protocol](architecture/READING_PROTOCOL.md), then run `python scripts/docs_read.py read ...` for exact paths and causal property. Open the verified bundle and record its read receipt before mutation. A route alone is navigation, not comprehension or runtime proof.
 <!-- eliot-doc-routing:end -->
 
-For V3 prose, verify version/status consistency, links, ownership, normal/failure paths, source attribution and `git diff --check`. Raw research, generated bundles/receipts and temporary review notes remain outside source tree.
+Work rules and checks live in [AGENTS](../AGENTS.md) and [WORKFLOW](../WORKFLOW.md).

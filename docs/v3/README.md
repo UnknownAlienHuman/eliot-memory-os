@@ -1,154 +1,71 @@
 # Eliot Memory OS V3
 
-**Layered Base and additive extensions · 2026-10-27 · normative design, not implemented code.**
+**Working design in PR #5325; not a qualified runtime.**
 
-V1/V2 Memory implementations are donors. V3 is greenfield. Current `eliot-swarm-controller` V2 is also a fresh implementation target; its legacy runtime is donor-only.
+Memory preserves observations, revises knowledge and supplies useful context.
+Hosts/controllers execute tasks and own permissions/acceptance. Base capture,
+replay, exact/lexical retrieval and context must work without inference. Learning
+later uses the same records and produces a revision consumed by a real caller.
 
-## Reading order
+For documentation work, start with the
+[existing stages](ANALYSIS-REGISTRY.md#documentation-stages), then choose one route
+below. Read the relevant sections and source, not this entire directory. The
+[version boundary](../ARCHITECTURE_CONTRACT.md) identifies document precedence.
 
-1. [Architecture draft.19](ARCHITECTURE.md) — product purpose, authority, Base, schema/backup invariants.
-2. [Implementation draft.42](IMPLEMENTATION.md) — runtime, exact SurrealDB 3.3.4 migration/query boundary, Windows/process, backup/rollback and sequence.
-3. [Cognition draft.23](COGNITION.md) — reconstruction, retrieval, learning, backup authority and failure algorithms.
-4. [Inference Contract 0.18](INFERENCE-CONTRACT.md) — sole normative Memory↔controller V2 boundary.
-5. [Store candidate assets](store/README.md) — design-only migration/query pack for Slice 0; subordinate to Implementation and not runtime evidence.
-6. [Active analysis registry](ANALYSIS-REGISTRY.md) — checked evidence, decisions, gaps and queue.
-7. [Audit](AUDIT.md) — root causes, rejected machinery and evidence limits.
-8. [Requirements/source map](AUDIT-MAP.md) — stable dispositions for requirements and donors.
+## Task routes
 
-Architecture 19, Implementation 42, Cognition 23, Contract 0.18 and this README describe one synchronized design. `ANALYSIS-REGISTRY.md` is the only active work ledger. Git history preserves chronology; do not create another report, task catalogue, gate database or errata authority.
+| Change | Required starting sections | Expand only when |
+|---|---|---|
+| Entry pages, navigation or work registry | [AGENTS](../../AGENTS.md), [authority](../ARCHITECTURE_CONTRACT.md), affected index/registry row | A link or summary changes a product rule: read that owner section. |
+| Product boundary or new mechanism | [Architecture §1–3](ARCHITECTURE.md#1-purpose-and-completion) | Follow the mechanism into Implementation; do not create an owner per noun. |
+| Startup, processes, Windows IPC | [Implementation §1–3](IMPLEMENTATION.md#1-runtime-and-installation), [Architecture §2](ARCHITECTURE.md#2-ownership) | Identity, credentials, shutdown or restore custody changes. |
+| Store schema, IDs, query or transaction | [Implementation §4–6](IMPLEMENTATION.md#4-migration-0001-and-schema-authority), [Store candidate scope](store/README.md) | Follow the changed field/query to its writer and reader; inspect exact pinned upstream semantics when relied on. |
+| Capture, spool, replay or host emission | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host), [Cognition §1–2](COGNITION.md#1-observations-claims-and-revisions) | Context construction: read Cognition §6; maintenance crossing: read Implementation §8. |
+| Retrieval, context, correction or learning | [Cognition §2–6](COGNITION.md#2-current-work-reconstruction), then the affected algorithm | Persistence: Implementation §4–7; external model call: Inference contract. |
+| Backup, restore, erasure or rotation | [Implementation §8–10](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle), [Architecture §7–8](ARCHITECTURE.md#7-backup-authority) | Controller copies, release or retention are involved: read the matching Inference clauses. |
+| Controller inference | [Inference contract](INFERENCE-CONTRACT.md), [current dependency finding](ANALYSIS-REGISTRY.md#controller-dependency) | Verify the live controller API/source before changing its adapter; current compatibility is unresolved. |
+| Requirements, donor reuse or rejected design | Relevant item in [AUDIT-MAP](AUDIT-MAP.md), then its pinned source | Open [AUDIT](AUDIT.md) only for the disputed rationale, not as a default prompt. |
 
-The Store pack is a subordinate review artifact: it makes the selected DDL and fixed read-query shapes concrete, but its exact bytes remain `NOT QUALIFIED` until Slice 0 executes them against the pinned Windows/RocksDB profile. None of these documents proves implemented runtime behavior.
+Section links are starting points, not permission to omit a boundary the change
+actually crosses. Record the sections inspected in the PR; a navigation result
+is not evidence that the text was understood.
 
-## Construction and authority
+## Small implementation rule
 
-One Rust codebase provides supervisor, daemon and transient relay modes. One active SurrealDB child owns persistence; one isolated disposable candidate may exist during restore.
+A change must connect a real caller → owning operation → durable result or typed
+unknown → actual consumer/readback, including restart where persistence matters.
+A standalone type, schema, port, receipt or passing compile is an intermediate
+artifact, not completed product behavior.
 
-- **Daemon:** application operations, Store Editor, replay/jobs, controller-mutation owner, backup-set owner, bounded restore leases, retrieval/context and public control.
-- **Supervisor:** executable/root/process identity, Store root/Owner credentials, migrations, candidate process/root, credential rotation and final cutover.
-- **Controller V2:** one-shot caller authentication, profiles, provider execution/readback, global `WriteId` receipts and private temporary copies.
-- **Host/controller:** user task/action execution and acceptance.
+Prefer an ordinary function/module and existing storage owner. A new process,
+crate, table, protocol or dependency needs a concrete caller and a reason the
+existing owner cannot serve it. Do not add parallel task/proof/report machinery.
 
-Base starts without inference, vectors, converters or Research.
+The owner selects runtime work separately from this documentation task. For that
+work, write production code first and run formatting/minimum changed-package
+Clippy. Broad campaigns follow the assembled product; claims must still match
+actual checks. The [registry stages](ANALYSIS-REGISTRY.md#documentation-stages)
+are documentation work, not an alternative runtime scheduler.
 
-## Connected completion
+## Design assets and dependencies
 
-```text
-real caller
-→ owning operation
-→ durable result or typed unknown
-→ actual consumer/readback
-→ restart/recovery where relevant
-```
+[Store candidates](store/README.md) are subordinate to Implementation and remain
+unqualified. The separate Store source PR is not present in this documentation
+branch; its disposition and concrete mismatches are in the registry. Do not load
+candidate `.surql` dynamically or mistake design assets for an admitted Store.
 
-Types, fixtures, receipts, reports, branches and compilation alone are intermediate evidence.
+Controller foundation and Memory inference are different capabilities. Do not
+copy a historical controller SHA or unchecked-roadmap claim into a current task.
+Use the [pinned observation](ANALYSIS-REGISTRY.md#controller-dependency); missing
+inference does not justify an Agent/Goal/owner-token fallback or block Base.
 
-## Store and schema baseline
+## Maintaining these documents
 
-First qualification target:
+Correct the owner rule, update its direct consumers, then update the existing
+registry row with remaining work and evidence. Indexes contain links and purpose,
+not duplicated schema, backup algorithms, revision lists or CI status. Keep
+chronology in Git and issue/PR discussion. No second ledger or errata document.
 
-```text
-SurrealDB 3.3.4
-external RocksDB
-sync=every
-query-only authenticated WebSocket
-STRICT database
-six SCHEMAFULL tables
-```
-
-Application IDs crossing JSON are canonical bounded strings; native Surreal record IDs remain internal. Base IDs are generated from 128 OS-random bits, retained before retryable writes and never treated as time order. Derived unique keys are domain-separated SHA-256 over length-prefixed components. Every fixed query has an explicit projection and DTO; direct work reconstruction uses explicit indexed workspace/task/actor/session fields rather than parsing `binding_json`.
-
-Migration bundle identity includes format version, runner protocol, exact wrapper template, ordered UTF-8/LF DDL assets and expected catalog template. Bound generation/digest values remain outside the preimage. Schema admission uses plain `INFO FOR DB` / `INFO FOR TABLE` maps, sorted by owned keys and compared as exact pinned-version canonical `DEFINE` strings. `INFO ... STRUCTURE` is not an admission API.
-
-The design-only Store pack now contains:
-
-```text
-store/0001-base.surql
-store/queries-base.surql
-```
-
-The first file makes the six-table field/index/analyzer/metadata candidate concrete. The second makes exact readers, stable continuations, lexical top-K, backup pages and catalog reads concrete. It deliberately does not invent unrun transaction branching or cross-field ASSERT expressions; those remain named Slice 0 gaps rather than fake executable proof.
-
-Exact tag source/tests establish:
-
-- `DEFINE FIELD` clause/type grammar and canonical rendering;
-- `READONLY` permits initial assignment and same-value replay but rejects changed value;
-- row-local ASSERT evaluation after type coercion;
-- UNIQUE tuple skipping when any component is `NONE` or `NULL`;
-- persisted PARAM rollback and cancelled index-overwrite preservation;
-- numbered FTS score, zero-score matches and representative indexed iteration;
-- plain INFO maps of canonical DEFINE strings.
-
-They do **not** prove the complete V3 migration wrapper, bound metadata over the production WebSocket client, all DDL rollback points, concurrent uniqueness, every reader plan, Windows/RocksDB durability or DTO correctness. Those remain Slice 0.
-
-V3 uses `NONE` as the sole conditional-key absence state; `NULL` is not written to optional unique-key fields. `READONLY` guards later changed values but never generates or owns application identity. Migration 0001 row assertions are defense in depth; byte digests, replay identity, sequence allocation and cross-row invariants remain application/transaction owned.
-
-Scored FTS uses numbered match references:
-
-```text
-WHERE search_text @0@ $query
-SELECT ..., search::score(0) AS score
-ORDER BY score DESC, canonical_id ASC
-LIMIT $hard_limit
-```
-
-A zero score remains a match. Lexical retrieval is one bounded top-K statement snapshot per call, not a durable cursor across corpus changes.
-
-## Capture and context
-
-First host profile captures SessionStart, UserPromptSubmit, PostToolUse/Failure, Stop, SubagentStop, PostCompact and SessionEnd.
-
-```text
-same immutable command → daemon capture → Store readback → committed
-no established ownership → exact durable spool → staged
-staged command → daemon replay → Store readback → pending removed
-```
-
-`stage_required` is private quiesce flow control. SessionStart/UserPromptSubmit return actual packet content. Prepared, emitted, action-associated and used remain separate facts.
-
-## Backup authority
-
-Backup ID is `b_` plus 32 lowercase hex characters from 128 OS-random bits.
-
-Daemon writes canonical `fence.json` inside a private same-parent temp directory, flushes file+directory, atomically no-replace renames the directory to the final ID, flushes the parent and reopens the final fence. The final directory never appears empty. Pre-rename temp is non-pinning cleanup debt; post-rename uncertainty pins conservatively after reconciliation.
-
-Daemon owns controller-mutation and backup-set owners:
-
-```text
-close/drain controller mutation
-→ backup-set transition
-→ publish/read back final fence
-→ reopen mutation admission
-```
-
-Self-contained abort/retire tombstones remain terminal after content cleanup.
-
-Restore first admits finite part-count/per-part/total-byte/path limits. It keeps a logical lease plus final-directory/parts-directory/fence/manifest handles with read sharing only, then opens, verifies, copies and closes one part at a time. V3 never holds an unbounded handle set. Final terminal/manifest identity is rechecked before cutover.
-
-Supervisor owns candidate process/root and final cutover. Daemon/channel loss forces candidate kill/reap/discard before another daemon or cutover.
-
-## Controller boundary
-
-Current controller authority:
-
-```text
-eliot-swarm-controller@613ea6b5ff6389c7629a988e271477ee45c9d2c1
-```
-
-Issue #200 separates allocated revision, selected pointer and effect state. Candidate admission never moves pointer; launch/resume publish target pointer with dispatch; attach/detach move it only after exact effect. Allocator is monotonic and independent of pointer/history pruning. PR #201 remains fixture-only.
-
-Contract 0.18 uses stable `memory_inference` client ID, current token version, precommitted global `WriteId`, one provider attempt, exact result copy, fixed retention inventory and dependency-aware cleanup. Issue #199 remains blocked on #200 and V2 L0/L1.
-
-## Implementation order
-
-0. **Slice 0:** compile the candidate Store pack; finish exact capture/revision/job mutation scripts and row-local guards; run wrapper-bound metadata/full rollback/catalog, unique concurrency and fixed-query DTO/EXPLAIN qualification; then Windows/process/IPC/Surreal/Store, external-ID state, staged backup publication, bounded restore lease, rollback/erasure/rotation/shutdown.
-1. **Base Slice 1:** event → Store/spool → replay → restart → exact open.
-2. **Base Slice 2:** qualified Claude relay, indexed continuation, lexical top-K retrieval, actual context emission, notes/corrections/commitments and maintenance.
-3. **Controller #200 + V2 L0/L1.**
-4. **Inference P1a:** stable caller, calls/copies/runner, cut/retention, backup integration and one result changing later context.
-5. **P1b/later:** rotation, embeddings, views, documents, Research and more hosts.
-
-Production code first. Run `cargo fmt --check` and minimum changed-package Clippy after coherent increments. Broad campaigns follow connected product.
-
-## Evidence limits
-
-Source/design evidence is not runtime qualification. PR #5325 still lacks genuine final-tree documentation evidence and independent approval; the last completed gate also reported SurrealDB provisioner failure. No fabricated evidence block is accepted.
+For prose, check requirements, ownership, contradictions, changed links and
+`git diff --check`. Existing CI and independent review remain necessary; do not
+invent receipts or call a pushed draft merged. See [WORKFLOW](../../WORKFLOW.md).

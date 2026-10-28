@@ -1,60 +1,51 @@
 # Architecture authority and version boundary
 
-## Current owner decision
+This page identifies owners and precedence. It is not another product specification.
 
-On 2026-10-18 the owner directed that V2 join V1 as an archived Memory donor and that V3 be designed from scratch before implementation. This supersedes old Memory documents as authority for the next implementation. It does not claim V3 code exists.
+## V3 working authority
 
-Current synchronized V3 set:
+The owner selected a fresh V3 design and retained V1/V2 Memory as donors. While
+issue #5324 / PR #5325 is open, `docs/v3/` on
+`docs/5324-v3-documentation-audit` is the working design. `main` remains the
+integration base. A working draft is neither merged authority nor runtime support.
+After integration, use the merged files on `main`; do not revive a closed branch.
 
-| Surface | Role |
+| Owner document | Decision owned |
 |---|---|
-| [Architecture draft.19](v3/ARCHITECTURE.md) | Purpose, authority, Base and invariants |
-| [Implementation draft.42](v3/IMPLEMENTATION.md) | Runtime, exact SurrealDB 3.3.4 Store/schema/query boundary, maintenance and order |
-| [Cognition draft.23](v3/COGNITION.md) | Reconstruction, retrieval, learning and failure algorithms |
-| [Inference Contract 0.18](v3/INFERENCE-CONTRACT.md) | Sole Memory↔controller boundary |
-| [Active registry](v3/ANALYSIS-REGISTRY.md) | Sole current decisions/gaps/source/queue ledger |
-| [V3 audit and source map](v3/AUDIT.md), [AUDIT-MAP](v3/AUDIT-MAP.md) | Evidence, criticism and donor dispositions |
+| [Architecture](v3/ARCHITECTURE.md) | Product purpose, responsibility and invariants |
+| [Implementation](v3/IMPLEMENTATION.md) | Runtime, Store, operations, maintenance and build order |
+| [Cognition](v3/COGNITION.md) | Reconstruction, retrieval, learning and revision algorithms |
+| [Inference contract](v3/INFERENCE-CONTRACT.md) | Proposed Memory/controller interface, not proof of provider support |
 
-Architecture intent prevails over conflicting lower-level mechanism. Resolve a changed load-bearing mechanism in every affected owner document; do not add an errata layer or second contract.
+Architecture intent prevails over a conflicting mechanism. Correct the owning
+mechanism and its consumers together before implementing the disputed behavior.
+Do not resolve conflicts by inventing an exception in a README, issue, registry or
+a new contract. An external repository owns its own accepted API; a Memory draft
+cannot declare that API implemented or impose a superseded controller design.
 
-A mechanism, threshold, process, database or credential path is accepted only with a real caller, owner, durable result/unknown and consumer plus appropriate evidence. Synchronized prose establishes an implementation target, not working behavior.
+The [registry](v3/ANALYSIS-REGISTRY.md#documentation-stages) tracks unresolved
+consistency work, including controller compatibility. No blanket assertion that
+all drafts are synchronized is made. Base work is not blocked by missing inference.
 
-## Current controller, Store and backup boundary
+## Navigation and evidence
 
-Controller authority:
+[Task routes](v3/README.md#task-routes) are navigation only. The
+[registry](v3/ANALYSIS-REGISTRY.md) is the sole work ledger, not another normative
+source. The [audit](v3/AUDIT.md) and [source map](v3/AUDIT-MAP.md) retain rationale
+and bounded donor findings. Source review, selected design, compilation, observed
+runtime behavior and product qualification are distinct; record the actual scope.
 
-```text
-eliot-swarm-controller@613ea6b5ff6389c7629a988e271477ee45c9d2c1
-```
+Do not copy external roadmap status or revision lists into entry pages. Keep a
+dated, pinned observation in the existing registry and refresh it for an affected
+integration decision. Read only the owning sections required by the task.
 
-It selects fresh V2 JSON-RPC + SQLite WAL and treats the old runtime as legacy.
+## Donors
 
-Therefore:
+V2 source baseline: `5aac094834fb5635921b550c821cb933a1196105`.
+V1 donor: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`.
+The V2 pair, router, workstream records and validators remain retained evidence;
+they do not prescribe V3 topology or certify its design. Their machine migration
+is a separate explicit change, not a consequence of this prose update.
 
-- issue #200 must separate monotonic binding allocation, selected current pointer and effect publication;
-- candidate admission never moves pointer; launch/resume publish target pointer with dispatch, while attach/detach move it only after exact effect;
-- controller V2 L0/L1 must exist before issue #199 implements Contract 0.18;
-- daemon owns controller-mutation and backup-set owners;
-- supervisor owns candidate process/root and final cutover;
-- final backup directory first appears through atomic directory rename with exact fence already inside;
-- self-contained abort/retire tombstones remain terminal after cleanup;
-- restore admits finite part limits, retains directory/parts/fence/manifest with read sharing only and streams one verified part at a time;
-- daemon/channel loss forces candidate discard before restart/cutover;
-- Store maintenance rows are mirrors only;
-- missing controller capability is a dependency, not permission to revive V1.
-
-Initial Store target is SurrealDB 3.3.4/RocksDB `sync=every`, one query-only authenticated client, a `STRICT` database and six Base `SCHEMAFULL` tables.
-
-Application IDs crossing JSON are canonical strings generated from OS randomness; derived unique keys are domain-separated length-prefixed hashes. Direct continuation uses explicit indexed work-address columns. Queries are fixed and explicitly projected.
-
-Exact tag source/tests establish selected clause/type grammar, `READONLY` create/same/change behavior, row-local ASSERT evaluation, UNIQUE skipping of tuples containing `NONE` or `NULL`, persisted-PARAM rollback, plain INFO maps and numbered FTS score/index behavior. V3 canonically writes `NONE`, not `NULL`, for absent conditional keys. `READONLY` is a changed-value guard, not an identity generator.
-
-This evidence does not qualify the complete V3 migration wrapper. Bound metadata through the production WebSocket client, all table/field/analyzer/index rollback points, concurrent uniqueness, every expected catalog string, representative reader plans and Windows/RocksDB durability remain Slice 0.
-
-Schema bundle identity includes runner protocol, wrapper template, ordered DDL and expected catalog. Schema admission uses plain `INFO FOR DB/TABLE` maps and forbids `STRUCTURE`. Scored FTS uses numbered match references and one bounded top-K snapshot per call.
-
-## Donor identity
-
-V2 baseline: `5aac094834fb5635921b550c821cb933a1196105`. V1 donor: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`. The V2 normative pair and routing tools remain donor evidence only.
-
-While issue #5324 and PR #5325 remain open, their branch `docs/v3/` files are current working authority. Follow [AGENTS](../AGENTS.md) and [WORKFLOW](../WORKFLOW.md). Independent review and required CI remain applicable.
+Follow [AGENTS](../AGENTS.md) and [WORKFLOW](../WORKFLOW.md). Required checks and
+independent integration remain applicable.
