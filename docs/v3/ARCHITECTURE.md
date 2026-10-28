@@ -1,28 +1,30 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.19 · 2026-10-27 · normative design for the greenfield rewrite.**
+**Revision 1.0-draft.20 · 2026-10-28 · design for the greenfield rewrite, not implemented behavior.**
 
-V1/V2 Memory implementations are donors. V3 is a new implementation. Current `eliot-swarm-controller` V2 is also a fresh implementation target; its legacy runtime is donor-only.
-
-This document owns product purpose, authority and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store and maintenance. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.18](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only active work ledger.
+V1/V2 Memory implementations are donors. This document owns purpose, responsibility
+and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store, maintenance
+and build order; [Cognition](COGNITION.md) owns algorithms; the
+[Inference contract](INFERENCE-CONTRACT.md) owns the proposed external call boundary.
+[ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the only work ledger.
 
 ## 0. External dependency
 
-Controller authority:
+Controller foundation and Memory inference are different capabilities. The inspected
+controller has an implemented foundation but lacks the Memory principal and inference
+handlers; exact source and adaptation requirements are maintained in
+[Inference §0](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
 
-```text
-UnknownAlienHuman/eliot-swarm-controller
-main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
-```
-
-Its V2 roadmap remains unimplemented. Issue #200 must separate monotonic binding allocation, selected pointer and native effect before L0/L1. Issue #199 implements Memory inference only after that foundation. Base does not wait.
+Base has no controller dependency. Model-assisted learning requires the scoped inference
+extension, not another implementation of controller L0/L1 or an Agent-binding programme.
+Never route around missing inference through owner credentials, Agent tasks or legacy V1.
 
 ## 1. Purpose and completion
 
 Eliot makes accumulated experience useful at the next decision:
 
 ```text
-observe exact source
+preserve exact observation
 → reconstruct current work
 → supply applicable context
 → observe action/result
@@ -30,258 +32,190 @@ observe exact source
 → use the revision later
 ```
 
-Product value is visible when Eliot restores work without inventing state, prevents known failures from silently returning, exposes constraints/exceptions/unknowns before action, learns from outcomes, preserves source/history and remains useful without optional inference.
+Value means restored work without invented state, remembered failures and exceptions,
+explicit unknowns, learning from outcomes and preserved source/history. Optional
+inference must not be necessary for ordinary capture, retrieval or context.
 
-A mechanism enters V3 only after its real caller, owner, durable result or typed unknown and consumer are named.
-
-```text
-shipped caller
-→ owning operation
-→ durable result or typed unknown
-→ actual consumer/readback
-→ restart/recovery where relevant
-```
-
-Types, ports, fixtures, receipts, reports and compilation are not product behavior by themselves.
+Add a mechanism only for a named caller, owner, durable result or typed unknown and
+actual consumer. Completion includes restart/readback where persistence matters.
+A type, port, fixture, receipt, report, branch or passing compile alone is intermediate.
 
 ## 2. Ownership
 
 | Responsibility | Owner |
 |---|---|
-| User goal, permissions and acceptance | Human and host/controller |
+| Goals, permissions and acceptance | Human and host/controller |
 | Agent/task/tool execution | Host/controller |
-| Host event translation and context emission | Narrow relay/adapter |
+| Event translation and actual context emission | Narrow host relay |
 | Observations, revisions, retrieval, context, outcomes and finite jobs | Memory daemon |
-| Store mutations, replay and quiesce evidence | Memory daemon |
-| Controller-mutation serialization, backup IDs/records, dependency snapshots, bounded restore leases and backup cleanup | Daemon backup-set owner |
-| Executable/root identity, Store root/Owner credentials, migrations, candidate process/root and cutover | Supervisor/installer |
+| Store mutations, replay and quiesce | Memory daemon |
+| External-call serialization and backup dependency checks | Daemon controller-mutation owner |
+| Backup records, transitions, bounded restore leases and cleanup | Daemon backup-set owner |
+| Executable/root identity, Store root/Owner credentials, migration, candidate and cutover | Supervisor/installer |
 | Interpretation, consolidation and method improvement | Memory learning handlers |
-| One-shot authentication, profiles, provider execution/readback, receipts and temporary inference copies | Controller V2 |
-| Persistence/indexes/transactions | Private SurrealDB Store |
+| Scoped one-shot call, provider execution/readback and private inference copies | Controller extension |
+| Persistence, indexes and transactions | Private SurrealDB Store |
 
-Public control reaches the daemon. Privileged root/Owner/process/cutover effects cross one inherited typed channel. Supervisor independently resolves approved resources; it never accepts arbitrary SQL, argv, endpoint, path or secret from daemon. Daemon never receives root or Owner credentials.
+Public control reaches the daemon. Privileged process/root/Owner/cutover effects cross
+one inherited typed channel. Supervisor independently resolves approved resources;
+it does not accept arbitrary SQL, argv, endpoint, path or secret from the daemon.
+Daemon never receives root or Owner credentials.
 
-Memory links external work but is not another task manager, permission engine, swarm controller or acceptance authority.
+Dreamer is a role performed for one finite semantic job, not a permanent process,
+provider stack, scheduler, special database or canonical writer. A controller call is
+not an Agent/session/Goal lifecycle. Memory links external work but does not own it.
 
-### 2.1 Dreamer is a role
-
-Dreamer means model-assisted interpretation for one finite Memory job. It is not a permanent process, provider, scheduler, special database or canonical writer.
-
-### 2.2 One-shot inference is not Agent orchestration
-
-Memory uses one dedicated `memory_inference` principal and precommitted global `WriteId`s. It creates no controller Agent, binding, turn, command, Goal, automation, Task or review lifecycle.
-
-### 2.3 Stable caller, credential and effects are distinct
-
-```text
-client_id = memory:<stable-random-installation-id>
-token_version = current credential version
-call identity = WriteId + client_id + method + canonical payload
-```
-
-Client ID survives rollback and rotation. Token version authenticates but does not own calls. Memory owns one monotonic WriteId state outside rollback roots. Unknown old effects are read back or retained unknown; a new ID is never recovery.
-
-### 2.4 Profiles and disclosure belong to the send owner
-
-Controller owns versioned connection/profile, provider credential reference, actual destination, model and finite limits. Memory chooses a profile name and reduces input to `local_only | external_allowed`. Controller checks actual destination before provider I/O. No silent fallback exists.
+Stable client identity, credential version and call identity remain separate. Rotation
+or rollback cannot authorize a second uncertain effect. The send owner controls actual
+profile/destination/credentials; a profile name is not permission for silent fallback.
+Detailed identities and readback belong to the inference contract, not a second model here.
 
 ## 3. Product shape
 
-Initial product is one Rust codebase/executable with supervisor, daemon and transient relay modes; one private inherited channel; one active external SurrealDB child; at most one disposable restore candidate; installation-scoped external-ID and backup authority outside rollback roots; and optional outbound clients constructed only when enabled.
+One Rust codebase/executable provides supervisor, daemon and transient relay modes.
+One active external SurrealDB child owns persistence. At most one isolated disposable
+candidate exists during restore. External-ID and backup authority live outside rollback
+Store roots. Optional outbound adapters are constructed only when enabled.
 
-A new process, crate, table or registry requires independently owned state, dependency, deployment or failure boundary.
+Layers are domain values/pure transformations → application operations → I/O adapters
+→ surfaces/runtime composition. Internal calls use typed Rust values; serialization
+belongs at Store/process/network boundaries.
 
-### 3.1 Layers, not process tiers
+A process, crate, table or registry needs an independently owned state, dependency,
+deployment or failure boundary. The target topology is not an instruction to scaffold
+all future capability owners before the first caller exists.
 
-1. domain values and pure transformations;
-2. application operations;
-3. external I/O adapters;
-4. surfaces/runtime composition.
+### 3.1 Useful Base
 
-Internal calls use typed Rust values. Serialization belongs only at Store/process/network boundaries.
+Base captures real host events; preserves source/occurrence identity; supports notes,
+corrections and commitments; reconstructs addressed work; performs exact and lexical
+retrieval; emits actual context; opens exact sources; survives restart/spooling; and
+provides local backup, rollback, erasure and direct control. It needs no inference,
+vectors, converters or Research. These are Base completion requirements, not all
+prerequisites for starting the first capture/open increment.
 
-### 3.2 Useful Base and additive capabilities
+### 3.2 Additive learning
 
-Base works without inference, vectors, converters or Research. It provides real host capture, exact source/occurrence identity, notes/corrections/commitments, exact and lexical retrieval, addressed current work, actual context emission, exact source opening, restart/spool, local backup/rollback/erasure and direct control.
-
-First learning closes one loop from retained episode through one controller call to a Memory revision consumed by later context and dependency-aware cleanup.
-
-Vectors, views, documents, Research and additional hosts are independent increments sharing the same records/jobs/revisions/context.
+The first learning loop turns a retained episode and exact processing method into one
+controller call, then a Memory revision consumed by later context. Cleanup and backup
+continuity are part of enabling that call, not claims inferred from a returned model body.
+Vectors, views, documents, Research and other hosts reuse the same records/jobs/revisions.
 
 ### 3.3 First host is narrow
 
-Initial Claude events:
-
-```text
-SessionStart
-UserPromptSubmit
-PostToolUse
-PostToolUseFailure
-Stop
-SubagentStop
-PostCompact
-SessionEnd
-```
-
-Claude JSON is adapter input, not Memory domain state. Prompt/session boundaries emit actual context. Final messages are retained directly. Compact summary is derived representation. Enforcement hooks are outside Base.
+The first Claude profile selects SessionStart, UserPromptSubmit, PostToolUse,
+PostToolUseFailure, Stop, SubagentStop, PostCompact and SessionEnd. Verify the installed
+host contract before enabling each event. Host JSON is adapter input, not domain state.
+Session/prompt boundaries emit actual context; final messages are retained directly;
+compact summaries are derived representations. Enforcement hooks are outside Base.
 
 ## 4. Identity and memory invariants
 
-- Work identity is project/workspace plus actual task or actor/session; path/branch/commit are environment.
-- Occurrence identity is native event identity or relay command ID; digest verifies bytes and does not merge occurrences.
-- Accepted source is preserved before interpretation; excerpts and normalized fields are projections.
-- Source, representation and claim have distinct identities.
-- Current revision and history never substitute for each other.
-- Origin, reuse scope and disclosure are independent.
-- Grounds groups encode conjunction/alternatives; navigation is not evidence; cycles add no support.
-- Support, retrieval exposure and advisory influence are separate.
-- Exact `open` requires one handle and reports exact identity/revision/range/digest/gaps/relations/continuation. Historical handles never fall forward.
-- Reduce exposure, withdraw influence, supersede/refute, retire backup and physically erase are different operations.
+- Work address is project/workspace plus actual task or actor/session; path/branch/commit
+  are environment, not task identity. Late results retain issue-time binding.
+- Occurrence identity is native event identity or relay command ID. Digest verifies
+  bytes; it does not merge distinct occurrences with equal content.
+- Preserve accepted source before interpretation. Source, representation and claim
+  have distinct identities; excerpts/normalization cannot replace original bytes.
+- Current revision and history never substitute for each other. Exact historical
+  opening cannot fall forward, rerun inference or resurrect erased content.
+- Origin, reuse scope and disclosure are independent. Grounds groups express required
+  conjunctions and alternatives; navigation and cycles do not establish support.
+- Support, retrieval exposure and advisory influence are separate. Reducing exposure,
+  withdrawing influence, superseding/refuting, retiring backup and erasing bytes differ.
 
-Deletion notices, membership tombstones and backup terminal markers prevent false reintroduction/inventory/restore claims but are not physical deletion proof.
+Deletion notices, membership tombstones and terminal backup records prevent false
+reintroduction/inventory/restore claims; none is physical deletion proof.
 
 ## 5. Retrieval, context and learning
 
-Address current work before similarity search. Candidate arms are direct/address/exact/lexical/vector/grounds/relation/method and are unioned before final selection.
+Address current work before similarity search. Union independently bounded direct,
+address, exact-cue, lexical, optional vector, grounds/relation and method candidates
+before final selection. Apply scope before arm limits.
 
-Lexical retrieval is one bounded top-K Store snapshot per call. BM25 score depends on the current corpus; V3 does not expose a durable page cursor across calls. Equal scores use canonical-ID tie-break. Score ranks candidates only; it does not establish truth/support/applicability.
+Lexical ranking uses one bounded statement snapshot, not a durable BM25 cursor across
+corpus changes. Score orders candidates but proves neither truth nor applicability.
 
-A decision packet contains current goal/progress, exact corrections, open commitments, applicable methods with exceptions, relevant episodes, dissent/unknowns and source handles. Exact values and qualifications travel together.
+A packet preserves current goal/progress, exact corrections, open commitments,
+applicable methods with exceptions, relevant episodes, dissent/unknowns and exact
+source handles. Negation, version and contraindications travel with the value.
+Prepared, emitted, action-associated, used and successful are different facts.
 
-Prepared, emitted, action-associated, used and successful are separate facts.
-
-A project view is a versioned answer over examined scope. Failed refresh leaves prior qualified view and exact source access available.
-
-No-change is valid only after completed cognitive work on supplied input. Rejection, no result, malformed output, truncation, omitted coverage or unknown execution is not no-change. Cleanup is separate from cognitive result.
+A project view is a versioned answer over examined scope. Failed refresh leaves the
+previous qualified view and exact source access available. No-change requires completed
+cognitive work on supplied input; rejection, missing/malformed/truncated output or
+unknown execution is not no-change. Cleanup is separate from cognitive outcome.
 
 ## 6. Store and schema authority
 
-Initial Store target is SurrealDB 3.3.4, external RocksDB and explicit `sync=every`. Base owns six `SCHEMAFULL` tables plus immutable blobs:
+The selected initial target is external SurrealDB 3.3.4/RocksDB with explicit
+`sync=every`, six `SCHEMAFULL` tables (`stream`, `observation`, `memory`,
+`memory_history`, `link`, `job`) and immutable blobs. These are design selections,
+not a claim of a running or qualified Store.
 
-```text
-stream
-observation
-memory
-memory_history
-link
-job
-```
+Application IDs crossing JSON are bounded canonical strings; native record IDs stay
+internal. Queries are fixed, bound, explicitly projected and decoded through DTOs.
+There is no user-supplied SQL, generic CRUD or `SELECT *` application boundary.
 
-Application identity crossing JSON is a canonical bounded string; Surreal record IDs remain internal. Queries are fixed, bound and explicitly projected. No generic `Value`, `SELECT *` or raw SurrealQL boundary exists.
-
-Migration bundle identity includes a format version, runner protocol, exact transactional wrapper template, ordered UTF-8/LF DDL assets and expected-catalog template. Bound generation/digest values are outside the preimage, avoiding self-reference.
-
-Schema admission uses plain `INFO FOR DB` and `INFO FOR TABLE` maps. `STRUCTURE` is forbidden as unstable internal output. The client sorts parsed owned map keys and compares exact pinned-version server-canonical `DEFINE` strings, not raw JSON byte order. Roles/credentials are admitted separately.
-
-Base full-text queries use numbered match references when score is requested and separate FULLTEXT indexes over observation excerpts and Memory text.
+[Implementation §4–6](IMPLEMENTATION.md#4-migration-0001-and-schema-authority) owns IDs,
+field invariants, indexes, schema-bundle identity, catalog comparison, queries and
+transactions. Source/upstream-test evidence cannot qualify the complete Eliot wrapper.
+Do not copy these internal details into the controller protocol.
 
 ## 7. Backup authority
 
-### 7.1 Concrete owners and lock order
+The daemon owns backup records and dependency decisions; supervisor owns candidate
+process/root and cutover. Installation records outside rollback roots outrank restored
+Store maintenance mirrors.
 
-Daemon owns controller-mutation and backup-set owners. Supervisor owns candidate process/root and final cutover.
+Required invariants: a final backup first appears with its fence; ambiguous publication
+pins conservatively; terminal records survive content cleanup; restore validates finite
+limits and retains a bounded lease; parts are verified one at a time; final recheck
+precedes cutover; daemon/channel loss discards a candidate before restart/cutover.
+Restore is exact rollback, never an invented merge with future cognition. Current
+deletion notices dominate backup content.
 
-```text
-close/drain controller mutation
-→ enter backup-set transition
-→ publish/read back final fence authority
-→ leave transition
-→ reopen mutation admission
-```
-
-No release/retention can cross a newly visible fence. Terminal transitions remove pins, so stale pre-terminal reads are conservative.
-
-### 7.2 Atomic first visibility
-
-Backup ID is `b_` plus 32 lowercase hexadecimal characters from 128 OS-random bits. Daemon writes canonical fence inside a private same-parent temp directory, flushes file+directory, no-replace renames the directory to final ID, flushes parent and reopens final directory/fence no-follow.
-
-Final directory never appears empty. Pre-rename temp is non-pinning cleanup debt. Post-rename sync/readback uncertainty is publication-unknown and pins after reconciliation.
-
-### 7.3 Terminal records
-
-Self-contained `abort.json` and `retire.json` remain terminal after content cleanup and prevent backup-ID reuse. Abort is pre-publication only; retire is published-backup only; both/malformed/mismatched combinations fail closed. Terminalization is not erasure.
-
-### 7.4 Bounded restore lease
-
-Daemon lease holds a logical lease plus final-directory/fence/manifest handles opened no-follow with read sharing only. Before candidate work, manifest part count, per-part bytes, total bytes and canonical unique paths must satisfy finite limits.
-
-Parts are streamed one at a time: open one no-follow read handle with write/delete sharing denied, verify path/identity/length/digest, copy+verify into candidate, close, then continue. V3 never retains an unbounded handle set.
-
-The logical owner blocks daemon retirement/cleanup. A final terminal/manifest identity recheck occurs immediately before cutover. Daemon/channel loss forces supervisor to kill/reap/discard candidate before another daemon or cutover. A scan without a held lease is not restore authority.
-
-### 7.5 Controller dependencies
-
-Backup cut dispositions every call/cancel/release/retention ID. Every admitted call is `controller_closed` or `controller_dependent`. Published non-retired backups and unresolved fences pin dependent copies and post-cut retention. Store maintenance rows are status mirrors only.
-
-Restore is exact rollback, not invented merge. Closed jobs restore from backup facts; dependent jobs require exact call/copy; post-cut calls are inventoried over one fixed interval and never adopted as restored cognition. Base remains usable when inference continuity is unavailable.
+[Implementation §8](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle) is the sole owner
+of physical publication, plan/terminal codecs, lease/custody and rollback procedures.
+The [inference contract](INFERENCE-CONTRACT.md#8-memory-backup-interaction) adds the
+external-effect cut and release/retention rules only when controller calls exist.
+Base backups must not contact a controller that Base does not use.
 
 ## 8. Reliability, privacy and control
 
-Persist adjacent states separately: committed/staged/unknown capture; prepared/emitted context; complete/paged/missing/damaged reads; inference prepared/admitted/sending/settled/unknown/abandoned; closed/dependent controller state; backup staging/preparing/publication-unknown/published/aborted/retired; release/retention pins; restore lease/limit/candidate state; physical cleanup and owner-action debt.
+Persist adjacent states separately: committed/staged/unknown capture; prepared/emitted
+context; complete/paged/missing/damaged reads; admitted/sending/settled/unknown calls;
+backup publication/terminal state; lease/candidate state; physical cleanup and owner debt.
+Acknowledgement is not completion; a body is not a decoded proposal; a terminal marker
+is not erasure; loss after possible effect is not proof of rollback.
 
-Acknowledgement is not completion. Provider body is not decoded proposal. Backup plan digest is not manifest digest. Rename without parent durability/readback is not publication. Terminal marker is not erasure.
+Secrets stay with their owners. Controller owns provider/caller credential issuance;
+supervisor owns Store root/Owner references; daemon receives Editor and its scoped
+Memory caller credential reference only. Restrictive OS access is not a portable
+encrypted-backup guarantee or hostile-same-user sandbox.
 
-Secrets remain with their owners. Controller owns provider credentials/token issuance; supervisor owns Store root/Owner references; daemon receives Store Editor and current Memory caller credential reference only.
-
-Direct control provides status/open/configure/pause/cancel/correct/withdraw/erase/backup/restore/rotate/retire/shutdown. Status derives from actual process, Store, schema catalog, spool, controller and installation-record readback.
+Control supports status/open/configure/pause/cancel/correct/withdraw/erase/backup/restore/
+rotate/retire/shutdown as their owners are implemented. Status uses actual readback;
+unavailable features remain explicit rather than empty successful handlers.
 
 ## 9. Non-goals
 
-V3 does not add without demonstrated need:
-
-- public supervisor API or generic admin bus;
-- arbitrary SQL/path/argv/secret over inherited IPC;
-- another task manager, workflow engine, semantic DB or provider stack;
-- controller Agent/Goal/automation/script/MCP for one-shot inference;
-- permanent Dreamer process;
-- truth/skill/outcome/packet registries;
-- general Governor/approval/proof platform;
-- service/crate/manifest per noun;
-- controller backup-pin service or second mutation ledger;
-- generic Surreal protocol/value reimplementation;
-- rollback-derived external IDs or backup IDs;
-- empty final backup-directory reservation;
-- unbounded restore part handles;
-- unstable `INFO ... STRUCTURE` as schema API;
-- durable lexical cursor without a retained corpus snapshot;
-- first admission of old absent calls from backup;
-- Memory impersonation of controller-owner erase.
+No second task manager, permission/acceptance engine, semantic DB, provider stack,
+permanent Dreamer, generic admin bus or proof platform. No crate/manifest per noun,
+truth/skill/packet registry, controller backup service, second mutation ledger or
+compatibility executor. Do not copy a dependency's lifecycle machinery to obtain one
+model call. Reuse an existing owner before creating a new one.
 
 ## 10. Product evidence and order
 
-Base evidence:
+Build the connected increments in
+[Implementation §11](IMPLEMENTATION.md#11-implementation-sequence); it alone owns their
+order. Start with capture → durable Store/spool → replay/restart → exact open, then host
+context and Base maintenance. Complete the inference boundary before enabling learning.
+A complete backup/crash/load campaign is not a condition for writing the first path.
 
-```text
-real host event
-→ Store ownership or durable stage
-→ replay when staged
-→ restart
-→ continuation/context or retrieval
-→ exact source open
-```
-
-Backup evidence:
-
-```text
-final directory first visible with exact fence
-→ finite manifest limits admitted
-→ every external ID has cut disposition
-→ plan/parts/manifest exact
-→ parts streamed with bounded handles
-→ final lease recheck precedes cutover
-→ crash cannot cut over stale candidate
-→ terminal state survives cleanup
-```
-
-Implementation order:
-
-1. Memory Slice 0 physical/Store/schema/backup qualification;
-2. useful Base capture/replay/open;
-3. first qualified host/context path;
-4. controller #200 plus V2 L0/L1;
-5. Contract 0.18 text-inference P1a;
-6. credential rotation P1b;
-7. independent vectors/views/documents/Research/hosts;
-8. advanced curation after connected Base.
-
-Production code comes first. Run formatting and minimum changed-package Clippy after coherent increments. Broad qualification follows connected product.
+Preserve safety checks at the boundary that needs them: no unverified credentials sent,
+no false durable capture, no unleased restore/cutover, no uncertain external effect retried.
+Production code first, formatting and minimum changed-package Clippy after coherent
+increments. Broad qualification follows the assembled product; unexecuted behavior
+remains unqualified.

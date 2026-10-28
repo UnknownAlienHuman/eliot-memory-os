@@ -1,23 +1,25 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.42 · 2026-10-27 · concrete design for the greenfield rewrite.**
+**Revision 1.0-draft.43 · 2026-10-28 · design for the greenfield rewrite.**
 
-This document turns [Architecture](ARCHITECTURE.md) into the Memory runtime, Store and connected operations. [Cognition](COGNITION.md) owns algorithms. [Inference Contract 0.18](INFERENCE-CONTRACT.md) is the sole Memory↔controller boundary. [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the sole active work ledger.
+This document owns runtime, Store, physical maintenance and implementation order.
+[Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
+algorithms; the [Inference contract](INFERENCE-CONTRACT.md) owns external calls.
+[ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) is the sole active work ledger.
 
-Nothing is implemented merely because it is specified. Build connected production slices in §12. Do not construct scaffolding for a later capability before its first real writer and consumer exist.
+Build connected increments in §11. A specified mechanism is not implemented behavior.
+Do not construct later scaffolding before its first writer and consumer exist.
 
 ## 0. External prerequisite
 
-Current controller authority:
+Memory Base does not depend on controller inference. The controller foundation already
+exists in the inspected snapshot; the Memory principal, one-shot methods and required
+readback do not. [Inference §0](INFERENCE-CONTRACT.md#0-authority-and-prerequisites)
+owns the pinned source comparison and proposed extension.
 
-```text
-UnknownAlienHuman/eliot-swarm-controller
-main = 613ea6b5ff6389c7629a988e271477ee45c9d2c1
-```
-
-Controller V2 remains specification-only. Issue #200 owns separation of binding allocation, selected pointer and effect publication; PR #201 is fixture-only. V2 L0.1–L1.11 remain unchecked. Memory inference issue #199 stays blocked on #200 and V2 L0/L1.
-
-Memory Slice 0 and useful Base do not depend on controller V2.
+Do not schedule controller L0/L1 or the old #200 Agent-binding model as Memory work.
+Enable model-assisted jobs only after the scoped extension is implemented and admitted.
+Missing inference never justifies a fallback to controller owner or Agent credentials.
 
 ## 1. Runtime and installation
 
@@ -29,9 +31,11 @@ eliot daemon         Memory application + backup-set owner
 eliot relay ...      transient host/CLI adapter
 ```
 
-Supervisor owns executable/root identity, child handles, Store bootstrap credentials, migrations, Store-user rotation, candidate process/root and final cutover.
-
-Daemon owns Memory semantics, Store Editor access, replay/jobs, controller-mutation serialization, backup IDs/records, bounded restore leases, retrieval/context and public control.
+Supervisor owns executable/root identity, child handles, Store bootstrap credentials,
+migrations, Store-user rotation, candidate process/root and final cutover. Daemon owns
+Memory semantics, Editor access, replay/jobs, backup IDs/records/leases/cleanup,
+retrieval/context and public control. Its controller-mutation owner is needed only
+when the inference extension is enabled.
 
 ### 1.2 Installation layout
 
@@ -39,10 +43,8 @@ Daemon owns Memory semantics, Store Editor access, replay/jobs, controller-mutat
 %LOCALAPPDATA%\Eliot\
   config.toml
   installation.toml
-  controller-write-id.state
-  data\roots\<root-id>\
-    db\
-    blobs\
+  controller-write-id.state       # only when inference is provisioned
+  data\roots\<root-id>\{db,blobs}\
   spool\{pending,failed,tmp}\
   deletions\
   backups\
@@ -56,13 +58,18 @@ Daemon owns Memory semantics, Store Editor access, replay/jobs, controller-mutat
   logs\
 ```
 
-Initial profile is one fixed local NTFS/ReFS volume with protected user+LocalSystem DACL. Network/removable roots, broad principals and reparse traversal are rejected. Data is plaintext under OS/volume protection; Base claims no portable encrypted backup.
-
-External-ID state and final backup records are outside rollback Store roots.
+Initial profile is one fixed local NTFS/ReFS volume with protected user+LocalSystem
+DACL. Reject network/removable roots, broad principals and reparse traversal. Data is
+plaintext under OS/volume protection; Base claims no portable encrypted backup.
+External-ID state and final backup authority remain outside rollback Store roots.
 
 ### 1.3 Installation selection
 
-Supervisor owns `installation.toml` under installation mutex. It retains selection generation, stable Memory installation ID, current/previous roots, controller/client/token references, current/pending/previous Store credentials, expected schema bundle format/generation/digest and maintenance state. Another cutover/rotation waits while an earlier previous generation remains unretired.
+Under the installation mutex, supervisor owns selection generation, stable Memory
+installation ID, current/previous roots, current/pending/previous Store credential
+references, expected schema format/generation/digest and maintenance state. Inference
+adds controller/client/token references without another installation registry.
+A new cutover/rotation waits while an earlier previous generation remains unretired.
 
 ### 1.4 Startup
 
@@ -72,43 +79,69 @@ validate installation + executable/root identities
 → reconcile bootstrap/credentials
 → apply/verify migration bundle through Owner
 → create inherited channel and launch daemon
-→ daemon independently admits process/listener/peer/Editor/schema/query path
-→ clean/quarantine pre-publication backup temps
-→ reconstruct final backup/terminal authority
-→ reconcile stale Store maintenance mirrors and pending release/retention
+→ daemon admits process/listener/peer/Editor/schema/query path
+→ reconcile implemented spool/backup/maintenance state
 → daemon ready
 → expose relay
 ```
 
-No capture is `committed` before admission. Backup-dependent release/retention cannot run before installation authority is reconstructed.
+No capture is committed before admission. Once backup exists, startup cleans/quarantines
+pre-publication temps and reconstructs final fence/terminal authority before maintenance.
+Once inference exists, reconcile external mutations and release/retention before new jobs.
+An absent optional module is not an empty successful reconciliation handler.
 
 ## 2. Windows identity, custody and IPC
 
-Before child resume, retain no-follow executable/root/ancestor handles, verify identity/digest/DACL, deny required write/delete/rename sharing, launch suspended with exact inherited handles, compare actual child image, assign Job and only then resume.
+Before child resume, retain no-follow executable/root/ancestor handles, verify identity,
+digest and DACL, deny required write/delete/rename sharing, launch suspended with exact
+inherited handles, compare the actual child image, assign its Job and only then resume.
 
-Supervisor owns process-family Job and candidate custody. Daemon/channel loss while candidate exists forces candidate termination, reaping and discard before another daemon or cutover.
+Supervisor owns process-family Job and candidate custody. Daemon/channel loss while a
+candidate exists requires termination, reaping and discard before another daemon/cutover.
 
-Relay uses one first-instance, remote-rejected, protected named pipe with mutual process attestation and one bounded request/response per connection.
+Relay uses one first-instance, remote-rejected, protected named pipe with mutual process
+attestation and one bounded request/response per connection. Supervisor↔daemon uses two
+inherited anonymous pipes with closed typed frames. Restore frames carry operation ID,
+backup ID, plan/manifest digests, candidate root ID and selection generation, never
+arbitrary path, SQL, argv, endpoint or secret.
 
-Supervisor↔daemon uses two inherited anonymous pipes with closed typed frames. Restore frames carry operation ID, backup ID, plan/manifest digests, candidate root ID and selection generation—never arbitrary path, SQL, argv, endpoint or secret.
+These checks apply before the affected credential/effect boundary; the later broad
+Windows campaign does not authorize an insecure development shortcut.
 
 ## 3. SurrealDB child and Store transport
 
-Pin exact SurrealDB 3.3.4 Windows artifact. Selected profile is external RocksDB `sync=every`, loopback dynamic port, `--deny-all`, HTTP `rpc`, RPC `query`, system-only arbitrary query, no defaults, no identification headers and sanitized environment. Origin/CORS is not WebSocket authentication.
+Pin the exact SurrealDB 3.3.4 Windows artifact. Selected profile: external RocksDB
+`sync=every`, loopback dynamic port, `--deny-all`, HTTP `rpc`, RPC `query`, system-only
+arbitrary query, no defaults/identification headers and sanitized environment. Origin/
+CORS is not WebSocket authentication. This remains an unqualified deployment target.
 
-Before credentials, Windows TCP ownership must prove listener and established peer belong to retained Store process. Basic-authenticated WebSocket selects exact NS/DB.
+Before credentials, Windows TCP ownership must bind listener and established peer to
+the retained Store process. Basic-authenticated WebSocket selects exact NS/DB.
 
-Root bootstrap is short-lived. Same root credential reconciles unknown persistence; Store restarts without root environment, provisions STRICT DB + database Owner/Editor with PASSHASH, applies migration through Owner, closes privileged sockets, restarts again and admits daemon Editor.
+Root bootstrap is short-lived. Reconcile unknown persistence using the same root
+credential; restart without root environment; provision STRICT DB + database Owner/
+Editor with PASSHASH; apply migration through Owner; close privileged sockets, restart
+again and admit daemon Editor. Daemon never receives root/Owner credentials.
 
-One Tokio task owns each query-only socket with one in-flight ID and continuous control-frame handling. Timeout, cancellation ambiguity, wrong/late response or protocol fault poisons it. Possible mutation send becomes `OUTCOME_UNKNOWN`; reconnect repeats admission and exact application readback.
+One Tokio task owns each query-only socket with one in-flight ID and continuous
+control-frame handling. Timeout, cancellation ambiguity, wrong/late response or protocol
+fault poisons it. Possible mutation send becomes `OUTCOME_UNKNOWN`; reconnect repeats
+admission and exact application readback, not blind mutation replay.
 
-JSON carries explicit DTOs only: bounded strings, signed integers, booleans, finite floats, integer times with precision, explicit optional states and immutable blob references. Surreal native IDs/special types remain internal. No generic `Value`, `SELECT *`, broad CRUD, copied CBOR tags or user-supplied grammar exists.
+JSON carries explicit bounded DTOs: strings, signed integers, booleans, finite floats,
+integer times with precision, explicit optional states and immutable blob references.
+Native Surreal IDs/special values stay internal. No generic `Value`, `SELECT *`, broad
+CRUD, copied CBOR tags or user-supplied grammar crosses the application boundary.
 
 ## 4. Migration 0001 and schema authority
 
+[Store candidates](store/README.md) make the design concrete. They are not the separately
+proposed production crate in #5327 and have not been executed as a complete Eliot bundle.
+D4 in the registry owns reconciling those assets; do not silently choose either as proven.
+
 ### 4.1 Bundle identity and catalog
 
-Bundle SHA-256 preimage includes:
+The SHA-256 preimage contains:
 
 ```text
 domain "eliot-memory-schema-bundle-v1"
@@ -119,70 +152,60 @@ ordered UTF-8/LF DDL assets
 expected-catalog template
 ```
 
-Bound format/generation/digest values are outside the preimage. Fixed wrapper executes ordered DDL and overwrites three metadata params in one transaction.
+Bound format/generation/digest values are outside the preimage. The fixed wrapper runs
+ordered DDL and overwrites three metadata params in one transaction.
 
-Exact-tag evidence establishes that persisted `DEFINE PARAM` is rolled back by `CANCEL TRANSACTION`, and the 3.3.4 index tests include cancelled index overwrite retaining the previous definition. It does **not** establish the whole proposed wrapper over every table, field, analyzer, index and bound metadata value on the selected Windows/RocksDB transport. Slice 0 must execute that exact wrapper against 3.3.4 and prove:
+Retained exact-tag evidence covers PARAM cancellation and cancelled index overwrite,
+not the complete wrapper over Windows/RocksDB. Store bring-up must execute the exact
+selected bytes and bound `$bound_*` metadata through its real client. Verify before
+admitting writes: all selected statements parse; metadata and owned catalog agree;
+unknown commit is resolved by readback, not inferred rollback. Full injected-failure
+coverage over every DDL boundary remains the later qualification campaign.
 
-- every checked-in DDL asset parses in the exact order used by the runner;
-- bound RPC variables are accepted in the three `DEFINE PARAM ... VALUE $bound_*` statements;
-- a forced pre-commit failure leaves no partial owned catalog or metadata;
-- a lost commit reply is classified only by exact params + catalog readback;
-- a fresh mismatched candidate is discarded rather than repaired with `IF NOT EXISTS`;
-- an active-root mismatch requires an explicit named migration repair.
+Admission uses plain `INFO FOR DB` / `INFO FOR TABLE`, not `STRUCTURE`. Parse owned maps,
+sort keys and compare exact pinned-version server-canonical `DEFINE` strings against the
+checked expected catalog. Raw JSON order is irrelevant. Compare dynamic metadata to
+bound typed values; users/accesses are admitted separately through role handshakes.
 
-Schema admission uses plain `INFO FOR DB` and `INFO FOR TABLE`; `STRUCTURE` is forbidden. Plain INFO returns maps whose owned values are server-canonical `DEFINE` strings. Parse owned maps, sort keys and compare exact strings against the checked expected-catalog template. Raw JSON order is irrelevant. Dynamic metadata param values are compared to the bound typed values; static table/field/index/analyzer definitions are exact strings. Users/accesses are admitted separately through role handshakes.
-
-Unknown outcome is committed only by exact metadata+catalog readback. Exact empty fresh candidate may retry the same bundle; partial/mismatched state fails closed.
+An unknown outcome is committed only after exact metadata+catalog readback. An exactly
+empty fresh candidate may retry the same bundle; partial/mismatched state fails closed.
+Discard a mismatched disposable candidate instead of hiding drift with `IF NOT EXISTS`.
+An active-root mismatch requires an explicit named repair.
 
 ### 4.2 Exact 3.3.4 DDL grammar boundary
 
-Migration assets use only parser forms confirmed in tag `v3.3.4`:
+The retained design selects these exact-tag parser forms:
 
 - `DEFINE TABLE <name> TYPE NORMAL SCHEMAFULL PERMISSIONS NONE`;
-- `DEFINE FIELD <field> ON TABLE <table>` with one occurrence of each selected clause;
-- `TYPE option<T>` and `TYPE array<T>` for optional/array fields;
-- `READONLY`, `DEFAULT`, `VALUE`, `ASSERT`, `COMMENT` and `PERMISSIONS` in their canonical emitted order;
-- `FLEXIBLE` only immediately after an object-compatible `TYPE`, never as a free later clause;
+- `DEFINE FIELD <field> ON TABLE <table>`, with each selected clause once;
+- `TYPE option<T>` and `TYPE array<T>`;
+- canonical emitted order for `READONLY`, `DEFAULT`, `VALUE`, `ASSERT`, `COMMENT`
+  and `PERMISSIONS`; `DEFAULT` and `VALUE` must not coexist;
+- `FLEXIBLE` only immediately after an object-compatible TYPE;
 - `DEFINE ANALYZER ... TOKENIZERS blank,class FILTERS lowercase`;
-- separate `DEFINE INDEX ... UNIQUE` and `DEFINE INDEX ... FULLTEXT ANALYZER ... BM25` definitions;
+- separate UNIQUE and `FULLTEXT ANALYZER ... BM25` indexes;
 - `DEFINE PARAM OVERWRITE $name VALUE <expression>`.
 
-The field parser accepts most clauses in flexible input order, but checked-in assets use the server's canonical `to_sql` order so expected catalog strings are stable for the pinned version. Duplicate clauses, `DEFAULT`+`VALUE`, unsupported flexible types and guessed syntax are compile-time asset defects, not runtime fallbacks.
+Parser acceptance and canonical rendering are separate from executing the complete
+asset. Duplicate clauses, unsupported types and guessed syntax are defects, not reasons
+for a runtime fallback. Verify pinned source when changing a selected form.
 
 ### 4.3 Application ID generation
 
-Base object IDs are generated by the daemon before Store mutation:
+Before mutation, daemon generates `<prefix>_<26 canonical Crockford Base32 chars>`.
+Prefixes are `s` stream, `o` observation, `m` memory, `h` memory_history, `l` link and
+`j` job. Draw 128 OS-random bits; encode fixed-width uppercase with first digit `0..7`.
+Validate exact prefix/length/regex. These IDs contain no time ordering promise.
 
-```text
-<prefix>_<26 canonical Crockford Base32 chars>
-```
-
-Prefixes:
-
-```text
-s stream
-o observation
-m memory
-h memory_history
-l link
-j job
-```
-
-Generation rules:
-
-- draw exactly 128 bits from the OS CSPRNG;
-- encode fixed-width uppercase Crockford Base32 with the first character restricted to `0..7` so the 26-character form is canonical;
-- do not encode wall-clock time and do not claim chronological ordering;
-- validate exact regex, prefix and length before any Store call;
-- persist the chosen ID in the owning immutable command/proposal before retryable Store mutation;
-- a collision with a different object is `ID_COLLISION`/integrity failure, not silent regeneration after ownership transfer;
-- exact command/proposal replay reuses the same ID.
-
-Time ordering always uses explicit time/sequence plus canonical ID tie-break, never ID lexicographic order alone.
+Retain the selected ID in the immutable command/proposal before retryable mutation.
+Replay reuses it. A collision with another object is `ID_COLLISION`/integrity failure,
+not silent regeneration after ownership transfer. Order by explicit time/sequence and
+ID tie-break, not the random ID alone.
 
 ### 4.4 Derived unique keys and absence
 
-Never concatenate components with an ambiguous delimiter. Derived keys are lowercase SHA-256 over a domain tag and length-prefixed UTF-8 components:
+Use domain-separated SHA-256 over length-prefixed UTF-8 components, never ambiguous
+concatenation. Store readable components separately and verify the digest in the writer:
 
 ```text
 stream_unique_key  = H("stream-v1", project, source_kind, source_native_id)
@@ -190,206 +213,93 @@ address_unique_key = H("memory-address-v1", origin_project, kind, address_kind, 
 slot_key           = H("job-slot-v1", project, purpose, target_key, slot_kind)
 ```
 
-Store readable components separately. Fixed Rust query builders compute and verify the digest; private query corpus is the only writer.
-
-The exact 3.3.4 unique-index implementation skips the whole unique tuple when **any** indexed component is `NONE` or `NULL`. V3 therefore standardizes absence:
-
-- `NONE`/omitted field means “not applicable / no optional identity”; this is the only absence state used by conditional unique keys;
-- `NULL` is not written to those fields;
-- semantic “known unknown” is represented by an explicit closed state field when required;
-- JSON DTOs never collapse `NONE` and `NULL` implicitly.
-
-Optional address/command/slot keys are `NONE` when absent. Slice 0 still proves concurrent insert/conflict behavior through the production client.
+Retained 3.3.4 source evidence says UNIQUE skips a tuple containing NONE or NULL. V3
+writes only NONE/omission for absent conditional keys; NULL is not the alternative
+representation. Express semantic unknown through a closed state where needed. Query
+DTOs must not silently collapse NONE and NULL. Concurrency through Eliot's client remains
+unqualified; a unique-index declaration does not prove the complete operation.
 
 ### 4.5 Canonical projections and bounds
 
-Raw accepted source bytes remain the source blob/inline body. Structured projection fields use one application canonical JSON codec:
+Preserve accepted raw bytes separately from structured projections. Projection JSON
+uses UTF-8, lexicographically sorted object keys, no duplicate keys/insignificant
+whitespace, finite numbers, no Surreal special values and explicit field/aggregate byte
+limits before I/O. Retain canonical strings; decoding must reproduce bytes/digest.
 
-- UTF-8;
-- object keys sorted lexicographically;
-- no duplicate keys;
-- no insignificant whitespace;
-- finite numbers only;
-- no Surreal native/special values;
-- exact per-field and aggregate byte limits checked before Store I/O.
+Query input/result budgets must fit permitted objects plus encoded envelope/JSON overhead.
+String character limits are not UTF-8 byte limits. Bounds metadata is not enforcement:
+check bind, transport and decode paths. The mismatches in source PR #5327 remain D4 work;
+do not raise every query limit to the largest object or silently truncate an exact open.
 
-The Store retains canonical JSON strings, not generic objects. A decoder must reproduce identical bytes/digest before using the projection. Source raw bytes are never replaced by this projection.
+### 4.6 READONLY, row assertions and operation ownership
 
-### 4.6 `READONLY`, row assertions and operation ownership
+Retained exact-tag evidence: READONLY allows initial and same-value assignment, but
+rejects later changed values. It does not generate identity or establish provenance.
+IDs and creation facts remain daemon-generated and command-retained.
 
-Exact 3.3.4 behavior is narrower than “server-owned immutable field”:
+Field type coercion precedes ASSERT. Row context includes value/before/after/input;
+use only expressions whose exact behavior is established. Regex validation is string
+comparison such as `$value = /.../`, not `TYPE regex` for an ordinary string.
 
-- a `READONLY` field may receive its initial value on create;
-- a later write of the same value is accepted;
-- a later changed value is rejected;
-- `READONLY` does not generate identity, discard caller input or validate provenance.
-
-Therefore IDs and creation facts remain daemon-generated and command-retained before Store mutation. `READONLY` is defense against later changed values, not the identity owner.
-
-Field processing coerces the declared type before evaluating `ASSERT`. Assertion context exposes the current value and row/document context, including `$value`, `$before`, `$after`, `$input` and current-row references. Checked-in assertions use only exact row-local expressions qualified by language tests and Slice 0. They do not own cross-row cardinality, sequence allocation, replay identity, digest computation or set-wide concurrency; those stay in fixed transactions, locks and unique indexes.
-
-For bounded strings, pattern assertions use string-vs-regex expressions such as `$value = /.../`; `TYPE regex` is a regex-value type and is not used to validate ordinary ID strings. Byte length/digest of source/blob content is checked by application code because string length is not a substitute for UTF-8 byte length.
+Selected row invariants below are requirements, not claims that the candidate assets
+already enforce them. Qualify cross-field expressions before relying on them. Fixed
+application transactions own replay, byte digests, sequence allocation, revision CAS
+and set-wide concurrency; database assertions are defense in depth.
 
 ### 4.7 Tables, immutable fields and assertions
 
-All six tables are `TYPE NORMAL SCHEMAFULL PERMISSIONS NONE`. Identity and creation fields are `READONLY` with the semantics in §4.6. Closed literals are used for stable enums such as disclosure, occurrence precision, body storage and job state. String/digest/array limits are explicit absolute bounds; user configuration may narrow them.
+All six tables are `TYPE NORMAL SCHEMAFULL PERMISSIONS NONE`. Identity and creation
+facts are READONLY with §4.6 semantics. String/array limits have absolute build bounds;
+configuration may narrow them. Closed values govern disclosure, occurrence precision,
+body storage and job state. The candidate assets enumerate field definitions; the
+semantic writer/reader contract is:
 
-#### `stream`
+| Table | Identity and immutable facts | Mutable/projection state and consumer |
+|---|---|---|
+| `stream` | stream_id, project, source_kind/native_id, workspace_id, stream_unique_key, created_at_ms | last_ingest_seq, updated_at_ms; capture allocation and ordered replay |
+| `observation` | observation_id, stream/event/command/native-event identity, ingest_seq, source bytes, occurrence/receipt/creation facts and captured work binding | Immutable accepted observation; exact open, continuation and retrieval projections |
+| `memory` | memory_id, origin_project, created_at_ms | revision, kind, reuse_scope, address tuple/key, content/search_text/exact_cues, disclosure, subject/aspect/perspective, conditions/exceptions, validity, support/exposure/influence, commitment/method state and updated_at_ms |
+| `memory_history` | history_id, memory_id, revision, exact semantic snapshot, replaced_at_ms | Immutable prior revision; historical open and provenance |
+| `link` | link_id, source/target kind+ID+optional revision, relation_kind, grounds_group, locator/qualification, created_at_ms | Immutable relation; bounded forward/reverse traversal |
+| `job` | job_id, project, purpose/target, first_queued_at_ms, created_at_ms and frozen claimed input/method/limits | state, slot_key, due/attempt/waiting, claim owner/expiry, request/result/coverage/cleanup and updated_at_ms; one finite consumer |
 
-```text
-stream_id READONLY
-project READONLY
-source_kind READONLY
-source_native_id READONLY
-workspace_id option<string> READONLY
-stream_unique_key READONLY
-last_ingest_seq int >= 0
-created_at_ms READONLY
-updated_at_ms
-```
-
-#### `observation`
-
-```text
-observation_id READONLY
-project READONLY
-stream_id READONLY
-event_key READONLY
-command_id option<string> READONLY
-native_event_key option<string> READONLY
-ingest_seq int > 0 READONLY
-occurrence_time_ms option<int> READONLY
-occurrence_precision literal READONLY
-receipt_time_ms int READONLY
-kind bounded string READONLY
-body_storage "inline" | "blob" READONLY
-body_inline option<string> READONLY
-blob_ref option<string> READONLY
-body_length int >= 0 READONLY
-body_sha256 lowercase-hex-64 READONLY
-search_excerpt bounded string READONLY
-disclosure "local_only" | "external_allowed" READONLY
-workspace_id/task_id/actor_id/session_id option<string> READONLY
-call_id/parent_observation_id/resource_id/resource_version option<string> READONLY
-locator_json/binding_json/relations_json/capture_limit_json canonical bounded strings READONLY
-created_at_ms READONLY
-```
-
-A row-local assertion evaluated after field values are final requires exactly one body location:
+Observation projects workspace/task/actor/session, call/parent observation and resource/
+version into explicit columns. Locator, binding, relations and capture-limit projections
+remain canonical bounded JSON strings. Store body length/digest and exactly one location:
 
 ```text
-body_storage = "inline" <=> body_inline present AND blob_ref absent
-body_storage = "blob"   <=> blob_ref present AND body_inline absent
+body_storage = inline  <=> body_inline present AND blob_ref absent
+body_storage = blob    <=> blob_ref present AND body_inline absent
 ```
 
-The fixed capture query independently verifies UTF-8/blob byte length and SHA-256.
+The application verifies actual UTF-8/blob byte length and SHA-256. Memory validity
+requires from <= until when both exist. Address key is present exactly when the complete
+address tuple exists and its digest matches. History snapshots preserve the complete
+replaced semantic projection, not a best-effort subset.
 
-#### `memory`
-
-```text
-memory_id READONLY
-origin_project READONLY
-reuse_scope bounded closed value
-revision int > 0
-kind bounded string
-address_kind/address_key option<string>
-address_unique_key option<lowercase-hex-64>
-content bounded string
-search_text bounded string
-exact_cues bounded array<string>
-disclosure closed literal
-subject/aspect/perspective option<string>
-conditions_json/exceptions_json canonical bounded strings
-valid_from_ms/valid_until_ms option<int>
-support_state/exposure_state/influence_state closed literals
-commitment_state/method_role/processing_purpose option<bounded string>
-created_at_ms READONLY
-updated_at_ms
-```
-
-If both validity bounds exist, `valid_from_ms <= valid_until_ms`. `address_unique_key` is present iff the complete address tuple is present and matches the fixed-query digest.
-
-#### `memory_history`
-
-Immutable exact previous semantic projection with:
-
-```text
-history_id READONLY
-memory_id READONLY
-revision int > 0 READONLY
-replaced_at_ms READONLY
-```
-
-#### `link`
-
-```text
-link_id READONLY
-source_kind/source_id READONLY
-source_revision option<int > 0> READONLY
-target_kind/target_id READONLY
-target_revision option<int > 0> READONLY
-relation_kind READONLY
-grounds_group option<string> READONLY
-locator_json/qualification_json canonical bounded strings READONLY
-created_at_ms READONLY
-```
-
-#### `job`
-
-```text
-job_id READONLY
-project READONLY
-purpose/target_key READONLY
-state closed Base literal
-slot_key option<lowercase-hex-64>
-origin/cause_id
-first_queued_at_ms READONLY
-due_at_ms option<int>
-attempt int >= 0
-waiting_reason option<string>
-claim_owner/claim_until_ms option
-frozen_input_json canonical bounded string
-method_id/method_revision option
-limits_json canonical bounded string
-disclosure closed literal
-profile_name option<string>
-request_blob_ref/request_length/request_sha256 option tuple
-result_json/coverage_json/cleanup_json canonical bounded strings
-created_at_ms READONLY
-updated_at_ms
-```
-
-Assertions require:
-
-- claim owner and expiry are both present or both absent;
-- request blob/length/digest are all present or all absent;
-- pending state uses a `pending` slot digest;
-- claimed/running/waiting states use the matching `active` slot digest;
-- terminal states have `slot_key = NONE`;
-- optional revision/length values are positive/non-negative as appropriate.
-
-Fixed claim/settle queries recheck these invariants transactionally; field assertions are defense in depth, not a substitute for operation ownership.
+Job claim owner/expiry are both present or both absent; request blob/length/digest are
+all present or absent. Pending uses the pending-slot digest; claimed/running/waiting use
+the active-slot digest; terminal uses NONE. Freeze method ID/revision, sources, limits,
+disclosure and profile at claim. Positive revision/sequence and nonnegative length/time/
+attempt constraints apply. Recheck state/slot/claim invariants in fixed claim/settle
+transactions, not only unexecuted field ASSERTs.
 
 ### 4.8 Indexes connected to readers
 
-Unique/exact:
+Unique identities:
 
 ```text
-stream.stream_id
-stream.stream_unique_key
+stream.stream_id; stream.stream_unique_key
 observation.observation_id
 observation(project,stream_id,event_key)
-observation(project,command_id)       # NONE skipped
-memory.memory_id
-memory.address_unique_key             # NONE skipped
-memory_history.history_id
-memory_history(memory_id,revision)
+observation(project,command_id)            # NONE skipped
+memory.memory_id; memory.address_unique_key
+memory_history.history_id; memory_history(memory_id,revision)
 link.link_id
-job.job_id
-job.slot_key                           # NONE skipped
+job.job_id; job.slot_key                  # NONE skipped
 ```
 
-Continuation and exact-reader indexes:
+Reader-backed continuation/relation/job indexes:
 
 ```text
 observation(stream_id,ingest_seq,observation_id)
@@ -402,154 +312,256 @@ job(state,due_at_ms,first_queued_at_ms,job_id)
 job(project,purpose,target_key,state,job_id)
 ```
 
-Direct work-address reconstruction therefore does not parse or scan `binding_json`. JSON retains source detail; explicit columns/indexes own continuation.
-
-Full-text:
-
-```text
-DEFINE ANALYZER eliot_base_text TOKENIZERS blank,class FILTERS lowercase;
-observation.search_excerpt FULLTEXT BM25
-memory.search_text FULLTEXT BM25
-```
-
-Exact tag tests prove analyzer/index syntax and indexed iteration for numbered match predicates. Slice 0 must still run `EXPLAIN` for every selected continuation/unique/FTS query over representative cardinality and reject a migration/query bundle whose required reader falls back to an unbounded table scan.
+Continuation uses these columns, not scan/parse of binding_json. Separate FULLTEXT BM25
+indexes serve observation.search_excerpt and memory.search_text under the selected
+`blank,class` / `lowercase` analyzer. Index syntax/source evidence does not prove every
+reader's bounded execution; inspect actual plans/cardinality as each reader is connected.
 
 ## 5. Fixed query corpus
 
-Every operation is a checked-in fixed query with bound data and explicit DTO. Initial corpus includes store probe, stream resolve/lock, capture identity/insert, direct work-task/session continuation, current/history/source open, forward/reverse relation pages, bounded lexical top-K, due-job claim, canonical backup table pages and schema readback.
+Every exposed operation uses checked-in fixed statements, bound data, explicit
+projections and DTOs. The selected corpus covers probe, stream resolve/lock, capture
+identity/insert, work-task/session continuation, current/history/source open, relation
+pages, lexical top-K, due-job claim, canonical backup pages and schema readback.
+Add no arbitrary SQL or dynamically loaded migration/query directory.
 
 ### 5.1 Exact full-text shape
 
 Scored search uses a numbered match reference:
 
 ```text
-SELECT observation_id,
-       search::score(0) AS score,
-       search_excerpt
+SELECT observation_id, search::score(0) AS score, search_excerpt
 FROM observation
-WHERE project = $project
-  AND search_excerpt @0@ $query
+WHERE project = $project AND search_excerpt @0@ $query
 ORDER BY score DESC, observation_id ASC
 LIMIT $hard_limit;
 ```
 
-Memory query uses `memory_id`/`search_text`. Plain `@@` is unscored only.
+Memory uses memory_id/search_text. Plain `@@` is unscored only. A zero score remains a
+match. Retained exact tests establish numbered scores and representative index iteration,
+not the performance of Eliot's entire corpus.
 
-Exact 3.3.4 language tests prove:
-
-- `search::score(n)` binds to the matching `@n@` predicate;
-- `EXPLAIN` can report `Iterate Index` for the FULLTEXT predicate;
-- a returned score may be exactly `0` and the row is still a match;
-- no matching indexed term returns an empty result rather than a fabricated score.
-
-BM25 ordering changes with corpus statistics. Lexical retrieval is one bounded top-K statement snapshot per call and exposes no cross-call page cursor. A later expansion is a new snapshot with new observed Store/schema/query facts.
-
-Only stable-key readers expose cursors. Every cursor binds query version, scope, identity/revision and options.
+BM25 order changes with corpus statistics. Return one bounded top-K snapshot per call,
+never a cross-call page cursor. A later expansion is a new snapshot. Stable-key cursors
+bind query version, scope, identity/revision and options.
 
 ### 5.2 Bound-data and plan qualification
 
-Ordinary data always uses bound variables. The initial bundle does not claim source qualification for bound variables inside `DEFINE PARAM` merely because the parser accepts a full expression. Slice 0 must execute the exact RPC query with bound metadata values and compare resulting plain INFO output.
+Bound variables always carry ordinary data. Parser acceptance does not prove bound
+`DEFINE PARAM` execution over the real client. Verify exact selected metadata statements
+and resulting plain INFO before admitting that bundle.
 
-For each fixed reader, Slice 0 records the exact query asset digest, representative input shape, `EXPLAIN` result and bounded result DTO. An optimizer choice is evidence for the pinned dataset/version, not a permanent semantic contract; correctness never depends on index use, but latency/admission budgets may reject an unbounded plan.
+For each connected reader retain in PR/check evidence the query digest, representative
+input, result decoder and EXPLAIN. Optimizer choice is version/dataset evidence, not a
+truth contract. Correctness cannot depend on index use; latency/admission budgets may
+reject an unbounded scan. The complete plan/load matrix follows the connected product.
 
 ## 6. Transactions and durable files
 
-Unique values own identity/cardinality. Controlling rows use `FOR UPDATE`. Stream sequence/current revision lock and recheck. Set-wide invariants use deterministic slots. Nondeterministic `UPSERT` is not idempotency. Blobs publish before row transactions. External calls never run inside Store transactions.
+Unique values own identity/cardinality. Controlling stream/current-revision rows lock
+and recheck; selected fixed transactions use FOR UPDATE only after exact execution is
+verified. Deterministic slots own set-wide cardinality. Nondeterministic UPSERT is not
+idempotency. Publish blobs before row transactions. No external call runs under a Store
+transaction.
 
-Retry the entire immutable transaction only for exact retryable conflict. Unknown transport/shutdown/fsync reconciles first. With `sync=every`, an error is not rollback proof.
+Retry the entire immutable transaction only for an exact retryable conflict. Unknown
+transport/shutdown/fsync reconciles first; an error under `sync=every` is not rollback
+proof. No partially executed multi-statement sequence may report committed capture.
 
-Immutable files use same-directory `CREATE_NEW` temp, complete write, file flush, no-replace write-through rename, parent-directory flush and exact no-follow readback. Mutable installation/external-ID state uses expected-generation replacement and exact old/new/unknown reconciliation.
-
-Final backup directory is published atomically from a same-parent temp directory containing an already durable fence. Pre-rename temp never pins; post-rename uncertainty pins after reconciliation.
+Immutable files use same-directory CREATE_NEW temp, complete write, file flush,
+no-replace write-through rename, parent flush and exact no-follow readback. Mutable
+installation/external-ID state uses expected-generation replacement and old/new/unknown
+reconciliation. These are selected durability requirements, not qualified Windows facts.
 
 ## 7. Core operations and host
 
-Capture uses one immutable relay command. After blob publication, one transaction resolves/locks stream, reads replay identities, rejects changed bytes/binding, allocates sequence, inserts observation/relations, coalesces implemented work and commits. Matching readback is required for `committed`; capture never calls a model.
+Capture owns one immutable relay command. Publish its blob, then in one transaction
+resolve/lock stream, read replay identities, reject changed bytes/binding, allocate the
+sequence, insert observation/relations and coalesce only implemented work. Matching
+readback establishes committed. Capture never calls a model.
 
-Private daemon result is `committed | rejected | stage_required | unknown`. Relay stages the same command when direct ownership is unavailable/uncertain. One daemon replayer owns pending files and exposes pause/drain for maintenance.
+Private result is `committed | rejected | stage_required | unknown`. Relay stages the
+same command when direct ownership is unavailable/uncertain. One daemon replayer owns
+pending files; it removes one only after matching commit readback and supports bounded
+pause/drain for maintenance. Staged is durable custody, not a canonical Store commit.
 
-Memory revision preserves history and publishes current/links/result atomically. Job claim freezes finite inputs/method/limits/disclosure/profile. Exact `open` resolves one handle/range and never falls historical identity forward.
+Revision preserves exact history and publishes current/links/result atomically. A stale
+expected revision conflicts; exact command replay returns its original result. Job claim
+freezes finite input/method/limits/disclosure/profile. Exact open resolves one handle/
+range; a historical handle never falls forward.
 
-Initial Claude relay supports SessionStart, UserPromptSubmit, PostToolUse/Failure, Stop, SubagentStop, PostCompact and SessionEnd. Address current work before search; pack corrections, commitments, methods+exceptions, episodes, dissent and handles.
+Initial Claude relay supports SessionStart, UserPromptSubmit, PostToolUse/Failure,
+Stop, SubagentStop, PostCompact and SessionEnd only as verified against the installed
+host. Address work before search and emit actual packet content at admitted boundaries;
+prepared packet metadata alone is not delivery. Cognition owns selection/packing.
 
 ## 8. Backup-set owner and lifecycle
 
-Daemon owns controller-mutation and backup-set owners.
+This section solely owns Memory's physical backup format, publication and restore.
+Controller-dependent cut/release semantics belong to
+[Inference §8–10](INFERENCE-CONTRACT.md#8-memory-backup-interaction). Inference-disabled
+Base neither authenticates a controller nor constructs fake external-call inventory.
+
+One daemon backup-set owner serializes record transitions, dependency snapshots, leases
+and cleanup. When inference is enabled, take locks in this order:
 
 ```text
 close/drain controller mutation
 → enter backup-set transition
-→ disposition external IDs and capture controller/spool cut
-→ build canonical plan
-→ atomically publish/read back final directory + fence
+→ classify external IDs and capture controller high-water
+→ capture Store/replay/spool cut and build plan
+→ publish/read back final directory + fence
 → leave transition
 → reopen controller mutation
 ```
 
-Every call ID is admitted/retired-not-admitted/unknown; every cancel/release/retention ID is observed/retired-not-sent/unknown; every admitted call is controller-closed/dependent.
+For Base omit the external-call steps, not Store consistency. Pause/drain canonical
+mutation and replay across paged Store export, or use a separately established coherent
+snapshot; timestamps and successive SELECT pages alone are not a snapshot. With the
+selected quiesced path, hold canonical mutation/replay closed until table/blob capture
+finishes; direct capture returns stage_required. Take the spool publication lock only
+for a brief exact inventory/generation cut, then allow post-cut relay staging while
+copying. On failure, reconcile exact capture state before reopening; never acknowledge
+uncommitted data to shorten the pause.
 
-Plan digest excludes itself, publication state and later parts/manifest. After fence publication, daemon pages Base tables in canonical application-ID order, copies exact referenced blobs/cut spool/deletions/config and publishes the manifest.
+Backup ID is `b_` plus 32 lowercase hex digits from 128 OS-random bits. It does not come
+from rollback state or wall clock. The canonical plan binds backup/root/schema/spool
+cut, controller cut/dependencies when present, selected config/disclosure and gaps.
+Plan digest excludes itself, publication state and later part/manifest digests. The
+manifest repeats the plan digest and adds exact actual inventories/digests.
 
-Self-contained abort/retire terminal records remain authoritative after cleanup. Malformed/both/mismatch combinations fail closed. Terminalization is not erasure.
+Before any part, create a private same-parent temp directory, write canonical fence.json,
+flush file+directory, atomically no-replace rename to the final backup ID, flush parent
+and reopen final directory/fence no-follow for exact readback. Final directory never
+appears empty. Collision discards temp and recomputes the plan with a new ID before
+publication. Pre-rename temps are non-restorable/non-pinning cleanup debt. A possibly
+committed rename is publication_unknown and pins conservatively after reconciliation.
+Any final fence/terminal record consumes that ID permanently.
+
+Page the fenced Base tables in canonical application-ID order; copy exact referenced
+blobs, cut spool, deletion notices and admitted config; publish the final manifest only
+when every expected member and digest agrees. Missing/truncated/extra/conflicting parts
+cannot become a complete backup.
+
+Terminal records are create-new, durable and self-contained: format, kind, backup ID,
+plan digest, observed fence digest, terminal operation ID, closed reason and, for retire,
+observed manifest digest. Abort requires exact fence, no valid manifest/writer/restore
+lease, exact partial-cleanup disposition and final-manifest absence readback. Retire
+requires exact published fence+manifest, no abort and no restore lease.
+
+```text
+valid standalone retire                  retired/non-restorable
+valid standalone abort                   aborted-before-publish
+fence + matching manifest, no terminal    published/restorable
+fence without valid manifest/terminal     preparing/publication_unknown
+malformed/both/mismatch/ambiguity          unresolved; fail closed
+```
+
+Retain self-contained terminal markers after content cleanup. Terminalization is not
+erasure. Restored maintenance rows cannot create installation authority.
 
 ### 8.1 Bounded restore lease
 
-Before lease admission validate format/schema, part count, unique canonical relative paths, per-part bytes and total bytes against build hard limits and configured narrower limits.
+Before candidate work validate format/schema, finite part count, unique canonical
+relative paths, per-part and total bytes against build and narrower configured limits.
+Keep a logical lease bound to backup/plan/manifest plus no-follow final-directory,
+parts-directory, fence and manifest handles with FILE_SHARE_READ only.
 
-Retain for whole restore:
+In deterministic manifest order open one part with write/delete sharing denied, verify
+regular identity/path/length/digest, copy+verify into the candidate and close it before
+the next part. Never retain an unbounded all-parts handle set. Logical owner blocks
+terminalization/cleanup; directory handles block replacement; the active part handle
+blocks changes during read; digest detects pre-open substitution.
 
-- logical lease bound to backup/plan/manifest;
-- final backup directory handle;
-- `parts/` directory handle;
-- fence and manifest handles;
-- `FILE_SHARE_READ` only;
-- final terminal/manifest identity recheck before cutover.
-
-Stream parts in deterministic manifest order. Open one no-follow read handle with `FILE_SHARE_READ` only, verify regular identity/path/length/digest, copy+verify into candidate and close before the next part.
-
-Logical owner blocks daemon terminalization/cleanup; retained directory handles block directory replacement; active part handle blocks part write/delete while read; digest catches pre-open substitution. No unbounded handle set exists.
-
-Supervisor owns candidate process/root only. Daemon/channel loss forces candidate kill/reap/discard before restart/cutover.
+Retain the lease through final terminal/manifest identity recheck before cutover.
+Supervisor owns the disposable candidate process/root and selection change, not backup
+interpretation. Daemon/channel loss forces candidate kill/reap/discard before another
+daemon or cutover. Supervisor loss is contained by its Job. A scan is not a lease.
 
 ### 8.2 Exact rollback and external work
 
-Restore never writes live root or invents merge. Healthy current Store first gets safety backup. Current deletion notices dominate backup; current post-cut spool merges by exact bytes/disposition; previous root remains until retirement.
+Never restore into the live root or merge later Store rows into restored cognition.
+Healthy current Store first gets a safety backup; disaster mode records unavailable
+current inventory. Current deletion notices dominate backups. Merge current post-cut
+spool only by exact identity/bytes/disposition; retain the previous root until retirement.
 
-Controller-closed jobs restore from backup facts; dependent jobs require exact call/copy. Fixed post-cut interval is inventoried and not adopted as cognition. Missing caller creates owner-action debt. History gap, terminal/auxiliary uncertainty, limit violation or missing dependent copy disables inference while Base remains usable.
-
-Store maintenance mirrors are reconciled against installation authority before job claims and cannot create terminal records, clear pins or replay stale effects.
+Before new job claims, reconstruct installation authority and reconcile future-timeline/
+unmatched Store maintenance mirrors. They cannot create terminal records, clear pins
+or replay stale effects. With inference enabled apply the contract's exact in-cut
+closed/dependent classification and fixed post-cut inventory. History gap or missing
+external copy disables inference, not an otherwise valid Base. A broken local Store/
+lease/cutover invariant still blocks the affected local operation independently.
 
 ## 9. Controller V2 adapter
 
-Contract 0.18 uses stable `memory_inference` client ID, current token version, precommitted global WriteIds and one provider attempt. Reads are identity/get/list/high-water/result-range; caller mutations are text/embed later/cancel/release/retention; owner-only operations install/rotate/disable/erase.
+Implement only the [proposed inference boundary](INFERENCE-CONTRACT.md), after its
+controller-side owner resolves the listed choices and supplies the handlers. Use the
+existing private controller transport, new scoped principal and current commands/writes
+namespace. No assumed write_receipts table, routing key, mutation-floor service or Agent
+binding machinery belongs here.
 
-Exact result is copied and decoded. Release remains blocked by any final/provisional dependent backup. Registration owns monotonic admission and retention cuts. Fixed-window list below cut returns history gap; erased content above cut retains bounded membership tombstone until cut advancement.
+Memory persists IDs before send, validates exact reply identity, copies/verifies result,
+decodes it and publishes a revision consumed later. It exposes disabled/unavailable
+rather than pretending the extension exists. The inference contract owns method names,
+auxiliary readback, credential transitions, release and retention; do not duplicate them
+as a second adapter protocol here.
 
 ## 10. Erasure, rotation and observability
 
-Physical erasure publishes a deletion notice, closes affected mutation/replay, reconciles effects, terminalizes/deletes dependent backup content after leases, uses caller cancel/release-abandon where available and deletes controlled current/previous data. Missing caller requires observed owner break-glass. Markers/tombstones are not physical deletion proof.
+Physical erasure publishes a deletion notice, closes affected mutation/replay, fences
+jobs and reconciles possible effects. After leases, terminalize dependent backups and
+delete their controlled content. Remove affected current/history rows, blobs, spool,
+packet/job copies; delete affected previous roots/candidates/backups wholly where safe
+selective offline rewriting is absent. Respect shared references and exact ownership.
+Caller cleanup or observed owner break-glass covers controller copies; missing authority
+leaves explicit debt. A marker is not deletion proof; provider-side copies remain external.
 
-Store credential rotation closes sockets and restarts Store. Controller rotation preserves stable client ID and delays previous-secret deletion until old-call read/release and restart readback.
-
-Status derives from executable/root/DACL, process/channel/Store admission, schema format/generation/bundle/catalog, query health, capture/spool/replay, backup staging/terminal/lease/limits/candidate/cleanup, controller identity/high-water/cut/tombstones and cleanup debt.
+Store rotation closes sockets and restarts Store. Controller rotation uses its own
+contract and stable client identity; do not give daemon privileged credentials to repair
+it. Status reports actual executable/root/DACL, process/channel/Store/schema/query,
+capture/spool/replay, maintenance/lease/candidate and cleanup readback. Only report
+controller identity/cut/state when that integration actually exists.
 
 ## 11. Implementation sequence
 
-After each coherent production increment run:
+One coherent increment connects caller → operation → durable result/unknown → consumer
+and relevant restart/readback. The following are increments, not mandatory separate
+crates, issues, PRs or stages of a new manager. Runtime work needs its own authorization.
+
+| Increment | Implement now | Exit for that increment |
+|---|---|---|
+| Slice 0 — minimal Store path | Exact child/process/credential admission, selected schema, one bounded client, capture/open transactions and required file/ID helpers | A disposable input can be committed/read back through the real client; uncertain mutation is not falsely acknowledged. No model or backup implementation prerequisite. |
+| Slice 1 — capture and restart | Relay command, durable spool, single replay owner, exact identity/open and restart | One real input survives direct/staged ownership and restart; replay does not duplicate it. |
+| Slice 2 — useful host context | Selected host events, addressed continuation, exact/lexical retrieval, notes/corrections/commitments, packet emission | Host receives useful qualified context and can open exact sources/history. |
+| Slice 3 — Base maintenance | Coherent backup cut, fenced publication, terminal records, bounded restore/cutover, erasure, rotation and shutdown | Actual maintenance paths work with inference disabled; no user-data migration or destructive operation is enabled prematurely. |
+| Inference P1a | Scoped controller extension, persisted job/ID, verified result consumer and external cut/release/retention integration | One finite episode changes later context without hidden retries or rollback resubmission. |
+| Inference P1b and later | Credential rotation and independently selected vectors/views/documents/Research/hosts | Each feature has its own actual consumer; no unused adapter blocks Base. |
+
+Implement the invariants needed by each path with that path. Do not defer credential
+checks, exact mutation identity, size bounds or unknown handling to a final test phase.
+Conversely, do not require the complete DDL/crash/load/backup campaign before writing
+capture/open. Features absent from an increment are unavailable, not successful stubs.
+
+After coherent Rust increments run formatting and minimum changed-package Clippy:
 
 ```text
 cargo fmt --check
-cargo clippy -p <changed-package> --lib --bins -- -D warnings
+cargo clippy -p <changed-package> -- -D warnings
 ```
 
-Slice 0 qualifies Windows/IPC/Surreal/Store, exact migration 0001 grammar, `READONLY`/ASSERT/absence semantics, wrapper bound values and full DDL rollback, catalog readback, unique/concurrency behavior, fixed query DTOs, FTS score/EXPLAIN, durable files/IDs, backup-set owner, terminal records, bounded restore lease, rollback/erasure/rotation/shutdown.
-
-Slice 1 closes event→Store/spool→replay→restart→exact-open. Slice 2 adds qualified Claude context, direct work indexes, lexical top-K, notes/corrections/commitments and Base maintenance with inference disabled.
-
-Then controller #200 and V2 L0/L1; never extend V1. Inference P1a adds stable caller/calls/copies/runner/cut/retention/backup integration and one result changing later context. P1b adds rotation; broader capabilities follow independently. Broad suites follow connected product.
+No broad test factory is introduced by this documentation task. Follow the owner's
+code-first order; the complete deterministic/platform/crash/load campaign comes after
+the assembled product. The controller repository owns checks for its own runtime.
 
 ## 12. Qualification ceiling
 
-Static exact-tag source and language tests now establish the selected clause grammar, `READONLY` update behavior, row-local assertion variables, unique `NONE`/`NULL` skipping, persisted-parameter rollback, plain INFO maps, numbered FTS score and representative index iteration.
+Retained exact-tag source/tests cover selected parser, READONLY/ASSERT, optional UNIQUE,
+PARAM rollback, plain INFO and numbered FTS behavior. They do not qualify Eliot's full
+wrapper, client DTOs, Windows/RocksDB process/durability profile or every reader plan.
 
-They do **not** establish the final Windows binary/process profile, the complete migration wrapper over RocksDB, bound metadata through the production WebSocket client, concurrent unique/lock behavior, every expected catalog string, all reader plans, crash durability or application DTO correctness. Those remain Slice 0 runtime qualification and must not be upgraded to `IMPLEMENTED` by prose or upstream tests.
+Run focused execution as each real path is connected; do not label unrun paths ready.
+The later complete campaign covers every DDL interruption/rollback point, concurrent
+uniqueness/locking, bind/decode and catalog drift, representative FTS/plans/load,
+Windows IPC/ACL/custody, crash/restart, coherent backup/rollback, limits/leases/substitution,
+rotation/erasure, and external unknown/retention behavior when inference is enabled.
+A passing compile or copied upstream test cannot replace those executions.
