@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.25 · 2026-10-28 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.26 · 2026-10-29 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -29,6 +29,7 @@ truth. Equal content from separate occurrences remains separate. Capture policy 
 before durable custody; see [Implementation §7.1](IMPLEMENTATION.md#71-capture-policy-before-durable-custody).
 Preserve supplied temporal resolution/offset separately from certainty; a normalized
 millisecond projection cannot invent unavailable precision or replace the original value.
+The exact time tuple is owned by [Implementation §4.7.1](IMPLEMENTATION.md#471-occurrence-time).
 
 A semantic item is a revisable claim, method, explanation, commitment, prediction or
 project view. Retain exact current/history revisions, origin/reuse/disclosure,
@@ -60,6 +61,9 @@ evidence; cycles add no independent support. Unknown composition stays unknown.
 Applicability is `applicable | inapplicable | conditional_or_unknown`. Evaluate material
 selectors, validity, work/resource version and exceptions. Token/vector similarity is
 not sufficient. Methods and contraindications travel together.
+[Implementation §4.7.2](IMPLEMENTATION.md#472-reuse-and-guidance-states) owns the persisted
+reuse/support/exposure/influence vocabulary. Conditional applicability is not withdrawal;
+a supported but withdrawn method is not eligible advice.
 
 Correction/refutation/erasure triggers bounded reverse traversal over affected revisions.
 Load complete required groups before deciding impact; a truncated traversal cannot
@@ -160,6 +164,9 @@ Automatic mode is `off | idle | background`; a profile may forbid automatic call
 New committed input, correction or explicit question can trigger interpretation. Reads,
 packet creation, cleanup and accounting cannot. For `(project,purpose,target)`, permit
 one active job and one coalesced successor. Waiting is not failure or retry authorization.
+[Implementation §4.7.3](IMPLEMENTATION.md#473-job-state-and-claim-ownership) owns scheduling
+states, claim generations and terminal-result mapping; provider, cognitive and cleanup
+states must not be collapsed into that scheduler status.
 Keep reserved limits, measured usage and unknown usage distinct. A configured token/cost
 ceiling is not observed consumption; absent provider accounting is not zero usage.
 

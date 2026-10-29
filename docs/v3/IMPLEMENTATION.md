@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.45 · 2026-10-28 · design for the greenfield rewrite.**
+**Revision 1.0-draft.46 · 2026-10-29 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -307,7 +307,7 @@ not a generic CRUD method for every table.
 |---|---|---|
 | `stream` | stream_id, project, source_kind/native_id, workspace_id, stream_unique_key, created_at_ms | last_ingest_seq, updated_at_ms; capture allocation and ordered replay |
 | `observation` | observation_id, stream/event/command/native-event identity, ingest_seq, source bytes, occurrence/receipt/creation facts and captured work binding | Immutable accepted observation; exact open, continuation and retrieval projections |
-| `memory` | memory_id, origin_project, created_at_ms | revision, kind, reuse_scope, address tuple/key, content/search_text/exact_cues, disclosure, subject/aspect/perspective, conditions/exceptions, validity, support/exposure/influence, commitment/method state and updated_at_ms |
+| `memory` | memory_id, origin_project, created_at_ms | revision, kind, reuse_scope/reuse_projects, address tuple/key, content/search_text/exact_cues, disclosure, subject/aspect/perspective, conditions/exceptions, validity, support/exposure/influence, commitment/method state and updated_at_ms |
 | `memory_history` | history_id, memory_id, revision, exact semantic snapshot, replaced_at_ms | Immutable prior revision; historical open and provenance |
 | `link` | link_id, source/target kind+ID+optional revision, relation_kind, grounds_group, locator/qualification, created_at_ms | Immutable relation; bounded forward/reverse traversal |
 | `job` | job_id, project, purpose/target, first_queued_at_ms, created_at_ms | Pending intent may coalesce; claim freezes input/method/limits/disclosure/profile; state, slot, due/attempt/claim, result/coverage/cleanup serve one finite consumer |
@@ -325,33 +325,121 @@ The application verifies actual UTF-8/blob byte length and SHA-256. Memory valid
 requires from <= until when both exist. Address key is present exactly when the complete
 address tuple exists and its digest matches.
 
-History uses one typed, versioned `snapshot_json` of the complete replaced semantic
-projection, plus its identity/revision/replaced time. Do not maintain duplicate flattened
-semantic columns. Its decoder verifies agreement with the outer identity/revision and
-preserves all conditions, exceptions, scopes, disclosure, validity, cues and method/
-commitment states. Historical open, backup and restore use that same decoder, never
-reconstruct missing history from the current row. The candidate's unversioned string
-alone does not yet implement this contract.
+History stores `snapshot_json` as `{"format":1,"memory":{...}}`, using the same complete
+semantic revision DTO as current open, plus outer history ID/memory ID/revision/replaced
+time. Outer and inner identity/revision must agree. Include all scopes, target membership,
+conditions, exceptions, disclosure, validity, cues and method/commitment states. Do not
+maintain duplicate flattened history columns or fill missing fields from current state.
+Historical open, backup and restore share this decoder. The source candidate's unversioned
+string does not yet implement it.
 
-Closed enum spellings must be agreed with their writer and consumer before admission.
-The retired pack and source candidate disagree on precision, reuse, support, influence
-and unknown-job encoding; the exact unresolved choices are in R-183. They are not safe
-aliases. Preserve temporal resolution separately from certainty; preserve conditional
-applicability separately from withdrawal/supersession. A `selected` reuse label needs
-persisted target membership and an enforcing reader; until connected, reject that mode
-rather than treating it as permission for every project. Do not create a new policy DB.
+The following spellings are the selected fresh-V3 codecs, not aliases for the retired
+pack or source candidate. Writers, queries, DTOs and history must agree with the admitted
+schema bundle. Unknown discriminants/formats reject as unsupported; malformed tuples
+reject as invalid/damaged, never as an ordinary semantic `unknown` or a permissive default.
+Any needed old-data conversion is explicit and versioned, not a fallback reader.
 
-Job claim owner/expiry are both present or absent; request blob/length/digest are all
-present or absent. Pending uses the pending-slot digest; claimed/running/waiting use the
-active-slot digest; terminal uses NONE. Recheck these invariants transactionally.
-Claim-time immutability is not create-time READONLY: pending fields must remain safely
-coalescible, then the claim transaction freezes the complete tuple once. New input after
-claim goes to the one pending successor; it never rewrites an active request.
+#### 4.7.1 Occurrence time
 
-An uncertain effect keeps its active slot and requires reconciliation. Claim expiry,
-worker loss or a waiting state does not authorize another provider attempt. A stale
-worker cannot publish using only job ID: settlement must match the retained claim and
-frozen input/revision. Exact state/reason encoding must express these distinctions.
+Capture owns these immutable observation fields; exact open returns them together:
+
+| Field | Encoding and meaning |
+|---|---|
+| `occurrence_source` | Optional bounded exact source time spelling, including supplied fractional digits/zone. Numeric input keeps its original token, not a float re-rendering; unit/time scale belongs to the captured source format. |
+| `occurrence_precision` | `unknown`, `date`, `second`, `millisecond`, `submillisecond`, `native`: source resolution, not certainty. `native` means a source-defined clock/unit not represented by the other resolutions. |
+| `occurrence_certainty` | `exact`, `approximate`, `unknown`: source assertion at that resolution, not independent proof of the event's time. |
+| `occurrence_offset_seconds` | Optional signed offset supplied by the source; absence is not UTC and seconds are not rounded to minutes. |
+| `occurrence_time_ms` | Optional signed-64 UTC Unix-millisecond projection, only when the admitted source format yields an unambiguous representable instant. Finer input is floored for this projection only; exact source precision remains above. |
+
+A date-only value does not invent midnight; a timezone-free local time does not adopt
+this machine's timezone. Native clocks and unparseable/out-of-range values retain the
+permitted source and an explicit projection gap, not a fabricated instant. Without source
+time, the optional fields are absent and precision/certainty are `unknown`. A timestamp
+before the epoch is not clamped to zero. Parsing alone never upgrades certainty.
+Source-format conversion is adapter code, not model inference. For example, an exact date and an approximate millisecond timestamp
+remain different tuples. Receipt time and stream sequence still describe capture/order;
+none of these fields makes a wall-clock change feed.
+
+#### 4.7.2 Reuse and guidance states
+
+`origin_project` never changes. The revision writer owns `reuse_scope` and the bounded,
+sorted, duplicate-free `reuse_projects` array of canonical project IDs:
+
+| `reuse_scope` | Eligible destination projects before current authorization/disclosure checks |
+|---|---|
+| `origin` | Origin only; `reuse_projects` is empty. |
+| `selected` | Origin plus the explicitly listed additional projects. The list is nonempty and excludes origin. No wildcard or missing-list default. |
+| `owner_local` | Projects admitted by the current owner's configuration for this Memory installation; `reuse_projects` is empty. This grants neither remote disclosure nor another installation's access. |
+
+Apply this eligibility inside every retrieval arm before its limit, then enforce current
+caller authorization and disclosure at delivery. A caller-supplied project string is not
+an authority. A shared method does not grant access to its private raw sources or permit
+revealing them through a summary. Automatic generalization may select scope only within
+owner-configured permission; it never broadens that permission. Unimplemented membership
+writes/reads leave `selected` unavailable, not equivalent to `owner_local`.
+
+Support, exposure and influence are independent revision fields:
+
+| Field | Closed values and consumer meaning |
+|---|---|
+| `support_state` | `unknown`, `supported`, `disputed`, `refuted`. Records assessed support within its conditions and retained grounds; citations, retrieval count and model confidence do not set it by themselves. |
+| `exposure_state` | `normal`, `reduced`, `hidden`. Controls automatic presentation priority/eligibility, not truth, withdrawal or permission for explicit inspection. |
+| `influence_state` | `active`, `withdrawn`, `superseded`. Only active, non-hidden, non-refuted items may be offered as positive guidance, still subject to applicability and current notices. |
+
+Conditional applicability is computed by Cognition §3, not encoded as influence.
+Unknown/disputed advice stays explicitly qualified; refuted/superseded material may be
+returned as an authorized counterexample or history, never silently as current advice.
+Supersession records exact replacement revision links (multiple for a split); a missing
+or deleted replacement does not reactivate its predecessor. Withdrawal follows §10 even
+when support remains `supported`. Historical open preserves the old tuple plus current
+suppression/authorization qualifications; it cannot bypass current policy.
+
+#### 4.7.3 Job state and claim ownership
+
+Use one scheduling state and a separate cognitive result/cleanup, not extra `unknown`
+and `reconcile_required` lifecycle states:
+
+| `job.state` | Slot and permitted work |
+|---|---|
+| `pending` | Pending slot; coalescible intent, no worker claim or external send. |
+| `claimed` | Active slot; exact input/method/limits/disclosure/profile frozen atomically, one current worker claim. |
+| `running` | Active slot and current claim; execute only that frozen work and retained external identity. |
+| `waiting` | Active slot and frozen tuple remain; resume/reconcile the same work, not a new call. |
+| `succeeded`, `failed`, `cancelled` | No slot or current claim. Retain outcome/coverage and any external cleanup debt; terminal scheduling is not controller-closed backup status. |
+
+`waiting_reason` is present exactly for `waiting`: `capacity`, `dependency`, `policy`,
+`external_pending` or `reconcile_required`. Missing call-admission/send/semantic-commit
+outcome selects `waiting/reconcile_required`; it cannot become `failed` or `cancelled`
+merely to free the slot. Known external work still in progress uses `external_pending`.
+Claimed/running require an owner/expiry pair; in waiting that pair may be retained
+or cleared when the worker relinquishes it. Request blob/length/digest are always all
+present or all absent. Validate each tuple in the owning transaction.
+
+Pending intent may coalesce in existing coverage/source references; `frozen_input_json`
+is absent, not a fake completed snapshot. Claim resolves finite input and method revision
+when the purpose uses a method, freezes the complete tuple and atomically moves pending
+to active. New input goes to the one pending successor. After the first claim the job
+never returns to pending or changes its frozen tuple. Cancellation before claim may
+terminate without a frozen tuple; changed work requires a distinct job, not reused identity.
+
+Reuse `attempt` as the monotonically increasing worker-claim generation (initially zero),
+not a provider-attempt/usage count. Each new claim/reclaim increments it once; exact
+claim replay does not. Exhaustion rejects. Worker-driven state changes/publication must
+match the current installation selection generation, job ID, claim owner, attempt and
+exact frozen tuple, and require an unexpired claim. An expired/old worker cannot publish
+after recovery or cutover.
+Reclaim can recover stored results or read the same controller call; it cannot replace
+an unknown call ID. Lease expiry is not proof that a provider never received the request.
+
+For cognitive jobs, `succeeded` requires completed frozen input and an accepted `changes`
+or `no_change` result. A terminal partial result is `failed` with cognitive `partial`
+and exact remaining coverage; useful accepted revisions remain available. Decode failure
+or definite operational failure is failed with its own result kind. A known stale-revision
+conflict may fail; an unknown commit must reconcile first. `cancelled` requires known
+non-start or observed cancellation/terminal disposition, not a timeout. None authorizes
+an automatic replacement model call. Cleanup uncertainty after a known semantic outcome
+stays in cleanup facts; it does not change that outcome or rerun interpretation. The
+inference contract separately governs release, retention and backup dependencies.
 
 ### 4.8 Indexes connected to readers
 
