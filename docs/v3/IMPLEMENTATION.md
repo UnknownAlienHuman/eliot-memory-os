@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.44 · 2026-10-28 · design for the greenfield rewrite.**
+**Revision 1.0-draft.45 · 2026-10-28 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -46,7 +46,7 @@ when the inference extension is enabled.
   controller-write-id.state       # only when inference is provisioned
   data\roots\<root-id>\{db,blobs}\
   spool\{pending,failed,tmp}\
-  deletions\
+  deletions\                     # typed erasure / influence-withdrawal notices
   backups\
     .tmp-<random>\
     b_<32-lowercase-hex>\
@@ -70,6 +70,11 @@ installation ID, current/previous roots, current/pending/previous Store credenti
 references, expected schema format/generation/digest and maintenance state. Inference
 adds controller/client/token references without another installation registry.
 A new cutover/rotation waits while an earlier previous generation remains unretired.
+
+Parse configuration with the format's parser and validate the selected values. A missing
+optional value may use its documented default; unreadable, malformed or unsupported
+selected configuration is an explicit error, not a silent default. In particular, an
+unavailable capture/disclosure policy cannot become permissive admission.
 
 ### 1.4 Startup
 
@@ -107,6 +112,19 @@ arbitrary path, SQL, argv, endpoint or secret.
 
 These checks apply before the affected credential/effect boundary; the later broad
 Windows campaign does not authorize an insecure development shortcut.
+
+### 2.1 Liveness and bounded recovery
+
+The existing supervisor observes daemon process exit and bounded health replies while
+it owns that process. Process-alive, responsive, operation-progress and committed outcome
+are separate facts. An IPC timeout is unresponsive/unknown, not proof that a mutation
+failed or that a live job made progress. The transient relay is not the watchdog.
+
+Use finite configured drain/stop/restart deadlines and a bounded recovery budget for
+the same incident. Exhaustion leaves actionable status and owner-controlled recovery,
+not an unbounded respawn loop. After restart, application readback resolves outstanding
+operations before retry. Optional log/metric failure must not overwrite a known operation
+result; diagnostics use existing status/log surfaces, not another monitoring service.
 
 ## 3. SurrealDB child and Store transport
 
@@ -472,6 +490,7 @@ reconciliation. These are selected durability requirements, not qualified Window
 
 ## 7. Core operations and host
 
+Apply §7.1 admission before retaining the command or publishing any payload.
 Capture owns one immutable relay command. Publish its blob, then in one transaction
 resolve/recheck stream, read replay identities, reject changed bytes/binding, allocate
 the sequence, insert observation/relations and coalesce only implemented work. Matching
@@ -489,7 +508,9 @@ atomically. Its writer must retain the command identity/result in the existing o
 records; checking only the present revision cannot reconcile a lost reply after another
 revision. Reject reuse with changed semantic input, including scope/disclosure. Until
 that complete transaction and readback exist, primitive inserts/updates are not an API.
-Do not solve this gap with a general second mutation-ledger framework.
+Do not solve this gap with a general second mutation-ledger framework. Retain the
+change's cause/source and attributed actor (or explicit unknown) in the owning observation,
+links and history; a model proposal does not manufacture a human authorization.
 
 Job claim freezes finite input/method/limits/disclosure/profile under §4.7. Exact open
 resolves one handle/range; a historical handle never falls forward. Initial Claude relay
@@ -497,6 +518,26 @@ supports SessionStart, UserPromptSubmit, PostToolUse/Failure, Stop, SubagentStop
 and SessionEnd only as verified against the installed host. Address work before search
 and emit actual packet content at admitted boundaries; prepared packet metadata alone is
 not delivery. Cognition owns selection/packing.
+
+### 7.1 Capture policy before durable custody
+
+The relay applies the owner's selected capture exclusions and byte limits before the
+first payload-bearing spool/temp file, blob, diagnostic or outbound IPC. Daemon capture
+and every import adapter enforce the same admission rule; daemon unavailability is not
+permission to stage otherwise excluded input. Policy load/validation failure rejects
+that capture without echoing the excluded payload. No model decides this admission.
+
+Retain exact **accepted** bytes with the applied policy revision and capture limitations.
+A permitted redacted/partial representation records that transformation and cannot be
+called the complete original. Metadata, locators and error messages must not retain
+excluded content by another route. Never persist an unredacted shadow merely for replay.
+This is configured exclusion, not a promise to detect every possible secret.
+
+The admitted command remains immutable. Replay under a stricter current policy may
+withhold it and require cleanup; it must not rewrite bytes under the same identity or
+re-introduce excluded/deleted input. Recheck current disclosure and suppression before
+context emission, external send and semantic publication, including delayed job results.
+Previously emitted bytes cannot be recalled by a later policy change; report that limit.
 
 ## 8. Backup-set owner and lifecycle
 
@@ -542,7 +583,7 @@ committed rename is publication_unknown and pins conservatively after reconcilia
 Any final fence/terminal record consumes that ID permanently.
 
 Page the fenced Base tables in canonical application-ID order; copy exact referenced
-blobs, cut spool, deletion notices and admitted config; publish the final manifest only
+blobs, cut spool, suppression/deletion notices and admitted config; publish the final manifest only
 when every expected member and digest agrees. Missing/truncated/extra/conflicting parts
 cannot become a complete backup.
 
@@ -585,8 +626,15 @@ daemon or cutover. Supervisor loss is contained by its Job. A scan is not a leas
 
 Never restore into the live root or merge later Store rows into restored cognition.
 Healthy current Store first gets a safety backup; disaster mode records unavailable
-current inventory. Current deletion notices dominate backups. Merge current post-cut
-spool only by exact identity/bytes/disposition; retain the previous root until retirement.
+current inventory. Current suppression/deletion notices in §10 dominate backups before
+any restored guidance, job or replay becomes available. A backup's active influence flag
+cannot cancel a later withdrawal. Merge current post-cut spool only by exact identity/
+bytes/disposition; retain the previous root until retirement.
+
+Missing notice continuity is not an empty notice set. Keep that recovery isolated and
+report the gap; enabling it requires an explicit owner recovery decision acknowledging
+unknown history, never a claim that prior withdrawals/deletions were preserved. Known
+notices cannot be bypassed by that decision.
 
 Before new job claims, reconstruct installation authority and reconcile future-timeline/
 unmatched Store maintenance mirrors. They cannot create terminal records, clear pins
@@ -610,6 +658,24 @@ auxiliary readback, credential transitions, release and retention; do not duplic
 as a second adapter protocol here.
 
 ## 10. Erasure, rotation and observability
+
+Influence withdrawal and erasure have different effects but use the existing outside-
+rollback installation-notice path (`deletions/`), not a second registry. A typed notice
+retains operation identity, target identity, explicit scope (one revision or all revisions),
+kind and a closed reason, without the source body. Daemon owns its publication/readback;
+Store influence fields are projections, not the sole authority surviving rollback.
+
+For withdrawal, close affected publication/delivery, durably publish/read back the notice,
+then update the canonical projection through the existing revision operation. A crash
+between these steps leaves effective suppression and an unfinished projection to reconcile,
+not permission to resume the advice. Never acknowledge success before durable notice
+readback. Startup/restore, context/method selection and delayed-result publication all
+check this authority. Explicit historical open may still return permitted withdrawn
+content with its withdrawal qualification; withdrawal is not erasure.
+
+Reactivation requires an explicitly authorized new operation against the current notice
+identity, durably reflected outside rollback roots. A restore, model proposal, pending
+packet or stale worker cannot retire a withdrawal. Reactivation never overrides erasure.
 
 Physical erasure publishes a deletion notice, closes affected mutation/replay, fences
 jobs and reconciles possible effects. After leases, terminalize dependent backups and

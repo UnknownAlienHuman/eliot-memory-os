@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.24 · 2026-10-28 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.25 · 2026-10-28 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -25,7 +25,10 @@ Implementation §11 owns build order; cognitive algorithms are not another roadm
 An observation preserves occurrence identity, exact accepted source bytes/blob,
 occurrence/receipt times, work/resource binding, locator, capture limitations,
 source-supplied relations and disclosure. It records what a source supplied, not universal
-truth. Equal content from separate occurrences remains separate.
+truth. Equal content from separate occurrences remains separate. Capture policy applies
+before durable custody; see [Implementation §7.1](IMPLEMENTATION.md#71-capture-policy-before-durable-custody).
+Preserve supplied temporal resolution/offset separately from certainty; a normalized
+millisecond projection cannot invent unavailable precision or replace the original value.
 
 A semantic item is a revisable claim, method, explanation, commitment, prediction or
 project view. Retain exact current/history revisions, origin/reuse/disclosure,
@@ -44,7 +47,9 @@ later observations of that work → apply explicit correction/withdrawal/superse
 mark association/environment gaps → only then retrieve related experience.
 
 A similar cancelled direction is not current work. Late results retain issue-time
-binding. Fork/transfer creates explicit relations, not silent renaming.
+binding. Fork/transfer creates explicit relations, not silent renaming. A model summary
+or suggested method cannot silently replace the user's goal/acceptance criteria. Retain
+the source goal and an explicitly attributable amendment; an inference is not an amendment.
 
 ## 3. Grounds and applicability
 
@@ -92,6 +97,11 @@ aliases, lexical search, compatible vectors when enabled, grounds/contradictions
 replacements, typed relations and eligible methods. Apply project/work scope before arm
 limits; union before final selection.
 
+Return examined scope/cut, arm availability and truncation/gaps with the result. An empty
+top-K means no match in that examined retrieval, not that no relevant source exists.
+Timeout, unavailable arm and truncated traversal are not successful empty searches.
+Independent useful arms may still contribute a qualified partial answer.
+
 ### 6.3 Lexical snapshot
 
 Lexical ranking is one bounded top-K Store snapshot. Its BM25 corpus/order can change
@@ -109,11 +119,25 @@ missing checks; exact source handles.
 When a complete qualified unit does not fit, emit a faithful reduction plus handle or
 omit it with an explicit gap. Never drop negation, version or contraindication to fit.
 
+Retrieved text, documents, tool output and recalled model answers are evidence, not
+new host/system instructions. Render them as attributed data with source/revision and
+scope, separately from the selected processing recipe and current user request. Neither
+quoted commands nor a model's claim of authorization can change permissions, disclosure,
+provider route, execution budget or the user goal. Text delimiters alone do not enforce
+this boundary; the application accepts only the owning operation's closed DTO/effects.
+
 ### 6.5 Handoff
 
 Keep prepared, emitted through host contract, action-associated when observable,
 used/influential (often unknown) and outcome-observed distinct. Packet creation proves
 neither use nor success. Context failure does not roll back capture.
+
+Retain the emitted packet's exact bytes/digest, source revisions and observable host
+handoff identity in existing observation/job records. When that packet is later captured
+from a transcript, preserve the occurrence and mark known injected/derived lineage.
+It is not independent evidence for the same claim or a new outcome of the method.
+Do not deduplicate real occurrences by text similarity; unknown echo attribution stays
+unknown. Mere recapture of Eliot's own context cannot drive an interpretation feedback loop.
 
 ## 7. Exact open
 
@@ -136,6 +160,8 @@ Automatic mode is `off | idle | background`; a profile may forbid automatic call
 New committed input, correction or explicit question can trigger interpretation. Reads,
 packet creation, cleanup and accounting cannot. For `(project,purpose,target)`, permit
 one active job and one coalesced successor. Waiting is not failure or retry authorization.
+Keep reserved limits, measured usage and unknown usage distinct. A configured token/cost
+ceiling is not observed consumption; absent provider accounting is not zero usage.
 
 ## 9. Controller-backed job lifecycle
 
@@ -170,6 +196,12 @@ No-change requires completed cognitive work over supplied input. A refused profi
 missing result, unknown call, truncated input/output or failed decoder is not no-change.
 The call's technical success does not prove the interpretation is supported.
 
+Before publication, resolve cited source IDs/ranges against admitted supplied input or
+an explicit authorized exact read; an ID in model JSON cannot create evidence. Recheck
+expected revisions, current scope/disclosure and suppression/deletion notices. Unsupported
+claims remain qualified proposals; fabricated sources or unauthorized effects reject.
+An old job result cannot reinstate a withdrawn method or erased source.
+
 ### 9.3 Cleanup authority
 
 After verified copy or terminal no-result, request caller-authorized release only after
@@ -199,9 +231,10 @@ or require controller availability for an installation that has never admitted c
 
 ## 11. Exact rollback and external work
 
-Restore exact backup cognition, not a merge of later Store rows. Current deletion
-notices dominate backup content. Post-cut spool is reconciled by exact identity and
-bytes through Implementation's owner; its existence is not permission to adopt unrelated
+Restore exact backup cognition, not a merge of later Store rows. Current suppression/
+deletion notices dominate backup content; see
+[Implementation §10](IMPLEMENTATION.md#10-erasure-rotation-and-observability).
+Post-cut spool is reconciled by exact identity and bytes through Implementation's owner; its existence is not permission to adopt unrelated
 future results.
 
 Closed jobs restore from exact backup facts. Dependent jobs need the exact call/copy.
@@ -233,10 +266,17 @@ conditions/body or scoped negative memory, preserves history and checks that lat
 context/request actually consumes the revision. No intelligence score or separate
 self-improvement registry substitutes for that path.
 
+Automatic changes may revise methods or non-security parameters only within owner-
+configured bounds, through the existing revision writer and a named consumer. They
+cannot raise permission/disclosure/cost ceilings or retire a withdrawal. Code changes
+remain developer work, not a runtime self-modifying execution path.
+
 ## 13. Forgetting and erasure
 
 Withdrawal changes guidance, not bytes. Exposure reduction, supersession/refutation,
-source deletion and physical erasure are different decisions.
+source deletion and physical erasure are different decisions. Withdrawal is also an
+outside-rollback suppression fact: an older active revision remains withheld after
+restore, even when its bytes may still be opened for permitted historical inspection.
 
 [Implementation §10](IMPLEMENTATION.md#10-erasure-rotation-and-observability) owns physical
 erasure across controlled current/history/blob/spool/packet/job/backup/previous/candidate
@@ -274,3 +314,22 @@ scoped caller + persisted ID
 Maintenance evidence follows the physical and inference owner contracts. An upstream
 unit test, compiling DTO, prepared packet or model response alone proves none of these
 complete paths.
+
+## 15. Additive capabilities and their consumers
+
+These retained requirements are later increments, not reasons to scaffold new engines
+before Base. Each uses existing observations, revisions, finite jobs and exact open.
+
+| Capability | Input → result → actual consumer | Failure boundary |
+|---|---|---|
+| Project views | Explicit question/scope/cut → versioned answer with source coverage → context or exact view open | Failed/partial refresh retains the prior qualified view and exposes its age/gaps, not an empty successful refresh. |
+| Cross-project methods | Attributable episode/outcome → provisional generalization with conditions and origin → authorized project retrieval | Shared label is not broad efficacy or permission. Selected membership must be persisted/enforced before that mode is enabled. |
+| Documents/media | Permitted original → versioned external conversion with hierarchy and page/span/time locators → retrieval and exact representation open | Conversion failure preserves allowed raw access and states unsupported/partial; no invented text or flattened loss of provenance. |
+| Embeddings | Exact source revision plus query/document role and compatible model/space → individually mapped vectors → optional retrieval arm | Missing, mismatched or failed input has no fabricated zero/aggregate vector; exact/lexical Base remains available. |
+| Research | Explicit finite acquisition request through the configured external owner → retained result, sources and terminal/partial status → ordinary interpretation | Unavailable source or failed request is not no-findings; Memory does not add another research executor. |
+
+Self-inspection uses the same source/open/status paths for Eliot's own documents and
+operations; it does not create a separate self-model registry.
+
+Adapters are chosen when their first writer and consumer are implemented. Historical
+donor choices are research inputs, not authorization to add unused dependencies.
