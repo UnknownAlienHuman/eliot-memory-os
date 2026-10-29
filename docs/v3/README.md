@@ -19,7 +19,7 @@ below. Read the relevant sections and source, not this entire directory. The
 | Entry pages, navigation or work registry | [AGENTS](../../AGENTS.md), [authority](../ARCHITECTURE_CONTRACT.md), affected index/registry row | A link or summary changes a product rule: read that owner section. |
 | Product boundary or new mechanism | [Architecture §1–3](ARCHITECTURE.md#1-purpose-and-completion) | Follow the mechanism into Implementation; do not create an owner per noun. |
 | Startup, processes, Windows IPC | [Implementation §1–3](IMPLEMENTATION.md#1-runtime-and-installation), [Architecture §2](ARCHITECTURE.md#2-ownership) | Identity, credentials, shutdown or restore custody changes. |
-| Store schema, IDs, query or transaction | [Implementation §4–6](IMPLEMENTATION.md#4-migration-0001-and-schema-authority), [Store candidate scope](store/README.md) | Follow the changed field/query to its writer and reader; inspect exact pinned upstream semantics when relied on. |
+| Store schema, IDs, query or transaction | [Implementation §4–6](IMPLEMENTATION.md#4-migration-0001-and-schema-authority), [Store source ownership](store/README.md) | Follow the changed field/query to its writer and reader; inspect exact pinned upstream semantics when relied on. |
 | Capture, spool, replay or host emission | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host), [Cognition §1–2](COGNITION.md#1-observations-claims-and-revisions) | Context construction: read Cognition §6; maintenance crossing: read Implementation §8. |
 | Retrieval, context, correction or learning | [Cognition §2–6](COGNITION.md#2-current-work-reconstruction), then the affected algorithm | Persistence: Implementation §4–7; external model call: Inference contract. |
 | Backup, restore, erasure or rotation | [Implementation §8–10](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle), [Architecture §7–8](ARCHITECTURE.md#7-backup-authority) | Controller copies, release or retention are involved: read the matching Inference clauses. |
@@ -49,10 +49,11 @@ are documentation work, not an alternative runtime scheduler.
 
 ## Design assets and dependencies
 
-[Store candidates](store/README.md) are subordinate to Implementation and remain
-unqualified. The separate Store source PR is not present in this documentation
-branch; its disposition and concrete mismatches are in the registry. Do not load
-candidate `.surql` dynamically or mistake design assets for an admitted Store.
+[Store source ownership](store/README.md) identifies one executable asset owner.
+Its separate unmerged PR is not present in this documentation branch and is not
+an admitted Store. The former docs SQL copies are retired; their exact historical
+links and unresolved differences remain available. Do not dynamically load docs
+or import a stale pack instead of fixing the owning source.
 
 Controller foundation and Memory inference are different capabilities. Do not
 copy a historical controller SHA or unchecked-roadmap claim into a current task.

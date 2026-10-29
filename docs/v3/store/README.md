@@ -1,76 +1,44 @@
-# V3 Store candidate assets
+# Store source ownership
 
-**Status: design-only Slice 0 input. Not runtime code, not a second Store contract, and not proof that SurrealDB 3.3.4 accepts the complete bundle.**
+The Store package owns executable schema, migration wrapper and fixed query bytes.
+[Implementation §4–7](../IMPLEMENTATION.md#4-migration-0001-and-schema-authority) owns
+the contract; [the existing D4 findings](../ANALYSIS-REGISTRY.md#store-reconciliation)
+own unresolved work. This directory is navigation, not a second executable SQL pack.
 
-The normative owner remains [Implementation](../IMPLEMENTATION.md), especially §§4–6 and §12. The [analysis registry](../ANALYSIS-REGISTRY.md) records the exact proof ceiling. These files make the selected schema and read/query shapes reviewable before production code exists.
+## Source candidate, not a working Store
 
-## Files
+The current review target is
+[PR #5327](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5327), owned by
+[issue #5326](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5326):
 
-- [`0001-base.surql`](0001-base.surql) — candidate first migration body for the six Base tables, fields, analyzers and indexes.
-- [`queries-base.surql`](queries-base.surql) — named fixed-query shapes for exact readers, lexical retrieval, backup paging and schema readback.
+- [Schema package at c5154b0](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/c5154b0ea352980279cd0d46ca3353148d4c8027/crates/storage/eliot-v3-store-schema)
+  owns DDL, one wrapper, source catalog metadata and their digests.
+- [Fixed queries](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c5154b0ea352980279cd0d46ca3353148d4c8027/crates/storage/eliot-v3-store-schema/src/queries.rs)
+  are source fragments, not complete capture/revision/job operations or a connected client.
 
-The runtime must not load this directory dynamically. Production code will embed or include exact checked assets, compute their digests, bind only closed DTO variables and compare the live catalog against an expected catalog generated from the **same qualified asset bytes**.
+That PR is separate and unmerged at this review. Naming its package as the sole asset
+owner does not approve its current bytes. Imports, unsupported FOR UPDATE targets,
+byte budgets, representations, claim-time freeze, catalog evidence and full transaction/
+readback remain recorded defects. Correct them in the owning source task; do not copy
+its files into the documentation branch or create a third schema/query catalogue.
 
-## Exact target
+## Retired design inputs
 
-```text
-SurrealDB tag/commit: v3.3.4 / 1ac2b1dba7cd177621a4cf5d507caebeb2414395
-transport:            authenticated query-only JSON WebSocket
-storage candidate:    external RocksDB with sync=every
-schema:                STRICT database, six SCHEMAFULL tables
-```
+The former [migration](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c2b7402c3fedc51ccb3fb881173e028ffcbdac44/docs/v3/store/0001-base.surql)
+and [query pack](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c2b7402c3fedc51ccb3fb881173e028ffcbdac44/docs/v3/store/queries-base.surql)
+remain available at that exact historical revision. They were never qualified runtime
+assets. Their enum/history/wrapper differences are dispositions to reconcile, not two
+equally current formats. Do not restore or dynamically load them as a fallback.
 
-Exact-tag source/tests already support the selected `DEFINE TABLE`, `DEFINE FIELD`, `READONLY`, type, analyzer, FULLTEXT, UNIQUE, plain `INFO`, numbered match and score forms. They also establish that a unique tuple containing `NONE` or `NULL` is skipped, that `READONLY` allows initial and same-value writes, and that persisted `DEFINE PARAM` plus index overwrite participate in tested transaction cancellation cases.
+## Next source increment
 
-They do **not** prove the complete Eliot wrapper over every DDL statement, bound metadata value, query DTO, conflict path or Windows/RocksDB failure. Slice 0 must execute the exact bytes and retain the result.
+Follow [Implementation §11](../IMPLEMENTATION.md#11-implementation-sequence), not the old
+all-in-one Slice 0 checklist. First connect the actual Store admission and one complete
+capture/open path with finite input/result bounds, exact identity and unknown readback.
+Select only statements used by that path; keep unimplemented operations unavailable.
 
-## Runner-owned wrapper
-
-`0001-base.surql` is one candidate transaction body. The runner:
-
-1. selects the configured namespace and STRICT database through the authenticated Store connection;
-2. binds exactly:
-   - `$bound_schema_bundle_format`;
-   - `$bound_schema_generation`;
-   - `$bound_schema_bundle_sha256`;
-3. executes the file as one query call;
-4. checks every returned statement status;
-5. on success, reads the three params plus plain `INFO FOR DB` and `INFO FOR TABLE` for every owned table;
-6. sorts owned map keys and compares exact server-canonical `DEFINE` strings for the pinned version;
-7. classifies a lost reply only through exact metadata and catalog readback.
-
-The schema-bundle digest preimage is defined by Implementation and includes runner protocol, wrapper template, ordered UTF-8/LF asset bytes and expected-catalog template. Bound metadata values are outside the preimage.
-
-## Deliberate qualification gaps
-
-The candidate migration uses only per-field assertions whose exact language form is already supported by the pinned parser/runtime evidence. The following invariants remain owned by fixed writers and must be exercised in Slice 0 before any server-side cross-field assertion is promoted into the migration:
-
-- observation inline/blob XOR and exact byte length/digest;
-- memory validity interval ordering;
-- complete-address tuple and derived digest agreement;
-- job claim-owner/expiry pair;
-- job request blob/length/digest tuple;
-- job state/slot-key agreement;
-- stream sequence and revision allocation;
-- replay identity, set cardinality and concurrency.
-
-This is intentional. A guessed `$before`/`$after` expression inside a checked-in migration is worse than an explicit open qualification item.
-
-`queries-base.surql` is a review corpus of named statements. The production client must split and embed the selected blocks; it must never expose the whole file, arbitrary SurrealQL, dynamic grammar or a generic CRUD surface.
-
-## Slice 0 acceptance
-
-The pack becomes production-qualified only after the exact Windows binary/profile demonstrates:
-
-- parse and execution of every DDL asset in the exact runner order;
-- bound metadata variables inside the three `DEFINE PARAM` statements;
-- rollback after injected failure at each table/field/analyzer/index boundary;
-- exact catalog strings and metadata readback after commit and lost reply;
-- positive/negative immutable-field and closed-state writes;
-- concurrent unique-key and `FOR UPDATE` behavior;
-- exact query DTO decoding and stable-key continuation;
-- representative `EXPLAIN` for every required reader;
-- bounded lexical top-K behavior, including score `0`;
-- crash/restart admission with RocksDB `sync=every`.
-
-Until then, these files remain `DECIDED / NOT QUALIFIED` design inputs.
+Rust compile/Clippy checks source; exact-engine execution checks the selected DDL/query
+and DTO boundary; restart/readback checks the connected behavior. One does not imply
+the others. Add broader rollback/concurrency/platform/load coverage after the connected
+product in the owner's development order. No successful local compiler, SurrealDB or
+Windows run is claimed by this documentation change.
