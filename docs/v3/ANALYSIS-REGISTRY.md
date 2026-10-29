@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Сверка: 2026-10-28. Рабочая документация PR #5325; не merged authority и не runtime gate.**
+**Сверка: 2026-10-29. Рабочая документация PR #5325; не merged authority и не runtime gate.**
 
 Единственный активный реестр V3: текущие решения, разрывы, границы проверки и следующий
 шаг. Контракты принадлежат своим документам; [AUDIT](AUDIT.md) и
@@ -17,9 +17,9 @@
 | D0. Установить версии и владельцев | `CHECKED` source | Снимки ниже; обновить перед изменением внешнего контракта. | V3 working branch, V2 donor, Store source и controller не смешаны. |
 | D1. Исправить вход и маршруты чтения | `REVIEW_PENDING` | AGENTS/WORKFLOW/START и индексы сокращены; Store route теперь ведёт к одному source owner. | Независимый читатель находит owner section без обязательного стека книг и V2-инструкций для V3. |
 | D2. Согласовать нормативные документы с controller | `REVIEW_PENDING` | Четыре owner drafts и #199 исправлены; foundation отделён от предложенного Memory API. | Независимо проверить source mapping, scoped методы и оставленные решения. Controller acceptance/runtime не подразумеваются. |
-| D3. Упростить конструкцию и порядок реализации | `PARTIAL` | Physical backup принадлежит Implementation §8; §11 отделяет первый Store/capture/open от maintenance/qualification. Удалён второй исполняемый SQL-каталог из docs. | Проверить оставшиеся механизмы на caller/owner/result/consumer и сохранение требований. |
+| D3. Упростить конструкцию и порядок реализации | `PARTIAL` | Physical backup и порядок реализации имеют одного owner; docs SQL retired. AUDIT сокращён до причин выбора, historical evidence и маршрутов, без второй runtime-инструкции. | Проверить оставшиеся механизмы на caller/owner/result/consumer и сохранение требований. |
 | D4. Свести Store-контракт и assets | `PARTIAL` | Исправлены ownership, record-target FOR UPDATE, history, claim-time freeze, bounds и readback в Implementation §4–7. Далее выбрать конкретные state/precision/reuse codecs R-183 и согласовать изменения с #5326/#5327. | Один source owner; каждый field/query/limit соединён с writer/reader. Source defects не закрыты правкой prose; compile, DDL execution и runtime разделены. |
-| D5. Проверить требования и сценарии | `PARTIAL` | В AUDIT-MAP все 63 якоря, 8 границ и T01–T37 связаны с owner sections; добавлены 7 сквозных маршрутов. Исправлены R-189–R-194. Далее проверить retained AUDIT/inbound references и независимо прочитать сценарии. | Сверка записанного корпуса не объявляется повторным чтением недоступных первоисточников или runtime proof. Все известные требования имеют route; unresolved codecs остаются D4. |
+| D5. Проверить требования и сценарии | `PARTIAL` | AUDIT-MAP: 63 якоря, 8 границ, T01–T37 и 7 маршрутов. AUDIT: дополнительно все 34 требования и A15-1–29 ведут к current owners; старые imperatives устранены. Далее R-183, retained-tree inbound pass и независимое чтение сценариев. | Сверка записанного корпуса не объявляется повторным чтением недоступных первоисточников или runtime proof. Все известные требования имеют route; unresolved codecs остаются D4. |
 | D6. Интеграция документации | `BLOCKED` | Независимое ревью, финальный diff, применимые doc/link checks и существующий merge gate. | Проверен именно финальный кандидат; нет фиктивных receipts, снятия protection или незаявленных CI-изменений. |
 
 Read-only проверки можно разделять; общие файлы меняет один writer. REVIEW_PENDING
@@ -31,7 +31,7 @@ Read-only проверки можно разделять; общие файлы 
 | Объект | Проверенный снимок | Граница |
 |---|---|---|
 | Memory integration base | `5aac094834fb5635921b550c821cb933a1196105` | Retained V2; PR #5325 не слит. |
-| V3 parent этой правки | `03114308a4ee5e2a1fddffd8f8452c31bcf87d70` | Четыре owner drafts и полный AUDIT-MAP сопоставлены по записанным требованиям; это не runtime. |
+| V3 parent этой правки | `ec9a8e591fa82871369bb637667c5bfca8385434` | Перечитан retained AUDIT и сопоставлен с актуальными owners. Scope: legacy directives, 34 требования, A15-1–29 и навигация; не runtime. |
 | Store source | `c5154b0ea352980279cd0d46ca3353148d4c8027`, PR #5327 | Наследованный D4 snapshot. Исходники и runtime этим проходом не изменялись и не квалифицировались. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованный D4 source finding; этот D5-проход не перепроверял upstream и не запускал движок. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb` | Наследованный D2 snapshot; этот D5-проход не заявляет новую проверку controller main. |
@@ -70,6 +70,7 @@ PARTIAL — неполное покрытие; BLOCKED — конкретная 
 | R-176 | Blanket «drafts synchronized» скрывал несовместимые prerequisites. | Owning sections исправлены; полная сверка требований остаётся D5. |
 | R-177 | Slice 0 требовал полный maintenance/crash campaign до первого Base. | §11 задаёт connected increments; устаревшая инструкция Store README заменена ссылкой на §11. |
 | R-181 | Последовательные backup pages не устанавливают coherent cut. | Implementation §8 удерживает mutation/replay quiesce; spool lock краткий. Runtime не проверен. |
+| R-195 | Retained AUDIT продолжал предписывать SDK, Agent/Task inference, daemon-owned Store, branch-address и отдельный график с inference до maintenance. | Эти указания заменены ссылками на фактических owners; старые решения/source trace сохранены по pinned history. Аудит не пятый нормативный документ. Требуется независимое чтение, не runtime proof. |
 
 ## Scenario preservation
 
@@ -81,9 +82,10 @@ PARTIAL — неполное покрытие; BLOCKED — конкретная 
 | R-189 | SEC-01/MEM-01 требовали permitted capture, но не определяли exclusion перед spool/blob/IPC. | Implementation §7.1: admission до durable custody, policy revision/limitations, без unredacted shadow и переписывания same-ID replay. При реализации проверить relay/import/daemon и stricter-policy replay. |
 | R-190 | Data/instruction boundary и исключение injected echo оставались в карте, а не в алгоритме. | Cognition §6.4–6.5/§9.2: attributed evidence, closed effects, exact source validation; packet lineage не independent support. Реальные host lineage/packet DTO ещё подключить. |
 | R-191 | Restore сохранял deletion notices, но мог вернуть отозванный метод из старого active row. | Implementation §10/§8.2: typed suppression в существующем outside-root notice path; publish-before-ack, projection reconciliation, current-notice checks. Кодек/atomic file protocol ещё реализовать; не строить второй registry. |
-| R-192 | Карта всё ещё предписывала legacy controller Operation; часть later capabilities была сведена к названиям без consumer/failure. | AUDIT-MAP §6 теперь направляет в current owner; Cognition §15 сохраняет view/transfer/document/vector/Research paths. Далее исправить historical imperative в AUDIT §38 (Operation/старые draft-set claims), не меняя source evidence; не добавлять dependencies раньше callers. |
+| R-192 | Карта всё ещё предписывала legacy controller Operation; часть later capabilities была сведена к названиям без consumer/failure. | AUDIT-MAP §6 и AUDIT §9/§33/§38 направляют в current Inference owner; Operation — только historical trace, synchronized-draft claim удалён. Cognition §15 сохраняет later consumers; runtime остаётся отдельной работой. |
 | R-193 | WDG-01/02/T14 не имели конкретного наблюдателя зависшего daemon. | Implementation §2.1: existing supervisor, finite health/recovery, separate alive/progress/outcome, no uncertain-effect retry. Реальные deadline/custody/status paths ещё реализовать. |
 | R-194 | Пустой/частичный retrieval и budget metadata могли быть приняты за полноту/измерение. | Cognition §6.2/§8: examined scope/cut, unavailable/truncation отдельно; reserved/measured/unknown usage. Проверить итоговые DTO/consumers вместе с R-183. |
+| R-196 | Дополнительные 34 требования и A15-1–29 оставались в AUDIT с собственными краткими предписаниями, без current owner routes. | Все номера/названия сохранены и адресованы; эти наборы не подменены 63 якорями Claude или семью объединёнными сценариями. A15-22 использует уже существующий §8.2 isolated owner recovery при missing notice continuity, без объявления неизвестной истории сохранённой. |
 
 D5 не отменяет D4: precision/reuse/state codecs и source defects не исправлены этой
 правкой. Новые notice/packet поля должны войти в существующих владельцев, не новый
@@ -235,7 +237,7 @@ R-идентификаторы сохранены. Подробная исход
 | R-058–R-067 | Connected behavior, один ledger, cheap preflight, без object family на noun. D3 проверяет оставшуюся конструкцию. |
 | R-049 | Code first; minimum fmt/changed-package Clippy; broad qualification после assembled product. |
 | R-059 | Исправлять owner text, не append-only errata. |
-| R-024 | PARTIAL: recorded requirements получили current owner routes; privacy/withdrawal/echo gaps исправлены в design. Полные архивы, retained inbound graph и независимое D5 review не закрыты. |
+| R-024 | PARTIAL: recorded requirements, включая 34/A15-29, имеют current owner routes; AUDIT больше не задаёт конкурирующий механизм. R-183, полные архивы, retained inbound graph и независимое review не закрыты. |
 | R-076 | PARTIAL: Base/inference separation сохранена; Store representation/source completion остаётся D4. |
 
 ## Source coverage
@@ -256,6 +258,7 @@ S-084–S-087 — exact-tag Surreal evidence; S-088/S-089 — design/assets, н�
 | S-097 | Docs pack c2b7402 против source DDL/query/catalog c5154b0. | Найдены R-182–R-188; удаление дубля не квалифицирует source. |
 | S-098 | Полный AUDIT-MAP на 03114308: 63 якоря, 8 границ, T01–T37, 47 донорских строк и поздний §6. | Сверка записанного корпуса с current owners; первичные недоступные архивы и доноры не перечитывались. |
 | S-099 | Implementation/Cognition после scenario repair и требовательные normal/failure routes. | Design changes R-189–R-194; существующий ledger/исторический корпус сохранены, независимое review и runtime не заявлены. |
+| S-100 | AUDIT на ec9a8e59 целиком: §1–14, retained §16–38, 34 требования и A15-1–29; current Implementation §8.2 и Cognition §15. | R-195/R-196: source/text reconciliation. Primary archives, historical donor code и runtime повторно не проверялись. |
 
 ## Integration blockers
 
