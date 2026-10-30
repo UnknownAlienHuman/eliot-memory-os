@@ -11,6 +11,7 @@ fifth specification nor another backlog. Read only the section needed by your ta
 | Start one implementable assignment | [One bounded task](#one-bounded-task) |
 | Choose checks and interpret failure | [Checks](#checks) |
 | Update a contract, source or reference | [Change propagation](#change-propagation) |
+| Register or refresh the actual task | [Assignment registration](#assignment-registration) |
 | Deliver documentation to main | [Documentation integration](#documentation-integration) |
 
 ## Repository map
@@ -68,6 +69,11 @@ Path: caller -> operation -> saved result/unknown -> reader/consumer.
 Checks: commands, expected observations and target environment.
 Remaining: next action or exact blocker; no implied runtime PASS.
 ```
+
+Keep the issue body as the stable assignment. Put changing commits, runs and progress
+in the PR or comments; editing a body bound by a catalogue invalidates that binding.
+A real scope/disposition change needs [registration refresh](#assignment-registration),
+not a copied digest or a second work ledger.
 
 For source work, first trace the current caller and reader. Then implement the
 smallest coherent change in the owning module. Use
@@ -242,6 +248,8 @@ matching row is only membership, not acceptance. With a nonempty legacy catalogu
 `_checklist_state` refuses an undeclared issue even when `recorded=true`; changing an
 R-row or supplying a plausible digest does not register it. Never borrow an old issue,
 delete the catalogue or hand-edit its generated hashes to make the check pass.
+For a missing or changed assignment, use [the existing generator](#assignment-registration);
+absence of a row does not by itself require modifying the checker.
 
 For reading coverage, inspect the existing reader's required paths on the complete
 candidate checkout. This single-path command is a diagnostic, not full-PR evidence:
@@ -283,6 +291,57 @@ a successful read bundle neither registers the task nor supplies independent rev
 The concrete repair scope and current observations are in
 [the existing D6 finding](ANALYSIS-REGISTRY.md#integration-tooling-follow-up).
 
+### Assignment registration
+
+Only the root/assignment owner changes the catalogue. Use the existing
+[`generate-cohort-lock` entrypoint](../../scripts/work_unit_gate/__main__.py), not
+an issue-specific verifier exception. This is metadata generation, not product proof.
+
+Prepare one **local** `.eliot/cohort-snapshot.json` for the declared catalogue scope:
+
+| Input | How to obtain and check it |
+|---|---|
+| `header.repository`, `base_revision` | Observed repository and full `git rev-parse HEAD` before generation. This is the acquisition base, not a claim that every old row was freshly verified. |
+| `header.acquired_at`, `acquisition`, `note` | Actual UTC acquisition time, exact sources and limits. Distinguish inherited catalogue rows from live issue reads; preserve their older provenance rather than relabelling it current. |
+| `header.complete`, `missing_sections`, coverage/counts | Account for every row in the selected catalogue and the actual descriptor directory. Refuse partial/moved acquisition; do not claim a whole-GitHub inventory. |
+| `rows` | Preserve every unrelated existing row. Add/update only the assigned issue with its declared unit, disposition and prerequisites; compute `body_sha256` from the exact API `body` UTF-8 string, without trimming or appending a newline. |
+| `numeric_descriptors` | Actual `cohort.discover_numeric_descriptor_files` result, not a desired list. Never filter out an inconvenient real descriptor. Synthetic examples belong in `scripts/testdata/`, not the active directory. |
+
+The closed snapshot row is `{issue, unit, body_sha256, disposition, prerequisites}`.
+The generator's exact schema and constraints live in
+[`cohort.generate_cohort_lock`](../../scripts/work_unit_gate/cohort.py). An `assigned`
+row needs its real executable descriptor. A documentation task blocked on review uses
+its explicitly declared `blocked` disposition without inventing a Rust package, test
+matrix or executable descriptor; its final-candidate checklist remains required.
+
+For an API JSON response saved as `.eliot/issue.json`, compute the body digest with:
+
+```text
+python -c "import json,hashlib; from pathlib import Path; d=json.loads(Path('.eliot/issue.json').read_text(encoding='utf-8-sig')); assert d['number']==5324 and d['state']=='open' and 'pull_request' not in d; print(hashlib.sha256(d['body'].encode('utf-8')).hexdigest())"
+```
+
+Use the actual task number and verify the response repository URL before using it.
+A metadata digest binds the text; it does not decide its disposition or grant authority.
+Then generate to a temporary output. The readback below is for the descriptor-free
+documentation catalogue; executable rows instead need their real decoded descriptor
+mapping passed to the existing cohort validator, never an invented empty mapping:
+
+```text
+python -m scripts.work_unit_gate generate-cohort-lock --snapshot .eliot/cohort-snapshot.json --out .eliot/work-unit-cohort.toml --root . --json
+python -c "from scripts.work_unit_gate import cohort; p='.eliot/work-unit-cohort.toml'; lock=cohort.read_cohort_lock(p); rows=cohort.locked_catalogue_rows(p); observed=tuple(sorted(n for n,_ in cohort.discover_numeric_descriptor_files('.github/work-units'))); assert observed==lock.aggregate.numeric_descriptors; print({'rows':len(rows),'numeric_descriptors':observed,'digest':lock.aggregate.sha256})"
+```
+
+Require success from **each** command. Read back the issue again: a changed body or
+scope requires fresh generation. Review every changed row, preservation of unrelated
+rows, descriptor membership and counts. Only then copy the generated bytes to
+`.github/work-unit-cohort.toml` and inspect `git diff --check` and the full diff.
+Keep snapshots, API responses and temporary outputs out of Git. The retained lock is
+the machine catalogue; ANALYSIS-REGISTRY remains the sole V3 work ledger.
+
+Membership fixes only the assignment lookup. The actual PR still needs its own recorded
+checklist bound to the final candidate tree, genuine reading evidence and independent
+review. A local counterexample using synthetic tree IDs is never that evidence.
+
 ### Final-candidate verification
 
 The documented shared command is:
@@ -299,7 +358,7 @@ Do not hand-author an invented receipt or an independent review under the writer
 | Failure | Next action, not a workaround |
 |---|---|
 | `EMPTY_DOCUMENTATION_EVIDENCE` | First check assignment and V3 reading coverage above; then prepare the genuine final-candidate block. A missing block may be only the first failure. |
-| `CHECKLIST_REQUIRED_MISSING` or undeclared work issue | Tooling owner resolves the actual task/assignment binding. `recorded=true`, an unrelated historical issue or a new Markdown checklist cannot substitute for it. |
+| `CHECKLIST_REQUIRED_MISSING` or undeclared work issue | Missing/stale assignment: [regenerate the actual binding](#assignment-registration). Registered task: inspect its recorded checklist and final-tree binding. An unrelated issue, stale tree or `recorded=true` alone is not a repair. |
 | Reader cannot route/admit this V3 change | Record the exact command/error and affected input in D6. The tooling owner must resolve the version mismatch as a scoped change; do not expand payload caps or weaken the gate here. |
 | No independent review | Request a real read-only review of the frozen candidate; report unavailable review honestly. Do not manufacture approval. |
 | Provisioning/build environment failure | Identify the failed input/step and its owner; do not blame unexecuted code or mark skipped compilation passed. |
