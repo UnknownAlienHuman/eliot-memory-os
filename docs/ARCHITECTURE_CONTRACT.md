@@ -4,11 +4,11 @@ This page identifies owners and precedence. It is not another product specificat
 
 ## V3 working authority
 
-The owner selected a fresh V3 design and retained V1/V2 Memory as donors. While
-issue #5324 / PR #5325 is open, `docs/v3/` on
-`docs/5324-v3-documentation-audit` is the working design. `main` remains the
-integration base. A working draft is neither merged authority nor runtime support.
-After integration, use the merged files on `main`; do not revive a closed branch.
+The owner selected a fresh V3 design and retained V1/V2 Memory as donors.
+PR #5325 is merged: `docs/v3/` on current `main` is the documentation baseline.
+The exception for `docs/5324-v3-documentation-audit` has ended; do not revive it.
+Merged design is not implemented behavior, independent review or runtime support.
+The existing registry keeps unresolved decisions and verification work visible.
 
 | Owner document | Decision owned |
 |---|---|

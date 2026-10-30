@@ -1,6 +1,6 @@
 # Eliot Memory OS V3
 
-**Working design in PR #5325; not a qualified runtime.**
+**Documentation baseline on `main`; PR #5325 is merged. Not a qualified runtime.**
 
 Memory preserves observations, revises knowledge and supplies useful context.
 Hosts/controllers execute tasks and own permissions/acceptance. Base capture,
@@ -52,8 +52,8 @@ are documentation work, not an alternative runtime scheduler.
 ## Design assets and dependencies
 
 [Store source ownership](store/README.md) identifies one executable asset owner.
-Its separate unmerged PR is not present in this documentation branch and is not
-an admitted Store. The former docs SQL copies are retired; their exact historical
+Verify its separate source PR and current code; merging documentation does not
+admit that Store implementation. The former docs SQL copies are retired; their exact historical
 links and unresolved differences remain available. Do not dynamically load docs
 or import a stale pack instead of fixing the owning source.
 
