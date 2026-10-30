@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 SCHEMA = "eliot-doc-routes-v1"
+CONFIG_SCHEMA_V2 = "eliot-doc-route-config-v2"
 INDEX_SCHEMA = "eliot-handle-index-v1"
 GENERATED_MARKER = "<!-- generated: eliot-doc-routes-v1 -->"
 DEFAULT_CONFIG = "docs/architecture/route-rules.toml"
@@ -34,7 +35,7 @@ LEGACY_BOOKS = {
     "docs/architecture/ELIOT_IMPLEMENTATION.md",
 }
 SKIP_PARTS = {".git", "target", ".idea", ".vscode", "node_modules", "bin", "obj"}
-COVERAGE_KEYS = ("path", "topic", "expect_routes", "expect_required_handles", "expect_absent_routes")
+COVERAGE_KEYS = ("path", "topic", "expect_routes", "expect_required_handles", "expect_absent_routes", "expect_required_files")
 # Topic text is matched as whole alphanumeric tokens, never as an arbitrary
 # substring. Punctuation, whitespace, and symbol boundaries all separate
 # tokens, so a multiword keyword such as "source code" matches "source-code",
@@ -57,6 +58,7 @@ class RouteRule:
     required_files: tuple[str, ...]
     optional_files: tuple[str, ...]
     max_required_bytes: int | None
+    version: str = "v2"
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,8 @@ class Config:
     max_required_bytes: int
     routes: tuple[RouteRule, ...]
     examples: tuple[dict[str, Any], ...]
+    v3_baseline_files: tuple[str, ...] = ()
+    v3_optional_files: tuple[str, ...] = ()
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -121,7 +125,8 @@ def string_tuple(value: Any, field: str) -> tuple[str, ...]:
 
 def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
     payload = read_toml(root / relative)
-    if payload.get("schema_version") != SCHEMA:
+    config_schema = payload.get("schema_version")
+    if config_schema not in (SCHEMA, CONFIG_SCHEMA_V2):
         raise RouteError(f"unsupported route schema in {relative}")
     baseline = payload.get("baseline")
     if not isinstance(baseline, dict):
@@ -157,6 +162,14 @@ def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
         route_max = raw.get("max_required_bytes")
         if route_max is not None and (not isinstance(route_max, int) or route_max <= 0):
             raise RouteError(f"route {route_id}.max_required_bytes must be positive")
+        version = raw.get("version", "v2")
+        if version not in ("v2", "v3"):
+            raise RouteError(f"route {route_id}.version must be v2 or v3")
+        if version == "v3":
+            if raw.get("required_handles") or raw.get("optional_handles"):
+                raise RouteError(f"route {route_id}: V3 owners are files, not V2 handles")
+            if route_max is not None and route_max > max_required:
+                raise RouteError(f"route {route_id}: V3 cannot raise the baseline byte limit")
         routes.append(
             RouteRule(
                 route_id=route_id,
@@ -168,8 +181,19 @@ def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
                 required_files=string_tuple(raw.get("required_files"), f"route {route_id}.required_files"),
                 optional_files=string_tuple(raw.get("optional_files"), f"route {route_id}.optional_files"),
                 max_required_bytes=route_max,
+                version=version,
             )
         )
+
+    v3_baseline = payload.get("v3_baseline", {})
+    if not isinstance(v3_baseline, dict) or set(v3_baseline) - {"required_files", "optional_files"}:
+        raise RouteError("v3_baseline allows only required_files and optional_files")
+    v3_files = string_tuple(v3_baseline.get("required_files"), "v3_baseline.required_files")
+    v3_optional = string_tuple(v3_baseline.get("optional_files"), "v3_baseline.optional_files")
+    if config_schema == SCHEMA and ("v3_baseline" in payload or any(route.version != "v2" for route in routes)):
+        raise RouteError("versioned routing requires eliot-doc-route-config-v2")
+    if any(route.version == "v3" for route in routes) and not v3_files:
+        raise RouteError("V3 routes require a nonempty v3_baseline.required_files")
 
     raw_examples = payload.get("coverage", {}).get("example", []) if isinstance(payload.get("coverage"), dict) else []
     if raw_examples is None:
@@ -197,6 +221,10 @@ def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
                     raw.get("expect_required_handles"),
                     f"coverage example {path}.expect_required_handles",
                 ),
+                "expect_required_files": string_tuple(
+                    raw.get("expect_required_files"),
+                    f"coverage example {path}.expect_required_files",
+                ),
                 "expect_absent_routes": string_tuple(
                     raw.get("expect_absent_routes"),
                     f"coverage example {path}.expect_absent_routes",
@@ -213,6 +241,8 @@ def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
         max_required_bytes=max_required,
         routes=tuple(routes),
         examples=tuple(examples),
+        v3_baseline_files=v3_files,
+        v3_optional_files=v3_optional,
     )
 
 
@@ -342,11 +372,29 @@ def keyword_token_hit(topic_token_list: Sequence[str], keyword: str) -> bool:
     )
 
 
+def version_paths(config: Config, paths: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """Select the version from path rules, never from caller-supplied topic text.
+
+    Unclassified/shared paths retain V2 obligations. A mixed set keeps both
+    profiles; adding a V3 document cannot erase the old paths' reading floor.
+    """
+    v3_patterns = tuple(pattern for route in config.routes if route.version == "v3"
+                        for pattern in route.path_globs)
+    selected: dict[str, list[str]] = {"v2": [], "v3": []}
+    for path in sorted(set(normalize_repo_path(path) for path in paths)):
+        version = "v3" if any(path_matches(path, pattern) for pattern in v3_patterns) else "v2"
+        selected[version].append(path)
+    return {version: tuple(items) for version, items in selected.items()}
+
+
 def matched_routes(config: Config, paths: Sequence[str], topic: str) -> list[RouteRule]:
-    normalized = tuple(normalize_repo_path(path) for path in paths)
+    selected = version_paths(config, paths)
     tokens = topic_tokens(topic)
     matched: list[RouteRule] = []
     for route in config.routes:
+        normalized = selected[route.version]
+        if not normalized:
+            continue
         path_hit = any(
             path_matches(path, pattern)
             for path in normalized
@@ -454,10 +502,21 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
             "no non-baseline documentation route matched; add a route before mutating this scope"
         )
 
-    required_selectors = list(config.baseline_handles)
-    optional_selectors = list(config.baseline_optional_handles)
-    required_files = list(config.baseline_files)
-    optional_files = list(config.baseline_optional_files)
+    selected = version_paths(config, normalized_paths)
+    if selected["v2"] and not any(route.version == "v2" for route in routes):
+        raise RouteError("mixed scope has V2 paths without a non-baseline route")
+    required_selectors = list(config.baseline_handles) if selected["v2"] else []
+    optional_selectors = list(config.baseline_optional_handles) if selected["v2"] else []
+    required_files = list(config.baseline_files) if selected["v2"] else []
+    optional_files = list(config.baseline_optional_files) if selected["v2"] else []
+    if selected["v3"]:
+        required_files.extend(config.v3_baseline_files)
+        optional_files.extend(config.v3_optional_files)
+        # Read edited V3 prose itself as well as its owning contract. Deleted
+        # paths remain in the scope; their surviving owner rules still apply.
+        required_files.extend(path for path in selected["v3"]
+                              if Path(path).suffix.lower() in (".md", ".markdown")
+                              and (root / path).is_file())
     limits = [config.max_required_bytes]
     for route in routes:
         required_selectors.extend(route.required_handles)
@@ -472,7 +531,7 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
     # must not silently demote it to one-hop optional material (#929, #958,
     # #1730, #2970). Resolved from the prose title, so it names the governing
     # fragment without widening any glob, keyword, or required byte ceiling.
-    governing = governing_handles(handles, topic)
+    governing = governing_handles(handles, topic) if selected["v2"] else []
     required_handles = sorted(
         set(expand_selectors(required_selectors, handles)) | set(governing),
         key=handle_key,
@@ -630,27 +689,38 @@ def render_routes_markdown(config: Config) -> str:
         "python scripts/docs_router.py route --path <repository/path> --topic \"<causal property>\"",
         "```",
         "",
-        "Every result includes the global Decision Safety Floor and all matching specialized routes.",
-        "A path may intentionally match more than one route.",
+        "Path rules select V2 or V3; topic wording never changes a path's version.",
+        "Unclassified/shared paths retain V2 obligations. Mixed scopes include both baselines.",
+        "Required payload ceilings still apply to the combined set, not separately to each version.",
+        "A path may intentionally match more than one route within its selected version.",
         "",
         "## Global required baseline",
+        "",
+        "Retained V2/shared paths only; V3 uses the file baseline below.",
         "",
         "- Handles: " + ", ".join(f"`{item}`" for item in config.baseline_handles),
         "- Files: " + ", ".join(f"`{item}`" for item in config.baseline_files),
         f"- Default maximum required payload: `{config.max_required_bytes}` bytes",
         "",
+        "## V3 required baseline",
+        "",
+        "- Files: " + (", ".join(f"`{item}`" for item in config.v3_baseline_files) or "not configured"),
+        "- Existing edited V3 Markdown files are also required; deleted paths stay in scope.",
+        "- V3 owners are verified by file bytes, not by historical A/I handle membership.",
+        "- The legacy pair key remains receipt metadata, not V3 product authority.",
+        "",
         "## Route matrix",
         "",
-        "| Route | Purpose | Path patterns | Topic keywords | Required selectors | Optional selectors |",
-        "|---|---|---|---|---|---|",
+        "| Route | Version | Purpose | Path patterns | Topic keywords | Required handles/files | Optional handles/files |",
+        "|---|---|---|---|---|---|---|",
     ]
     for route in config.routes:
         paths = "<br>".join(f"`{item}`" for item in route.path_globs) or "—"
         topics = "<br>".join(f"`{item}`" for item in route.topic_keywords) or "—"
-        required = "<br>".join(f"`{item}`" for item in route.required_handles) or "—"
-        optional = "<br>".join(f"`{item}`" for item in route.optional_handles) or "—"
+        required = "<br>".join(f"`{item}`" for item in (*route.required_handles, *route.required_files)) or "—"
+        optional = "<br>".join(f"`{item}`" for item in (*route.optional_handles, *route.optional_files)) or "—"
         lines.append(
-            f"| `{route.route_id}` | {route.description} | {paths} | {topics} | {required} | {optional} |"
+            f"| `{route.route_id}` | {route.version} | {route.description} | {paths} | {topics} | {required} | {optional} |"
         )
     lines.extend(
         [
@@ -659,7 +729,8 @@ def render_routes_markdown(config: Config) -> str:
             "",
             "`python scripts/docs_router.py check --root .` validates selectors, files,",
             "route membership plus per-example merged payloads, expected required handles",
-            "at their indexed fragment path and current hash, routes a path must not gain,",
+            "at their indexed fragment path and current hash, expected required files,",
+            "routes a path must not gain,",
             "tracked-path coverage, route-size ceilings, and this generated projection.",
             "Unknown material paths fail closed.",
             "",
@@ -729,7 +800,8 @@ def check(root: Path, config_relative: str = DEFAULT_CONFIG) -> dict[str, Any]:
         expand_selector(selector, handles)
         selector_count += 1
 
-    files_to_check = set(config.baseline_files) | set(config.baseline_optional_files)
+    files_to_check = (set(config.baseline_files) | set(config.baseline_optional_files)
+                      | set(config.v3_baseline_files) | set(config.v3_optional_files))
     for route in config.routes:
         files_to_check.update(route.required_files)
         files_to_check.update(route.optional_files)
@@ -776,6 +848,10 @@ def check(root: Path, config_relative: str = DEFAULT_CONFIG) -> dict[str, Any]:
         assert_required_handles(
             root, handles, payload, example["expect_required_handles"], label
         )
+        for relative in example["expect_required_files"]:
+            expected_file = file_record(root, relative, "required")
+            if expected_file not in payload["required"]:
+                raise RouteError(f"{label}: required file missing or stale: {relative}")
         required_handle_expectations += len(example["expect_required_handles"])
         example_payloads_checked += 1
 

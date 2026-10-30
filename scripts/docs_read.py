@@ -138,6 +138,15 @@ def assert_governing_fragments(
     if not isinstance(handles, dict) or not handles:
         raise ReadError("handle index has no handles")
     expected = docs_router.governing_handles(handles, str(route.get("topic", "")))
+    if (root / docs_router.DEFAULT_CONFIG).is_file():
+        config = docs_router.load_config(root)
+        if docs_router.version_paths(config, route.get("paths", []))["v3"]:
+            # Reuse the one router to prove the V3 file-owner set. Trusting a
+            # route's claimed version or empty handles would permit omissions.
+            fresh = docs_router.route_payload(root, config, route["paths"], route.get("topic", ""))
+            if route != fresh:
+                raise ReadError("V3/mixed route is stale or incomplete; rerun the router")
+            expected = fresh["governing_handles"]
     if not expected:
         return []
     required = {
@@ -347,7 +356,6 @@ def self_test() -> None:
         if docs_router.governing_handles(handles, "backup and restore of host state") != ["I5.13"]:
             raise ReadError("governing fragment resolution self-test failed")
         # The incomplete route required a fragment that is NOT the governing one.
-        # This is the known-incomplete shape that previously passed silently.
         incomplete_route = dict(governing_route)
         incomplete_route["required"] = [
             {

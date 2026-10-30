@@ -1,8 +1,8 @@
-schema_version = "eliot-doc-routes-v1"
+schema_version = "eliot-doc-route-config-v2"
 pair_schema = "eliot-normative-pair-v2-sharded"
 
 [baseline]
-# Decision Safety Floor. These fragments apply to every material mutation.
+# Retained V2/shared-path reading floor. V3 uses the file baseline below.
 required_handles = [
   "A0.1",
   "A0.2",
@@ -265,6 +265,75 @@ optional_handles = ["I20"]
 required_files = []
 optional_files = []
 
+# V3 is selected only by versioned path rules, not the topic or a CLI flag.
+# Shared entry pages and tooling retain V2; mixed scopes preserve both sets.
+[v3_baseline]
+required_files = ["AGENTS.md", "WORKFLOW.md", "docs/ARCHITECTURE_CONTRACT.md", "docs/v3/README.md"]
+optional_files = ["docs/v3/DEVELOPMENT.md", "docs/v3/ANALYSIS-REGISTRY.md"]
+
+[[route]]
+id = "v3-documents"
+version = "v3"
+description = "V3 document entry and the edited prose itself; no automatic V2 book stack."
+path_globs = ["docs/v3/**"]
+topic_keywords = []
+required_files = []
+optional_files = []
+
+[[route]]
+id = "v3-product"
+version = "v3"
+description = "V3 product purpose, responsibility and invariants."
+path_globs = ["docs/v3/ARCHITECTURE.md"]
+topic_keywords = ["architecture", "invariants", "product boundary"]
+required_files = ["docs/v3/ARCHITECTURE.md"]
+optional_files = ["docs/v3/IMPLEMENTATION.md"]
+
+[[route]]
+id = "v3-store-runtime"
+version = "v3"
+description = "V3 Store/runtime rules and the actual separately scoped source owner."
+path_globs = ["docs/v3/IMPLEMENTATION.md", "docs/v3/store/**", "crates/storage/eliot-v3-store-schema/**"]
+topic_keywords = ["store", "runtime", "capture", "spool", "backup", "restore", "schema"]
+required_files = ["docs/v3/IMPLEMENTATION.md", "docs/v3/store/README.md"]
+optional_files = ["docs/v3/COGNITION.md", "docs/v3/INFERENCE-CONTRACT.md"]
+
+[[route]]
+id = "v3-cognition"
+version = "v3"
+description = "V3 reconstruction, retrieval, correction and learning consumers."
+path_globs = ["docs/v3/COGNITION.md"]
+topic_keywords = ["cognition", "retrieval", "context", "learning", "correction"]
+required_files = ["docs/v3/COGNITION.md"]
+optional_files = ["docs/v3/IMPLEMENTATION.md"]
+
+[[route]]
+id = "v3-inference"
+version = "v3"
+description = "Proposed V3 external-call contract, not implemented controller support."
+path_globs = ["docs/v3/INFERENCE-CONTRACT.md"]
+topic_keywords = ["inference", "controller", "provider"]
+required_files = ["docs/v3/INFERENCE-CONTRACT.md"]
+optional_files = ["docs/v3/COGNITION.md"]
+
+[[route]]
+id = "v3-development"
+version = "v3"
+description = "V3 task/source/check/update recipes and the existing work ledger."
+path_globs = ["docs/v3/DEVELOPMENT.md", "docs/v3/ANALYSIS-REGISTRY.md"]
+topic_keywords = ["navigation", "checks", "integration", "development"]
+required_files = ["docs/v3/DEVELOPMENT.md"]
+optional_files = []
+
+[[route]]
+id = "v3-audit"
+version = "v3"
+description = "Recorded V3 requirements and historical rationale, not a competing specification."
+path_globs = ["docs/v3/AUDIT.md", "docs/v3/AUDIT-MAP.md"]
+topic_keywords = ["requirements", "donor", "audit"]
+required_files = ["docs/v3/ARCHITECTURE.md"]
+optional_files = ["docs/v3/AUDIT-MAP.md"]
+
 [coverage]
 
 [[coverage.example]]
@@ -428,3 +497,54 @@ path = "apps/Eliot.Operator/MainWindow.xaml"
 topic = ""
 expect_routes = ["generic-source", "human-surfaces"]
 expect_required_handles = ["A0.3", "I0.5", "A2.3", "I2.20", "A11", "I3", "I11"]
+
+# V3 cases prove owner-file coverage, not just matching route names.
+[[coverage.example]]
+path = "docs/v3/README.md"
+topic = ""
+expect_routes = ["v3-documents"]
+expect_absent_routes = ["documentation-authority", "workspace-governance"]
+expect_required_files = ["docs/v3/README.md", "docs/ARCHITECTURE_CONTRACT.md"]
+
+[[coverage.example]]
+path = "docs/v3/IMPLEMENTATION.md"
+topic = "backup and restore"
+expect_routes = ["v3-documents", "v3-store-runtime"]
+expect_absent_routes = ["canonical-storage", "documentation-authority", "host-kernel"]
+expect_required_files = ["docs/v3/IMPLEMENTATION.md", "docs/v3/store/README.md"]
+
+[[coverage.example]]
+path = "docs/v3/COGNITION.md"
+topic = ""
+expect_routes = ["v3-documents", "v3-cognition"]
+expect_absent_routes = ["memory-context", "documentation-authority"]
+expect_required_files = ["docs/v3/COGNITION.md"]
+
+[[coverage.example]]
+path = "docs/v3/INFERENCE-CONTRACT.md"
+topic = ""
+expect_routes = ["v3-documents", "v3-inference"]
+expect_absent_routes = ["agent-swarm", "documentation-authority"]
+expect_required_files = ["docs/v3/INFERENCE-CONTRACT.md"]
+
+[[coverage.example]]
+path = "docs/v3/DEVELOPMENT.md"
+topic = ""
+expect_routes = ["v3-documents", "v3-development"]
+expect_absent_routes = ["documentation-authority", "instrument-verification"]
+expect_required_files = ["docs/v3/DEVELOPMENT.md"]
+
+[[coverage.example]]
+path = "docs/v3/AUDIT-MAP.md"
+topic = ""
+expect_routes = ["v3-documents", "v3-audit"]
+expect_absent_routes = ["documentation-authority"]
+expect_required_files = ["docs/v3/AUDIT-MAP.md", "docs/v3/ARCHITECTURE.md"]
+
+# A shared root file cannot be relabelled V3 through topic wording.
+[[coverage.example]]
+path = "AGENTS.md"
+topic = "V3 documentation"
+expect_routes = ["documentation-authority"]
+expect_absent_routes = ["v3-documents", "v3-development"]
+expect_required_handles = ["A0.3", "I0.5", "I18"]

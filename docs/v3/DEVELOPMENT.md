@@ -251,12 +251,34 @@ python scripts/docs_read.py read --path docs/v3/DEVELOPMENT.md --topic "V3 docum
 python -c "import json; from pathlib import Path; r=json.loads(Path('.eliot/v3-route-receipt.json').read_text(encoding='utf-8')); print(*(i['path'] for i in r['required']), sep=chr(10))"
 ```
 
-A `documentation-authority` match or successful hash check is not evidence that the
-V3 owning contracts were selected. Compare the actual required paths with the task
-route. An uncovered V3 owner is a tooling gap, not permission to replace it with V2
-instructions. The tooling owner must reconcile assignment lookup and version-aware
-reading in the existing pipeline; keep bounds, mixed V2/V3 coverage, exact-candidate
-identity and trusted review checks. Do not add a second router or weaken protections.
+The existing router selects V3 from the versioned path rules, never from the topic.
+`docs/v3/**` and the named V3 Store package use their file owners; shared entry/tooling
+paths retain V2 obligations. A mixed change includes both sets under the same combined
+byte limit. Inspect `required` against the task route: a route name is not coverage.
+An existing edited V3 Markdown file is also read; deleted paths remain in the scope.
+
+Route configuration uses `eliot-doc-route-config-v2`, so an older router rejects it
+instead of ignoring version fields. Route/read receipt formats are unchanged. Their
+retained V2 pair key is compatibility metadata, not V3 architectural authority.
+The reader recomputes the V3/mixed route before accepting its owner-file set.
+
+When an authorized task changes path ownership, update the existing
+[route rules](../architecture/route-rules.toml), add a bounded coverage example naming
+`expect_required_files`, and regenerate only their existing projection:
+
+```text
+python -m py_compile scripts/docs_router_core.py scripts/docs_router.py scripts/docs_read.py
+python scripts/docs_router.py self-test
+python scripts/docs_read.py self-test
+python scripts/docs_router.py sync --root .
+python scripts/docs_router.py check --root .
+```
+
+Run `check` on the complete checkout; a synthetic fixture pass is not that result.
+Review the generated ROUTES diff, pure V2/V3 and mixed paths, deletion, stale bytes,
+missing owners and over-limit input. Do not hand-edit ROUTES, raise caps or route a
+legacy path as V3 to avoid obligations. Assignment lookup remains a separate check;
+a successful read bundle neither registers the task nor supplies independent review.
 
 The concrete repair scope and current observations are in
 [the existing D6 finding](ANALYSIS-REGISTRY.md#integration-tooling-follow-up).
