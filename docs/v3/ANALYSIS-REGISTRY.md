@@ -17,12 +17,12 @@
 | Этап | Статус | Изменяемая область / следующий шаг | Критерий завершения |
 |---|---|---|---|
 | D0. Установить версии и владельцев | `CHECKED` source | Снимки ниже; обновить перед изменением внешнего контракта. | V3 working branch, V2 donor, Store source и controller не смешаны. |
-| D1. Исправить вход и маршруты чтения | `REVIEW_PENDING` | START/README ведут к задаче, source map и check recipes в DEVELOPMENT; WORKFLOW разделяет document merge и runtime completion. | Независимый читатель находит owner, существующий исходник/его отсутствие, конкретную проверку и companion updates без чтения всего аудита. |
+| D1. Исправить вход и маршруты чтения | `REVIEW_PENDING` | START/README и вложенные crates/storage AGENTS ведут в V3; CODE_NAVIGATION отделяет retained V2 toolchain. DEVELOPMENT связывает файлы, проверки и companion updates. | Независимо пройти весь instruction chain до Store source; V3 не получает старые transition/proof/Host обязанности из родительской папки. |
 | D2. Согласовать нормативные документы с controller | `REVIEW_PENDING` | Четыре owner drafts и #199 исправлены; foundation отделён от предложенного Memory API. | Независимо проверить source mapping, scoped методы и оставленные решения. Controller acceptance/runtime не подразумеваются. |
 | D3. Упростить конструкцию и порядок реализации | `PARTIAL` | Physical backup и порядок реализации имеют одного owner; docs SQL retired. AUDIT сокращён до причин выбора, historical evidence и маршрутов, без второй runtime-инструкции. | Проверить оставшиеся механизмы на caller/owner/result/consumer и сохранение требований. |
 | D4. Свести Store-контракт и assets | `PARTIAL` | R-183: в Implementation §4.7.1–3 выбраны time/reuse/support/influence/job codecs и единый history envelope. Далее #5326/#5327: DDL/DTO/query/bounds и caller/readback; отдельный code task, не prose PR. | Один source owner; каждый field/query/limit соединён с writer/reader. Source defects не закрыты правкой prose; compile, DDL execution и runtime разделены. |
 | D5. Проверить требования и сценарии | `PARTIAL` | AUDIT-MAP: 63 якоря, 8 границ, T01–T37 и 7 маршрутов. AUDIT: дополнительно все 34 требования и A15-1–29 ведут к current owners; старые imperatives устранены. Далее retained-tree inbound pass и независимое чтение сценариев, включая выбранные R-183 codecs. | Сверка записанного корпуса не объявляется повторным чтением недоступных первоисточников или runtime proof. Все известные требования имеют route; реализация выбранных codecs и source defects остаются D4. |
-| D6. Интеграция документации | `BLOCKED` — следующий интеграционный шаг | Интегратор: финальный prose/link pass, реальное независимое review, подлинный final-tree evidence block и новый CI результат. Конкретная диагностика — ниже. | Проверен и слит точный кандидат без обхода checks. Незавершённый runtime и недоступные исторические архивы не подменяют критерии приёмки документации. |
+| D6. Интеграция документации | `BLOCKED` — tooling incompatibility | Сначала R-200: действительный V3 assignment и чтение V3 owners в существующем pipeline. Затем final-tree evidence, independent review и применимые checks. | Не подменять #5324 старым issue, не повышать caps и не отключать protection. Документный merge не требует готового runtime. |
 
 Read-only проверки можно разделять; общие файлы меняет один writer. REVIEW_PENDING
 не означает независимую приёмку. OPEN-решение блокирует только затронутую capability,
@@ -33,7 +33,7 @@ Read-only проверки можно разделять; общие файлы 
 | Объект | Проверенный снимок | Граница |
 |---|---|---|
 | Memory integration base | `5aac094834fb5635921b550c821cb933a1196105` | Retained V2; PR #5325 не слит. |
-| V3 parent этой правки | `951e7b561b9c74ef19365158e6b2d627d00c8aaa` | Проверены входы, scripts/check interfaces, source paths и фактический CI blocker; продуктовые контракты и runtime не менялись. |
+| V3 parent этой правки | `de511551b0ca8ca6a04096248a52546765dcfaf9` | Проверены вложенные instructions, CODE_NAVIGATION, route/assignment source и CI steps. Полный checkout/gate и независимое review не выполнены. |
 | Store source | `c5154b0ea352980279cd0d46ca3353148d4c8027`, PR #5327 | Проверены список файлов и Cargo package для source/check map. R-183 source alignment не выполнен; compiler/runtime не запускались. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованный D4 source finding; этот проход не перепроверял upstream и не запускал движок. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb` | Наследованный D2 snapshot; этот проход не заявляет новую проверку controller main. |
@@ -74,7 +74,9 @@ PARTIAL — неполное покрытие; BLOCKED — конкретная 
 | R-181 | Последовательные backup pages не устанавливают coherent cut. | Implementation §8 удерживает mutation/replay quiesce; spool lock краткий. Runtime не проверен. |
 | R-195 | Retained AUDIT продолжал предписывать SDK, Agent/Task inference, daemon-owned Store, branch-address и отдельный график с inference до maintenance. | Эти указания заменены ссылками на фактических owners; старые решения/source trace сохранены по pinned history. Аудит не пятый нормативный документ. Требуется независимое чтение, не runtime proof. |
 | R-197 | Маршруты чтения не давали дешёвому агенту цельную инструкцию «файл → проверка → сопутствующее обновление». | DEVELOPMENT соединяет существующие owners/scripts с source map, узким заданием и check/update recipes. Нет нового verifier/ledger и фиктивных runtime CLI. D1 требует независимого использования маршрутов. |
-| R-198 | PR оставался вне main, а integration blocker переносился без конкретного устранения. | D6 и нижняя таблица различают отсутствующий evidence block, review и неисполненную compilation. Документный merge не ждёт реализации всего runtime; реальный gate не обходится. |
+| R-198 | PR оставался вне main, а integration blocker переносился без конкретного устранения. | Одного evidence block недостаточно: R-200 фиксирует assignment/route несовместимость. D6 сначала решает её у tooling owner, не запускает очередной неизменный CI. |
+| R-199 | crates/AGENTS, storage/AGENTS и CODE_NAVIGATION возвращали V3 к V2 reader/PreparedTransition/Host/proof programme. | Добавлены явные V3 маршруты, старые блоки ограничены retained V2. Содержимое generated blocks сохранено; code/validator migration этим не выполнена. |
+| R-200 | В gate catalogue 11 старых issues, без #5324; `_checklist_state` возвращает required_missing для undeclared issue. `documentation-authority` выбирает V2 handles, но не V3 owner files. | Source-confirmed integration gap; [точная следующая работа](#integration-tooling-follow-up). Не заявлять этот ещё не достигнутый CI failure результатом полного gate run. |
 
 ## Scenario preservation
 
@@ -268,24 +270,42 @@ S-084–S-087 — exact-tag Surreal evidence; S-088/S-089 — design/assets, н�
 | S-100 | AUDIT на ec9a8e59 целиком: §1–14, retained §16–38, 34 требования и A15-1–29; current Implementation §8.2 и Cognition §15. | R-195/R-196: source/text reconciliation. Primary archives, historical donor code и runtime повторно не проверялись. |
 | S-101 | R-183: current Implementation/Cognition на 2090eefc, PR #5327 head и DDL occurrence/reuse/state на c5154b0. | Design/source comparison, tuple/transition counterexamples; no compiler, live DB, independent review или новый controller audit. |
 | S-102 | На 951e7b56 прочитаны scripts README, docs_shards link function/CLI, docs_read CLI, merge-evidence module/template; PR #5327 file list/Cargo; CI job и список reviews #5325. | Команды guide проверены по source/caller, не выданы за исполнение полного checkout. Полный link scan, final-tree reader/verifier, Clippy и независимое review здесь не запускались. |
+| S-103 | На de511551 прочитаны обе crate AGENTS, CODE_NAVIGATION, `_checklist_state`/`_assignment_contract`, router selection и documentation-authority. Полный cohort blob c7c657c3 локально сверён и разобран TOML: 11 rows, #5324 отсутствует. | Source/text + catalogue parsing, не full merge verifier. CI run 40978188636: evidence step failure, MergeCompile skipped; nested V2 blocks/старые anchors сохранены. |
 
 ## Integration blockers
 
-Проверено 2026-10-29 для parent `951e7b56`, не результат последующего head:
-[run 40915942611](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/40915942611),
-job `123596056383`, и live список reviews PR #5325. После нового push перепроверять
-актуальный head; прежний failure не становится ни PASS, ни новым результатом.
+Проверенный parent: `de511551b0ca8ca6a04096248a52546765dcfaf9`.
+[Run 40978188636](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/40978188636),
+job `123811327153`: `Verify shared documentation evidence` — failure;
+`Run MergeCompile verification profile` — skipped. Это наблюдение CI steps, не
+результат компиляции или запуска V3. Source findings ниже — отдельная проверка.
 
-| Наблюдение | Действие и владелец | Условие снятия |
+| Блокер | Действие и владелец | Условие снятия |
 |---|---|---|
-| `Verify shared documentation evidence`: `EMPTY_DOCUMENTATION_EVIDENCE`, в body нет machine-readable block. | Интегратор на полном candidate checkout использует существующий reader и формат PR; открывает реальные required bytes, затем собирает/проверяет evidence. Инструкция: [DEVELOPMENT](DEVELOPMENT.md#documentation-integration). | Shared verifier принимает подлинные данные финального candidate/base; это не ручная замена digest и не отключение gate. |
-| Reviews API вернул пустой список. | Независимый reviewer читает замороженный кандидат; интегратор получает действительное review. Writer не представляется другим reviewer. | Review относится к проверяемому head и выполняет фактические требования репозитория. |
-| `Run MergeCompile verification profile` был skipped после evidence failure. | После устранения предыдущего шага получить новый CI результат; отдельно разбирать provisioner/build failures по их реальному шагу. | Исполнение наблюдено либо применимость определена настоящим owner; skipped не PASS. |
-| Полный retained-tree inbound scan и независимое чтение сценариев не выполнены. | Reviewer запускает существующую link-only function на полном checkout и проходит изменённые requirement/owner routes. | Исправлены затронутые ссылки/противоречия; остаток назван точно. |
+| R-200: #5324 отсутствует в непустом `.github/work-unit-cohort.toml`. | Tooling owner согласует V3 assignment с `_assignment_contract`/`_checklist_state`; не подставляет чужой issue или `recorded=true`. | Подлинная текущая задача принимается по определённому правилу, подмена/неизвестная задача не получает фиктивный PASS. |
+| R-200: matching `docs/**` не выбирает V3 owning contracts. | Тот же owner исправляет version-aware чтение в существующем router/reader и его projections. | V3 и mixed changes получают нужные реальные sections; границы bytes/paths/identity не ослаблены. |
+| В PR отсутствует final-candidate evidence block. | После исправления representability интегратор генерирует evidence из реального reading; [preflight](DEVELOPMENT.md#integration-preflight) предотвращает бессмысленные повторные попытки. | Shared verifier принимает точный candidate/base/body. Hand-authored digest не reading. |
+| Независимое ревью и полный retained-tree inbound scan не выполнены. | Отдельный reviewer читает финальный candidate и запускает существующую link-only function на полном checkout. | Проверены instruction chain, owner routes и затронутые ссылки; review действительно независим. |
+| Компиляция пропущена после evidence failure. | Разбирать следующий наблюдённый шаг только после предыдущего; provisioner/source failures имеют отдельных owners. | Не выдавать skipped за PASS и не менять runtime ради prose CI. |
 
-Это очередь интеграции документации, не требование сначала закончить V3 Store,
-Windows runtime или inference. Открытые source/qualification задачи сохраняются в
-своих строках после document merge. V2 router, CI/protection и runtime не меняются
-этой правкой; реальная несовместимость reader с V3 требует отдельного scoped tooling
-решения, а не очередного слоя prose. Документация не объявлена слитой или независимо
-принятой до фактического readback.
+### Integration tooling follow-up
+
+Это ограниченная работа в рамках D6, не новый реестр и не разрешение безусловного
+merge. Отдельно объявить tooling scope до его изменения; текущая prose-правка его
+не выполняет.
+
+| Проверить / изменить вместе | Что именно |
+|---|---|
+| `scripts/work_unit_gate/doc_read_evidence.py` + owning assignment source | `_assignment_contract`/`_checklist_state`: текущая V3 задача не должна быть неявно приравнена к отсутствующей старой capability-cell assignment. Не использовать terminal V2 issue как обход. |
+| `docs/architecture/route-rules.toml` + `scripts/docs_router_core.py` / `docs_read.py` | Baseline и selected owners должны соответствовать версии изменяемого пути; простой новый route поверх обязательного V2 baseline не решает конфликт. Mixed scope сохраняет обязанности обеих сторон. |
+| Generated route/index surfaces + `.github/pull_request_template.md` + DEVELOPMENT | После принятого изменения обновить существующие projections/инструкции одним проходом; не делать второй pipeline и не hand-edit generated cohort. |
+| Existing merge verifier и его negative cases | Проверить реальный #5324; ложный issue, omitted path, stale tree/digest и forged review по-прежнему отвергаются. Oracle changes требуют предусмотренного независимого review, не self-approval. |
+
+Минимальные исходные факты воспроизводятся [preflight-командами](DEVELOPMENT.md#integration-preflight).
+Полный gate здесь не запускался: доступен API-снимок, но не полный Git checkout.
+Сетевые попытки получения архива не удались; локальный snapshot не подставлен вместо
+финального дерева. Никакой receipt, чужое review или runtime outcome не выдуман.
+
+Открытые Store/Windows/inference задачи сохраняются после document merge и не служат
+его общим запретом. До фактического readback PR остаётся unmerged; workflow/protection,
+router/checker code, generated catalogue и runtime этой правкой не изменены.

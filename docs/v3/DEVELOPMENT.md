@@ -26,6 +26,7 @@ fifth specification nor another backlog. Read only the section needed by your ta
 | [ANALYSIS-REGISTRY](ANALYSIS-REGISTRY.md) | Decisions, gaps and next actions | Update the existing finding, not a new progress report. |
 | [AUDIT-MAP](AUDIT-MAP.md), [AUDIT](AUDIT.md) | Requirement routes and historical rationale | Resolve one disputed requirement or donor choice. Not the default reading stack. |
 | [Store source map](store/README.md) | Location/status of the separately proposed V3 Store package | Inspect the owning source branch; package files are not in the documentation branch. |
+| [Crate instructions](../../crates/AGENTS.md#select-the-source-version), [Storage instructions](../../crates/storage/AGENTS.md#v3-store-work), [code navigation](../CODE_NAVIGATION.md#select-v3-or-retained-v2) | Version-aware source entry points | Use the V3 sections for assigned V3 code; retained V2 instructions do not define its topology. |
 | Existing `bins/`, `crates/`, `apps/`, `workers/`, `plugin/`, `integrations/` | Retained code; names alone do not establish V3 ownership | Reuse only a selected donor mechanism after tracing its caller and consumer. |
 | [PROJECT_MAP](../PROJECT_MAP.md), [ACTIVE.toml](../../workstreams/ACTIVE.toml), `docs/architecture/` | Retained V2 navigation and routing | Only for an explicitly assigned donor/source or tooling change. Not a V3 task queue. |
 | [scripts map](../../scripts/README.md), `.github/` | Existing checks and automation | Invoke the narrow check below; do not regenerate V2 surfaces to repair V3 prose. |
@@ -211,19 +212,56 @@ contradictions and false readiness claims must not be hidden by a documentation 
 
 The integration owner follows [WORKFLOW](../../WORKFLOW.md#verification-and-integration):
 
-1. Freeze the candidate head and base; inspect the complete changed-path set and run
-   applicable prose/link checks. An independent reader reviews that same candidate.
-2. Satisfy the existing final-tree reading gate using its actual reader and
-   [PR evidence format](../../.github/pull_request_template.md). The task-scoped V3
-   reading route and this legacy merge requirement are different things. Generate
-   identities from the exact candidate; read the required bytes before attesting.
-3. Run the shared verifier with real base/candidate/body and trusted review evidence,
+1. Freeze the candidate head and base. Perform the preflight below before expensive
+   setup or another CI rerun; a body-only repair cannot fix a version/assignment gap.
+2. Inspect the complete diff and run applicable prose/link checks. An independent
+   reader reviews that same candidate, including the nested instruction chain.
+3. Once the actual tooling can represent the task, generate the exact candidate's
+   read evidence using the existing reader and [PR format](../../.github/pull_request_template.md).
+   Open every required item before attesting; a routed link is not reading.
+4. Run the shared verifier with real base/candidate/body and trusted review evidence,
    as the CI caller does. Read current-head CI, including skipped steps. Changed tree,
-   base or evidence requires fresh validation; rerunning an old event is not proof
-   that its captured PR body changed.
-4. Merge only through the allowed repository workflow. Read back `main` and the PR's
+   base or evidence needs fresh validation; rerunning an old event does not update
+   its captured PR body. Do not automatically loop a deterministic failure.
+5. Merge only through the allowed repository workflow. Read back `main` and the PR's
    merged state, then update the existing registry/source links and retire the branch.
    A push, an open PR or `mergeable: true` alone is not integration.
+
+### Integration preflight
+
+**Assignment and reading coverage are separate checks.** The legacy verifier reads
+[work-unit-cohort.toml](../../.github/work-unit-cohort.toml), not the V3 Markdown ledger.
+Inspect the real task's membership without changing that generated lock:
+
+```text
+python -c "import sys,tomllib; from pathlib import Path; n=int(sys.argv[1]); d=tomllib.loads(Path('.github/work-unit-cohort.toml').read_text(encoding='utf-8')); rows=[r for r in d.get('row',[]) if r.get('issue')==n]; print({'issue':n,'rows':rows}); sys.exit(0 if len(rows)==1 else 1)" 5324
+```
+
+Use the actual owning issue number. Missing/malformed input is an error; a nonempty
+matching row is only membership, not acceptance. With a nonempty legacy catalogue,
+`_checklist_state` refuses an undeclared issue even when `recorded=true`; changing an
+R-row or supplying a plausible digest does not register it. Never borrow an old issue,
+delete the catalogue or hand-edit its generated hashes to make the check pass.
+
+For reading coverage, inspect the existing reader's required paths on the complete
+candidate checkout. This single-path command is a diagnostic, not full-PR evidence:
+
+```text
+python scripts/docs_read.py read --path docs/v3/DEVELOPMENT.md --topic "V3 documentation integration" --output .eliot/v3-route-bundle.md --receipt-out .eliot/v3-route-receipt.json
+python -c "import json; from pathlib import Path; r=json.loads(Path('.eliot/v3-route-receipt.json').read_text(encoding='utf-8')); print(*(i['path'] for i in r['required']), sep=chr(10))"
+```
+
+A `documentation-authority` match or successful hash check is not evidence that the
+V3 owning contracts were selected. Compare the actual required paths with the task
+route. An uncovered V3 owner is a tooling gap, not permission to replace it with V2
+instructions. The tooling owner must reconcile assignment lookup and version-aware
+reading in the existing pipeline; keep bounds, mixed V2/V3 coverage, exact-candidate
+identity and trusted review checks. Do not add a second router or weaken protections.
+
+The concrete repair scope and current observations are in
+[the existing D6 finding](ANALYSIS-REGISTRY.md#integration-tooling-follow-up).
+
+### Final-candidate verification
 
 The documented shared command is:
 
@@ -238,7 +276,8 @@ Do not hand-author an invented receipt or an independent review under the writer
 
 | Failure | Next action, not a workaround |
 |---|---|
-| `EMPTY_DOCUMENTATION_EVIDENCE` | Integration owner prepares the one genuine final-candidate block from the existing reader/format. More prose outside that block does not fix it. |
+| `EMPTY_DOCUMENTATION_EVIDENCE` | First check assignment and V3 reading coverage above; then prepare the genuine final-candidate block. A missing block may be only the first failure. |
+| `CHECKLIST_REQUIRED_MISSING` or undeclared work issue | Tooling owner resolves the actual task/assignment binding. `recorded=true`, an unrelated historical issue or a new Markdown checklist cannot substitute for it. |
 | Reader cannot route/admit this V3 change | Record the exact command/error and affected input in D6. The tooling owner must resolve the version mismatch as a scoped change; do not expand payload caps or weaken the gate here. |
 | No independent review | Request a real read-only review of the frozen candidate; report unavailable review honestly. Do not manufacture approval. |
 | Provisioning/build environment failure | Identify the failed input/step and its owner; do not blame unexecuted code or mark skipped compilation passed. |
