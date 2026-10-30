@@ -1,8 +1,23 @@
 # Code navigation: crates, Rust modules, logical blocks, and Code Graph
 
-This is the operational entry point from a repository path to its current source
-boundary. It complements the normative documentation router; it does not replace
-Architecture, Implementation, exact source, tests, or runtime proof.
+## Select V3 or retained V2
+
+For V3 implementation, start with the [task routes](v3/README.md#task-routes),
+[source-file map](v3/DEVELOPMENT.md#repository-map) and
+[check recipes](v3/DEVELOPMENT.md#checks). Follow the root and nearest `AGENTS.md`
+version sections. A discovered Cargo package is not evidence of a V3 caller or
+permission to resume a retained V2 workstream.
+
+The sections below document the retained V2 navigation toolchain. Its generated
+indexes and Code Graph may help inspect selected donor code; they do not impose
+V2 handles, `CodeUnderstandingProof`, mandatory MCP availability or `just quick`
+on a V3 task. Use exact source and caller/reader tracing when a graph is unavailable;
+state the scope rather than claiming exhaustive coverage. Do not regenerate these
+indexes merely to edit V3 documentation. Actual tooling changes remain separately
+scoped; [merge requirements](v3/DEVELOPMENT.md#documentation-integration) are unchanged.
+
+For retained V2 work, this page maps repository paths to source boundaries and
+complements its normative router. It does not replace exact source or runtime proof.
 
 ## Start from a path
 

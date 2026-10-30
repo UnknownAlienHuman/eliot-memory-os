@@ -1,76 +1,20 @@
-# START HERE
+# Start here
 
-Read this file first. It is the shortest route from a cold start to a merged change.
-It does not replace `AGENTS.md`, `WORKFLOW.md`, or the normative pair; it points to the authority you need.
+Read [AGENTS.md](AGENTS.md), then choose one
+[V3 task route](docs/v3/README.md#task-routes). Read the owning sections, not every
+book or the complete audit.
 
-## 1. Priority — land the code and its proof
+| Your task | Next step |
+|---|---|
+| Continue documentation | Pick the existing [stage/finding](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages); correct its owner and direct consumers. |
+| Implement an assigned capability | Use the [source map and bounded task](docs/v3/DEVELOPMENT.md#one-bounded-task), then the owning section and actual caller/reader. |
+| Check or update a change | Use the [commands](docs/v3/DEVELOPMENT.md#checks) and [companion-update map](docs/v3/DEVELOPMENT.md#change-propagation). |
+| Integrate documentation into main | Resolve the [specific blockers](docs/v3/ANALYSIS-REGISTRY.md#integration-blockers), not the whole runtime backlog. |
 
-The product is a draft: write the missing code and land it on `main`. Ship the
-capability together with the proof its owning issue requires; security, negative,
-and edge proof is required from the first change and is never deferred to a later
-phase. Cut ceremony, projections, and optional hardening down to what acceptance
-asks for, not to how far along the product feels. Section 5 governs the proof.
+While PR #5325 is open, its documentation branch is the working design; after
+merge, use `main`. Check live state before editing. [WORKFLOW](WORKFLOW.md) owns
+branch/worktree and integration rules. V1/V2 source and workstreams are retained
+donors, not permission to resume old programmes.
 
-## 2. Roles are distinct
-
-- **Controller (root-owned sync only):** performs the coordinated upstream fetch and
-  publishes the authority receipt (remote URL, tracked ref, commit SHA, sync result, UTC timestamp).
-- **Manager:** works in its own worktree, never runs fetch or pull, and reviews the
-  verified PR against the owning issue. It never merges that PR.
-- **Writer:** implements one owning issue inside the claimed scope only, and never merges its own work.
-- **Integration owner (root/reviewer/controller):** owns integration. A different
-  principal than the writer reviews, merges, and retires; no lane merges its own result.
-- **Independent verifier:** reviews the diff against the owning issue; never the writer.
-
-## 3. Start from the published authority
-
-```powershell
-git status --short --branch
-git rev-parse HEAD
-```
-
-Confirm `HEAD` equals the base SHA from the published authority receipt and the tree is clean
-for your scope. Provision one worktree per mutating branch from that published SHA, then create:
-
-```powershell
-git switch -c <kind>/<issue>-<short-slug>
-```
-
-Form is `<kind>/<issue>-<slug>` with kind `work`, `fix`, `docs`, `chore`, `refactor`, or `test`.
-One issue, one branch, one PR. One mutable path scope has one writer. See `AGENTS.md` and `WORKFLOW.md`
-for branch validity and the forbidden sync and ref-mutation list.
-
-## 4. Route docs for every change
-
-```text
-python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
-```
-
-Run routing for every mutation class (code, configuration, tests, workflows, normative prose).
-Repeat `--path` for every mutable path family. Open the verified bundle and read every required
-item before mutation. Record receipt IDs, matched routes, required handles, fragment paths and hashes,
-bundle hash, and attestation in the PR. See `docs/architecture/READING_PROTOCOL.md`.
-
-## 5. Proof is governed by the owning issue
-
-The owning-issue acceptance defines the required proof. Run the smallest proof that can fail on the
-changed path while iterating; iteration speed never waives mandatory package, edge, negative, or Product
-checks at completion. Keep iteration checks separate from completion gates.
-
-```powershell
-cargo metadata --locked --no-deps
-cargo check --locked -p <package> --all-targets
-cargo test --locked -p <package>
-```
-
-Use focused package and edge proofs while iterating; run wider suites only for a matching blast radius.
-Report every skipped, failed, simulated, or unavailable check exactly. An honest gap is reported and is
-not automatically mergeable; a false claim never merges. See `WORKFLOW.md` and `docs/ARCHITECTURE_CONTRACT.md`.
-
-## 6. Finish
-
-Open a PR to `main` with the authority receipt, read receipt, base and candidate revisions, scope, proof,
-and residuals. No writer or manager merges its own work; the integration owner reviews, merges after the
-gate, then retires the branch and removes the worktree. See `workstreams/ACTIVE.toml` for programme state.
-
-Map: Architecture `docs/ARCHITECTURE_CONTRACT.md` · source `docs/PROJECT_MAP.md` · scripts `scripts/README.md`.
+One task connects a caller, owning operation, result/unknown and consumer.
+A schema, written contract or passing compile alone is not implemented behavior.

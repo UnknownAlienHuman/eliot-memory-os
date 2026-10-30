@@ -1,5 +1,30 @@
 # Storage source instructions
 
+## V3 Store work
+
+For separately assigned V3 Store work, use [root instructions](../../AGENTS.md),
+[Implementation §4–7](../../docs/v3/IMPLEMENTATION.md#4-migration-0001-and-schema-authority)
+and the [Store source owner](../../docs/v3/store/README.md). Continue its actual
+issue/branch; do not create another writer or copy the package into the docs branch.
+
+The [source-file map](../../docs/v3/DEVELOPMENT.md#store-package-files) identifies
+which DDL, wrapper, query, catalog and digest files change together. Follow the
+changed field through its writer, projection/decoder and exact history/open path.
+Run the [package-local checks](../../docs/v3/DEVELOPMENT.md#rust-source) after a
+coherent code increment. Product tests follow the owner's implementation order;
+compilation or asset inspection alone does not qualify a Store operation.
+
+Do not import the V2 `PreparedTransition`, MutationPlan, Host generation, bridge
+or proof programme below into greenfield V3. V3 responsibilities come from its
+owning contracts, not from the retained code's directory location.
+
+## Retained V2 instructions
+
+Everything below, including the generated reader block, applies only to an
+explicit retained V2/source-tooling assignment. Mixed changes still honor the
+applicable V2 boundaries. Required CI/evidence rules remain in force; prose routing
+does not repair their [version mismatch](../../docs/v3/ANALYSIS-REGISTRY.md#integration-blockers).
+
 <!-- eliot-doc-routing:start -->
 ## Mandatory documentation routing
 

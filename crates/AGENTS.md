@@ -1,5 +1,24 @@
 # Workspace crate instructions
 
+## Select the source version
+
+For an explicitly assigned V3 package, follow [root instructions](../AGENTS.md),
+the [V3 task route](../docs/v3/README.md#task-routes) and the nearest package-family
+V3 section. Read the changed operation's contract and actual caller/reader, not the
+retained V2 books. A package name alone does not authorize V3 work or change scope.
+
+Use the [source map and checks](../docs/v3/DEVELOPMENT.md#store-package-files) for
+existing V3 code. Do not create V2 capability cells, manifests, proof objects or
+index entries merely to make a new package resemble the retained architecture.
+Tooling/index changes need their own stated scope and affected consumers.
+
+The sections below apply only to retained V2 source or explicitly assigned changes
+to its tooling. A mixed change still reads the applicable V2 sections for those
+paths. This version boundary does not waive the existing merge gate; see the
+[integration preflight](../docs/v3/DEVELOPMENT.md#integration-preflight).
+
+## Retained V2 instructions
+
 <!-- eliot-doc-routing:start -->
 ## Mandatory documentation routing
 
