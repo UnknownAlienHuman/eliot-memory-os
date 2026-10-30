@@ -1,93 +1,51 @@
-# Architecture authority
+# Architecture authority and version boundary
 
-This file is the repository authority and navigation contract. It is not a
-third normative book.
+This page identifies owners and precedence. It is not another product specification.
 
-## Accepted sharded normative pair
+## V3 working authority
 
-The 2026-08-28 adopted Architecture semantic byte stream is updated to
-incorporate the owner-approved Cloudflare single-owner access-boundary
-amendment (#1376). The Implementation byte stream is updated to incorporate
-the owner-approved I9.4 amendment (#1980 / #1983) and the same #1376 access
-boundary. Each stream is reconstructed deterministically
-from ordered fragments and verified against its reconstructed SHA-256 digest.
+The owner selected a fresh V3 design and retained V1/V2 Memory as donors.
+PR #5325 is merged: `docs/v3/` on current `main` is the documentation baseline.
+The exception for `docs/5324-v3-documentation-audit` has ended; do not revive it.
+Merged design is not implemented behavior, independent review or runtime support.
+The existing registry keeps unresolved decisions and verification work visible.
 
-| Authority | Canonical manifest and entry | Revision | Edition | Reconstructed SHA-256 |
-|---|---|---|---|---|
-| Intent, theory, invariants, and Hard Boundaries | [`docs/architecture/architecture/manifest.json`](architecture/architecture/manifest.json) · [bounded index](architecture/architecture/README.md) | `4.5-draft` | `2026-08-28` | `A3C5B2028D9DF89A53CD565F8FF493484BE74078E4EFD7B534C0F1C3169577C7` |
-| Target owners, contracts, defaults, failure behavior, and migration | [`docs/architecture/implementation/manifest.json`](architecture/implementation/manifest.json) · [bounded index](architecture/implementation/README.md) | `0.29-draft` | `2026-08-28` | `EAD4CEFF2DB254E4202C8FA7AE167225A6F65B720C222075ADA61FC45FC407A4` |
+| Owner document | Decision owned |
+|---|---|
+| [Architecture](v3/ARCHITECTURE.md) | Product purpose, responsibility and invariants |
+| [Implementation](v3/IMPLEMENTATION.md) | Runtime, Store, operations, maintenance and build order |
+| [Cognition](v3/COGNITION.md) | Reconstruction, retrieval, learning and revision algorithms |
+| [Inference contract](v3/INFERENCE-CONTRACT.md) | Proposed Memory/controller interface, not proof of provider support |
 
-The machine-bindable adoption receipt is [`docs/normative-pair.toml`](normative-pair.toml). Its pair key is `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`, computed deterministically from the updated Architecture digest and the updated Implementation digest.
+Architecture intent prevails over a conflicting mechanism. Correct the owning
+mechanism and its consumers together before implementing the disputed behavior.
+Do not resolve conflicts by inventing an exception in a README, issue, registry or
+a new contract. An external repository owns its own accepted API; a Memory draft
+cannot declare that API implemented or impose a superseded controller design.
 
-The historical paths [`docs/architecture/ELIOT_ARCHITECTURE.md`](architecture/ELIOT_ARCHITECTURE.md) and [`docs/architecture/ELIOT_IMPLEMENTATION.md`](architecture/ELIOT_IMPLEMENTATION.md) are compact compatibility maps. They preserve incoming file and heading links,
-but agents must not load them as the documentation payload.
+The [registry](v3/ANALYSIS-REGISTRY.md#documentation-stages) tracks unresolved
+consistency work, including controller compatibility. No blanket assertion that
+all drafts are synchronized is made. Base work is not blocked by missing inference.
 
-Use [`docs/architecture/READING_PROTOCOL.md`](architecture/READING_PROTOCOL.md),
-[`docs/architecture/ROUTES.md`](architecture/ROUTES.md), and
-[`docs/architecture/HANDLE_INDEX.md`](architecture/HANDLE_INDEX.md) for bounded routing.
+## Navigation and evidence
 
-Architecture still prevails over Implementation on semantic conflict. A layout
-migration does not promote target behavior to current support; product status
-remains `NOT_ACCEPTED / UNVERIFIED` until exact Product Proof exists.
+[Task routes](v3/README.md#task-routes) are navigation only. The
+[registry](v3/ANALYSIS-REGISTRY.md) is the sole work ledger, not another normative
+source. The [audit](v3/AUDIT.md) and [source map](v3/AUDIT-MAP.md) retain rationale
+and bounded donor findings. Source review, selected design, compilation, observed
+runtime behavior and product qualification are distinct; record the actual scope.
 
-## Preserved pre-sharding authority contract
+Do not copy external roadmap status or revision lists into entry pages. Keep a
+dated, pinned observation in the existing registry and refresh it for an affected
+integration decision. Read only the owning sections required by the task.
 
-> The following text is retained as migration evidence. Where it calls the
-> two former monolith paths canonical files, the sharded authority section
-> above supersedes only that repository-layout statement.
+## Donors
 
-# Architecture authority
+V2 source baseline: `5aac094834fb5635921b550c821cb933a1196105`.
+V1 donor: `b5c84d4e53292dbc8996917c63448d5ee96c4bc7`.
+The V2 pair, router, workstream records and validators remain retained evidence;
+they do not prescribe V3 topology or certify its design. Their machine migration
+is a separate explicit change, not a consequence of this prose update.
 
-This file is the repository authority and navigation contract. It is not a
-third normative book.
-
-## Accepted normative pair
-
-On 2026-08-28 the Architecture Owner adopted the exact English pair below as
-ELIOT's sole current normative pair.
-
-| Authority | Canonical repository file | Revision | Edition | SHA-256 |
-|---|---|---|---|---|
-| Intent, theory, invariants, and Hard Boundaries | [`docs/architecture/ELIOT_ARCHITECTURE.md`](architecture/ELIOT_ARCHITECTURE.md) | `4.5-draft` | `2026-08-28` | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
-| Target owners, contracts, defaults, failure behavior, and migration | [`docs/architecture/ELIOT_IMPLEMENTATION.md`](architecture/ELIOT_IMPLEMENTATION.md) | `0.29-draft` | `2026-08-28` | `7805BF238FE91819ABA50D7E13AA86A8B977561195DBB98AA979F986E2FAB063` |
-
-The machine-bindable adoption receipt is
-[`docs/normative-pair.toml`](normative-pair.toml). Its pair key is
-`sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b`.
-Only the two document digests form the normative pair. The receipt, indexes,
-registries, issues, tests, audits, and generated projections are evidence or
-navigation and cannot become a third normative source.
-
-Architecture prevails over Implementation on semantic conflict. Adoption does
-not promote a target mechanism to current implementation support. Product status
-remains `NOT_ACCEPTED / UNVERIFIED` until exact Product Proof exists.
-
-## Repository location and branch authority
-
-The canonical files above live on `main`. A copy in another branch, worktree,
-package, report, prompt, or agent memory has no current authority. Agents must
-resolve current work through `AGENTS.md`, `WORKFLOW.md`, and
-`workstreams/ACTIVE.toml` before using documentation.
-
-There are no checked-in dated aliases or predecessor books. The superseded pair
-had these digests:
-
-- Architecture: `58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8`;
-- Implementation: `C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B`.
-
-Those bytes and their historical audits remain available through Git history
-and issue/PR records only. They must not be restored into the active checkout or
-combined with current sections as one contract. Any compiler, Rule Catalogue,
-conformance map, brief, or runtime handshake still bound to the predecessor is
-`STALE` until regenerated and verified against `docs/normative-pair.toml`.
-
-Use [`docs/architecture/README.md`](architecture/README.md) and
-[`docs/architecture/INDEX.md`](architecture/INDEX.md) for bounded routing.
-
-## Current-system truth
-
-Current source files, Cargo manifests and lockfile, generated metadata, compiler
-diagnostics, tests, installed artifact hashes, store identity, and live runtime
-observations are evidence for current support. Prose, reports, graphs, branch
-names, successful builds, and test counts cannot by themselves establish
-runtime health, D0/D1 acceptance, or `CURRENT_VERIFIED`.
+Follow [AGENTS](../AGENTS.md) and [WORKFLOW](../WORKFLOW.md). Required checks and
+independent integration remain applicable.
