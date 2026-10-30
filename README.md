@@ -1,8 +1,8 @@
 # Eliot Memory OS
 
-> **V3 is a working design, not a released runtime.** The documentation is being
-> refined in [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325)
-> for [issue #5324](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5324).
+> **The V3 documentation baseline is on `main`; it is not a released runtime.**
+> [PR #5325](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5325) is merged.
+> Continue from current `main`, not the retired documentation branch.
 > V1/V2 Memory source is retained as donor material.
 
 Eliot preserves experience, reconstructs current work and supplies applicable
