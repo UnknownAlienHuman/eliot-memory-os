@@ -500,3 +500,53 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "MERGE_COMPILE_SOURCE_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
+
+  # Narrow V3 diagnostics; never substitutes for the retained merge-compile gate.
+  v3-development:
+    name: V3 development checks
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CARGO_TARGET_DIR: target/v3-checks
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        id: checkout
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Retain exact tracked source
+        shell: pwsh
+        run: |
+          git archive --format=zip --output="$env:RUNNER_TEMP/v3-source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git rev-parse HEAD 'HEAD^{tree}' | Set-Content "$env:RUNNER_TEMP/v3-source-identity.txt"
+          git ls-tree -r --full-tree HEAD | Add-Content "$env:RUNNER_TEMP/v3-source-identity.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload tracked source for inspection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: v3-source-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/v3-source.zip
+            ${{ runner.temp }}/v3-source-identity.txt
+          if-no-files-found: error
+          retention-days: 1
+      - name: Check documentation links
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: python -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); import docs_shards; print(docs_shards.verify_markdown_links(Path.cwd()))"
+      - name: Check documentation routes
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: python scripts/docs_router.py check --root .
+      - name: Check Store formatting
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && hashFiles('crates/storage/eliot-v3-store-schema/Cargo.toml') != '' }}
+        run: cargo fmt -p eliot-v3-store-schema --check
+      - name: Check Store with Clippy
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && hashFiles('crates/storage/eliot-v3-store-schema/Cargo.toml') != '' }}
+        run: cargo clippy --locked -p eliot-v3-store-schema --lib --bins -- -D warnings
+      - name: Inspect embedded Store assets
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && hashFiles('crates/storage/eliot-v3-store-schema/Cargo.toml') != '' }}
+        run: cargo run --locked -p eliot-v3-store-schema --bin inspect
