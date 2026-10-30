@@ -509,7 +509,7 @@ jobs:
     permissions:
       contents: read
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/eliot-v3-target
+      CARGO_TARGET_DIR: target/v3-checks
       CARGO_INCREMENTAL: 0
       CARGO_BUILD_JOBS: 4
     steps:
