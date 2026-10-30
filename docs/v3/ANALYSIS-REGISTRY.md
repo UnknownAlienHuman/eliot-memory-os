@@ -6,6 +6,8 @@
 шаг. Контракты принадлежат своим документам; [AUDIT](AUDIT.md) и
 [AUDIT-MAP](AUDIT-MAP.md) хранят обоснования/источники. Хронология — в Git и issue/PR.
 Для продолжения читайте этап и строки своей задачи, не весь каталог.
+[DEVELOPMENT](DEVELOPMENT.md) содержит карту файлов, формат узкой задачи, команды проверок
+и правила сопутствующих обновлений; статусы и незакрытая работа остаются здесь.
 
 ## Documentation stages
 
@@ -15,12 +17,12 @@
 | Этап | Статус | Изменяемая область / следующий шаг | Критерий завершения |
 |---|---|---|---|
 | D0. Установить версии и владельцев | `CHECKED` source | Снимки ниже; обновить перед изменением внешнего контракта. | V3 working branch, V2 donor, Store source и controller не смешаны. |
-| D1. Исправить вход и маршруты чтения | `REVIEW_PENDING` | AGENTS/WORKFLOW/START и индексы сокращены; Store route теперь ведёт к одному source owner. | Независимый читатель находит owner section без обязательного стека книг и V2-инструкций для V3. |
+| D1. Исправить вход и маршруты чтения | `REVIEW_PENDING` | START/README ведут к задаче, source map и check recipes в DEVELOPMENT; WORKFLOW разделяет document merge и runtime completion. | Независимый читатель находит owner, существующий исходник/его отсутствие, конкретную проверку и companion updates без чтения всего аудита. |
 | D2. Согласовать нормативные документы с controller | `REVIEW_PENDING` | Четыре owner drafts и #199 исправлены; foundation отделён от предложенного Memory API. | Независимо проверить source mapping, scoped методы и оставленные решения. Controller acceptance/runtime не подразумеваются. |
 | D3. Упростить конструкцию и порядок реализации | `PARTIAL` | Physical backup и порядок реализации имеют одного owner; docs SQL retired. AUDIT сокращён до причин выбора, historical evidence и маршрутов, без второй runtime-инструкции. | Проверить оставшиеся механизмы на caller/owner/result/consumer и сохранение требований. |
 | D4. Свести Store-контракт и assets | `PARTIAL` | R-183: в Implementation §4.7.1–3 выбраны time/reuse/support/influence/job codecs и единый history envelope. Далее #5326/#5327: DDL/DTO/query/bounds и caller/readback; отдельный code task, не prose PR. | Один source owner; каждый field/query/limit соединён с writer/reader. Source defects не закрыты правкой prose; compile, DDL execution и runtime разделены. |
 | D5. Проверить требования и сценарии | `PARTIAL` | AUDIT-MAP: 63 якоря, 8 границ, T01–T37 и 7 маршрутов. AUDIT: дополнительно все 34 требования и A15-1–29 ведут к current owners; старые imperatives устранены. Далее retained-tree inbound pass и независимое чтение сценариев, включая выбранные R-183 codecs. | Сверка записанного корпуса не объявляется повторным чтением недоступных первоисточников или runtime proof. Все известные требования имеют route; реализация выбранных codecs и source defects остаются D4. |
-| D6. Интеграция документации | `BLOCKED` | Независимое ревью, финальный diff, применимые doc/link checks и существующий merge gate. | Проверен именно финальный кандидат; нет фиктивных receipts, снятия protection или незаявленных CI-изменений. |
+| D6. Интеграция документации | `BLOCKED` — следующий интеграционный шаг | Интегратор: финальный prose/link pass, реальное независимое review, подлинный final-tree evidence block и новый CI результат. Конкретная диагностика — ниже. | Проверен и слит точный кандидат без обхода checks. Незавершённый runtime и недоступные исторические архивы не подменяют критерии приёмки документации. |
 
 Read-only проверки можно разделять; общие файлы меняет один writer. REVIEW_PENDING
 не означает независимую приёмку. OPEN-решение блокирует только затронутую capability,
@@ -31,8 +33,8 @@ Read-only проверки можно разделять; общие файлы 
 | Объект | Проверенный снимок | Граница |
 |---|---|---|
 | Memory integration base | `5aac094834fb5635921b550c821cb933a1196105` | Retained V2; PR #5325 не слит. |
-| V3 parent этой правки | `2090eefc2da28e4f7e201592a4bbdb1c556d5626` | Проверены Store и cognitive contracts для R-183; выбранные codecs не являются реализованной схемой. |
-| Store source | `c5154b0ea352980279cd0d46ca3353148d4c8027`, PR #5327 | Head PR перепроверен; occurrence/reuse/state DDL сопоставлен с контрактом. Исходники не менялись, compiler/runtime не запускались. |
+| V3 parent этой правки | `951e7b561b9c74ef19365158e6b2d627d00c8aaa` | Проверены входы, scripts/check interfaces, source paths и фактический CI blocker; продуктовые контракты и runtime не менялись. |
+| Store source | `c5154b0ea352980279cd0d46ca3353148d4c8027`, PR #5327 | Проверены список файлов и Cargo package для source/check map. R-183 source alignment не выполнен; compiler/runtime не запускались. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованный D4 source finding; этот проход не перепроверял upstream и не запускал движок. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb` | Наследованный D2 snapshot; этот проход не заявляет новую проверку controller main. |
 
@@ -71,6 +73,8 @@ PARTIAL — неполное покрытие; BLOCKED — конкретная 
 | R-177 | Slice 0 требовал полный maintenance/crash campaign до первого Base. | §11 задаёт connected increments; устаревшая инструкция Store README заменена ссылкой на §11. |
 | R-181 | Последовательные backup pages не устанавливают coherent cut. | Implementation §8 удерживает mutation/replay quiesce; spool lock краткий. Runtime не проверен. |
 | R-195 | Retained AUDIT продолжал предписывать SDK, Agent/Task inference, daemon-owned Store, branch-address и отдельный график с inference до maintenance. | Эти указания заменены ссылками на фактических owners; старые решения/source trace сохранены по pinned history. Аудит не пятый нормативный документ. Требуется независимое чтение, не runtime proof. |
+| R-197 | Маршруты чтения не давали дешёвому агенту цельную инструкцию «файл → проверка → сопутствующее обновление». | DEVELOPMENT соединяет существующие owners/scripts с source map, узким заданием и check/update recipes. Нет нового verifier/ledger и фиктивных runtime CLI. D1 требует независимого использования маршрутов. |
+| R-198 | PR оставался вне main, а integration blocker переносился без конкретного устранения. | D6 и нижняя таблица различают отсутствующий evidence block, review и неисполненную compilation. Документный merge не ждёт реализации всего runtime; реальный gate не обходится. |
 
 ## Scenario preservation
 
@@ -263,13 +267,25 @@ S-084–S-087 — exact-tag Surreal evidence; S-088/S-089 — design/assets, н�
 | S-099 | Implementation/Cognition после scenario repair и требовательные normal/failure routes. | Design changes R-189–R-194; существующий ledger/исторический корпус сохранены, независимое review и runtime не заявлены. |
 | S-100 | AUDIT на ec9a8e59 целиком: §1–14, retained §16–38, 34 требования и A15-1–29; current Implementation §8.2 и Cognition §15. | R-195/R-196: source/text reconciliation. Primary archives, historical donor code и runtime повторно не проверялись. |
 | S-101 | R-183: current Implementation/Cognition на 2090eefc, PR #5327 head и DDL occurrence/reuse/state на c5154b0. | Design/source comparison, tuple/transition counterexamples; no compiler, live DB, independent review или новый controller audit. |
+| S-102 | На 951e7b56 прочитаны scripts README, docs_shards link function/CLI, docs_read CLI, merge-evidence module/template; PR #5327 file list/Cargo; CI job и список reviews #5325. | Команды guide проверены по source/caller, не выданы за исполнение полного checkout. Полный link scan, final-tree reader/verifier, Clippy и независимое review здесь не запускались. |
 
 ## Integration blockers
 
-CI и independent review относятся к точному candidate head. Предыдущие диагностические
-EMPTY_DOCUMENTATION_EVIDENCE / skipped MergeCompile / provisioner failure не являются
-результатами нового head; актуальный результат берётся из PR/CI.
+Проверено 2026-10-29 для parent `951e7b56`, не результат последующего head:
+[run 40915942611](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/40915942611),
+job `123596056383`, и live список reviews PR #5325. После нового push перепроверять
+актуальный head; прежний failure не становится ни PASS, ни новым результатом.
 
-Required merge evidence не сфабрикован. V2 router, workflow/protection и runtime source
-не меняются. Нет независимой агентной приёмки, полной проверки inbound links retained
-tree, Rust/Windows/Surreal runtime qualification. Проверенный текст — не выполненный код.
+| Наблюдение | Действие и владелец | Условие снятия |
+|---|---|---|
+| `Verify shared documentation evidence`: `EMPTY_DOCUMENTATION_EVIDENCE`, в body нет machine-readable block. | Интегратор на полном candidate checkout использует существующий reader и формат PR; открывает реальные required bytes, затем собирает/проверяет evidence. Инструкция: [DEVELOPMENT](DEVELOPMENT.md#documentation-integration). | Shared verifier принимает подлинные данные финального candidate/base; это не ручная замена digest и не отключение gate. |
+| Reviews API вернул пустой список. | Независимый reviewer читает замороженный кандидат; интегратор получает действительное review. Writer не представляется другим reviewer. | Review относится к проверяемому head и выполняет фактические требования репозитория. |
+| `Run MergeCompile verification profile` был skipped после evidence failure. | После устранения предыдущего шага получить новый CI результат; отдельно разбирать provisioner/build failures по их реальному шагу. | Исполнение наблюдено либо применимость определена настоящим owner; skipped не PASS. |
+| Полный retained-tree inbound scan и независимое чтение сценариев не выполнены. | Reviewer запускает существующую link-only function на полном checkout и проходит изменённые requirement/owner routes. | Исправлены затронутые ссылки/противоречия; остаток назван точно. |
+
+Это очередь интеграции документации, не требование сначала закончить V3 Store,
+Windows runtime или inference. Открытые source/qualification задачи сохраняются в
+своих строках после document merge. V2 router, CI/protection и runtime не меняются
+этой правкой; реальная несовместимость reader с V3 требует отдельного scoped tooling
+решения, а не очередного слоя prose. Документация не объявлена слитой или независимо
+принятой до фактического readback.

@@ -7,9 +7,11 @@ Hosts/controllers execute tasks and own permissions/acceptance. Base capture,
 replay, exact/lexical retrieval and context must work without inference. Learning
 later uses the same records and produces a revision consumed by a real caller.
 
-For documentation work, start with the
-[existing stages](ANALYSIS-REGISTRY.md#documentation-stages), then choose one route
-below. Read the relevant sections and source, not this entire directory. The
+Choose one route below. For file locations, a bounded assignment, exact check commands
+and companion updates, use the [development guide](DEVELOPMENT.md). It is a task
+reference, not another required book. Documentation work uses the
+[existing stages](ANALYSIS-REGISTRY.md#documentation-stages); implementation order belongs
+to [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). The
 [version boundary](../ARCHITECTURE_CONTRACT.md) identifies document precedence.
 
 ## Task routes
@@ -67,6 +69,8 @@ registry row with remaining work and evidence. Indexes contain links and purpose
 not duplicated schema, backup algorithms, revision lists or CI status. Keep
 chronology in Git and issue/PR discussion. No second ledger or errata document.
 
-For prose, check requirements, ownership, contradictions, changed links and
-`git diff --check`. Existing CI and independent review remain necessary; do not
-invent receipts or call a pushed draft merged. See [WORKFLOW](../../WORKFLOW.md).
+Use the [change-propagation map](DEVELOPMENT.md#change-propagation) to update only affected
+owners, source projections and references. [Checks](DEVELOPMENT.md#checks) give exact
+commands, their limits and failure actions. [Documentation integration](DEVELOPMENT.md#documentation-integration)
+separates merge evidence from unfinished product work; existing CI and independent
+review still apply under [WORKFLOW](../../WORKFLOW.md).

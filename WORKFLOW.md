@@ -22,7 +22,8 @@ A separate runtime task, such as #5326 / PR #5327, is not changed by this prose 
    checkout. Preserve unrelated changes. One manager uses one mutating worktree;
    one file scope has one writer. Read-only reviewers share no write authority.
 3. Read the [task route](docs/v3/README.md#task-routes), owning sections and relevant
-   source. State the concrete result, changed paths and non-goals in the issue/PR.
+   source. Use the [bounded task format](docs/v3/DEVELOPMENT.md#one-bounded-task) in the
+   existing issue/PR; it records outcome, owner, paths, caller/consumer and checks.
 4. Correct the owner document and affected consumers together. Replace duplicated
    policy in indexes with links. Update the existing registry row, not a new log.
 5. Inspect the diff and run the smallest applicable checks. Publish the exact
@@ -36,11 +37,15 @@ GitHub API writes must use the same branch/scope and an expected-head lease.
 
 ## Verification and integration
 
-V3 prose checks cover requirement preservation, ownership, contradictory status,
-normal/failure behavior, source attribution, changed links and `git diff --check`.
-The legacy `just quick` is not the default for V3 prose. For authorized Rust work,
-follow the owner's code-first order and minimum relevant formatting/Clippy checks;
-do not silently introduce a test-first programme.
+Use the [V3 check recipes](docs/v3/DEVELOPMENT.md#checks): diff/whitespace, the existing
+link-only scan, boundary-specific review and minimum changed-package fmt/Clippy for
+source. Each recipe names its proof limit and failure action. The legacy `just quick`
+is not the V3 prose default; broad tests follow the assembled product.
+
+Documentation integration is not product acceptance. Clearly marked runtime gaps may
+remain open after the documentation merges; they must not keep an otherwise reviewed
+and checked documentation baseline indefinitely outside `main`. Contract contradictions,
+missing review or a failed applicable merge check still require concrete resolution.
 
 A PR records the owning issue, base/candidate identity, scope, source/read evidence,
 actual check results and unresolved items. A source review, compile, runtime exercise
@@ -52,15 +57,20 @@ waive the legacy final-tree evidence verifier. If that verifier cannot represent
 V3 task, record the concrete incompatibility and its owner; do not fabricate receipts,
 weaken protection or modify CI within a prose-only task. All workflows remain unchanged.
 
-Integrate only the reviewed candidate, then retire the branch. A pushed documentation
-change is not merged authority or product acceptance.
+Follow the [integration procedure](docs/v3/DEVELOPMENT.md#documentation-integration)
+for the actual final candidate, PR evidence, review and CI readback. Record a blocker
+as head/run + failed step + next owner/action in the existing registry, not merely
+"CI pending" after a failed run. Integrate only the reviewed candidate, verify `main`
+and the merged PR state, then retire the branch.
 
 ## Placement and maintenance
 
 Keep current owner contracts, stable developer/operator guidance, the requested
 consolidated audit and its requirement/source map. Keep active decisions and next
 steps only in `docs/v3/ANALYSIS-REGISTRY.md`; Git history and issue/PR discussion keep
-chronology. No new audit framework, progress journal, donor dump or branch handoff file.
+chronology. The [development guide](docs/v3/DEVELOPMENT.md) maps files, checks and companion
+updates, without copying product mechanisms or work status. No new audit framework,
+progress journal, donor dump or branch handoff file.
 
 Do not commit credentials, runtime databases, logs, build output, generated read
 bundles/receipts, downloaded sources or local agent state. External repositories own

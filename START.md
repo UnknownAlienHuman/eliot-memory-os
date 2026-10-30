@@ -1,18 +1,20 @@
 # Start here
 
-Read [AGENTS.md](AGENTS.md), then choose a task in the
-[V3 task map](docs/v3/README.md#task-routes). Read the owning sections, not every
-book or the complete audit. Expand only when the change crosses another boundary.
+Read [AGENTS.md](AGENTS.md), then choose one
+[V3 task route](docs/v3/README.md#task-routes). Read the owning sections, not every
+book or the complete audit.
 
-For continuing documentation work, use the
-[stages in the existing registry](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages).
-Each stage names its scope, dependency and completion condition. Fix the first
-eligible unresolved stage; do not create another tracker.
+| Your task | Next step |
+|---|---|
+| Continue documentation | Pick the existing [stage/finding](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages); correct its owner and direct consumers. |
+| Implement an assigned capability | Use the [source map and bounded task](docs/v3/DEVELOPMENT.md#one-bounded-task), then the owning section and actual caller/reader. |
+| Check or update a change | Use the [commands](docs/v3/DEVELOPMENT.md#checks) and [companion-update map](docs/v3/DEVELOPMENT.md#change-propagation). |
+| Integrate documentation into main | Resolve the [specific blockers](docs/v3/ANALYSIS-REGISTRY.md#integration-blockers), not the whole runtime backlog. |
 
-V3 is an unmerged working design in issue #5324 / PR #5325. Existing V1/V2 source
-and workstreams are donors, not V3 capability or permission to resume old work.
-Check the live branch state before editing; [WORKFLOW](WORKFLOW.md) owns branch,
-worktree, verification and integration rules.
+While PR #5325 is open, its documentation branch is the working design; after
+merge, use `main`. Check live state before editing. [WORKFLOW](WORKFLOW.md) owns
+branch/worktree and integration rules. V1/V2 source and workstreams are retained
+donors, not permission to resume old programmes.
 
-A useful change has a real caller, owner, result or typed unknown and consumer.
-A written contract, schema, receipt or successful compile alone is not that result.
+One task connects a caller, owning operation, result/unknown and consumer.
+A schema, written contract or passing compile alone is not implemented behavior.
