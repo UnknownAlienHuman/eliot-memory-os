@@ -68,6 +68,8 @@ Correct the owner rule, update its direct consumers, then update the existing
 registry row with remaining work and evidence. Indexes contain links and purpose,
 not duplicated schema, backup algorithms, revision lists or CI status. Keep
 chronology in Git and issue/PR discussion. No second ledger or errata document.
+Use the [retirement recipe](DEVELOPMENT.md#retiring-documentation) before removing legacy material;
+file count is not a reason to delete a real input or retain an orphan projection.
 
 Use the [change-propagation map](DEVELOPMENT.md#change-propagation) to update only affected
 owners, source projections and references. [Checks](DEVELOPMENT.md#checks) give exact
