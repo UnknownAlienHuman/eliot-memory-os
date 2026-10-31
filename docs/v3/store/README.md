@@ -32,10 +32,28 @@ equally current formats. Do not restore or dynamically load them as a fallback.
 
 ## Next source increment
 
-Follow [Implementation §11](../IMPLEMENTATION.md#11-implementation-sequence), not the old
-all-in-one Slice 0 checklist. First connect the actual Store admission and one complete
-capture/open path with finite input/result bounds, exact identity and unknown readback.
-Select only statements used by that path; keep unimplemented operations unavailable.
+Use the contracts on current `main`. The root first reconciles that baseline into
+the existing open source PR; the package has one writer, not a new competing branch.
+Pinned links above identify the inspected original assets, not a frozen implementation
+base. Inspect the live head and preserve changes made since that observation.
+
+The immediate #5326 assignment is **asset-package repair**, not all of Slice 0:
+
+1. Correct the missing constant imports in `src/queries.rs`, format the package and
+   run its [package-local checks](../DEVELOPMENT.md#rust-source). Report actual failures;
+   a compile fix does not close the remaining schema/semantic findings.
+2. Align DDL, fixed statements/projections, validators, catalog and digests with
+   [R-174 and R-182–R-188](../ANALYSIS-REGISTRY.md#store-reconciliation). The selected
+   representations are in Implementation §4.7; do not invent aliases. Choose concrete
+   per-operation byte caps with the encoder/decoder, not a blanket larger limit.
+3. Publish the corrected asset increment with exact-engine/catalog gaps still named.
+   `inspect` validates embedded assets; it does not establish a working Store.
+
+The **next connected runtime assignment** follows
+[Implementation §11](../IMPLEMENTATION.md#11-implementation-sequence): actual Store
+admission, one bounded client and a complete capture/open path with unknown-outcome
+readback. Select only the statements used by that path. It does not wait for inference
+or the full backup campaign, and absent operations remain unavailable rather than stubs.
 
 Rust compile/Clippy checks source; exact-engine execution checks the selected DDL/query
 and DTO boundary; restart/readback checks the connected behavior. One does not imply

@@ -2,20 +2,22 @@
 
 ## Select the version and task
 
-V3 documentation is the current task. V1/V2 Memory source, architecture shards,
-`workstreams/ACTIVE.toml` and their validators are retained donors, not permission
-to resume their programmes. This is an agent-work boundary, not a claim that the
-legacy machine registry or CI has been migrated.
+V3 documentation on `main` is the design baseline. The user's task and its owning
+issue select documentation or implementation work. V1/V2 Memory source, architecture
+shards, `workstreams/ACTIVE.toml` and their validators are retained donors, not a V3
+programme or a claim that the legacy machine registry/CI has been migrated.
 
-`main` is the integration base. While issue #5324 / PR #5325 remains open, continue
-its V3 documentation on `docs/5324-v3-documentation-audit`; do not create a second
-writer branch for the same files. Check the live issue, PR state and head before
-editing. After merge, use `main`; a closed or superseded branch is not authority.
+PR #5325 is merged and its writer branch is retired. The still-open issue #5324
+tracks remaining documentation checks; it neither revives that branch nor blocks
+separately assigned implementation. Start new work from current `main`. Continue an
+existing open source PR only after the root reconciles its base; never create a
+second writer for its files or revive a closed/superseded branch.
 
-Start with [the V3 task map](docs/v3/README.md). Select one eligible stage in the
-[existing registry](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages), then read
-only the owning sections and the source needed for that decision. Architecture,
-Implementation, Cognition, Inference and the audit are not a mandatory reading
+Start with [the V3 task map](docs/v3/README.md). Documentation tasks select an existing
+[stage/finding](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages); implementation tasks
+follow [Implementation §11](docs/v3/IMPLEMENTATION.md#11-implementation-sequence) and
+the assigned source scope. Read only the owning sections and source for that decision.
+Architecture, Implementation, Cognition, Inference and the audit are not a mandatory reading
 stack for every task. Read an adjacent contract when the changed behavior crosses
 its boundary. Follow the nearest `AGENTS.md` for any source path being changed.
 
