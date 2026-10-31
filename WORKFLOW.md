@@ -6,12 +6,14 @@
 identifies the V3 contract owners; the [existing registry](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages)
 owns documentation stages. An issue defines the requested change, not another architecture.
 
-Use current `main` as the integration base. The explicit working exception is the
-open issue #5324 / PR #5325 documentation branch `docs/5324-v3-documentation-audit`.
-Verify its live state and head before continuing; do not start a sibling PR for the
-same semantic owner. This exception ends when that PR merges, closes or is superseded.
-Retained V2 source and `workstreams/ACTIVE.toml` do not authorize V3 implementation.
-A separate runtime task, such as #5326 / PR #5327, is not changed by this prose task.
+Use current `main` as the integration base. PR #5325 is merged; its former writer
+exception has ended even while issue #5324 remains open for documentation checks.
+New changes use a fresh issue-numbered branch. For an existing open implementation
+PR, the root reconciles current `main` into that same writer branch before continuing;
+do not create an overlapping PR or overwrite concurrent work.
+Retained V2 source and `workstreams/ACTIVE.toml` do not assign V3 implementation.
+The source issue defines its scope: #5326 / PR #5327 repairs the Store asset package,
+not the later network client or an entire daemon rewrite.
 
 ## One bounded change
 
