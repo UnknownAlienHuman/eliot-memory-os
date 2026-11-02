@@ -675,39 +675,6 @@ def render_source_readme(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_group_readmes(root: Path, spec: dict[str, str], manifest: dict[str, Any]) -> None:
-    entry_dir = repo_path(root, spec["entry"]).parent
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for fragment in manifest["fragments"]:
-        groups.setdefault(group_key_for_fragment(fragment, spec["prefix"]), []).append(fragment)
-    groups_dir = entry_dir / "sections"
-    if groups_dir.exists():
-        shutil.rmtree(groups_dir)
-    groups_dir.mkdir(parents=True, exist_ok=True)
-    for group, fragments in groups.items():
-        target_path = groups_dir / f"{safe_stem(group)}.md"
-        target_relative = str(target_path.relative_to(root)).replace("\\", "/")
-        lines = [
-            GENERATED_MARKER,
-            f"# {spec['label']} — {group}",
-            "",
-            "Read only the fragments returned by the documentation router.",
-            "",
-        ]
-        for fragment in fragments:
-            records = fragment["headings"]
-            title = records[0]["title"] if records else Path(fragment["path"]).stem
-            anchor = records[0]["fragment_anchor"] if records else ""
-            link = relative_markdown_link(target_relative, fragment["path"])
-            if anchor:
-                link += f"#{anchor}"
-            handles = ", ".join(
-                str(record["handle"]) for record in records if record.get("handle")
-            )
-            lines.append(f"- [{title}]({link})" + (f" — `{handles}`" if handles else ""))
-        write_utf8(target_path, "\n".join(lines).rstrip() + "\n")
-
-
 def natural_handle_key(handle: str) -> tuple[Any, ...]:
     if handle.startswith("APPENDIX-"):
         return (9, handle)
@@ -1245,7 +1212,6 @@ def migrate(root: Path) -> None:
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         )
         write_utf8(repo_path(root, spec["entry"]), render_source_readme(spec, manifest))
-        render_group_readmes(root, spec, manifest)
         write_utf8(legacy_path, render_compatibility_map(spec, manifest))
 
     pair_text = render_pair_receipt(old_pair, manifests_by_key)
