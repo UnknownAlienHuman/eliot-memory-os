@@ -24,6 +24,8 @@ from typing import Any, Iterable, Sequence
 
 SCHEMA = "eliot-doc-routes-v1"
 CONFIG_SCHEMA_V2 = "eliot-doc-route-config-v2"
+CONFIG_SCHEMA_V3 = "eliot-doc-route-config-v3"
+AUTHORITY_PATH = "docs/ARCHITECTURE_CONTRACT.md"
 INDEX_SCHEMA = "eliot-handle-index-v1"
 GENERATED_MARKER = "<!-- generated: eliot-doc-routes-v1 -->"
 DEFAULT_CONFIG = "docs/architecture/route-rules.toml"
@@ -73,6 +75,7 @@ class Config:
     examples: tuple[dict[str, Any], ...]
     v3_baseline_files: tuple[str, ...] = ()
     v3_optional_files: tuple[str, ...] = ()
+    authority_file: str | None = None
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -126,8 +129,14 @@ def string_tuple(value: Any, field: str) -> tuple[str, ...]:
 def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
     payload = read_toml(root / relative)
     config_schema = payload.get("schema_version")
-    if config_schema not in (SCHEMA, CONFIG_SCHEMA_V2):
+    if config_schema not in (SCHEMA, CONFIG_SCHEMA_V2, CONFIG_SCHEMA_V3):
         raise RouteError(f"unsupported route schema in {relative}")
+    authority_file = payload.get("authority_file")
+    if config_schema == CONFIG_SCHEMA_V3:
+        if authority_file != AUTHORITY_PATH:
+            raise RouteError(f"route config v3 requires authority_file = {AUTHORITY_PATH!r}")
+    elif "authority_file" in payload:
+        raise RouteError("authority_file requires eliot-doc-route-config-v3")
     baseline = payload.get("baseline")
     if not isinstance(baseline, dict):
         raise RouteError("route config is missing [baseline]")
@@ -243,6 +252,7 @@ def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
         examples=tuple(examples),
         v3_baseline_files=v3_files,
         v3_optional_files=v3_optional,
+        authority_file=authority_file,
     )
 
 
@@ -387,6 +397,16 @@ def version_paths(config: Config, paths: Sequence[str]) -> dict[str, tuple[str, 
     return {version: tuple(items) for version, items in selected.items()}
 
 
+def routing_input_paths(config: Config, paths: Sequence[str] | None = None) -> dict[str, str]:
+    """Exact metadata dependencies; unscoped callers retain the full legacy set."""
+    inputs = {"route_rules": DEFAULT_CONFIG}
+    if config.authority_file:
+        inputs["authority"] = config.authority_file
+    if not config.authority_file or paths is None or version_paths(config, paths)["v2"]:
+        inputs.update(handle_index=DEFAULT_INDEX, normative_pair=DEFAULT_RECEIPT)
+    return inputs
+
+
 def matched_routes(config: Config, paths: Sequence[str], topic: str) -> list[RouteRule]:
     selected = version_paths(config, paths)
     tokens = topic_tokens(topic)
@@ -481,30 +501,38 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
     normalized_paths = sorted(set(normalize_repo_path(path) for path in paths))
     if not normalized_paths:
         raise RouteError("at least one --path or --changed-from result is required")
-    index = read_json(root / DEFAULT_INDEX)
-    if index.get("schema_version") != INDEX_SCHEMA:
-        raise RouteError("unsupported handle index schema")
-    handles = index.get("handles")
-    if not isinstance(handles, dict) or not handles:
-        raise RouteError("handle index has no handles")
-    receipt = read_toml(root / DEFAULT_RECEIPT)
-    if config.pair_schema and receipt.get("schema_version") != config.pair_schema:
-        raise RouteError(
-            f"route config expects pair schema {config.pair_schema}, found {receipt.get('schema_version')}"
-        )
-    pair_key = str(receipt.get("pair_key", ""))
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", pair_key):
-        raise RouteError("normative pair receipt has no valid pair key")
-
     routes = matched_routes(config, normalized_paths, topic)
     if not routes:
         raise RouteError(
             "no non-baseline documentation route matched; add a route before mutating this scope"
         )
-
     selected = version_paths(config, normalized_paths)
     if selected["v2"] and not any(route.version == "v2" for route in routes):
         raise RouteError("mixed scope has V2 paths without a non-baseline route")
+
+    inputs = routing_input_paths(config, normalized_paths)
+    handles: dict[str, dict[str, Any]] = {}
+    pair_key = ""
+    if "handle_index" in inputs:
+        index = read_json(root / DEFAULT_INDEX)
+        if index.get("schema_version") != INDEX_SCHEMA:
+            raise RouteError("unsupported handle index schema")
+        handles = index.get("handles")
+        if not isinstance(handles, dict) or not handles:
+            raise RouteError("handle index has no handles")
+        receipt = read_toml(root / DEFAULT_RECEIPT)
+        if config.pair_schema and receipt.get("schema_version") != config.pair_schema:
+            raise RouteError(
+                f"route config expects pair schema {config.pair_schema}, found {receipt.get('schema_version')}"
+            )
+        pair_key = str(receipt.get("pair_key", ""))
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", pair_key):
+            raise RouteError("normative pair receipt has no valid pair key")
+    if config.authority_file:
+        # Common to all parts of a composed candidate, independent of V2 shards.
+        authority = file_record(root, config.authority_file, "required")
+        pair_key = "sha256:" + str(authority["sha256"])
+
     required_selectors = list(config.baseline_handles) if selected["v2"] else []
     optional_selectors = list(config.baseline_optional_handles) if selected["v2"] else []
     required_files = list(config.baseline_files) if selected["v2"] else []
@@ -526,6 +554,8 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
         if route.max_required_bytes is not None:
             limits.append(route.max_required_bytes)
     required_files.extend(ancestor_agent_files(root, normalized_paths))
+    if config.authority_file:
+        required_files.append(config.authority_file)
 
     # The causal property names its own governing fragment; a route table gap
     # must not silently demote it to one-hop optional material (#929, #958,
@@ -572,6 +602,8 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
         "required_bytes": required_bytes,
         "required_limit_bytes": required_limit,
     }
+    if config.authority_file:
+        core["authority_file"] = config.authority_file
     canonical = json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     core["receipt_id"] = "sha256:" + sha256_bytes(canonical)
     return core
@@ -638,7 +670,7 @@ def render_route(payload: dict[str, Any]) -> str:
         "# Documentation read route",
         "",
         f"Receipt: `{payload['receipt_id']}`",
-        f"Normative pair: `{payload['pair_key']}`",
+        f"Documentation authority key: `{payload['pair_key']}`",
         f"Matched routes: `{', '.join(payload['matched_routes'])}`",
         f"Required payload: `{payload['required_bytes']}` / `{payload['required_limit_bytes']}` bytes",
         "",
@@ -707,7 +739,8 @@ def render_routes_markdown(config: Config) -> str:
         "- Files: " + (", ".join(f"`{item}`" for item in config.v3_baseline_files) or "not configured"),
         "- Existing edited V3 Markdown files are also required; deleted paths stay in scope.",
         "- V3 owners are verified by file bytes, not by historical A/I handle membership.",
-        "- The legacy pair key remains receipt metadata, not V3 product authority.",
+        (f"- Authority: `{config.authority_file}`. Pure V3 does not load the V2 handle index or pair receipt."
+         if config.authority_file else "- The legacy pair key remains receipt metadata, not V3 product authority."),
         "",
         "## Route matrix",
         "",

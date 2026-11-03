@@ -28,7 +28,7 @@ Retained V2/shared paths only; V3 uses the file baseline below.
 - Files: `AGENTS.md`, `WORKFLOW.md`, `docs/ARCHITECTURE_CONTRACT.md`, `docs/v3/README.md`
 - Existing edited V3 Markdown files are also required; deleted paths stay in scope.
 - V3 owners are verified by file bytes, not by historical A/I handle membership.
-- The legacy pair key remains receipt metadata, not V3 product authority.
+- Authority: `docs/ARCHITECTURE_CONTRACT.md`. Pure V3 does not load the V2 handle index or pair receipt.
 
 ## Route matrix
 

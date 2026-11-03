@@ -24,6 +24,14 @@ current `sha256` and the boundary-crossing `reason`. `checklist` states whether 
 checklist/work-unit record is required by the assignment contract, and binds it
 to the final candidate tree.
 
+With route configuration v3, `pair_key` is the SHA-256 identity of
+`docs/ARCHITECTURE_CONTRACT.md`, not the retired V2 pair. The sample below includes
+V2/mixed metadata: for a pure V3 changed-path set, remove `handle_index_*` and
+`normative_pair_*`; the verifier rejects both missing required and extra unused keys.
+Use the reader's complete path set and the existing
+[metadata recipe](../docs/v3/DEVELOPMENT.md#routing-metadata), not guessed identities.
+A composed envelope uses the union of all parts for its metadata dependencies.
+
 <!-- eliot-doc-read-evidence:v2:start -->
 ```json
 {
@@ -49,6 +57,8 @@ to the final candidate tree.
     "recorded": false
   },
   "contract_inputs": {
+    "authority_path": "docs/ARCHITECTURE_CONTRACT.md",
+    "authority_sha256": "<current architecture authority sha256>",
     "handle_index_path": "docs/architecture/handle-index.json",
     "handle_index_sha256": "<current handle index sha256>",
     "normative_pair_path": "docs/normative-pair.toml",
@@ -62,7 +72,7 @@ to the final candidate tree.
     "<route id>"
   ],
   "optional_expansions": "none",
-  "pair_key": "sha256:<normative pair key>",
+  "pair_key": "sha256:<architecture authority sha256>",
   "read_receipt_id": "sha256:<read receipt id>",
   "repository": {
     "name": "eliot-memory-os",

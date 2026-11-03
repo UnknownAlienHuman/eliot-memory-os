@@ -720,9 +720,8 @@ def _materialize_full_tree(root: Path, candidate_tree: str) -> Path:
 # Filesystem closure the SOLE algorithms touch on a candidate root, enumerated
 # from docs_router_core/route_payload and docs_read/build_read_bundle (no
 # other reader input exists on that root):
-# * the route config, handle index and normative pair, read through
-#   _router.DEFAULT_CONFIG/_router.DEFAULT_INDEX/_router.DEFAULT_RECEIPT and
-#   _contract_inputs;
+# * the route config and its version-dependent routing_input_paths, including
+#   the current authority page; V2 metadata is not required by a pure V3 scope;
 # * the assignment contract (.github/work-unit-cohort.toml);
 # * AGENTS.md EXISTENCE at the repository root and at every ancestor directory
 #   of each changed path (ancestor_agent_files checks is_file only; file
@@ -731,8 +730,8 @@ def _materialize_full_tree(root: Path, candidate_tree: str) -> Path:
 #   the matched routes' config lists and the ancestor AGENTS.md set
 #   (file_record during route_payload);
 # * required item bytes named by route["required"] (verified_item during
-#   build_read_bundle). Optional fragments and changed-path bytes are never
-#   read; route matching itself is pure string comparison.
+#   build_read_bundle); existing changed V3 Markdown is also a required read.
+#   Optional fragments are not read; matching itself is pure string comparison.
 #
 # The projection serves exactly that closure with real bytes taken from the
 # immutable candidate TREE object: never the mutable worktree, never a
@@ -866,8 +865,7 @@ def _projection_fixed_inputs() -> list[str]:
     """The algorithms' own declared fixed inputs (their constants, not a list)."""
     return [
         _router.DEFAULT_CONFIG,
-        _router.DEFAULT_INDEX,
-        _router.DEFAULT_RECEIPT,
+        _router.AUTHORITY_PATH,
         COHORT_LOCK_PATH,
     ]
 
@@ -892,7 +890,14 @@ def _project_candidate(root: Path, candidate_tree: str, paths: Sequence[str], to
             matched = _router.matched_routes(config, list(paths), topic)
         except _router.RouteError as exc:
             raise _ProjectionGap(f"projection cannot reproduce route matching: {exc}") from exc
-        declared: set[str] = set(config.baseline_files) | set(config.baseline_optional_files)
+        selected = _router.version_paths(config, paths)
+        declared: set[str] = set(_router.routing_input_paths(config, paths).values())
+        if selected["v2"]:
+            declared |= set(config.baseline_files) | set(config.baseline_optional_files)
+        if selected["v3"]:
+            declared |= set(config.v3_baseline_files) | set(config.v3_optional_files)
+            declared.update(path for path in selected["v3"]
+                            if PurePosixPath(path).suffix.lower() in (".md", ".markdown"))
         for route in matched:
             declared |= set(route.required_files) | set(route.optional_files)
         try:
@@ -1045,7 +1050,7 @@ def _recompute(candidate_root: Path, paths: Sequence[str], topic: str) -> Recomp
     return Recomputed(route=route, read_receipt=read_receipt)
 
 
-def _contract_inputs(candidate_root: Path) -> dict[str, str]:
+def _contract_inputs(candidate_root: Path, paths: Sequence[str] | None = None) -> dict[str, str]:
     """Current digests of the immutable routing/reader inputs, from the candidate."""
 
     def digest(relative: str) -> str:
@@ -1054,16 +1059,16 @@ def _contract_inputs(candidate_root: Path) -> dict[str, str]:
             _fail(EvidenceFailure.STALE_SOURCE_TREE, f"routing input missing in candidate: {relative}")
         return _router.sha256_file(path)
 
-    return {
-        "route_rules_path": ROUTE_RULES_PATH,
-        "route_rules_sha256": digest(ROUTE_RULES_PATH),
-        "handle_index_path": HANDLE_INDEX_PATH,
-        "handle_index_sha256": digest(HANDLE_INDEX_PATH),
-        "normative_pair_path": PAIR_RECEIPT_PATH,
-        "normative_pair_sha256": digest(PAIR_RECEIPT_PATH),
-        "reader_contract": READER_CONTRACT,
-        "router_contract": ROUTER_CONTRACT,
-    }
+    try:
+        config = _router.load_config(candidate_root)
+        inputs = _router.routing_input_paths(config, paths)
+    except _router.RouteError as exc:
+        _fail(EvidenceFailure.ROUTER_INPUT_MISMATCH, f"routing inputs rejected: {exc}")
+    result = {"reader_contract": READER_CONTRACT, "router_contract": ROUTER_CONTRACT}
+    for label, relative in inputs.items():
+        result[label + "_path"] = relative
+        result[label + "_sha256"] = digest(relative)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1343,7 +1348,7 @@ def _compare(
     _compare_required(envelope["required_items"], recomputed)
     _compare_bundle(envelope["bundle"], recomputed)
     _compare_optional(envelope["optional_expansions"], recomputed)
-    _compare_contract_inputs(envelope["contract_inputs"], candidate_root)
+    _compare_contract_inputs(envelope["contract_inputs"], candidate_root, changed)
     _compare_attestation(envelope["attestation"])
     state = _checklist_state(envelope["checklist"], candidate_root, candidate_tree, work_issue)
     return state, _assignment_contract(candidate_root)
@@ -1554,8 +1559,10 @@ def _compare_optional(recorded: Any, recomputed: Recomputed) -> None:
             )
 
 
-def _compare_contract_inputs(recorded: Any, candidate_root: Path) -> None:
-    expected = _contract_inputs(candidate_root)
+def _compare_contract_inputs(
+    recorded: Any, candidate_root: Path, paths: Sequence[str] | None = None,
+) -> None:
+    expected = _contract_inputs(candidate_root, paths)
     if type(recorded) is not dict:
         _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "contract_inputs must be an object")
     unknown = sorted(set(recorded) - set(expected))
@@ -1867,7 +1874,7 @@ def refresh_provenance(
     current_reader = _text(read_by, "read_by", EvidenceFailure.ATTESTATION_MISSING)
     candidate_root, recomputed = _recompute_final(root, candidate_tree, changed, current_topic)
     try:
-        _compare_contract_inputs(prior["contract_inputs"], candidate_root)
+        _compare_contract_inputs(prior["contract_inputs"], candidate_root, prior["changed_paths"])
         _compare_attestation(prior["attestation"])
         if str(prior["attestation"]["read_by"]) != current_reader:
             _fail(
@@ -1927,7 +1934,7 @@ def refresh_provenance(
                 "bytes": recomputed.read_receipt["bundle_bytes"],
             },
             "optional_expansions": prior["optional_expansions"],
-            "contract_inputs": _contract_inputs(candidate_root),
+            "contract_inputs": _contract_inputs(candidate_root, changed),
             "attestation": {
                 "read_by": current_reader,
                 "statement": (
@@ -2201,7 +2208,12 @@ def _verify_composed(
                 EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
                 f"repository identity {owner}/{name} is not this checkout ({expected_name})",
             )
-        _compare_contract_inputs(envelope["contract_inputs"], roots[0])
+        input_root = next(
+            (part_root for part_root, part_paths in zip(roots, normalized_parts)
+             if _router.version_paths(_router.load_config(part_root), part_paths)["v2"]),
+            roots[0],
+        )
+        _compare_contract_inputs(envelope["contract_inputs"], input_root, changed)
         _compare_attestation(envelope["attestation"])
         state = _checklist_state(envelope["checklist"], roots[0], provenance.candidate_tree, work_issue)
         assignment = _assignment_contract(roots[0])
@@ -2671,7 +2683,7 @@ def _valid_envelope(root: Path, base: str, candidate: str, topic: str) -> str:
                 "bytes": recomputed.read_receipt["bundle_bytes"],
             },
             "optional_expansions": optional or "none",
-            "contract_inputs": _contract_inputs(candidate_root),
+            "contract_inputs": _contract_inputs(candidate_root, changed),
             "attestation": {
                 "read_by": "sanitized acceptance runner",
                 "statement": "Every required item in this envelope was opened and read before mutation.",
@@ -2897,7 +2909,12 @@ def _valid_composed_envelope(root: Path, base: str, parent: str, candidate: str,
                     "optional_expansions": "none",
                 }
             )
-        contract = _contract_inputs(roots[0])
+        input_root = next(
+            (part_root for part_root, part in zip(roots, parts)
+             if _router.version_paths(_router.load_config(part_root), part["paths"])["v2"]),
+            roots[0],
+        )
+        contract = _contract_inputs(input_root, changed)
     finally:
         for candidate_root in roots:
             _release_candidate(candidate_root)

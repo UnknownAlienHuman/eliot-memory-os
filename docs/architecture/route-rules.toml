@@ -1,4 +1,5 @@
-schema_version = "eliot-doc-route-config-v2"
+schema_version = "eliot-doc-route-config-v3"
+authority_file = "docs/ARCHITECTURE_CONTRACT.md"
 pair_schema = "eliot-normative-pair-v2-sharded"
 
 [baseline]

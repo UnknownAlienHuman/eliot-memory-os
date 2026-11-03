@@ -1,7 +1,10 @@
 <!-- generated: eliot-doc-shards-v1 -->
-# ELIOT documentation router
+# Retained V2 documentation and shared routing
 
-Do not open the former monoliths as task context.
+Current V3 work starts at the [V3 task map](../v3/README.md). The fragments below
+preserve V2 source evidence and still serve explicit V2/shared tooling tasks; they
+are not the V3 specification or its default context. Pure V3 reading is independent
+of their handle index and pair receipt. Do not open the former monoliths as task context.
 
 1. Read [`READING_PROTOCOL.md`](READING_PROTOCOL.md).
 2. Run the verified reader for the exact path and causal property:
@@ -29,7 +32,7 @@ A route alone is navigation, not reading evidence. The local
 - [Dependency policy](../DEPENDENCY_POLICY.md)
 - [Pre-sharding navigation snapshots](navigation-history/)
 
-Normative pair: `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`.
+Retained V2 pair: `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`.
 
 `ELIOT_ARCHITECTURE.md` and `ELIOT_IMPLEMENTATION.md` remain only to preserve
 incoming file and heading links. Their canonical content has moved to fragments.
