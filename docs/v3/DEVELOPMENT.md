@@ -12,6 +12,7 @@ fifth specification nor another backlog. Read only the section needed by your ta
 | Choose checks and interpret failure | [Checks](#checks) |
 | Update a contract, source or reference | [Change propagation](#change-propagation) |
 | Register or refresh the actual task | [Assignment registration](#assignment-registration) |
+| Retire old documentation safely | [Legacy consumers](#legacy-documentation-consumers) |
 | Deliver documentation to main | [Documentation integration](#documentation-integration) |
 
 ## Repository map
@@ -146,8 +147,10 @@ not proof that URLs in external issues or other repositories were checked. Inspe
 related open issues/PRs and pinned links separately. Keep historical links historical.
 
 Do not run `docs_shards.py migrate` or regenerate the V2 router/indexes for a V3 prose
-edit: they own different surfaces. Full shard/router/conformance checks are selected
-only when their actual surface changes or when required by integration.
+edit. The one-shot migration refuses an already-sharded tree before writing history
+or navigation. Full shard/router/conformance checks are selected only when their
+actual surface changes or when required by integration. A retained-V2 integrity
+result does not validate the V3 specification; see [the consumer map](#legacy-documentation-consumers).
 
 ### Rust source
 
@@ -374,12 +377,32 @@ were orphan projections: the two book indexes and handle index already supply th
 links. Their generator was removed too. Complete originals remain at
 [the pre-cleanup revision](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/e708e4aa67413bfde24b1115a95e181f4db7151c/docs/architecture).
 
-The remaining canonical V2 fragments are different: `docs_shards_core`,
-`doc_code_conformance_lib/normative_references` and retained source-navigation tools
-still consume them or their manifests. Do not delete a manifest member, turn missing
-input into PASS, or regenerate all V2 navigation to repair V3. Migrate the particular
-consumer first, preserve its rejected-input behavior, then remove the unused material
-and run link/router checks. The existing registry records that remaining migration.
+### Legacy documentation consumers
+
+These are real dependencies, not permission to resume V2. Change the named consumer
+and its callers before deleting its input. Keep one routing owner; do not add another
+schema catalogue or checker just to retire the first one.
+
+| Consumer and callers | Retained input actually read | Migration boundary / check |
+|---|---|---|
+| `docs_shards_core.verify` through `docs_shards.py`, `verify-normative.ps1`/`.sh`, `verify.ps1` and `Justfile` | Both manifests, their fragments, V2 pair receipt and generated indexes | `verify_pair` validates the retained receipt/manifests, not literals in the V3 authority page. Missing/corrupt V2 input must fail. `verify --normative-only` reports `scope=retained-v2`; a pass is not V3 acceptance. |
+| `doc_code_conformance_lib/normative_references.audit`, called by `verify-doc-code-conformance.py` | Numeric and Decision Anchor indexes; A16.1 is read to rebuild the latter; configured operational references are scanned | Separate current-file references from retained A/I and ARCH selectors before retiring either index. Unknown selectors and broken declared sources remain errors; excluding all V2 or V3 files is not migration. |
+| `code_navigation_lib/registry.build_registry`, `validate_handle_index`, capsule contract resolution and handle destinations, through `code_navigation.py` | Indexed fragment bytes/anchors, manifests, logical-block handles and package contract references | Migrate declarations and consumers together to versioned owner-file references. Preserve Cargo membership, dependency/path validation and unresolved-reference failures. A V3 task must not need a complete V2 registry first. |
+| `docs_closure_audit.py`, called by `Justfile`/`verify.ps1`; repository-policy also constrains their wiring | V2 manifests, pair/index identities, original Git history and historical workstream assumptions | Classify the retained audit explicitly at each caller before retirement. A missing historical commit is not missing V3 implementation; a skipped audit is not PASS. Changes to CI/profile admission need their own reviewed scope. |
+
+Before editing a consumer, inspect its current callers and declared inputs:
+
+```text
+git grep -n -F -e 'verify_pair' -e 'docs_shards' -e 'verify-normative' -- scripts Justfile .github
+git grep -n -F -e 'normative_references' -e 'DEFAULT_HANDLE_INDEX' -e 'docs_closure_audit' -- scripts config Justfile .github
+```
+
+Then run the existing check for that boundary on intact and deliberately missing
+input, plus the full local-link/router checks after path changes. Temporary negative
+inputs stay outside tracked files. Do not modify hashes or suppress failures to admit
+missing data. Preserve originals by immutable Git revision, not another archive tree.
+The [R-207 continuation](ANALYSIS-REGISTRY.md#legacy-consumer-migration) owns status and
+order; this table owns file responsibilities, not a duplicate backlog.
 
 ### Final-candidate verification
 

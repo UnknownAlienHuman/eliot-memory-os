@@ -17,4 +17,4 @@ if ($LASTEXITCODE -ne 0) {
     throw "VERIFY_NORMATIVE_FAIL: sharded normative pair verification failed"
 }
 
-Write-Output 'NORMATIVE_VERIFY: PASS layout=eliot-doc-shards-v1 authority=main'
+Write-Output 'NORMATIVE_VERIFY: PASS scope=retained-v2 layout=eliot-doc-shards-v1'

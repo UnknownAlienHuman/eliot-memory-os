@@ -1132,7 +1132,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "VERIFY_NORMATIVE_FAIL: sharded normative pair verification failed"
 }
 
-Write-Output 'NORMATIVE_VERIFY: PASS layout=eliot-doc-shards-v1 authority=main'
+Write-Output 'NORMATIVE_VERIFY: PASS scope=retained-v2 layout=eliot-doc-shards-v1'
 """
     write_utf8(root / "scripts/verify-normative.ps1", content)
 
@@ -1172,6 +1172,14 @@ def patch_verify_pipeline(root: Path) -> None:
 
 def migrate(root: Path) -> None:
     root = root.resolve()
+    # Refuse before writing history/navigation: this command is a one-shot V2
+    # layout conversion, never a repair or synchronization command for V3.
+    for spec in SOURCE_SPECS:
+        legacy_path = repo_path(root, spec["legacy"])
+        if repo_path(root, spec["manifest"]).exists() or (
+            legacy_path.is_file() and GENERATED_MARKER in read_utf8(legacy_path)[:300]
+        ):
+            raise DocsError("layout migration already completed; use verify, not migrate")
     pair_path = root / "docs/normative-pair.toml"
     old_pair = load_simple_toml(pair_path)
     old_index_path = root / "docs/architecture/INDEX.md"
@@ -1436,6 +1444,7 @@ def verify_markdown_links(root: Path) -> dict[str, int]:
 
 
 def verify_pair(root: Path, manifests: dict[str, dict[str, Any]]) -> str:
+    """Verify retained V2 identity, not the current V3 architectural authority."""
     receipt = load_simple_toml(root / "docs/normative-pair.toml")
     if receipt.get("schema_version") != PAIR_SCHEMA:
         raise DocsError("normative-pair receipt is not the sharded schema")
@@ -1467,17 +1476,9 @@ def verify_pair(root: Path, manifests: dict[str, dict[str, Any]]) -> str:
             f"computed={computed_pair}"
         )
 
-    contract = read_utf8(root / "docs/ARCHITECTURE_CONTRACT.md")
-    required = [
-        str(receipt["architecture_path"]),
-        str(receipt["implementation_path"]),
-        str(receipt["architecture_sha256"]).upper(),
-        str(receipt["implementation_sha256"]).upper(),
-        computed_pair,
-    ]
-    for value in required:
-        if value not in contract:
-            raise DocsError(f"architecture contract is missing current identity: {value}")
+    # The receipt/manifests above own retained V2 identity. The current authority
+    # page belongs to V3; requiring V2 identities there would re-adopt the donor.
+    # V3 authority and owner files are checked by the versioned router/reader.
 
     retired = (
         "docs/normative",
@@ -1500,7 +1501,7 @@ def verify(root: Path, normative_only: bool = False) -> None:
     if not normative_only:
         link_result = verify_markdown_links(root)
     print(
-        "DOC_SHARDS_VERIFY: PASS "
+        "DOC_SHARDS_VERIFY: PASS scope=retained-v2 "
         f"pair={pair} "
         + " ".join(
             f"{item['source']}_fragments={item['fragments']} "
