@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**Сверка: 2026-11-02. Документационная база в `main`; PR #5325 слит. Runtime не квалифицирован.**
+**Сверка: 2026-11-03. Документационная база в `main`; PR #5325 слит. Runtime не квалифицирован.**
 
 Единственный активный реестр V3: текущие решения, разрывы, границы проверки и следующий
 шаг. Контракты принадлежат своим документам; [AUDIT](AUDIT.md) и
@@ -29,7 +29,7 @@ CI и независимое review не становятся успешными
 | D0. Установить версии и владельцев | `CHECKED` source | Снимки ниже; обновить перед изменением внешнего контракта. | V3 baseline в main, V2 donor, Store source и controller не смешаны. |
 | D1. Исправить вход и маршруты чтения | `REVIEW_PENDING` | START/README и вложенные crates/storage AGENTS ведут в V3; CODE_NAVIGATION отделяет retained V2 toolchain. DEVELOPMENT связывает файлы, проверки и companion updates. | Независимо пройти весь instruction chain до Store source; V3 не получает старые transition/proof/Host обязанности из родительской папки. |
 | D2. Согласовать нормативные документы с controller | `REVIEW_PENDING` | Четыре owner drafts и #199 исправлены; foundation отделён от предложенного Memory API. | Независимо проверить source mapping, scoped методы и оставленные решения. Controller acceptance/runtime не подразумеваются. |
-| D3. Упростить конструкцию и порядок реализации | `PARTIAL` | Physical backup и порядок реализации имеют одного owner; docs SQL retired. AUDIT сокращён до причин выбора, historical evidence и маршрутов, без второй runtime-инструкции. | R-205: кандидат отвязки чтения; R-206: индексы удалены; R-207: оставшиеся consumers. Проверить сохранение требований и реальные зависимости перед дальнейшим удалением. |
+| D3. Упростить конструкцию и порядок реализации | `PARTIAL` | Physical backup и порядок реализации имеют одного owner; docs SQL retired. AUDIT сокращён до причин выбора, historical evidence и маршрутов, без второй runtime-инструкции. | R-205/R-206 слиты; R-207: [поэтапная миграция потребителей](#legacy-consumer-migration). Проверить сохранение требований и реальные зависимости перед дальнейшим удалением. |
 | D4. Свести Store-контракт и assets | `PARTIAL` | R-183: в Implementation §4.7.1–3 выбраны time/reuse/support/influence/job codecs и единый history envelope. Далее #5326/#5327: DDL/DTO/query/bounds и caller/readback; отдельный code task, не prose PR. | Один source owner; каждый field/query/limit соединён с writer/reader. Source defects не закрыты правкой prose; compile, DDL execution и runtime разделены. |
 | D5. Проверить требования и сценарии | `PARTIAL` | AUDIT-MAP: 63 якоря, 8 границ, T01–T37 и 7 маршрутов. AUDIT: дополнительно все 34 требования и A15-1–29 ведут к current owners; старые imperatives устранены. Полный link pass выполнен после retirement двух старых swarm reports; далее независимое чтение сценариев, включая выбранные R-183 codecs. | Сверка записанного корпуса не объявляется повторным чтением недоступных первоисточников или runtime proof. Все известные требования имеют route; реализация выбранных codecs и source defects остаются D4. |
 | D6. Интеграция документации | `MERGED / CHECKS_OPEN` | PR #5325 → main@d34451af по прямому указанию владельца; GitHub merged state и main ref перечитаны. Полные link/router checks выполнены; final evidence, независимое review и main CI остаются открытыми. | Слияние подтверждено; успешные проверки, независимая приёмка и готовность runtime из него не следуют. |
@@ -42,7 +42,7 @@ Read-only проверки можно разделять; общие файлы 
 
 | Объект | Проверенный снимок | Граница |
 |---|---|---|
-| V3 integration baseline | `d34451af006afb72584ced55c63cb575bdac92ba` | PR #5325 слит; main ref и merged=true проверены через API. Это integration readback, не CI/runtime PASS. |
+| V3 integration baseline | `d3f124cd871e87859843618b19653816f57279ac` | PR #5331 слит; дерево `fd7cdbe5bd00105d76c877470e0ef369d3cfdb1f` воспроизведено полностью. Узкие checks и review не означают общий CI/runtime PASS. |
 | Предыдущий metadata snapshot | `4af7df71959d50ae431761e3989040e2d1870aef` | Каталог расширен через source-isolated исполнение существующего generator; исходные metadata/doc blobs сверены. Полный package CLI, checkout/gate и независимое review не выполнены. |
 | Store source | `c5154b0ea352980279cd0d46ca3353148d4c8027`, PR #5327 | PR остаётся open/unmerged при интеграции docs. R-183 source alignment не выполнен; compiler/runtime не запускались. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованный D4 source finding; этот проход не перепроверял upstream и не запускал движок. |
@@ -91,9 +91,29 @@ PARTIAL — неполное покрытие; BLOCKED — конкретная 
 | R-202 | Store README требовал сразу runtime capture/open, а #5326 ограничивал работу asset package; root instructions сохраняли двусмысленное исключение слитой ветки. | Исправлены owner entry points и порядок первой source-задачи. Scope asset repair и следующего connected runtime явно разделён; никаких новых crates/сервисов/реестров. |
 | R-203 | Main CI дошёл до profile resolver, но terminal evidence его stages осталось OMITTED, outcome UNKNOWN. Подготовка Surreal inputs также сообщила provision_failed. | Run 41129265415 / job 124315696029. Отдельно исправлять реального владельца completion/admission, не менять UNKNOWN на PASS и не списывать это на старый PR evidence blocker. |
 | R-204 | Две swarm-страницы содержали 743 КБ устаревших task rows/operational diary, включая старые «действующие» правила и три ложных link destinations. | Текущие страницы заменены короткими historical pointers на полные оригиналы в Git; swarm README явно donor-only. Полный поиск имён нашёл только retained prose consumers; V2 source, checker и исторические данные не удалены. |
-| R-205 | Pure V3 router/reader/evidence безусловно требовали V2 index/pair; candidate projection могла пропускать изменённую V3 Markdown-страницу. | `CANDIDATE / CHECKED`: config v3 использует существующий ARCHITECTURE_CONTRACT как общую authority. Pure V3 не читает и не извлекает V2 metadata; mixed/V2 сохраняют их. Projection включает baseline и изменённый prose, сверена с полным деревом. До интеграции кандидат не является поведением main. |
+| R-205 | Pure V3 router/reader/evidence требовали V2 metadata; projection могла пропускать изменённый prose. | `MERGED`: PR #5331 / main@d3f124cd. Pure V3 не читает V2 metadata; mixed scopes сохраняют их; оба порядка composed parts проверены. Не применять сохранённый старый патч повторно. |
 | R-206 | 56 generated section indexes дублировали book/handle indexes без tracked consumers. | `MERGED`: PR #5330 / main@9864cc75 удалил 18+38 индексов и единственный generator/call. 627 canonical fragments и оба manifest сохранены; повторно применять удаления нельзя. |
-| R-207 | Canonical V2 corpus ещё нужен docs_shards_core, doc_code_conformance_lib/normative_references, code_navigation_lib и shared routes; старый pair checker требует V2 identities в V3 authority page. | Следующий отдельный участок: проследить callers этих consumers, отделить retained-V2 проверки от V3, затем архивировать только неиспользуемое. Не подставлять V2 identities в новую authority и не превращать missing input в PASS. |
+| R-207 | У retained V2 corpus есть реальные потребители; pair checker ошибочно требовал V2 identities на странице authority V3. | `PARTIAL`: локальный кандидат отделяет pair integrity от V3 authority и запрещает повторный migrate до записи. Остальные потребители и условия удаления — [ниже](#legacy-consumer-migration); все 627 fragments пока сохранены. |
+
+## Legacy consumer migration
+
+R-207 продолжать по [карте потребителей](DEVELOPMENT.md#legacy-documentation-consumers),
+не по числу файлов. Один writer; история остаётся в Git. Не менять CI/protections
+или закрывать findings ради зелёного статуса.
+
+| Участок | Статус | Следующая конкретная работа / условие завершения |
+|---|---|---|
+| P1. Разделить V2 integrity и V3 authority | `CANDIDATE / CHECKED` | Убран ложный literal-check новой authority; проверка V2 receipt/manifests/hashes сохранена. Повторный migrate отказывается до записи. Интегрировать проверенный candidate; его проверки не означают PASS общего CI. |
+| P2. Разделить operational reference conformance | `OPEN / NEXT` | `normative_references` и вызывающий `verify-doc-code-conformance.py`: version-aware набор ссылок, без исключения целых каталогов. Missing/unknown V2 selectors всё ещё FAIL; проверка V3 не требует неиспользуемый legacy index. |
+| P3. Перенести code-navigation contract references | `OPEN` | `registry`, `capsules`, `handle_destinations` и их конфигурация: current owner-file refs вместо обязательного A/I catalogue для V3. Сохранить package/path/dependency checks; проверить retained V2 отдельно. |
+| P4. Разделить вызовы legacy closure/profile | `OPEN` | Проследить `Justfile`, `verify.ps1`, repository-policy и их проверяющие механизмы; оформить отдельную integration-scope правку. Не выдавать skipped historical audit за успешную проверку и не отключать oracle. |
+| P5. Убрать освобождённый корпус | `BLOCKED` P2–P4 | Для каждого удаляемого набора нет исполняемых потребителей/активных ссылок, originals доступны по immutable revision. После удаления проходят ссылки, router и затронутые consumers; неизвестная зависимость блокирует только этот набор. |
+
+P1 проверяется на точном восстановленном дереве main плюс правка: штатный shard
+verifier, self-checks, link/router scan, отказ на отсутствующем/испорченном V2 input
+и отсутствие файловых изменений после отказа migrate. Результаты исполнения и
+финальный diff сохраняются с кандидатом. Удалённая публикация, независимое review,
+PowerShell wrapper, Windows runtime и общий CI этим локальным кандидатом не заявлены.
 
 ## Scenario preservation
 
@@ -291,7 +311,7 @@ S-084–S-087 — exact-tag Surreal evidence; S-088/S-089 — design/assets, н�
 | S-104 | На 3fa7b74 исходные router/reader/config/ROUTES blob hashes сверены; py_compile, 14 существующих self-test cases и 58 targeted checks выполнены. 27 прежних route payloads совпали с исходным алгоритмом на одинаковых synthetic inputs; production config содержит 34 coverage examples. | Исполнялся изменённый Python, но corpus был временной fixture. Это не полный checkout, фактическое V3 reading attestation, независимое review, compilation/runtime или final merge-gate PASS. |
 | S-105 | На 4af7df7 прочитаны generator/contract/checklist source, полный active-directory tree и обе копии 837 (один blob 29e696be). Issue #5324 стабилизирован и привязан к точному body digest; 12 rows с сохранением исходных 11. | Source-isolated metadata/checklist execution: deterministic generation, старый aggregate воспроизведён, 22 cases прошли. Это извлечённые определения, не полный package CLI/gate; синтетические tree IDs не reading evidence или review. |
 | S-106 | CI artifact 13014615416 проверен по SHA-256, все 5,017 source blobs — по Git SHA; main восстановлен исключением только source-PR delta, дерево точно af55bcb2935832f83ca5027b1de9a5c7072b859e (5,008 файлов). | Выполнены существующие full-tree link/router checks, не synthetic corpus. После retirement двух старых active-looking swarm reports link pass успешен; итоговые команды/счётчики — в PR. Полная Git history, runtime и независимое review не подразумеваются. |
-| S-107 | На точном полном tracked tree main@9864cc75 (6fca0030) восстановлен оставшийся reader/evidence patch; Python compilation, 14 router/read и 13 shard self-checks, 69 existing evidence acceptance cases и 58 адресных проверок прошли. Full-tree router/link checks выполнены; чистый V3 без V2 metadata, mixed refusals, stale/missing/extra inputs и projection/full equality проверены. | Это локальный кандидат, не remote commit, независимое review или общий CI. Acceptance cases используют штатные fixtures; адресные проверки используют текущую config/corpus и временные отрицательные варианты. Runtime/Clippy не запускались; source hashes V2 неизменны. |
+| S-107 | PR #5331 опубликован и слит как d3f124cd; GitHub run 41641971483 прошёл Python, router/reader/shard checks, 69 evidence cases, 804 Markdown / 4,332 links и V2 reconstruction. Codex review b907ddb не сообщил существенных замечаний. | Проверялся этот конкретный increment. Общий PR CI 41642449197 остановлен GWF-022 на изменении oracle; чтение/компиляция пропущены. Это не review всех V3 contracts и не product/runtime PASS. |
 
 ## Integration blockers
 
