@@ -121,14 +121,17 @@ def patch_navigation_surfaces(root: Path) -> None:
 
 def render_reading_protocol(pair_key_value: str) -> str:
     return f"""{_core.GENERATED_MARKER}
-# Mandatory agent documentation protocol
+# Verified documentation reading
 
-The documentation is a routed contract graph, not a book-shaped prompt.
+V3 owners are selected through the [task map](../v3/README.md). Retained V2
+fragments apply only to V2/shared paths. This protocol verifies selected bytes;
+it does not make the V2 workstream an active V3 assignment.
 
 ## Required sequence
 
-1. Resolve current repository authority through `AGENTS.md`, `WORKFLOW.md`, and
-   `workstreams/ACTIVE.toml`.
+1. Resolve the task through `AGENTS.md`, `WORKFLOW.md` and
+   [`ARCHITECTURE_CONTRACT.md`](../ARCHITECTURE_CONTRACT.md). The V3 registry tracks
+   V3 work; `workstreams/ACTIVE.toml` is retained V2 evidence, not its task queue.
 2. Run the verified reader from the repository root:
 
    ```text
@@ -147,7 +150,12 @@ The documentation is a routed contract graph, not a book-shaped prompt.
 6. Re-run the reader when the changed path, causal property, authority boundary,
    or evidence scope expands.
 
-Current normative pair: `{pair_key_value}`.
+Route configuration v3 uses the exact architecture-authority page as its common
+identity (wire field `pair_key`). Pure V3 reading does not load V2 metadata or shards;
+V2/mixed reading preserves their requirements. Final-candidate metadata is scoped by
+the complete changed-path set; see the [recipe](../v3/DEVELOPMENT.md#routing-metadata).
+
+Retained V2 pair: `{pair_key_value}`.
 
 ## Fail-closed cases
 
@@ -157,7 +165,7 @@ Do not mutate the repository when:
 - a required handle cannot be resolved;
 - a routed file/fragment hash or byte count differs from the read receipt;
 - the verified bundle cannot be materialized;
-- the shard manifest cannot reconstruct the adopted source hash;
+- a selected V2 shard manifest cannot reconstruct its retained source hash;
 - an incoming legacy anchor resolves only to a compatibility map and the
   canonical fragment was not opened;
 - the task expands beyond the read receipt without a new reader invocation.
@@ -177,21 +185,27 @@ python scripts/docs_read.py read --changed-from origin/main --topic "<causal pro
 
 The generated bundle and receipts are local evidence and must not be committed.
 
-To verify the documentation graph and reader implementation:
+For shared routing changes, check the complete configured corpus and reader:
 
 ```text
-python scripts/docs_shards.py verify --root .
 python scripts/docs_router.py check --root .
 python scripts/docs_read.py self-test
 ```
+
+For prose links use the existing [link-only recipe](../v3/DEVELOPMENT.md#documentation-and-navigation).
+The retained V2 shard/pair verifier is a separate legacy check, not a V3 readiness
+verdict or a prerequisite for reading a V3 owner file.
 """
 
 
 def render_architecture_readme(pair_key_value: str) -> str:
     return f"""{_core.GENERATED_MARKER}
-# ELIOT documentation router
+# Retained V2 documentation and shared routing
 
-Do not open the former monoliths as task context.
+Current V3 work starts at the [V3 task map](../v3/README.md). The fragments below
+preserve V2 source evidence and still serve explicit V2/shared tooling tasks; they
+are not the V3 specification or its default context. Pure V3 reading is independent
+of their handle index and pair receipt. Do not open the former monoliths as task context.
 
 1. Read [`READING_PROTOCOL.md`](READING_PROTOCOL.md).
 2. Run the verified reader for the exact path and causal property:
@@ -219,7 +233,7 @@ A route alone is navigation, not reading evidence. The local
 - [Dependency policy](../DEPENDENCY_POLICY.md)
 - [Pre-sharding navigation snapshots](navigation-history/)
 
-Normative pair: `{pair_key_value}`.
+Retained V2 pair: `{pair_key_value}`.
 
 `ELIOT_ARCHITECTURE.md` and `ELIOT_IMPLEMENTATION.md` remain only to preserve
 incoming file and heading links. Their canonical content has moved to fragments.

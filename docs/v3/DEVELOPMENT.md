@@ -265,10 +265,17 @@ paths retain V2 obligations. A mixed change includes both sets under the same co
 byte limit. Inspect `required` against the task route: a route name is not coverage.
 An existing edited V3 Markdown file is also read; deleted paths remain in the scope.
 
-Route configuration uses `eliot-doc-route-config-v2`, so an older router rejects it
-instead of ignoring version fields. Route/read receipt formats are unchanged. Their
-retained V2 pair key is compatibility metadata, not V3 architectural authority.
-The reader recomputes the V3/mixed route before accepting its owner-file set.
+Route configuration uses `eliot-doc-route-config-v3`; older loaders reject it.
+The `authority_file` is the existing architecture-authority page. Its exact SHA-256
+is the shared `pair_key` in both single and composed receipts (historical wire name,
+not adoption of V2). Pure V3 route/read/evidence needs no V2 handle index or pair
+receipt. V2 and mixed scopes still require and verify them. The reader recomputes
+the exact V3/mixed route before accepting the owner-file set.
+
+Final-tree projection must include the V3 baseline and every existing changed V3
+Markdown file, even one not individually named by a route. Check projected/full-tree
+receipt equality after changing this dependency set; an omitted file is not an
+optimization. Deletions remain in the changed-path denominator.
 
 When an authorized task changes path ownership, update the existing
 [route rules](../architecture/route-rules.toml), add a bounded coverage example naming
@@ -341,6 +348,38 @@ the machine catalogue; ANALYSIS-REGISTRY remains the sole V3 work ledger.
 Membership fixes only the assignment lookup. The actual PR still needs its own recorded
 checklist bound to the final candidate tree, genuine reading evidence and independent
 review. A local counterexample using synthetic tree IDs is never that evidence.
+
+### Routing metadata
+
+After the reader has generated a receipt for the **complete changed-path set**,
+print the metadata from the same checkout, using the existing verifier helper:
+
+```text
+python -c "import json; from pathlib import Path; from scripts.work_unit_gate import doc_read_evidence as e; r=json.loads(Path('.eliot/docs-read-receipt.json').read_text(encoding='utf-8')); print(json.dumps(e._contract_inputs(Path('.'), r['paths']), indent=2))"
+```
+
+Copy that exact object into `contract_inputs`. Pure V3 has route-rules and authority
+path/hash pairs plus reader/router identities; V2/mixed adds handle-index and
+normative-pair path/hash pairs. For composed evidence use the union of all part paths,
+not just the first part. Do not retain extra legacy keys for a pure V3 task or omit
+them for a mixed task. The candidate verifier independently recomputes the selection.
+This command generates metadata, not an attestation that someone read the bundle.
+Any candidate/base change still requires final-candidate verification below.
+
+### Retiring documentation
+
+Remove an index only after checking tracked links, string/path consumers and its
+producer. The removed `architecture/sections/` and `implementation/sections/` pages
+were orphan projections: the two book indexes and handle index already supply their
+links. Their generator was removed too. Complete originals remain at
+[the pre-cleanup revision](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/e708e4aa67413bfde24b1115a95e181f4db7151c/docs/architecture).
+
+The remaining canonical V2 fragments are different: `docs_shards_core`,
+`doc_code_conformance_lib/normative_references` and retained source-navigation tools
+still consume them or their manifests. Do not delete a manifest member, turn missing
+input into PASS, or regenerate all V2 navigation to repair V3. Migrate the particular
+consumer first, preserve its rejected-input behavior, then remove the unused material
+and run link/router checks. The existing registry records that remaining migration.
 
 ### Final-candidate verification
 

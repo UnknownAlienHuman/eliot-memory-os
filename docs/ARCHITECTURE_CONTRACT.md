@@ -35,6 +35,12 @@ source. The [audit](v3/AUDIT.md) and [source map](v3/AUDIT-MAP.md) retain ration
 and bounded donor findings. Source review, selected design, compilation, observed
 runtime behavior and product qualification are distinct; record the actual scope.
 
+The versioned route configuration binds this page's exact bytes as the common
+`pair_key` (the wire field retains its historical name). Pure V3 tasks read their
+owner files without loading the V2 handle index or pair receipt. V2/mixed tasks
+still verify their legacy metadata and required fragments. This common authority
+key allows composed reads without pretending that V3 adopts the old normative pair.
+
 Do not copy external roadmap status or revision lists into entry pages. Keep a
 dated, pinned observation in the existing registry and refresh it for an affected
 integration decision. Read only the owning sections required by the task.
