@@ -42,7 +42,7 @@
 | CONCIL-01 | несогласие важнее голосов | Альтернативы, основания и различающее наблюдение; один участник допустим, голосование не доказательство. | [Cognition §12](COGNITION.md#12-consolidation-disagreement-and-improvement) |
 | DEV-01 | сначала работающий срез | Поставлять связанное поведение. Это не запрет параллельных независимых работ. | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence) |
 | CORE-00 | работа накапливается | Наблюдения работы остаются в памяти. Обязательный урок или объяснение отсутствия урока на каждом finish убрать. | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host); [Implementation §7.1](IMPLEMENTATION.md#71-capture-policy-before-durable-custody) |
-| CORE-01 | непрерывность понимания | Адресная continuation project/workspace + task либо actor/session плюс новые события; host compaction не второй task manager. | [Cognition §2](COGNITION.md#2-current-work-reconstruction) |
+| CORE-01 | непрерывность понимания | Адресная continuation project/workspace + task либо actor/session плюс новые события; host compaction не второй task manager. | [Cognition §2](COGNITION.md#2-current-work-reconstruction); [stream scope](IMPLEMENTATION.md#44-derived-unique-keys-and-absence) |
 | CORE-02 | четыре плоскости, один цикл | Сохранить роли цикла; плоскости не являются обязательными процессами. | [Architecture §3](ARCHITECTURE.md#3-product-shape) |
 | HELP-01 | снижать нагрузку | Штатный захват и малый доменный интерфейс; произвольный потолок восемь инструментов не критерий пользы. | [Architecture §3.1](ARCHITECTURE.md#31-useful-base); [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host) |
 | ROLE-01 | наблюдение, толкование, полномочия и проверка разделены | Наблюдение, интерпретация, permission и acceptance различаются. Приёмка внешней задачи у host/controller. | [Architecture §2](ARCHITECTURE.md#2-ownership) |
@@ -53,7 +53,7 @@
 | MOD-03 | у состояния один владелец | Один Store writer; views читают его данные. Не отдельный guard registry ради этого правила. | [Architecture §2](ARCHITECTURE.md#2-ownership) |
 | PORT-01 | органы заменяемы | Настоящие adapters, network SDK и export; не универсальный backend framework. | [Architecture §3](ARCHITECTURE.md#3-product-shape) |
 | SCOPE-01 | область прежде повторного использования | Источник отдельно от reuse scope; проекты и общие методы фильтруются до top-k. | [Implementation §5.1](IMPLEMENTATION.md#51-exact-full-text-shape) |
-| MEM-01 | захват прежде организации | Сохранить permitted raw до модели, точность/полноту захвата обозначить. | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host); [Implementation §7.1](IMPLEMENTATION.md#71-capture-policy-before-durable-custody) |
+| MEM-01 | захват прежде организации | Сохранить permitted raw до модели, точность/полноту захвата обозначить. | [capture identity/readback](IMPLEMENTATION.md#721-capture-readback-and-native-redelivery); [Implementation §7.1](IMPLEMENTATION.md#71-capture-policy-before-durable-custody) |
 | MEM-02 | ошибки памяти исправимы | Редакция конкретного item и история; current row не вечная append-only проекция. | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host) |
 | MEM-03 | производное хранит источники | Реальные адресуемые источники и версия; модель не создаёт source contents одним ID. | [Cognition §1](COGNITION.md#1-observations-claims-and-revisions); [Cognition §9.2](COGNITION.md#92-result-and-cognitive-states) |
 | MEM-04 | извлечение не подкрепляет | Retrieval не support. Rank допускает relevance/recency, но не выдаёт популярность за истинность. | [Cognition §3](COGNITION.md#3-grounds-and-applicability); [Cognition §6.5](COGNITION.md#65-handoff) |
@@ -147,7 +147,7 @@
 | T20 | Positive Testd producer не подключён | Использовать наблюдаемый результат настоящего инструмента; fixture не effect | [Architecture §1](ARCHITECTURE.md#1-purpose-and-completion) |
 | T21 | Store теряет sub-minute timezone | Сохранять предоставленную точность/offset; unknown не округлённая выдумка | [Cognition §1](COGNITION.md#1-observations-claims-and-revisions) |
 | T22 | MUST_PROVE_ZONES не mandatory denominator | Coverage сообщает фактические checks/scope; policy label не полнота | [Cognition §4](COGNITION.md#4-episode-membership-and-coverage) |
-| T23 | Пять Observe variants defer-only при внутреннем owner | Один реальный capture entrypoint→writer; не полный V2 DTO inventory | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host) |
+| T23 | Пять Observe variants defer-only при внутреннем owner | Один реальный capture entrypoint→writer; не полный V2 DTO inventory | [capture identity/readback](IMPLEMENTATION.md#721-capture-readback-and-native-redelivery) |
 | T24 | OpenCode default уходит в legacy executable | Первый поддержанный host route выбран явно; no permanent legacy fallback | [Architecture §3.3](ARCHITECTURE.md#33-first-host-is-narrow) |
 | T25 | Packet работает, State flight отсутствует | Сохранить полезный packet; current continuation адресно связать с source events | [Cognition §2](COGNITION.md#2-current-work-reconstruction); [Cognition §6.5](COGNITION.md#65-handoff) |
 | T26 | Material gate есть, публичного Act caller нет | Внешний Act остаётся host/controller; не копировать gate в Memory OS | [Architecture §2](ARCHITECTURE.md#2-ownership) |
@@ -161,7 +161,7 @@
 | T34 | Research domain есть, source unadmitted; non-success теряется | Реальный adapter и сохранённый terminal failure/partial; недоступность источника не no-findings | [Cognition §15](COGNITION.md#15-additive-capabilities-and-their-consumers) |
 | T35 | Runner/providers не поданы существующему state machine | Соединить настоящий executor; не ещё один runner/state engine | [Inference §6](INFERENCE-CONTRACT.md#6-minimal-controller-state-and-runner) |
 | T36 | ORS durable event есть, receiving owner не принимает | Один primary capture→job→reader; различать сохранение и интерпретацию без ORS-клона | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host); [Cognition §8](COGNITION.md#8-processing-methods-and-jobs) |
-| T37 | Bridge forward/recovery есть, дальнейший consumer/replay разорван | Не заявлять отсутствующим весь Bridge; подтверждать реально сохранённый input и продолжать с того же ID | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host) |
+| T37 | Bridge forward/recovery есть, дальнейший consumer/replay разорван | Не заявлять отсутствующим весь Bridge; подтверждать реально сохранённый input и продолжать с того же ID | [capture identity/readback](IMPLEMENTATION.md#721-capture-readback-and-native-redelivery) |
 
 Сохранены самоисправления v9: отсутствие карты зависимостей, обязательность нового registry, тесты как установленная главная причина, blanket file limits и ряд выводов по счётчикам были отозваны или ограничены. Старые критерии ремонта V2 не становятся нормой переписывания. Аудит проекта не меняет сам code/issue state V2.
 

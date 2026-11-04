@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.51 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.52 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -242,10 +242,18 @@ with SHA-256 and encode lowercase hex. No Unicode normalization or separators ar
 implied. Store readable components separately and verify the digest in the writer:
 
 ```text
-stream_unique_key  = H("stream-v1", project, source_kind, source_native_id)
+stream_unique_key  = H("stream-v1", project, source_kind, source_native_id, workspace_id)
 address_unique_key = H("memory-address-v1", origin_project, kind, address_kind, address_key)
 slot_key           = H("job-slot-v1", project, purpose, target_key, slot_kind)
 ```
+
+The stream key includes the complete immutable stream tuple, including workspace.
+Two workspaces may observe the same native source ID without sharing a stream or
+conflicting on its workspace field. Use the captured admitted workspace, not today's
+working directory, during retry. A source-native-ID namespace must be stable within
+that tuple; changing its interpretation requires an explicit adapter/schema change.
+Update source key derivation and bundle identity together. Do not silently accept the
+old three-component key or re-key already retained rows during an ordinary replay.
 
 Retained 3.3.4 source evidence says UNIQUE skips a tuple containing NONE or NULL. V3
 writes only NONE/omission for absent conditional keys; NULL is not an alternative
@@ -659,6 +667,13 @@ length/SHA-256/location (§4.7). Host JSON stays in the accepted body. Command m
 has no floating-point fields. Internal native Store IDs and `ingest_seq` are not inputs.
 Reject disagreement between structured binding columns and their canonical projection.
 
+| Input group | Producer and validation boundary |
+|---|---|
+| Project/workspace, source kind/native ID, work/resource binding | The admitted relay resolves actual host identity and owner configuration before freezing the command. The daemon verifies that binding; request strings alone grant no scope. Missing task/actor/session facts remain absent, not inferred from a path, similar text or another workspace. |
+| Observation/command ID, native event key, first receipt time | Allocate once before custody. The adapter admits a stable native key only when the host supplies one; replay does not recompute identity or receipt time. Server-generated stream ID/sequence and creation facts are not caller inputs. |
+| Accepted body, metadata, locator, relations, policy revision/limitations | Apply §7.1 before custody, validate §4.5.1 field and aggregate bytes, then compute the command/event hashes. Caller-provided digests are checked against those exact bytes and projections, not accepted as a substitute for them. |
+| Operation kind and result | Ordinary capture cannot submit reserved kinds, operation results, semantic support-state mutations or arbitrary Store fields. §7.5 dispatches authorized operation-owned input to its owner. Reject unknown members/invalid optional tuples; absence follows §4.4, never a guessed empty string or JSON null. |
+
 The admitted host adapter selects occurrence identity, not the body hash:
 
 - With a documented stable native event key, `event_key = H("native-event-v1", kind,
@@ -725,6 +740,48 @@ not proof that Store has or has not committed. The relay returns its command ID/
 not a fabricated committed-source handle. A lost daemon reply can leave a staged entry
 with unknown Store outcome. §7.5 owns publication, replay and removal; never recapture
 with a new receipt time, ID or binding.
+
+#### 7.2.1 Capture readback and native redelivery
+
+`CaptureReadbackV1` is the committed payload of this operation, not a new stored receipt,
+alias table or public arbitrary-ID lookup. It has exactly `format=1`, `installation_id`,
+`selection_generation`, `submitted`, `matched_by` and `accepted`. The admitted daemon
+supplies installation/selection from the root used for commit/readback, never from a
+current-root guess after cutover. All identities, integer ranges and hashes use §4.
+
+| Field | Exact representation / consumer check |
+|---|---|
+| `submitted` | `{command_id,command_sha256}` for the immutable command being reconciled. Compare both with the caller's retained command/spool entry. This echo alone is not commit evidence. |
+| `matched_by` | `command` or `native_event`, selected by actual lookup/transaction comparison. A newly inserted command uses `command`; this field does not claim whether a previous transport attempt ran. |
+| `accepted` | `{observation_id,command_id,command_sha256,stream_id,stream_unique_key,event_key,event_sha256,ingest_seq,receipt_time_ms,body_length,body_sha256}` from one verified committed observation. `observation_id=command_id`; sequence is positive. Never mix submitted IDs/time with stored hashes or sequence. |
+
+For `command`, accepted command ID/hash must equal submitted ID/hash. For `native_event`,
+the submitted command must have an admitted stable native key; match the complete stream
+tuple, event key/digest and semantic projection in §7.2. The accepted ID, command hash and
+first receipt time may differ from the submission. The fixed internal lookup must expose
+all fields needed for that comparison; its small external result does not excuse a
+partial internal projection. It cannot return committed solely from equal body hashes.
+
+Example: native event E first commits as command A; redelivery proposes B with a later
+receipt time. Matching readback returns `submitted=B`, `accepted=A`, `matched_by=native_event`.
+Retire B's pending directory using its own ID only after that event comparison and the
+same-selection check in §7.5. Exact source handles use A. Do not require a nonexistent
+canonical row B, rewrite A's command hash, or create another observation just to match B.
+B remains a transient submission identity, not a separately stored canonical operation;
+producers never recycle it. Changed meaning for E conflicts; equal text for a different
+native event or a new callback without a stable key remains a distinct occurrence.
+
+`rejected`, `stage_required` and `unknown` contain no accepted payload. An unreadable,
+truncated, contradictory or mismatched response after a possible send stays unknown until
+exact reconciliation; do not turn a decoder failure into permission for a new ID. Current
+policy/erasure can withhold readback or content without authorizing replay through a
+barrier. A private readback does not grant another caller source access (§7.3).
+
+Connect this contract to the existing source package's complete capture statement and
+its decoder. Exercise same command; B-to-A native redelivery; changed event meaning;
+equal bytes from distinct events; and equal native IDs in two workspaces. Inspect actual
+stored identities/sequence and pending retirement, not just an echoed request or `ok`.
+These are Slice 0/1 checks, not a new runtime acceptance claim or test framework.
 
 ### 7.3 Exact open and byte ranges
 
@@ -864,8 +921,8 @@ if canonical outcome is still unknown; it reports committed only from matching r
 For each pending entry, retain no-follow read custody, validate its envelope/body and
 current scope/policy/notices, then resolve existing operation identity before mutation.
 Publish a required blob into the active root before its transaction, without changing
-the command. Native-event replay compares §7.2's semantic identity even when the stored
-observation ID differs from the proposed ID. Revision replay uses §7.4's original result.
+the command. Native-event replay uses §7.2.1's submitted/accepted comparison even when the stored
+observation ID differs from the pending directory ID. Revision replay uses §7.4's original result.
 No unknown effect becomes a new command, and no independent filesystem or provider effect
 is placed inside a Store retry. Retirement must use the same admitted root/selection
 generation as readback; after cutover leave pending for §8.2's restore reconciliation.

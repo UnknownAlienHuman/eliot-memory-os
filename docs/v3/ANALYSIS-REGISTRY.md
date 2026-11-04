@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `PARTIAL` | Проверены стыки Slice 0–2: commit/open, body/revision hash, current/history, notice/context и служебный replay. Исправлены owning правила; полный semantic review сохранённых требований, source/runtime и inference-specific snapshot остаются открыты. |
+| D5. Сценарии | `PARTIAL` | Стыки Slice 0–2 уточнены; CORE-01/MEM-01/T23/T37 сверены с capture/readback и source entry points. Далее bounded direct-revision input и прочие сохранённые сценарии; полный semantic review, source/runtime и inference-specific snapshot остаются открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -48,17 +48,21 @@ snapshot не подменяется Base-профилем. На стыках Sl
 current/history и notice/context: [точное чтение](IMPLEMENTATION.md#73-exact-open-and-byte-ranges),
 [публикация исправления](IMPLEMENTATION.md#74-direct-revision-and-lost-replies) и
 [пакет](COGNITION.md#641-base-packet-encoding). Это выбранные правила, не runtime PASS.
-Следующее поручение реализации остаётся #5326/#5327: полная операция и её decoder,
-а не набор primitives. В документации остаётся сверка сохранённых требований AUDIT-MAP
-и точных входных DTO/полей с этим source owner; общий проход не блокирует Store/capture.
-Не создавать новый слой, реестр или программу модернизации V2 tools.
+Следующее поручение реализации остаётся #5326/#5327: полная capture операция и её
+[readback decoder](IMPLEMENTATION.md#721-capture-readback-and-native-redelivery), а не primitives.
+[Карта source owner](store/README.md#next-source-increment) указывает конкретные старые
+queries и обязательные исправления полей. Сверены CORE-01/MEM-01/T23/T37; остальные
+сценарии этим не закрыты. Следующая документационная задача — bounded input прямой
+revision: полный semantic DTO/причина → immutable command → original result/history.
+Не создавать новый слой, реестр или программу модернизации V2 tools; Store/capture
+не ждёт завершения общего документационного прохода.
 
 ## Snapshot and evidence limits
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `c40384904e0ebcb09fdaa0cbd69d9ff45ae8892f`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
-| Store PR #5327, предыдущее чтение | Head `a040bd408be39afa9789561595d2cac8bef177b3`, open/unmerged; перечитаны metadata, начало `queries.rs` и `lib.rs` | По-прежнему отдельные capture primitives и неполные projections. Это не новый аудит всего source PR или запуск компилятора/движка. |
+| Memory main | `7882f0120965b9e4661934a9b36368272bc9a2c4`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
+| Store PR #5327, чтение 2026-11-04 | Head `a040bd408be39afa9789561595d2cac8bef177b3`, open/unmerged; перечитаны metadata и `queries.rs` строки 1–215 | Подтверждены раздельные capture primitives, отсутствие command/event digests в identity projection и неполный exact-open projection. Это не компиляция, execution или полный аудит source PR. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
 | Claude hooks | [Официальный контракт](https://code.claude.com/docs/en/hooks#add-context-for-claude), прочитан 2026-11-04 | Документированные output fields и replay контекста; версия установленного хоста и фактическая доставка здесь не проверялись. |
@@ -121,7 +125,7 @@ Owner — [Implementation §4–7](IMPLEMENTATION.md#4-migration-0001-and-schema
 
 | ID | Выбрано / что требуется в исходниках |
 |---|---|
-| R-171 | `DECIDED / SOURCE_OPEN`: [§7.2–7.5](IMPLEMENTATION.md#72-capture-command-commit-and-replay) разделяют подтверждённую операцию и текущую доступность её тела. Поздний forbidden/erased/damaged open не разрешает новую mutation. Один owner dispatch для первого вызова и replay; operational kinds недоступны обычному event capture. Реализация complete transactions/custody/readback остаётся открытой. |
+| R-171 | `DECIDED / SOURCE_OPEN`: [§7.2.1](IMPLEMENTATION.md#721-capture-readback-and-native-redelivery) разделяет submitted command и accepted observation. Native redelivery B→A сверяет event semantics и удаляет только pending B, без фиктивной canonical B. [§4.4](IMPLEMENTATION.md#44-derived-unique-keys-and-absence) включает workspace в полный stream key. Исправить source derivation, transaction/projections/decoder в #5327; runtime не принят. |
 | R-174/R-182 | Исправить imports и table-target `FOR UPDATE`; native record-ID разрешать и перепроверять внутри одной transaction (§6). UNIQUE/CAS не обещают predicate lock. |
 | R-183/R-186 | `DECIDED / SOURCE_OPEN`: [§7.3](IMPLEMENTATION.md#73-exact-open-and-byte-ranges) разделяет body и полный revision hash; current/history читаются согласованно, continuation закрепляет точную revision. Динамические запреты не меняют snapshot/hash. DDL/DTO/query/backup source ещё согласовать; отсутствие проверенного snapshot нельзя выдать за missing. |
 | R-184 | Pending coalesces; первый claim фиксирует tuple, последующие claims меняют generation, не исходный смысл или unknown call ID. Полная claim/settle реализация остаётся открытой. |
@@ -178,11 +182,11 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 
 S-001–S-107 и предыдущие check counts — исторические evidence в закреплённом срезе,
 [AUDIT](AUDIT.md), [AUDIT-MAP](AUDIT-MAP.md) и PR, не повторно исполненные результаты.
-Сверены текущие Implementation §4.3–7.5/10 и Cognition §5–6: идентичность результата,
-точное чтение, новая revision, live notices и фактическая выдача. Найденные противоречия
-исправлены в owners, не в отдельном errata. Это не новый аудит всего Store PR, всех
-первоисточников или всех сценариев. Результаты проверки точного diff и независимого
-review — в его PR; Rust/Clippy, Store и Windows runtime здесь не исполнялись.
+Сверены capture/replay в Implementation §4.3–4.5/7.1–7.5, сохранённые требования
+CORE-01/MEM-01/T23/T37 и текущий source candidate `queries.rs` (1–215). Закрыта
+несогласованность workspace/key и уточнён decoder native redelivery. Другие требования,
+полные первоисточники и весь source PR не объявлены проверенными. Точный diff и результат
+независимого review фиксируются в PR; Rust/Clippy, Store и Windows здесь не исполнялись.
 
 ## Integration blockers
 
