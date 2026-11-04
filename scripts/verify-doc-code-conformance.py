@@ -4,12 +4,18 @@
 The complete DCC-001..007 checks remain in ``doc_code_conformance_core``. This
 front door preserves fail-closed configured-root handling, adds documentation
 pipeline checks DCC-010..013, retires bounded stale traceability through DCC-014,
-and validates canonical numeric handles and Decision Anchors through DCC-015..017.
+and validates legacy selectors (DCC-015..017) and current file references (DCC-019).
+Use --references-only with repeatable --path for scoped reference checks; the
+unqualified command still runs every existing conformance detector.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
+import sys
+from dataclasses import asdict
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -348,7 +354,41 @@ def self_test() -> None:
 
 _core.audit = audit
 _core.self_test = self_test
-main = _core.main
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if "--references-only" not in arguments:
+        return _core.main(arguments)
+
+    parser = argparse.ArgumentParser(description="Operational references only; not full conformance")
+    parser.add_argument("--references-only", action="store_true", required=True)
+    parser.add_argument("--root", type=Path, default=Path("."))
+    parser.add_argument("--path", action="append", dest="paths")
+    parser.add_argument("--json-out", type=Path)
+    args = parser.parse_args(arguments)
+    root = args.root.resolve()
+    try:
+        findings, metrics = normative_references.audit(root, paths=args.paths)
+        payload = {
+            "schema_version": SCHEMA,  # noqa: F405
+            "scope": "references-only",
+            "selected_paths": args.paths or [],
+            "status": "FAIL" if findings else "PASS",
+            "metrics": metrics,
+            "findings": [asdict(item) for item in findings],
+        }
+        if args.json_out:
+            output = args.json_out if args.json_out.is_absolute() else root / args.json_out
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+        for item in findings:
+            print(f"{item.finding_id} {item.path}:{item.line}: {item.message}", file=sys.stderr)
+        print(f"DOC_REFERENCE_CONFORMANCE: {payload['status']} scope=references-only "
+              + " ".join(f"{key}={value}" for key, value in sorted(metrics.items())))
+        return 1 if findings else 0
+    except (OSError, ValueError, normative_references.ReferenceAuditError) as exc:
+        print(f"DOC_REFERENCE_CONFORMANCE_ERROR: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

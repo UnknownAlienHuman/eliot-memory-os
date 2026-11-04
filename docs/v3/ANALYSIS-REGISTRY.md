@@ -93,7 +93,7 @@ PARTIAL — неполное покрытие; BLOCKED — конкретная 
 | R-204 | Две swarm-страницы содержали 743 КБ устаревших task rows/operational diary, включая старые «действующие» правила и три ложных link destinations. | Текущие страницы заменены короткими historical pointers на полные оригиналы в Git; swarm README явно donor-only. Полный поиск имён нашёл только retained prose consumers; V2 source, checker и исторические данные не удалены. |
 | R-205 | Pure V3 router/reader/evidence требовали V2 metadata; projection могла пропускать изменённый prose. | `MERGED`: PR #5331 / main@d3f124cd. Pure V3 не читает V2 metadata; mixed scopes сохраняют их; оба порядка composed parts проверены. Не применять сохранённый старый патч повторно. |
 | R-206 | 56 generated section indexes дублировали book/handle indexes без tracked consumers. | `MERGED`: PR #5330 / main@9864cc75 удалил 18+38 индексов и единственный generator/call. 627 canonical fragments и оба manifest сохранены; повторно применять удаления нельзя. |
-| R-207 | У retained V2 corpus есть реальные потребители; pair checker ошибочно требовал V2 identities на странице authority V3. | `PARTIAL`: локальный кандидат отделяет pair integrity от V3 authority и запрещает повторный migrate до записи. Остальные потребители и условия удаления — [ниже](#legacy-consumer-migration); все 627 fragments пока сохранены. |
+| R-207 | У retained V2 corpus есть реальные потребители; проверки смешивали V3 authority/reference paths с обязательной загрузкой V2. | `PARTIAL`: P1 слит (#5332); P2 реализует scoped file/anchor checks и загрузку legacy inputs только при фактических ссылках. P3–P5 и ограничения проверки — [ниже](#legacy-consumer-migration); 627 fragments пока сохранены. |
 
 ## Legacy consumer migration
 
@@ -103,17 +103,23 @@ R-207 продолжать по [карте потребителей](DEVELOPMEN
 
 | Участок | Статус | Следующая конкретная работа / условие завершения |
 |---|---|---|
-| P1. Разделить V2 integrity и V3 authority | `CANDIDATE / CHECKED` | Убран ложный literal-check новой authority; проверка V2 receipt/manifests/hashes сохранена. Повторный migrate отказывается до записи. Интегрировать проверенный candidate; его проверки не означают PASS общего CI. |
-| P2. Разделить operational reference conformance | `OPEN / NEXT` | `normative_references` и вызывающий `verify-doc-code-conformance.py`: version-aware набор ссылок, без исключения целых каталогов. Missing/unknown V2 selectors всё ещё FAIL; проверка V3 не требует неиспользуемый legacy index. |
-| P3. Перенести code-navigation contract references | `OPEN` | `registry`, `capsules`, `handle_destinations` и их конфигурация: current owner-file refs вместо обязательного A/I catalogue для V3. Сохранить package/path/dependency checks; проверить retained V2 отдельно. |
+| P1. Разделить V2 integrity и V3 authority | `MERGED` | PR #5332 / main@c5318b2e: receipt/manifests/hashes сохранены, повторный migrate отказывается до записи. Повторно патч не применять. Независимое ревью не выполнилось из-за лимита; общий CI остановился на reading evidence, компиляция пропущена. |
+| P2. Разделить operational reference conformance | `IMPLEMENTED / SCOPED_CHECKED` | Существующий CLI: `--references-only --path docs/v3`; actual refs выбирают необходимые indexes. V3 paths/anchors проверяются напрямую, mixed/unknown/missing V2 остаются FAIL. Полный default audit и scan roots не сужены. Проверки и пределы — ниже; итоговое слияние подтверждать по PR, не по этой метке. |
+| P3. Перенести code-navigation contract references | `OPEN / NEXT` | `registry`, `capsules`, `handle_destinations` и их конфигурация: current owner-file refs вместо обязательного A/I catalogue для V3. Сохранить package/path/dependency checks; проверить retained V2 отдельно. |
 | P4. Разделить вызовы legacy closure/profile | `OPEN` | Проследить `Justfile`, `verify.ps1`, repository-policy и их проверяющие механизмы; оформить отдельную integration-scope правку. Не выдавать skipped historical audit за успешную проверку и не отключать oracle. |
 | P5. Убрать освобождённый корпус | `BLOCKED` P2–P4 | Для каждого удаляемого набора нет исполняемых потребителей/активных ссылок, originals доступны по immutable revision. После удаления проходят ссылки, router и затронутые consumers; неизвестная зависимость блокирует только этот набор. |
 
-P1 проверяется на точном восстановленном дереве main плюс правка: штатный shard
-verifier, self-checks, link/router scan, отказ на отсутствующем/испорченном V2 input
-и отсутствие файловых изменений после отказа migrate. Результаты исполнения и
-финальный diff сохраняются с кандидатом. Удалённая публикация, независимое review,
-PowerShell wrapper, Windows runtime и общий CI этим локальным кандидатом не заявлены.
+P2 проверен на полном восстановленном tracked tree `c5318b2e` (tree `f474f5ab`)
+плюс scoped delta. Временные адресные проверки охватывают V3 без V2 corpus, mixed
+refs, unknown selectors, missing/case/anchor/path/symlink failures и настоящий CLI.
+Штатные self-checks сохранены; нового test programme или checker framework нет.
+
+Полный reference scan по-прежнему находит пять прежних V2 ошибок: неверно дополненные
+нулями номера разделов в `runtime_supervision.rs` (1), `skill_lifecycle.rs` (2) и
+`eliot-ors/src/status.rs` (2). Их исходники не менялись; отсутствие исправлений не
+скрыто exclusion-правилом. Scoped V3 PASS не закрывает этот долг или общий CI.
+Полный link/router результат и точный candidate — в PR. PowerShell, Rust/Clippy,
+Windows/runtime и независимая приёмка всего V3 этим изменением не заявлены.
 
 ## Scenario preservation
 
