@@ -95,32 +95,6 @@ def _blocks(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
-def _handles(package: dict[str, Any], blocks: dict[str, dict[str, Any]]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for raw_id in package.get("logical_blocks", []):
-        block_id = str(raw_id)
-        block = blocks.get(block_id)
-        if block is None:
-            raise NavigationError(
-                f"prototype {package.get('root_path')} references unknown block {block_id}"
-            )
-        handles = block.get("documentation_handles")
-        routes = block.get("documentation_route_ids")
-        if not isinstance(handles, list) or not handles:
-            raise NavigationError(f"logical block has no documentation handles: {block_id}")
-        if not isinstance(routes, list) or not routes:
-            raise NavigationError(f"logical block resolves no docs route: {block_id}")
-        for raw_handle in handles:
-            handle = str(raw_handle).strip()
-            if not handle:
-                raise NavigationError(f"logical block contains an empty handle: {block_id}")
-            if handle not in seen:
-                result.append(handle)
-                seen.add(handle)
-    return sorted(result, key=natural_handle_key)
-
-
 def _metadata(root: Path, package: dict[str, Any]) -> dict[str, Any]:
     manifest = normalize_repo_path(str(package.get("manifest_path", "")))
     if not manifest:
@@ -185,7 +159,8 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
             raise NavigationError(
                 f"prototype package is outside every logical block: {package_root}"
             )
-        handles = _handles(package, blocks)
+        relations = target_relations(package, blocks)
+        handles = {ref for relation in relations for ref in relation["handles"]}
         if not handles:
             raise NavigationError(
                 f"prototype package resolves no governing docs: {package_root}"
@@ -198,7 +173,7 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
         # Per-target closure (issue #690 P3): every target reconciles its own
         # inherited AGENTS chain, block selection and governing handles. The
         # package-level evidence above is reused, never a replacement.
-        for relation in target_relations(package, blocks):
+        for relation in relations:
             target = relation["target"]
             relative = normalize_repo_path(str(target.get("path", "")))
             if CONTRACT_PATH not in nearest_agents(root, relation["path"]):
@@ -257,10 +232,12 @@ def render(root: Path, registry: dict[str, Any]) -> str:
         "that exist in the repository but are not admitted by the root",
         "[`Cargo.toml`](../../Cargo.toml). Prototype presence is not workspace admission,",
         "implementation completion, runtime support, or Product acceptance. Package-to-",
-        "documentation mappings come from [`logical-blocks.toml`](logical-blocks.toml),",
-        "the canonical [`handle-index.json`](../architecture/handle-index.json), and the",
-        "inherited [`crates/AGENTS.md`](../../crates/AGENTS.md) contract. Do not edit it",
-        "by hand.",
+        "documentation mappings use [`route-rules.toml`](../architecture/route-rules.toml)",
+        "and declared `contract_refs` for V3 targets; retained targets use",
+        "[`logical-blocks.toml`](logical-blocks.toml) defaults. Source classifications",
+        "do not override V3 routes. Actual legacy references still require their index.",
+        "The inherited [`crates/AGENTS.md`](../../crates/AGENTS.md) contract remains checked.",
+        "Do not edit by hand.",
         "",
         "```powershell",
         "python scripts/code_navigation.py sync-index --root .",

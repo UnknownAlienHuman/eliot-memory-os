@@ -67,6 +67,10 @@ class DestinationResolver:
         self._handles: dict[str, dict[str, Any]] | None = None
         self._owners: dict[str, str] = {}
 
+    @property
+    def uses_legacy_index(self) -> bool:
+        return self._handles is not None
+
     def _load(self) -> None:
         if self._handles is not None:
             return
@@ -152,6 +156,11 @@ class DestinationResolver:
         record = self._handles.get(key)
         if record is None:
             raise NavigationError(f"unknown documentation handle: {val}")
+        if val.startswith("ELIOT_"):
+            source = {"ELIOT_ARCHITECTURE": "architecture",
+                      "ELIOT_IMPLEMENTATION": "implementation"}.get(val.partition(":")[0])
+            if source is None or record["source"] != source:
+                raise NavigationError(f"documentation prefix disagrees with source: {val}")
         return {**record, "sha256": sha256_file(self.root / record["path"])}
 
     def relative_link(self, from_doc: str, handle: str) -> str:

@@ -30,8 +30,12 @@ handle catalogue, generate V2 capsule triads for V3, or make Code Graph mandator
 For a new source path, update the existing route rules and logical block coverage
 together; do not label an absent package or its runtime as implemented.
 
-`check` remains the full retained navigation/index check. A V3 route succeeding
-without unused V2 metadata does not make `check` succeed or permit corpus deletion.
+`check` and `sync-index` cover the whole Cargo inventory. Each V3 target uses its
+path-selected owners plus the package's declared `contract_refs`; a retained target
+uses its own matched block defaults. Forward and reverse indexes use this same
+relation, including mixed targets within one package. Actual legacy declarations
+still require the complete legacy index integrity check. A scoped route succeeding
+does not make the full check succeed or permit corpus deletion.
 
 The sections below document the retained V2 navigation toolchain. Its generated
 indexes and Code Graph may help inspect selected donor code; they do not impose
