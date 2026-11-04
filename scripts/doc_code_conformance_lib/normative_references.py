@@ -1,18 +1,21 @@
-"""Validate operational normative references against generated canonical indexes."""
+"""Validate current file references; resolve legacy selectors only when used."""
 
 from __future__ import annotations
 
 import fnmatch
+import html
+import urllib.parse
 import json
 import os
 import re
 import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 import doc_code_conformance_core as core
+import docs_shards as links
 from docs_shards_lib import decision_anchors
 
 SCHEMA = "eliot-normative-reference-conformance-v1"
@@ -22,6 +25,11 @@ DECISION_SCHEMA = "eliot-decision-anchor-index-v1"
 DCC_NUMERIC = "DCC-015"
 DCC_DECISION = "DCC-016"
 DCC_INDEX = "DCC-017"
+DCC_CURRENT = "DCC-019"
+CURRENT_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_./:-])(?P<path>docs/v3/[A-Za-z0-9_.%/\-]+\.md)"
+    r"(?:#(?P<anchor>[\w.%\-]+))?", re.IGNORECASE
+)
 
 CODE_SPAN = re.compile(r"`([^`\r\n]+)`")
 PATH_HANDLE = re.compile(
@@ -133,6 +141,8 @@ def _read_json_object(root: Path, relative: str, schema: str, field: str) -> dic
 def load_indexes(
     root: Path,
     config: Config,
+    *,
+    decisions: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     numeric = _read_json_object(
         root,
@@ -156,6 +166,9 @@ def load_indexes(
             "numeric handle index contains malformed entries",
             config.numeric_index,
         )
+
+    if not decisions:
+        return handles, {}
 
     decision = _read_json_object(
         root,
@@ -300,90 +313,146 @@ def _line(value: str, offset: int) -> int:
     return value.count("\n", 0, offset) + 1
 
 
+def _scope(config: Config, paths: Sequence[str] | None) -> Config:
+    if paths is None:
+        return config
+    selected = tuple(dict.fromkeys(_norm(path) for path in paths))
+    if not selected:
+        raise ReferenceAuditError("reference scope must not be empty")
+    for path in selected:
+        if not any(base == "." or path == base or path.startswith(base + "/")
+                   for base in config.scan_roots):
+            raise ReferenceAuditError("path is outside configured reference roots", path)
+        if _ignored(path, config.ignore_globs):
+            raise ReferenceAuditError("explicit reference path is excluded by configuration", path)
+    return replace(config, scan_roots=selected)
+
+
+def _current_references(root: Path, source: Path, value: str) -> Iterable[tuple[int, Path, str]]:
+    """Share Markdown parsing with the link checker; code uses root-relative refs."""
+    destinations = links.find_link_destinations(value)
+    for start, end, raw in destinations:
+        dest, _ = links.unwrap_destination(raw)
+        if links.should_skip_destination(dest):
+            continue
+        parsed = urllib.parse.urlsplit(html.unescape(dest))
+        if parsed.scheme or parsed.netloc:
+            continue
+        part = urllib.parse.unquote(parsed.path)
+        requested = (root / part.lstrip("/") if part.startswith("/")
+                     else source.parent / part if part else source)
+        absolute = Path(os.path.abspath(requested))
+        try:
+            relative = absolute.relative_to(root).as_posix()
+        except ValueError:
+            relative = ""
+        if (source.relative_to(root).as_posix().startswith("docs/v3/")
+                or relative.casefold().startswith("docs/v3/")):
+            yield start, absolute, urllib.parse.unquote(parsed.fragment)
+    for match in CURRENT_REFERENCE.finditer(value):
+        if any(start <= match.start() < end for start, end, _ in destinations):
+            continue
+        yield (match.start(), root / urllib.parse.unquote(match["path"]),
+               urllib.parse.unquote(match["anchor"] or ""))
+
+
+def _current_problem(root: Path, target: Path, anchor: str,
+                     cache: dict[Path, set[str]]) -> str | None:
+    status, resolved = links._case_resolution(root, target)
+    if status != "exact" or resolved is None:
+        return f"current reference {status}: {target}#{anchor}"
+    if any((root / Path(*resolved.relative_to(root).parts[:index])).is_symlink()
+           for index in range(1, len(resolved.relative_to(root).parts) + 1)):
+        return f"symlinked current reference: {target}"
+    if not resolved.is_file() and (anchor or target.suffix.casefold() in {".md", ".markdown"}):
+        return f"current document reference is not a file: {target}"
+    if anchor and resolved.is_file() and resolved.suffix.casefold() in {".md", ".markdown"}:
+        if resolved not in cache:
+            cache[resolved] = links.markdown_anchors(resolved.read_text(encoding="utf-8"))
+        if anchor not in cache[resolved]:
+            return f"current reference has missing anchor: {target}#{anchor}"
+    return None
+
+
 def audit(
     root: Path,
     config_relative: Path = CONFIG_PATH,
+    *,
+    paths: Sequence[str] | None = None,
 ) -> tuple[list[core.Finding], dict[str, int]]:
+    root = root.resolve()
+    metrics = {"normative_reference_files": 0, "numeric_reference_candidates": 0,
+               "decision_anchor_candidates": 0, "current_file_references": 0,
+               "legacy_indexes_loaded": 0}
     try:
-        config = load_config(root, config_relative)
-        handles, anchors = load_indexes(root, config)
+        config = _scope(load_config(root, config_relative), paths)
+        for relative in config.scan_roots:
+            status, resolved = links._case_resolution(root, root / relative)
+            if status != "exact" or resolved is None:
+                raise ReferenceAuditError(f"reference scan root is {status}", relative)
+            if resolved.resolve() != resolved:
+                raise ReferenceAuditError("symlinked reference scan root is prohibited", relative)
         surfaces = selected_files(root, config)
+        if paths is not None:
+            for relative in config.scan_roots:
+                requested = root / relative
+                if not any(path == requested or requested in path.parents for path in surfaces):
+                    raise ReferenceAuditError("reference path selects no configured files", relative)
     except ReferenceAuditError as exc:
-        return [core.Finding(DCC_INDEX, exc.path, 0, str(exc))], {
-            "normative_reference_files": 0,
-            "numeric_reference_candidates": 0,
-            "decision_anchor_candidates": 0,
-        }
+        return [core.Finding(DCC_INDEX, exc.path, 0, str(exc))], metrics
 
     findings: list[core.Finding] = []
-    numeric_candidates = 0
-    decision_candidates = 0
+    numeric: list[tuple[str, int, str]] = []
+    decisions: list[tuple[str, int, str]] = []
+    anchor_cache: dict[Path, set[str]] = {}
     for path in surfaces:
         relative = path.relative_to(root).as_posix()
         try:
             value = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            findings.append(
-                core.Finding(DCC_INDEX, relative, 0, f"cannot read configured surface: {exc}")
-            )
+            findings.append(core.Finding(DCC_INDEX, relative, 0,
+                                         f"cannot read configured surface: {exc}"))
             continue
-
-        seen_numeric: set[tuple[int, str]] = set()
+        seen: set[tuple[int, str]] = set()
         for span in CODE_SPAN.finditer(value):
-            for selector, local_offset in selectors_in_span(span.group(1)):
-                absolute = span.start(1) + local_offset
-                key = (absolute, selector)
-                if key in seen_numeric:
-                    continue
-                seen_numeric.add(key)
-                numeric_candidates += 1
+            for selector, offset in selectors_in_span(span.group(1)):
+                seen.add((span.start(1) + offset, selector))
+        for match in PATH_HANDLE.finditer(value):
+            seen.add((match.start(1), match.group(1)))
+        numeric.extend((relative, _line(value, offset), selector)
+                       for offset, selector in sorted(seen))
+        decisions.extend((relative, _line(value, match.start()), match.group(0))
+                         for match in DECISION_ANCHOR.finditer(value))
+        try:
+            for offset, target, anchor in _current_references(root, path, value):
+                metrics["current_file_references"] += 1
+                problem = _current_problem(root, target, anchor, anchor_cache)
+                if problem:
+                    findings.append(core.Finding(DCC_CURRENT, relative, _line(value, offset), problem))
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            findings.append(core.Finding(DCC_CURRENT, relative, 0,
+                                         f"cannot validate current reference: {exc}"))
+
+    metrics.update(normative_reference_files=len(surfaces),
+                   numeric_reference_candidates=len(numeric),
+                   decision_anchor_candidates=len(decisions))
+    # A directory/version name cannot hide a legacy selector in a mixed file.
+    if numeric or decisions:
+        try:
+            handles, anchors = load_indexes(root, config, decisions=bool(decisions))
+            metrics["legacy_indexes_loaded"] = 2 if decisions else 1
+        except ReferenceAuditError as exc:
+            findings.append(core.Finding(DCC_INDEX, exc.path, 0, str(exc)))
+        else:
+            for relative, line, selector in numeric:
                 problem = validate_selector(selector, handles)
                 if problem:
-                    findings.append(
-                        core.Finding(
-                            DCC_NUMERIC,
-                            relative,
-                            _line(value, absolute),
-                            problem,
-                        )
-                    )
-
-        for match in PATH_HANDLE.finditer(value):
-            selector = match.group(1)
-            key = (match.start(1), selector)
-            if key in seen_numeric:
-                continue
-            seen_numeric.add(key)
-            numeric_candidates += 1
-            problem = validate_selector(selector, handles)
-            if problem:
-                findings.append(
-                    core.Finding(
-                        DCC_NUMERIC,
-                        relative,
-                        _line(value, match.start(1)),
-                        problem,
-                    )
-                )
-
-        for match in DECISION_ANCHOR.finditer(value):
-            decision_candidates += 1
-            anchor = match.group(0)
-            if anchor not in anchors:
-                findings.append(
-                    core.Finding(
-                        DCC_DECISION,
-                        relative,
-                        _line(value, match.start()),
-                        f"unknown Decision Anchor: {anchor}",
-                    )
-                )
-
-    return sorted(set(findings)), {
-        "normative_reference_files": len(surfaces),
-        "numeric_reference_candidates": numeric_candidates,
-        "decision_anchor_candidates": decision_candidates,
-    }
+                    findings.append(core.Finding(DCC_NUMERIC, relative, line, problem))
+            for relative, line, anchor in decisions:
+                if anchor not in anchors:
+                    findings.append(core.Finding(DCC_DECISION, relative, line,
+                                                 f"unknown Decision Anchor: {anchor}"))
+    return sorted(set(findings)), metrics
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:

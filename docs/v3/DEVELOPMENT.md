@@ -152,6 +152,32 @@ or navigation. Full shard/router/conformance checks are selected only when their
 actual surface changes or when required by integration. A retained-V2 integrity
 result does not validate the V3 specification; see [the consumer map](#legacy-documentation-consumers).
 
+### Operational references
+
+For V3 file/heading references, use the existing conformance front door:
+
+```text
+python scripts/verify-doc-code-conformance.py --references-only --path docs/v3
+```
+
+Repeat `--path` for the exact files/directories being checked, including source
+consumers. Scope must be inside the configured scan roots; missing, symlinked,
+wrong-case or empty selections fail. This checks current repository-relative
+`docs/v3/IMPLEMENTATION.md#4-migration-0001-and-schema-authority` references and local Markdown links in selected V3 pages.
+External pinned URLs are not fetched or reinterpreted as current local files.
+
+Indexes are loaded from actual references, not from a claimed version: a legacy
+numeric selector still needs its numeric index; an `ARCH-*` reference also needs
+the Decision Anchor projection. A mixed file cannot hide a broken V2 reference
+by living under `docs/v3`. Unknown selectors and missing required inputs fail.
+
+The output explicitly says `scope=references-only`; it is not full conformance,
+reader evidence, semantic review or product acceptance. Run the unqualified
+`python scripts/verify-doc-code-conformance.py` when the full repository check is
+assigned. Its configured denominator and other detectors are unchanged. Use the
+full [link scan](#documentation-and-navigation) after renames/deletions: a selected
+outgoing-reference check alone cannot find unselected incoming references.
+
 ### Rust source
 
 Write production code first. After a coherent increment, run formatting and minimum
@@ -386,7 +412,7 @@ schema catalogue or checker just to retire the first one.
 | Consumer and callers | Retained input actually read | Migration boundary / check |
 |---|---|---|
 | `docs_shards_core.verify` through `docs_shards.py`, `verify-normative.ps1`/`.sh`, `verify.ps1` and `Justfile` | Both manifests, their fragments, V2 pair receipt and generated indexes | `verify_pair` validates the retained receipt/manifests, not literals in the V3 authority page. Missing/corrupt V2 input must fail. `verify --normative-only` reports `scope=retained-v2`; a pass is not V3 acceptance. |
-| `doc_code_conformance_lib/normative_references.audit`, called by `verify-doc-code-conformance.py` | Numeric and Decision Anchor indexes; A16.1 is read to rebuild the latter; configured operational references are scanned | Separate current-file references from retained A/I and ARCH selectors before retiring either index. Unknown selectors and broken declared sources remain errors; excluding all V2 or V3 files is not migration. |
+| `doc_code_conformance_lib/normative_references.audit`, called by `verify-doc-code-conformance.py` | Current file/heading targets; V2 numeric index only for numeric/Decision selectors, Decision Anchor index and A16.1 only for Decision selectors | [Scoped reference check](#operational-references) needs no unused V2 inputs. Full/mixed scans still validate every selected legacy reference. No directory-wide exclusion; remaining legacy references must migrate before their indexes are removed. |
 | `code_navigation_lib/registry.build_registry`, `validate_handle_index`, capsule contract resolution and handle destinations, through `code_navigation.py` | Indexed fragment bytes/anchors, manifests, logical-block handles and package contract references | Migrate declarations and consumers together to versioned owner-file references. Preserve Cargo membership, dependency/path validation and unresolved-reference failures. A V3 task must not need a complete V2 registry first. |
 | `docs_closure_audit.py`, called by `Justfile`/`verify.ps1`; repository-policy also constrains their wiring | V2 manifests, pair/index identities, original Git history and historical workstream assumptions | Classify the retained audit explicitly at each caller before retirement. A missing historical commit is not missing V3 implementation; a skipped audit is not PASS. Changes to CI/profile admission need their own reviewed scope. |
 

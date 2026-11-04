@@ -36,7 +36,7 @@ they do not certify V3 design or runtime. See the
 | `code_navigation.py` | Navigate current Cargo packages, Rust files, logical blocks, and documentation routes (supported commands: `check`, `sync-index`, `package-docs-self-test`, `prototype-docs-self-test`, `self-test`, `list`, `route`) | Repository navigation and static path/dependency consistency only |
 | `verify-standalone-crates.py` | Runs fmt, clippy and tests for every crate that declares its own `[workspace]` and is neither a workspace member nor an excluded capability cell, and proves the workspace member set and the standalone-crate set agree as two independent declared sets | Package proof for crates no other gate reaches; admits nothing to the workspace |
 | `verify-cognitive-donor-dispositions-816.py` | Compares every `cognitive-donor-map.toml` donor and topology-donor disposition against current source, holds them to one current base, and refuses a topology donor promoted past its authority ceiling | Static metadata evidence at the donor map's declared proof ceiling; never runtime or product evidence |
-| `verify-doc-code-conformance.py` | Public conformance front door for reader instructions, workflow claims, retired/nonexistent references, script/binary maps, owner bindings, and documentation-pipeline integrity | Static repository path/inventory/instruction consistency only |
+| `verify-doc-code-conformance.py` | Public conformance front door; `--references-only --path <file-or-directory>` selects only operational-reference checks without changing the default full audit | Explicitly scoped reference consistency or full static conformance; neither is runtime acceptance |
 | `verify-process-deadline-owner.py` | Source-shape discriminator for the #83 failure where a resumed process receives a start receipt while the wall-deadline owner thread is never spawned | Static source-shape evidence only; not Windows containment or wall-time proof |
 | `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
 | `audit-architecture-boundaries.py` | Detect forbidden dependencies, SurrealDB leakage, untracked direct process launch, placeholders, and exact tracked debt | Static source/build architecture evidence only |
@@ -91,6 +91,10 @@ the link scan. Never use `migrate` to repair V3 or a partially missing shard set
 recover the exact missing input from Git instead. Repository-wide conformance and
 code-navigation commands are separate checks, not prerequisites for V3 prose edits.
 
+For a current-only reference check, follow the [scoped recipe](../docs/v3/DEVELOPMENT.md#operational-references).
+Legacy inputs are loaded only when selected content actually references them.
+The full command and its other checks remain unchanged; a scoped PASS is not a full PASS.
+
 The conformance policy introduced by issue #291 lives at
 `config/doc-code-conformance.toml`; findings fail nonzero:
 
@@ -110,10 +114,12 @@ The conformance policy introduced by issue #291 lives at
 - `DCC-015` — unknown numeric `A*`/`I*` handle or handle range in a code span or
   path-qualified reference;
 - `DCC-016` — unknown `ARCH-*` Decision Anchor;
-- `DCC-017` — generated normative/Decision-Anchor index missing, symlinked, or
-  drifted from its canonical projection;
+- `DCC-017` — invalid reference scope/configuration or a required legacy index
+  missing, symlinked, or drifted from its canonical projection;
 - `DCC-018` — stale documentation provenance or authority prose anywhere under the
-  declared production/current-documentation roots. See the section below.
+  declared production/current-documentation roots. See the section below;
+- `DCC-019` — missing/wrong-case/symlinked current document target, missing heading,
+  unreadable target or repository escape in a current reference.
 
 ### DCC-018 — stale documentation provenance (issue #1147)
 
