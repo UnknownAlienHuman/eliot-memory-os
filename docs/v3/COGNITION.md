@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.27 · 2026-11-04 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.28 · 2026-11-04 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -52,6 +52,13 @@ binding. Fork/transfer creates explicit relations, not silent renaming. A model 
 or suggested method cannot silently replace the user's goal/acceptance criteria. Retain
 the source goal and an explicitly attributable amendment; an inference is not an amendment.
 
+A staged command is custody, not a committed observation or revision. It cannot supply
+an exact Memory citation, satisfy an expected revision or trigger learning. The live
+prompt may remain explicit caller input, without claiming it was persisted. Report pending
+capture when the committed view lacks it. Stream ingest sequence orders commits, not host
+occurrences; use observed source sequence/parent relations for causality and label gaps.
+Replay after an outage must not silently invent a newer user goal from arrival order.
+
 ## 3. Grounds and applicability
 
 For one conclusion revision, links in a non-null grounds group are conjunctive;
@@ -85,6 +92,9 @@ Structured correction verifies expected current revision, preserves history, pub
 the revision/source/grounds/replacement and coalesces affected work in one transaction.
 Exact replay returns the original result; stale revision conflicts. Store transaction
 shape belongs to Implementation, not a separate cognitive persistence owner.
+The [durable command](IMPLEMENTATION.md#75-durable-ingress-and-replay) precedes Store
+send; a pending correction is not an accepted semantic state. After rollback, post-cut
+corrections require the explicit adoption rule in Implementation §8.2, not automatic replay.
 
 ## 6. Retrieval and context
 
@@ -314,7 +324,7 @@ Correct its owning implementation/contract, not a new registry or report family.
 Base evidence:
 
 ```text
-real event → Store commit or durable stage → replay → restart → context/retrieval → exact open
+real event → policy admission → durable command → Store commit/replay → restart → context → exact open
 ```
 
 Learning evidence:

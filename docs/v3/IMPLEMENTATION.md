@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.47 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.48 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -303,10 +303,14 @@ in the owning Rust code and use them in the relay, Store writer/decoder and exac
 | Complete memory revision DTO | 64 KiB canonical JSON | Includes conditions, exceptions, scopes, cues and method body; history uses the same cap. |
 | One Store or local IPC request/response | 1 MiB serialized, including envelope | Check before send and while receiving; possible mutation send still means unknown on failure. |
 | Exact body range | 64 KiB decoded bytes | One identity-bound range; never buffer the entire blob to serve a range. |
+| One spool `command.json` / total spool | 256 KiB / 256 MiB and 1,024 entries | Count pending, failed and temporary entries together under §7.5's publication lock; no eviction of accepted input. |
 | Candidate page / emitted Base packet | 32 candidates / 32 KiB UTF-8 | Page also has an encoded-byte cap; packet omissions carry explicit gaps. |
 
 A capture above inline capacity uses the existing durable spool and bounded blob reads,
-not a 16 MiB IPC frame or a new upload service. One-row exact/history reads must fit
+not a 16 MiB IPC frame or a new upload service. Spool quota counts actual file bytes,
+not only body bytes. Full quota rejects new custody, never discards old input; restored
+backlog above a narrower quota drains without admitting more. These are admission limits,
+not permission to skip a retained command during recovery. One-row exact/history reads must fit
 with worst-case escaping; split candidate pages before the response cap. Configuration
 may narrow admission/selection limits, but must not strand already accepted data: keep
 build-bounded readers able to open it. An incompatible read cap rejects configuration.
@@ -599,8 +603,8 @@ or transaction across the socket merely because one task owns that socket.
 
 After a definite retryable conflict, retry the entire immutable transaction, never
 its remaining statements. Unknown transport/shutdown/fsync reconciles first; an error
-under `sync=every` is not rollback proof. The purely Store-owned idempotent capture
-completion in §7.2 may repeat the same command after exact lookup; this does not authorize
+under `sync=every` is not rollback proof. The purely Store-owned idempotent capture/revision
+completion in §7.2/§7.4 may repeat the same command after exact lookup; this does not authorize
 repeating an external effect or replacing its identity. No partially executed multi-statement sequence may
 report committed capture. Nondeterministic UPSERT is not idempotency. Publish blobs
 before row transactions; never perform provider or filesystem effects inside them.
@@ -667,10 +671,18 @@ The latter excludes proposed observation/command IDs, receipt time and physical 
 location, but retains body length/hash, event/stream identity and every semantic field
 above, including policy and limitations. Hashes do not contain themselves. Body location
 is a checked inline value or owned blob key, never a caller-supplied filesystem path.
-A second delivery may have a different proposed ID/receipt time, not different meaning.
+For blob bodies the key is `sha256:` plus the 64 lowercase hex body digest, fixed before
+custody. The selected root and spool pathname are not command fields: copying bytes
+from spool to an admitted root does not change the command or either digest. A key is
+not authorization to read another project's bytes. A second delivery may have a
+different proposed ID/receipt time, not different meaning.
 
-After admission and verified blob publication when needed, execute **one** fixed Store
-transaction, not `StreamInsert`, `StreamAdvance` and `ObservationInsert` as separate calls:
+Production ingress first publishes the immutable command under §7.5, **before any
+possible Store send**, then verifies blob publication when needed. Spooling only after
+a timeout leaves a crash window in which the command identity and accepted input vanish.
+Slice 0 may exercise direct capture with a disposable caller retaining the command;
+it is not the production host durability path. Execute **one** fixed Store transaction,
+not `StreamInsert`, `StreamAdvance` and `ObservationInsert` as separate calls:
 
 1. Resolve the stream by its unique key; compare its complete tuple. Resolve any matches
    for `(project, command_id)` and `(project, stream_id, event_key)` before allocating
@@ -700,14 +712,14 @@ I/O on this retry. An unreferenced pre-published blob is cleanup debt, not commi
 |---|---|
 | `committed` | Return the recorded canonical identity. Remove a pending command only after matching readback. |
 | `rejected` | Return a definite validation/policy/identity error without echoing private input; do not retry changed input under this ID. |
-| `stage_required` | No Store claim. Publish the same admitted command and body to the existing spool. |
+| `stage_required` | No Store claim. Keep the already-published production entry pending; a direct development caller has no custody guarantee until §7.5 succeeds. |
 | `unknown` | Preserve the same command for reconciliation; neither report committed nor infer rejection. |
 
-`stage_required` is not an acknowledgement. Relay reports **staged** only after exact
-file/directory durability and readback (§6); a spool write failure is not staged. One
-daemon replayer owns pending files, checks current policy/suppression and resumes the
-same command. The spool envelope preserves its version/bytes/hashes and body location;
-replay must not recapture input with a new receipt time, ID or binding.
+`stage_required` is not an acknowledgement. **Staged** means verified durable custody,
+not proof that Store has or has not committed. The relay returns its command ID/digest,
+not a fabricated committed-source handle. A lost daemon reply can leave a staged entry
+with unknown Store outcome. §7.5 owns publication, replay and removal; never recapture
+with a new receipt time, ID or binding.
 
 ### 7.3 Exact open and byte ranges
 
@@ -739,7 +751,10 @@ damaged, never a claimed exact body.
 revision 1 only when absent; revise requires the exact current positive revision and
 publishes its checked successor. The command freezes the target memory ID (a retained newly generated ID for create),
 a full replacement semantic DTO, attributed cause/source and a fresh `o_` command ID
-before send. No model is needed.
+before send. Before the first Store send, the authorized revision owner durably
+publishes this complete command through §7.5; a process-local variable does not survive
+a lost reply followed by restart. Use command-derived event identity, not native-event
+deduplication for the attributed cause. No model is needed.
 
 Use an operation-owned `observation` with reserved kind `memory_change` and that command
 ID, not a new mutation table. Its immutable body records the permitted command/cause;
@@ -760,9 +775,93 @@ Same command/digest returns its original result even after later revisions. Open
 exact resulting revision through §7.3; never replace it with current. A changed command
 is identity conflict; a new command with stale expected revision is revision conflict.
 Possible commit with a lost reply is unknown until lookup by operation identity, not a
-second revision. Erasure may suppress the old result, but must not make the operation
+second revision. The same-input reconciliation rule in §7.2 applies only to this complete
+idempotent transaction, with original-result lookup before CAS. A pending proposal is not
+a committed revision on which another edit may base its expected revision. Erasure may suppress the old result, but must not make the operation
 eligible to run again (§10). Withdrawal/reactivation still use the outside-root notice
 authority in §10; a generic revision cannot bypass it.
+
+### 7.5 Durable ingress and replay
+
+Use the existing installation spool and one daemon replay owner, not a broker, second
+database or job framework. Its durable unit is one self-contained directory:
+
+```text
+spool/tmp/<random>/                  private construction or retired cleanup
+spool/pending/<command_id>/          published custody; eligible for reconciliation
+spool/failed/<command_id>/           withheld custody; no automatic replay
+  command.json
+  body.bin?                         exact raw bytes, present only for blob storage
+```
+
+`command.json` is canonical UTF-8 JSON with exactly `format=1`, `installation_id`,
+`command_sha256`, `event_sha256` and the complete `command: CaptureCommandV1` (§7.2).
+The hashes bind that command, not this enclosing file. Directory name and command ID
+must agree; installation ID must match the selected installation, not a restored root.
+Unknown format, duplicate JSON keys, extra members, malformed size/hash tuples, reparse
+paths and missing/extra files reject. Inline bytes remain in the command; blob bytes
+are only in `body.bin`, whose exact length/hash must match. No path from input is opened.
+The same envelope can hold the reserved `memory_change` input, but only its authorized
+daemon front door may admit it; ordinary relay capture still rejects that kind. A kind
+or installation ID in a file is not a grant of authority. Replay checks current policy
+and dispatches to the owning capture or revision transaction, never generic inserts.
+
+**Publish before send.** All relay publishers and daemon cleanup use the same protected
+installation-scoped OS mutex, available even while the daemon is down. Validate policy,
+complete command and bounds before writing. Under that mutex: recheck current notices;
+compare any existing pending/failed entry for this ID; count bounded spool usage; create the private temp;
+write and flush every member; verify bytes; flush the directory; no-replace rename into
+pending on the same volume; flush both parents and read back the final entry (§6).
+Hold it through this bounded local publication, not across Store/IPC/network I/O. A
+finite lock wait/write failure is not staged. Without qualified durable directory
+publication on the selected platform, staging is unavailable, not best-effort success.
+An ambiguous rename/flush keeps the same
+ID for custody reconciliation; it is not a definite rejection or permission to overwrite.
+A matching pending entry reuses its custody; a conflicting entry fails integrity. A
+failed entry stays withheld rather than being silently requeued. No age-based eviction,
+truncation, fresh-ID retry or separate quota-reservation ledger is permitted.
+
+Only after durable publication may the relay notify the daemon with command ID/digest
+and await a bounded result. Notification is a wake-up hint: startup and periodic bounded
+scans also discover pending entries. The daemon's one replay owner performs the operation;
+a relay notification does not start a competing mutation path. No notification, timeout
+or relay death removes an entry. The caller may report staged when custody is known even
+if canonical outcome is still unknown; it reports committed only from matching readback.
+
+For each pending entry, retain no-follow read custody, validate its envelope/body and
+current scope/policy/notices, then resolve existing operation identity before mutation.
+Publish a required blob into the active root before its transaction, without changing
+the command. Native-event replay compares §7.2's semantic identity even when the stored
+observation ID differs from the proposed ID. Revision replay uses §7.4's original result.
+No unknown effect becomes a new command, and no independent filesystem or provider effect
+is placed inside a Store retry. Retirement must use the same admitted root/selection
+generation as readback; after cutover leave pending for §8.2's restore reconciliation.
+
+| Observed state | Replay / recovery action |
+|---|---|
+| Matching committed result and durable referenced body | Under the publication mutex, rename pending into a private unique temp, flush parents, then delete it. A crash during cleanup leaves only harmless retired cleanup or an idempotently replayable pending entry, not a half-deleted pending command. |
+| Store unavailable, uncertain result or maintenance pause | Keep pending unchanged. Apply finite per-attempt deadlines and capped backoff; no busy loop or drop after a retry count. Stop new attempts on shutdown and preserve unresolved entries. |
+| Definite invalid input, identity conflict, damaged or unsupported entry | Withhold in failed under the same mutex; expose ID and bounded reason through existing status, never the private body. Quarantine describes custody, not proof that an earlier possible send failed. An unavailable diagnostic after restart stays unknown, not invented rejection. |
+| Current policy or deletion barrier forbids input | Do not publish/replay it. Withhold and perform the owning cleanup under §10; erasure debt cannot be cleared by moving bytes into failed. |
+| Abandoned temp after obtaining the publication mutex | No active publisher can own it. Remove or quarantine within quota; temp contents are never an accepted pending operation to replay. |
+
+Start with one in-flight replay. Retry eligibility uses monotonic deadlines (initial
+1 second, exponential backoff capped at 30 seconds), not source wall-clock time. These
+are engineering defaults, not latency guarantees. Visit eligible entries in bounded
+rounds; one failing entry must not starve unrelated entries. Do not add persisted attempt
+rows: pending files retain custody and a restart may rebuild transient scheduling.
+Ingest sequence records actual Store commit order, not guaranteed host occurrence order;
+retain explicit source sequence/parent facts when available. Semantic dependencies must
+be checked by the owning operation, not guessed from file names or mtime.
+
+Do not reclaim blobs by age or one empty reference query: pending/failed commands,
+in-flight transactions and retained backup/previous roots may still need them. Keep
+unreferenced blobs as visible cleanup debt until the maintenance owner can establish
+that none of these consumers holds them. A full spool rejects new ingress, not readback,
+replay or cleanup of already accepted entries. Before enabling this path, observe the
+same disposable command across a lost notification, restart, lost commit reply, quota
+rejection and interrupted retirement; each reports custody and canonical outcome
+separately. This is a connected Slice 1 exit, not a new test programme or a runtime PASS.
 
 ## 8. Backup-set owner and lifecycle
 
@@ -853,8 +952,13 @@ Never restore into the live root or merge later Store rows into restored cogniti
 Healthy current Store first gets a safety backup; disaster mode records unavailable
 current inventory. Current suppression/deletion notices in §10 dominate backups before
 any restored guidance, job or replay becomes available. A backup's active influence flag
-cannot cancel a later withdrawal. Merge current post-cut spool only by exact identity/
-bytes/disposition; retain the previous root until retirement.
+cannot cancel a later withdrawal. Reconcile spool by the plan's exact command inventory,
+not wall-clock age. Included pending commands retain their original identity. Post-cut
+capture may be admitted as source input under current policy; post-cut `memory_change`
+commands are withheld, not replayed into rolled-back cognition. Read their original result
+from the retained previous root when available; unavailable outcome stays unknown. Adopting
+such a change requires a new explicit operation against the restored current revision,
+never an automatic rewrite of the old command. Retain the previous root until retirement.
 
 Missing notice continuity is not an empty notice set. Keep that recovery isolated and
 report the gap; enabling it requires an explicit owner recovery decision acknowledging
@@ -905,8 +1009,13 @@ Reactivation requires an explicitly authorized new operation against the current
 identity, durably reflected outside rollback roots. A restore, model proposal, pending
 packet or stale worker cannot retire a withdrawal. Reactivation never overrides erasure.
 
-Physical erasure publishes a deletion notice, closes affected mutation/replay, fences
-jobs and reconciles possible effects. After leases, terminalize dependent backups and
+Physical erasure first closes affected mutation/replay and delivery admission, then
+durably publishes/readbacks its notice. Drain and reconcile already accepted operations
+before deleting their storage; a possible late commit must not recreate removed content.
+Fence jobs and retain suppression while an outcome is unknown; erasure is incomplete,
+not failed-open. Publish notices under §7.5's spool mutex; publishers recheck notices there, including
+while the daemon is unavailable. Fix the cleanup inventory only after that publication,
+so a late relay cannot recreate accepted custody. After leases, terminalize dependent backups and
 delete their controlled content. Remove affected current/history rows, blobs, spool,
 packet/job copies; delete affected previous roots/candidates/backups wholly where safe
 selective offline rewriting is absent. Respect shared references and exact ownership.
@@ -928,8 +1037,8 @@ Runtime work remains separately authorized; documentation changes do not impleme
 | Increment | Connected change | Observable exit / do not include yet |
 |---|---|---|
 | Asset repair (#5326/#5327) | Fix existing schema/query owner, selected codecs and bounds; replace capture primitives with a complete transaction and exact-open projection | Package fmt/Clippy and embedded inspection pass; still **not** a working Store. Do not add network/provider/backup machinery to `inspect`. |
-| Slice 0 — inline capture/open | Verified Store startup/admission → one bounded client → §7.2 transaction → §7.3 exact open | One admitted input is read back byte-for-byte with canonical ID/sequence. Same command changes nothing; changed input conflicts. Inline-only rejects larger bodies explicitly. No host/model/backup prerequisite. |
-| Slice 1 — durable ingress/restart | Relay → private spool/blob → single replay owner → Store/open after restart | With Store unavailable, a real input is staged, then replayed once and opened exactly. Lost response remains the same command. Same native event is deduplicated only under its documented adapter identity; equal bytes from distinct occurrences remain distinct. |
+| Slice 0 — inline capture/open | Verified Store startup/admission → one bounded client → §7.2 transaction → §7.3 exact open | Disposable caller retains the command for direct readback/retry. Same command changes nothing; changed input conflicts. Inline-only; no production-host crash-custody claim until Slice 1. No model/backup prerequisite. |
+| Slice 1 — durable ingress/restart | §7.5 publish before send → single replay owner → Store/open → retire pending | Input survives restart and lost notification/reply under the same ID. Full quota does not evict old input; interrupted cleanup does not destroy pending custody. Native-event identity alone permits redelivery deduplication; equal bytes from distinct occurrences remain distinct. |
 | Slice 2 — useful context and corrections | Verified host boundary → addressed exact/lexical retrieval → deterministic packet → actual host emission; §7.4 direct update → later exact history/context | Host receives goal/constraints/qualified evidence and source handles. Correction survives another revision and a lost reply. Empty, unavailable and truncated retrieval differ. No generated summary or model required. |
 | Slice 3 — Base maintenance | Quiesced cut → backup/fence/manifest → isolated restore/cutover; notices → erasure; rotation/shutdown | Disposable data exercises actual paths with inference disabled. No user-data migration/destructive command is enabled before its own boundary works. |
 | Inference P1a | Accepted scoped controller extension → one persisted call → decoded revision → later context; dependency-aware backup/release | Unknown send is not repeated under a new ID. Only this row waits for controller decisions; do not scaffold it in Base. |
@@ -951,7 +1060,7 @@ V1/V2 bins are donors, not an instruction to wire their whole runtime into V3.
 | Planned runtime `src/main.rs`, `src/lib.rs` | Select supervisor/daemon/relay mode and compose only implemented operations. No successful stubs for later modes. |
 | Planned runtime `src/store.rs` | One admitted client, bindings/decoders and operation calls using schema-package assets. No general SQL API. |
 | Planned runtime `src/capture.rs`, `src/open.rs` | §7.2 identities/outcomes and §7.3 exact reads, used immediately by the first caller. |
-| Later `src/spool.rs`, host/context and maintenance modules in that package | Add with their slice; reuse the same records, decoder and client. Split files when needed, not a crate/process per noun. |
+| Later `src/spool.rs`, host/context and maintenance modules in that package | §7.5 owns publication/quota/replay/retirement; add with Slice 1 and reuse it for §7.4. Host and maintenance arrive with their callers. No second queue database or crate/process per noun. |
 
 These are default source locations, not installed interfaces or a new module registry.
 A different location requires a concrete existing owner/caller advantage, not a new
