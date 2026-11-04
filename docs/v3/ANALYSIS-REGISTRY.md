@@ -12,8 +12,8 @@
 ## Documentation stages
 
 **Приоритет: законченный контракт → связанная реализация. Не очередная миграция V2 tools.**
-Работать от текущего `main`. Старые PR #5325/#5330–#5339 закрыты слиянием; их writer-ветки
-не возобновлять. Открытое/закрытое состояние issue #5324 не является результатом приёмки.
+Работать от текущего `main`. Закрытые слиянием документационные writer-ветки
+не возобновлять; актуальный head проверять перед новой правкой. Открытое/закрытое состояние issue #5324 не является результатом приёмки.
 
 | Этап | Состояние | Что продолжать / критерий завершения |
 |---|---|---|
@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `PARTIAL` | Packet/handoff, notices и Base backup format/bounds выбраны. Далее перекрёстно проверить handoff Slice 0–2 и существующие сценарии; source/runtime и inference-specific snapshot остаются открыты. |
+| D5. Сценарии | `PARTIAL` | Проверены стыки Slice 0–2: commit/open, body/revision hash, current/history, notice/context и служебный replay. Исправлены owning правила; полный semantic review сохранённых требований, source/runtime и inference-specific snapshot остаются открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -44,16 +44,20 @@ Slice 0 проверяет прямой Store путь на disposable input; cr
 для первого Store пути. [Base backup/restore](IMPLEMENTATION.md#83-base-format-and-complete-inventory)
 теперь имеет точные поля, состав, limits и cutover/readback. Source DTO/export/import,
 конфигурационный allowlist и Windows durability ещё реализовать; внешний inference
-snapshot не подменяется Base-профилем. Следующий проход документации — сверка уже
-написанных Slice 0–2 по цепочке задача → поля/query → результат/readback → потребитель.
-Исправлять найденные противоречия в owners; новых документов, реестров и модернизации
-V2 tools не требуется. Реализация Store/capture не ждёт этого общего прохода.
+snapshot не подменяется Base-профилем. На стыках Slice 0–2 исправлены hash/readback,
+current/history и notice/context: [точное чтение](IMPLEMENTATION.md#73-exact-open-and-byte-ranges),
+[публикация исправления](IMPLEMENTATION.md#74-direct-revision-and-lost-replies) и
+[пакет](COGNITION.md#641-base-packet-encoding). Это выбранные правила, не runtime PASS.
+Следующее поручение реализации остаётся #5326/#5327: полная операция и её decoder,
+а не набор primitives. В документации остаётся сверка сохранённых требований AUDIT-MAP
+и точных входных DTO/полей с этим source owner; общий проход не блокирует Store/capture.
+Не создавать новый слой, реестр или программу модернизации V2 tools.
 
 ## Snapshot and evidence limits
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `f057cc2e164802d17b4337f0b1bbf70ef0ae684f`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
+| Memory main | `c40384904e0ebcb09fdaa0cbd69d9ff45ae8892f`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
 | Store PR #5327, предыдущее чтение | Head `a040bd408be39afa9789561595d2cac8bef177b3`, open/unmerged; перечитаны metadata, начало `queries.rs` и `lib.rs` | По-прежнему отдельные capture primitives и неполные projections. Это не новый аудит всего source PR или запуск компилятора/движка. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
@@ -104,7 +108,7 @@ Required checks не отключать; skipped historical audit не выда�
 | ID | Что должно остаться при реализации |
 |---|---|
 | R-189 | Exclusions до spool/blob/IPC; строгий current policy повторно проверяется перед replay. Failed custody не равна erasure; публикация spool не обходит закрытую admission boundary. |
-| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §6.4.1–6.5](COGNITION.md#641-base-packet-encoding) задаёт packet и host handoff. Exact source/revision/qualifiers, current disclosure/fence, outcome facts в существующих observations; restart/restore не отправляют старые пакеты. Echo/поддельный marker не создаёт evidence или job. |
+| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §6.4.1–6.5](COGNITION.md#641-base-packet-encoding) передаёт current withdrawal отдельно от сохранённого influence. Выдача current-guidance сверяет текущую revision и сериализована с её публикацией; исторический open не заменяет эту проверку. Reserved packet/handoff replay сохраняет факты, но не выполняет выдачу/job. |
 | R-191 | `DECIDED / SOURCE_OPEN`: [§10.1–10.4](IMPLEMENTATION.md#101-notice-command-and-durable-encoding) задают NoticeV1, точный target/scope, отмену только названного отзыва, erasure replay keys и непрерывность через существующий installation checkpoint. Нет зеркальной Store-ревизии ради флага. Удаление current не переизбирает history и не обнуляет счётчик. Реализация, Windows durability и полная cleanup-инвентаризация открыты. |
 | R-192/R-196 | Поздние capabilities и все требования сохраняют owner routes; старый Operation/SDK путь не возвращается через rationale. |
 | R-193 | Supervisor различает alive/responsive/progress/outcome; конечный recovery budget, без retry неизвестного внешнего эффекта. |
@@ -117,9 +121,9 @@ Owner — [Implementation §4–7](IMPLEMENTATION.md#4-migration-0001-and-schema
 
 | ID | Выбрано / что требуется в исходниках |
 |---|---|
-| R-171 | `DECIDED / SOURCE_OPEN`: [§7.2–7.5](IMPLEMENTATION.md#72-capture-command-commit-and-replay) задают полные операции и durable-before-send. Spool fallback после timeout оставлял crash gap; теперь определены self-contained entry, single replay owner, quota, retirement и повтор correction. Blob key не зависит от spool/root path. Реализовать caller → custody → commit/readback, не отдельные primitives. |
+| R-171 | `DECIDED / SOURCE_OPEN`: [§7.2–7.5](IMPLEMENTATION.md#72-capture-command-commit-and-replay) разделяют подтверждённую операцию и текущую доступность её тела. Поздний forbidden/erased/damaged open не разрешает новую mutation. Один owner dispatch для первого вызова и replay; operational kinds недоступны обычному event capture. Реализация complete transactions/custody/readback остаётся открытой. |
 | R-174/R-182 | Исправить imports и table-target `FOR UPDATE`; native record-ID разрешать и перепроверять внутри одной transaction (§6). UNIQUE/CAS не обещают predicate lock. |
-| R-183/R-186 | Time/reuse/support/influence/job codecs и полный history envelope выбраны; DDL/DTO/query/backup source ещё согласовать. Историю не достраивать из current. |
+| R-183/R-186 | `DECIDED / SOURCE_OPEN`: [§7.3](IMPLEMENTATION.md#73-exact-open-and-byte-ranges) разделяет body и полный revision hash; current/history читаются согласованно, continuation закрепляет точную revision. Динамические запреты не меняют snapshot/hash. DDL/DTO/query/backup source ещё согласовать; отсутствие проверенного snapshot нельзя выдать за missing. |
 | R-184 | Pending coalesces; первый claim фиксирует tuple, последующие claims меняют generation, не исходный смысл или unknown call ID. Полная claim/settle реализация остаётся открытой. |
 | R-185 | `DECIDED / SOURCE_OPEN`: [§4.5.1](IMPLEMENTATION.md#451-first-base-limits) задаёт ingress limits; [§8.4](IMPLEMENTATION.md#84-bounds-outcomes-and-connected-check) — Base backup/restore bytes, rows и parts. Узкая конфигурация не делает старые принятые данные нечитаемыми; overflow не разрешает truncation/eviction. Job/inference aggregate limits ещё отдельная работа. |
 | R-187 | Scope до arm limits, точная revision hydration; receipt-time cursor не change feed. Selected reuse требует membership writer/reader; иначе unavailable. |
@@ -174,11 +178,11 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 
 S-001–S-107 и предыдущие check counts — исторические evidence в закреплённом срезе,
 [AUDIT](AUDIT.md), [AUDIT-MAP](AUDIT-MAP.md) и PR, не повторно исполненные результаты.
-Текущий проход прочитал Implementation §4.5/7–10, owning Architecture/Cognition и
-Inference §8–10: согласован локальный cut, полный snapshot и изолированный restore.
-Ранее проверенные внешние API не объявлены перепроверенными. Локальные checks использовали
-исторический корпус; проверки полного текущего дерева и точного diff выполняются отдельно
-на GitHub и фиксируются в PR. Source/runtime, Rust/Clippy и Windows не исполнены этой правкой.
+Сверены текущие Implementation §4.3–7.5/10 и Cognition §5–6: идентичность результата,
+точное чтение, новая revision, live notices и фактическая выдача. Найденные противоречия
+исправлены в owners, не в отдельном errata. Это не новый аудит всего Store PR, всех
+первоисточников или всех сценариев. Результаты проверки точного diff и независимого
+review — в его PR; Rust/Clippy, Store и Windows runtime здесь не исполнялись.
 
 ## Integration blockers
 
