@@ -49,6 +49,11 @@ The immediate #5326 assignment is **asset-package repair**, not all of Slice 0:
    maximum. Implement [capture identity/transaction/readback](../IMPLEMENTATION.md#72-capture-command-commit-and-replay)
    and [exact open](../IMPLEMENTATION.md#73-exact-open-and-byte-ranges) first; do not expose
    the existing separate stream/observation primitives as a complete capture API.
+   Carry §7.2's exact input through identity lookup, complete insert and open together.
+   The inspected candidate omits command/event digests, capture format and parts of the
+   occurrence tuple from those paths. Add the owning fields/projections, not defaults
+   inferred from body hash, current time or another observation. Use the workspace-bound
+   stream key and server-derived binding projection; update schema/query digests together.
 3. Publish the corrected asset increment with exact-engine/catalog gaps still named.
    `inspect` validates embedded assets; it does not establish a working Store.
 
