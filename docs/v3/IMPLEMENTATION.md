@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.49 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.50 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -867,112 +867,222 @@ separately. This is a connected Slice 1 exit, not a new test programme or a runt
 
 ## 8. Backup-set owner and lifecycle
 
-This section solely owns Memory's physical backup format, publication and restore.
-Controller-dependent cut/release semantics belong to
-[Inference §8–10](INFERENCE-CONTRACT.md#8-memory-backup-interaction). Inference-disabled
-Base neither authenticates a controller nor constructs fake external-call inventory.
+The daemon's existing backup-set owner controls publication, leases and cleanup;
+supervisor controls the disposable candidate and root selection. This section selects
+one **Base logical snapshot**: fixed typed table exports plus immutable files, not a
+copy of a live RocksDB directory, executable SQL dump or new backup service. Base needs
+no controller. A cut containing external-call history/debt needs the separate admitted
+inference encoding under [Inference §8–10](INFERENCE-CONTRACT.md#8-memory-backup-interaction);
+turning inference off does not make that history disappear or qualify it as Base.
 
-One daemon backup-set owner serializes record transitions, dependency snapshots, leases
-and cleanup. When inference is enabled, take locks in this order:
+When inference is enabled, keep the existing order: close/drain controller mutation →
+backup-set transition → classify external IDs/high-water → capture local cut → publish
+and read back fence → leave transition → reopen controller mutation. Do not replace its
+dependency/retention rules with Base's empty external inventory.
 
-```text
-close/drain controller mutation
-→ enter backup-set transition
-→ classify external IDs and capture controller high-water
-→ capture Store/replay/spool cut and build plan
-→ publish/read back final directory + fence
-→ leave transition
-→ reopen controller mutation
-```
+For Base, serialize backup against restore/cutover, rotation, config replacement, notice
+publication and erasure. Drain **known outcomes**, not merely client tasks; an unresolved
+possible Store commit prevents a coherent cut. Pause canonical mutation/replay and blob
+cleanup until export and final manifest readback finish. Reads may continue. Under the
+spool mutex take an exact inventory of both pending and failed entries, then release it.
+Keep those entries pinned against moves/removal while copying; new post-cut staging may
+continue within quota. Never hold that mutex across Store/host/supervisor I/O. Unresolved
+notice publication or an active erasure fence prevents starting the cut. A new restrictive
+control request may cancel the bounded backup, not modify its cut midway.
 
-For Base omit the external-call steps, not Store consistency. Pause/drain canonical
-mutation and replay across paged Store export, or use a separately established coherent
-snapshot; timestamps and successive SELECT pages alone are not a snapshot. With the
-selected quiesced path, hold canonical mutation/replay closed until table/blob capture
-finishes; direct capture returns stage_required. Take the spool publication lock only
-for a brief exact inventory/generation cut, then allow post-cut relay staging while
-copying. On failure, reconcile exact capture state before reopening; never acknowledge
-uncommitted data to shorten the pause.
+Freeze root/selection, schema, non-secret configuration and notice head with that cut.
+Record independent counts for all six tables while writes remain stopped. Page each by
+its canonical application ID, with explicit projections and §4.5 byte bounds. Copy every
+required referenced blob and every inventoried spool member. Temporary/unpublished spool
+entries are not admitted input; failed entries remain withheld, not silently omitted or
+made replayable. A damaged selected member makes the backup incomplete.
 
-Backup ID is `b_` plus 32 lowercase hex digits from 128 OS-random bits. It does not come
-from rollback state or wall clock. The canonical plan binds backup/root/schema/spool
-cut, controller cut/dependencies when present, selected config/disclosure and gaps.
-Plan digest excludes itself, publication state and later part/manifest digests. The
-manifest repeats the plan digest and adds exact actual inventories/digests.
+Allocate `backup_id = b_` plus 32 lowercase hex OS-random digits, and an ordinary `o_`
+operation ID before publication. Retry resolves that operation in existing backup records
+before creating another set; conflicting bindings reject. Freeze the plan in §8.3.
+In a private same-parent temp,
+write/flush/read back `fence.json`, flush the directory, then no-replace rename the whole
+directory to the backup ID, flush parent and reopen no-follow. The first visible final
+directory therefore contains its fence. Resolve a collision before publication with a
+new backup ID/plan; after possible publication reconcile that exact ID, never overwrite.
+Pre-publication temps are cleanup debt, not restorable sets. An uncertain final publication
+pins conservatively; any final fence or terminal consumes its backup ID permanently.
 
-Before any part, create a private same-parent temp directory, write canonical fence.json,
-flush file+directory, atomically no-replace rename to the final backup ID, flush parent
-and reopen final directory/fence no-follow for exact readback. Final directory never
-appears empty. Collision discards temp and recomputes the plan with a new ID before
-publication. Pre-rename temps are non-restorable/non-pinning cleanup debt. A possibly
-committed rename is publication_unknown and pins conservatively after reconciliation.
-Any final fence/terminal record consumes that ID permanently.
+Write each part using §6's immutable publication. Compare the actual inventory against
+the frozen table counts, complete required-body closure, spool list, notice chain and
+config identity; matching hashes of only the files that happen to exist are insufficient.
+Publish `manifest.json` last, no-replace, and verify its bytes plus fence binding before
+reporting `published`. Missing/extra/duplicate members cannot yield a complete manifest.
 
-Page the fenced Base tables in canonical application-ID order; copy exact referenced
-blobs, cut spool, suppression/deletion notices and admitted config; publish the final manifest only
-when every expected member and digest agrees. Missing/truncated/extra/conflicting parts
-cannot become a complete backup.
+A restart does not resume a paged export against a newly mutable Store. First reconcile
+the same fence/manifest. If the manifest was durably published, keep that result; otherwise
+stop/reap the old writer, establish final-manifest absence and abort the incomplete set.
+Uncertain absence remains unresolved. An aborted operation keeps its result; a fresh
+export needs a new operation ID, cut and backup ID, not newer rows appended to old parts.
+Cancellation or capacity/I/O failure follows this same rule; reopen application admission only after the owning cut has been safely released.
 
-Terminal records are create-new, durable and self-contained: format, kind, backup ID,
-plan digest, observed fence digest, terminal operation ID, closed reason and, for retire,
-observed manifest digest. Abort requires exact fence, no valid manifest/writer/restore
-lease, exact partial-cleanup disposition and final-manifest absence readback. Retire
-requires exact published fence+manifest, no abort and no restore lease.
+Abort requires exact fence, no valid manifest, no writer/restore lease and known cleanup
+disposition. Retire requires exact fence+manifest, no abort and no restore lease. Publish
+and read back the self-contained terminal **before** deleting its fence/manifest/parts;
+retain the terminal permanently. No restored Store mirror may create or remove authority.
 
 ```text
 valid standalone retire                  retired/non-restorable
 valid standalone abort                   aborted-before-publish
-fence + matching manifest, no terminal    published/restorable
+fence + matching manifest, no terminal    published; validate contents before restore
 fence without valid manifest/terminal     preparing/publication_unknown
 malformed/both/mismatch/ambiguity          unresolved; fail closed
 ```
 
-Retain self-contained terminal markers after content cleanup. Terminalization is not
-erasure. Restored maintenance rows cannot create installation authority.
-
 ### 8.1 Bounded restore lease
 
-Before candidate work validate format/schema, finite part count, unique canonical
-relative paths, per-part and total bytes against build and narrower configured limits.
-Keep a logical lease bound to backup/plan/manifest plus no-follow final-directory,
-parts-directory, fence and manifest handles with FILE_SHARE_READ only.
+Validate §8.3/8.4 and the exact admitted schema bundle before allocating a candidate.
+An unsupported schema requires an explicit conversion, not a permissive restore decoder.
+A request names a known backup ID, not an arbitrary archive/path. Existing maintenance
+state retains its restore operation ID, backup/plan/manifest hashes and expected selection
+generation before candidate work. Retry reads that state instead of starting another
+restore. Keep a logical lease bound to backup/plan/manifest and no-follow
+final-directory, parts-directory, fence and manifest handles with FILE_SHARE_READ only.
+Reject reparse points, non-regular members and path aliases; hashes alone do not authorize
+opening an outside file. The logical owner blocks terminalization and cleanup.
 
-In deterministic manifest order open one part with write/delete sharing denied, verify
-regular identity/path/length/digest, copy+verify into the candidate and close it before
-the next part. Never retain an unbounded all-parts handle set. Logical owner blocks
-terminalization/cleanup; directory handles block replacement; the active part handle
-blocks changes during read; digest detects pre-open substitution.
+In manifest path order open **one** part with write/delete sharing denied, verify its
+exact path/identity/length/hash, copy and verify it into the isolated candidate, then close
+it. Keep only the bounded ancestor handles needed for that member, not every part handle.
+Stream raw bodies; bound JSONL lines before decoding. Check the entire inventory, six
+counts, unique application identities, history envelopes, blob closure and notice chain.
+Native record IDs are reconstructed internally by fixed bound restore statements; never
+execute SQL or deserialize arbitrary Store values supplied by a backup.
 
-Retain the lease through final terminal/manifest identity recheck before cutover.
-Supervisor owns the disposable candidate process/root and selection change, not backup
-interpretation. Daemon/channel loss forces candidate kill/reap/discard before another
-daemon or cutover. Supervisor loss is contained by its Job. A scan is not a lease.
+Apply the shipped schema through supervisor Owner admission, restore typed application
+fields through the owning client, then read back ordered application DTOs and required
+bodies against the export. Exclude native database IDs from comparison, not replay IDs,
+sequence counters, revision/history, optional-state distinctions or operation results.
+A partial import is a disposable candidate, never an active root or successful restore.
+
+Current §10 notices are checked before copying affected content and again before
+admission. A known erasure covering a required member prevents normal restore of that
+set; do not import it and call a silently filtered database an exact restore. Withdrawal
+qualifications do not alter historical bytes. Backup configuration is comparison/recovery
+material, not permission to loosen current capture/disclosure policy or replace secrets.
+
+After complete candidate readback, retain the lease through final fence/manifest/terminal,
+current-notice and installation-generation checks. Supervisor alone performs expected-
+generation cutover and independently validates candidate identity. Lost cutover reply
+reconciles selected root/generation; it does not repeat import or select a second candidate.
+Daemon/channel loss kills/reaps/discards an unselected candidate; supervisor loss is
+contained by its Job. Once selection may have changed, read it back before deleting any
+root. Preserve the previous root until its separate retirement. A scan is not a lease.
 
 ### 8.2 Exact rollback and external work
 
 Never restore into the live root or merge later Store rows into restored cognition.
-Healthy current Store first gets a safety backup; disaster mode records unavailable
-current inventory. Current suppression/deletion notices in §10 dominate backups before
-any restored guidance, job or replay becomes available. A backup's active influence flag
-cannot cancel a later withdrawal. Reconcile spool by the plan's exact command inventory,
-not wall-clock age. Included pending commands retain their original identity. Post-cut
-capture may be admitted as source input under current policy; post-cut `memory_change`
-commands are withheld, not replayed into rolled-back cognition. Read their original result
-from the retained previous root when available; unavailable outcome stays unknown. Adopting
-such a change requires a new explicit operation against the restored current revision,
-never an automatic rewrite of the old command. Retain the previous root until retirement.
+Healthy current Store first gets a safety backup; failure to make it stops normal restore.
+Explicit disaster mode records unavailable current inventory, not an invented safety copy.
+Reconcile cut spool by exact command/file identity, not age: restore pending as pending
+and failed as failed. A matching current entry is reused; a conflicting one is quarantined,
+never overwritten. Apply present notices/policy before enabling replay. Post-cut capture
+may be admitted as source input; post-cut `memory_change` stays withheld. Read its original
+result from the previous root when available; otherwise outcome is unknown. Adoption
+requires an explicit new operation against the restored current revision.
 
-Missing notice continuity is not an empty notice set. Keep that recovery isolated and
-report the gap; enabling it requires an explicit owner recovery decision acknowledging
-unknown history, never a claim that prior withdrawals/deletions were preserved. Known
-notices cannot be bypassed by that decision.
+Notice/checkpoint continuity, installation credentials/root selection, external-ID state
+and the live backup catalogue are **not restored from this snapshot**. Backup notice bytes
+may repair missing files only if they reconstruct the retained checkpoint exactly (§10.3).
+A backup's active influence flag cannot cancel a later withdrawal. Missing continuity is
+not an empty notice set: isolate recovery and report the gap. Enabling recovery requires
+an explicit owner decision acknowledging unknown history; it cannot bypass known notices
+or claim that prior withdrawals/deletions were preserved.
 
-Before new job claims, reconstruct installation authority and reconcile future-timeline/
-unmatched Store maintenance mirrors. They cannot create terminal records, clear pins
-or replay stale effects. With inference enabled apply the contract's exact in-cut
-closed/dependent classification and fixed post-cut inventory. History gap or missing
-external copy disables inference, not an otherwise valid Base. A broken local Store/
-lease/cutover invariant still blocks the affected local operation independently.
+Before new job claims, reconcile future-timeline/unmatched Store maintenance mirrors;
+they cannot create terminal records, clear pins or replay stale effects. With inference
+enabled, use its exact in-cut closed/dependent classification and fixed post-cut inventory.
+History gap or a missing external copy disables inference, not an otherwise valid Base;
+a broken local cut/lease/root invariant independently blocks its affected operation.
+
+### 8.3 Base format and complete inventory
+
+All control JSON is canonical §4.5 UTF-8 plus one LF, closed fields, integer-only metadata,
+no duplicate keys or unknown formats. Hash exact file bytes with SHA-256 lowercase hex.
+`plan_sha256` hashes canonical plan JSON plus LF, without containing itself. No compression,
+encryption, multipart archive framing or second serialization framework is selected.
+
+| Record | Exact fields / validation |
+|---|---|
+| Plan (embedded in fence) | `format=1`, `profile="base"`, `backup_id`, `operation_id`, `installation_id`, `source_root_id`, `selection_generation`, `schema={bundle_format,generation,sha256}`, `tables`, `spool`, `notice_head`, `config_sha256`. IDs/generations use existing admitted installation/schema types; root IDs are identities, not paths. |
+| `tables` | Six `{name,row_count}` entries in lexical name order: job, link, memory, memory_history, observation, stream. Counts are nonnegative signed-64, measured under the cut; a zero table is explicit, never omitted. |
+| `spool` | Sorted unique `{command_id,state,command_file_sha256}` entries, with state `pending` or `failed`. Hash is of exact command.json bytes, not its inner command hash. The command determines whether exact body.bin is required. |
+| `notice_head` | Exact `{sequence,sha256}` from current installation authority. Zero/null only for a truly empty initialized chain; include every notice through this head. |
+| `fence.json` | `{format:1,plan,plan_sha256}`. Backup directory, embedded backup ID and computed plan hash agree. No manifest/part hash appears in the plan. |
+| `manifest.json` | `{format:1,backup_id,plan_sha256,fence_sha256,parts,total_bytes}`. `parts` is a path-sorted unique list of `{path,bytes,sha256}` for every payload file; `total_bytes` is their checked sum. Metadata files do not list/hash themselves. |
+| `abort.json` / `retire.json` | `{format:1,kind,backup_id,operation_id,backup_operation_id,plan_sha256,fence_sha256,reason,cleanup}`; retire also requires `manifest_sha256`. Kind agrees with filename. Abort reasons: `cancelled`, `capacity`, `source_unavailable`, `integrity_failure`, `deadline`, `io_failure`; retire: `owner_request`, `retention`, `erasure`. Cleanup is `pending` or `complete` **as observed at publication**, not a mutable progress field. Later completion requires actual readback. |
+
+A terminal retains `backup_operation_id = plan.operation_id` even after the fence is
+removed; its own `operation_id` identifies the abort/retire request. Retry finds the
+original set, including a retired set, never a replacement. Same terminal-operation
+ID/bytes is replay; changed bytes conflict. A terminal does not claim cleanup that has
+not been observed.
+
+Only the following payload paths are allowed. Page numbers are eight decimal digits,
+start at 00000001 and are contiguous per table/notice stream. Member paths use `/`, exact
+case and the displayed grammar; reject absolute paths, `..`, alternate separators/streams,
+empty components, links and unlisted files. Do not sanitize an invalid path into a valid one.
+
+| Payload | Bytes and required completeness |
+|---|---|
+| `parts/tables/<table>/<page>.jsonl` | One canonical `{format:1,table,row}` plus LF per line, no blank lines. `row` is the full schema-versioned application backup DTO owned with its writer/reader, not SELECT *, native IDs or an exact-open subset missing replay fields. Preserve canonical nested JSON strings verbatim. Global per-table application-ID order is strict; no duplicate IDs across pages. Decode the same history/absence representations as §4.7. A zero-count table has no pages; every other count must match exported and restored rows. |
+| `parts/blobs/<64-lowercase-hex>.bin` | Exact raw body bytes for each required canonical blob reference; filename digest, actual bytes and referencing length/hash agree. Include the full required set, not unreferenced cleanup debris. Identical body storage does not merge occurrence identities or permissions. |
+| `parts/spool/<pending-or-failed>/<command_id>/command.json` and optional `body.bin` | Exact §7.5 members for every plan entry. No tmp directory or extra member. Each entry's state, file hash, command/body tuple and installation binding must agree; a failed entry is not a gap the exporter may discard. |
+| `parts/notices/<page>.jsonl` | Concatenate exact NoticeV1 file bytes, preserving each LF, in sequence order through notice_head. Reconstructed per-line hashes must form the full chain and end at that head. These bytes are recovery material, not replacement authority. No pages for a zero head. |
+| `parts/config.toml` | One non-secret snapshot from the admitted configuration owner's explicit export allowlist, parsed by that same owner; its exact hash equals config_sha256. No credential values, bootstrap environment, installation selection, external-ID allocator or inferred secret filtering. An unsupported required setting makes export unsupported, not silently omitted. Restore compares settings; it never automatically applies older permissions. |
+
+No installation.toml, live database files, logs, executables, previous roots or nested
+backups belong in parts. Build the required-body set from full table DTOs and selected
+spool entries, then compare it with actual members. Explicitly absent source states stay
+absent; the exporter cannot invent absence to excuse a missing required body. Dangling
+historical evidence with an already recorded qualification is not fabricated content.
+Missing, duplicate, truncated or surplus parts reject restore before cutover, even when
+every listed part's individual hash is correct. Hashes detect integrity, not authority
+against an attacker able to replace the entire untrusted set and its metadata.
+
+### 8.4 Bounds, outcomes and connected check
+
+Initial limits are selected engineering defaults, not measured performance. Enforce them
+while enumerating/writing and **before** allocation/parsing during restore; never truncate
+a count, inventory or file to fit. Source field/query limits in §4.5 still apply.
+
+| Boundary | Build limit |
+|---|---:|
+| Fence / manifest / one terminal | 1 MiB / 8 MiB / 16 KiB |
+| Payload files / all six tables' rows | 16,384 / 1,000,000 |
+| One payload part / one JSONL row including LF | 16 MiB / 1 MiB |
+| Entire set, including metadata and temporary copies | 4 GiB |
+| Spool / notices / configuration snapshot | §4.5.1 / §10.1 / 256 KiB |
+| One active part and body-copy buffer | One member / 64 KiB; a bounded JSONL row may need its own decoder buffer |
+
+A 16 MiB file is streamed, not sent through the 1 MiB Store/IPC frame. Shorten query pages
+by encoded bytes as well as rows. Before each write reserve/check remaining actual-byte
+budget, including temporary replacement overhead; a full disk yields incomplete/unknown,
+not a shortened complete backup. Finite operation/I/O deadlines apply; on expiry release
+or reconcile owned resources before resuming work. Never extend a cut indefinitely.
+
+Narrower configuration limits new exports, not the ability to parse an already accepted
+set within build limits. An insufficient restore resource budget returns capacity failure
+and leaves the backup and active root intact. A larger legitimate installation may exceed
+this profile: report that limit rather than making a lossy backup or silently raising caps.
+
+Report creation `published | rejected | aborted | unknown` separately from current set
+lifecycle and cleanup debt. Rejected requires known non-publication; aborted requires
+terminal readback. Published requires final manifest readback, not a restore exercise. Restore is successful
+only after candidate checks, actual selection readback and admitted daemon/open on that
+selection. Candidate validated, cutover unknown, and selected-but-startup-unavailable are
+distinct failure/status facts; none permits deleting the previous root or guessing success.
+
+Connect this with Slice 3's actual exporter/importer: empty table; last page/blob missing;
+extra part; interrupted manifest publication; post-cut spool arrival; current deletion
+notice; and lost cutover reply. Observe exact open after restart of the selected candidate.
+No separate backup database, general serializer, job family or new test/report framework
+is required; source execution and Windows durability remain unqualified until observed.
 
 ## 9. Controller V2 adapter
 
