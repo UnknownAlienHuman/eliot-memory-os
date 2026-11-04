@@ -7,7 +7,8 @@ identifies the V3 contract owners; the [existing registry](docs/v3/ANALYSIS-REGI
 owns documentation stages. An issue defines the requested change, not another architecture.
 
 Use current `main` as the integration base. PR #5325 is merged; its former writer
-exception has ended even while issue #5324 remains open for documentation checks.
+exception has ended. Remaining documentation work is tracked in the existing registry;
+issue #5324's open/closed state is not a readiness result.
 New changes use a fresh issue-numbered branch. For an existing open implementation
 PR, the root reconciles current `main` into that same writer branch before continuing;
 do not create an overlapping PR or overwrite concurrent work.

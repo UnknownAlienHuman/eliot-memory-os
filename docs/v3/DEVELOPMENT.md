@@ -152,6 +152,35 @@ or navigation. Full shard/router/conformance checks are selected only when their
 actual surface changes or when required by integration. A retained-V2 integrity
 result does not validate the V3 specification; see [the consumer map](#legacy-documentation-consumers).
 
+### Code navigation
+
+Use the current path route, not the full retained-V2 index generator:
+
+```text
+python scripts/code_navigation.py route --path docs/v3/IMPLEMENTATION.md --format json
+```
+
+Replace the path with the actual existing source/document; add `--topic` only when
+another boundary is relevant. `route-rules.toml` selects V3 by path. Confirm
+`documentation_scope`, package/admission, dependencies and `resolved_contract_refs`.
+The full Cargo inventory is still checked; only unrelated legacy documentation
+references are outside this path scope. Actual legacy refs in selected package
+metadata are not discarded. A malformed or unresolved ref is an error, not a
+reason to remove it or mark the package complete.
+
+Declare V3 `[package.metadata.eliot].contract_refs` as root-relative files with
+optional Markdown anchors. Update each referring manifest when its owner/heading
+moves, plus the existing route rule and logical block when adding a source family.
+The resolver checks actual file/anchor/case/path identity without a V2 index.
+The capsule resolver accepts the same file refs, but capsule generation remains a
+retained-V2 consumer, not a new V3 requirement.
+
+For navigation-tool changes, run `python scripts/code_navigation.py self-test` and
+`python scripts/code_navigation.py check --root .`. The latter still validates all
+retained handles and both committed indexes. If an index is stale, inspect the
+source/manifest difference, run the existing `sync-index`, review only its generated
+diff, then repeat `check`. Never substitute the scoped route for this full result.
+
 ### Operational references
 
 For V3 file/heading references, use the existing conformance front door:
@@ -413,7 +442,8 @@ schema catalogue or checker just to retire the first one.
 |---|---|---|
 | `docs_shards_core.verify` through `docs_shards.py`, `verify-normative.ps1`/`.sh`, `verify.ps1` and `Justfile` | Both manifests, their fragments, V2 pair receipt and generated indexes | `verify_pair` validates the retained receipt/manifests, not literals in the V3 authority page. Missing/corrupt V2 input must fail. `verify --normative-only` reports `scope=retained-v2`; a pass is not V3 acceptance. |
 | `doc_code_conformance_lib/normative_references.audit`, called by `verify-doc-code-conformance.py` | Current file/heading targets; V2 numeric index only for numeric/Decision selectors, Decision Anchor index and A16.1 only for Decision selectors | [Scoped reference check](#operational-references) needs no unused V2 inputs. Full/mixed scans still validate every selected legacy reference. No directory-wide exclusion; remaining legacy references must migrate before their indexes are removed. |
-| `code_navigation_lib/registry.build_registry`, `validate_handle_index`, capsule contract resolution and handle destinations, through `code_navigation.py` | Indexed fragment bytes/anchors, manifests, logical-block handles and package contract references | Migrate declarations and consumers together to versioned owner-file references. Preserve Cargo membership, dependency/path validation and unresolved-reference failures. A V3 task must not need a complete V2 registry first. |
+| `code_navigation.py route` / registry / contract destinations | Current V3 owner files from existing route rules; actual package `contract_refs` | V3 path scope no longer needs unused V2 indexes. Keep exact file/anchor and Cargo checks; mixed package refs still require their V2 input. See [the recipe](#code-navigation). |
+| Full code-navigation `check`, package indexes and capsule generation | Retained block handles, fragment bytes/anchors and V2 triad semantics | P4 must migrate or retire actual callers/declarations before corpus removal. Direct file-ref support does not make V2 capsule generation a V3 requirement. |
 | `docs_closure_audit.py`, called by `Justfile`/`verify.ps1`; repository-policy also constrains their wiring | V2 manifests, pair/index identities, original Git history and historical workstream assumptions | Classify the retained audit explicitly at each caller before retirement. A missing historical commit is not missing V3 implementation; a skipped audit is not PASS. Changes to CI/profile admission need their own reviewed scope. |
 
 Before editing a consumer, inspect its current callers and declared inputs:

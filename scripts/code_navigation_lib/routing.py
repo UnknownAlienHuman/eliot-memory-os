@@ -32,16 +32,18 @@ def route_payload(root: Path, path: str, topic: str | None = None) -> dict[str, 
             "no non-baseline documentation route matched; add a route before mutating this scope"
         )
 
-    registry = build_registry(root)
+    current = bool(docs_router.version_paths(docs_config, [path])["v3"]) if hasattr(docs_router, "version_paths") else False
+    registry = (build_registry(root, documentation_paths=[path], documentation_topic=preliminary_topic)
+                if current else build_registry(root))
     package = matching_package(registry, path)
     blocks = [
         block
         for block in registry["logical_blocks"]
         if any(path_matches(path, pattern) for pattern in block["path_globs"])
     ]
-    effective_topic = topic or " ".join(
+    effective_topic = preliminary_topic if current else (topic or " ".join(
         block["route_topic"] for block in blocks
-    ) or "repository source ownership and change impact"
+    ) or "repository source ownership and change impact")
 
     routes = docs_router.matched_routes(docs_config, [path], effective_topic)
 
@@ -108,6 +110,8 @@ def route_payload(root: Path, path: str, topic: str | None = None) -> dict[str, 
 
     return {
         "schema_version": SCHEMA,
+        "documentation_scope": "selected-v3-paths" if current else "retained-v2-full-registry",
+        "resolved_contract_refs": registry.get("resolved_contract_refs", []),
         "path": path,
         "topic": effective_topic,
         "nearest_agents": nearest_agents(root, path),
@@ -118,8 +122,10 @@ def route_payload(root: Path, path: str, topic: str | None = None) -> dict[str, 
                 "id": block["id"],
                 "title": block["title"],
                 "responsibility": block["responsibility"],
-                "documentation_handles": block["documentation_handles"],
-                "documentation_route_ids": block["documentation_route_ids"],
+                "documentation_handles": [] if current else block["documentation_handles"],
+                "documentation_authority": "route-rules.toml V3 owners" if current else "retained V2 handles",
+                "documentation_route_ids": ([route.route_id for route in routes]
+                                            if current else block["documentation_route_ids"]),
             }
             for block in blocks
         ],
@@ -136,7 +142,10 @@ def route_payload(root: Path, path: str, topic: str | None = None) -> dict[str, 
         ),
         "code_graph": {
             "adapter": "CodeBase Memory MCP",
-            "required_assurance": "Verify tier for mutation; Auditor tier for exhaustive/negative claims",
+            "required_assurance": (
+                "optional for V3; use exact source/caller/readback when unavailable"
+                if current else "Verify tier for mutation; Auditor tier for exhaustive/negative claims"
+            ),
             "query_intents": graph_intents,
             "hard_boundaries": [
                 "graph output is derived navigation evidence, not source or semantic authority",
@@ -210,6 +219,9 @@ def render_route(payload: dict[str, Any]) -> str:
         "- Nearest agent contracts: "
         + (", ".join(f"`{item}`" for item in payload["nearest_agents"]) or "none"),
     ]
+    lines.append(f"- Documentation scope: `{payload.get('documentation_scope', 'retained-v2')}`")
+    for ref in payload.get("resolved_contract_refs", []):
+        lines.append(f"- Contract: `{ref['direct_destination']}`")
     package = payload.get("package")
     if package:
         admission = (
@@ -255,6 +267,12 @@ def render_route(payload: dict[str, Any]) -> str:
             or "none"
         )
     )
+    if payload.get("documentation_scope") == "selected-v3-paths":
+        lines.extend(["", "## Source inspection",
+                      "Read the selected owners and trace the actual caller, result and consumer.",
+                      "Code Graph is optional; report missing coverage instead of claiming exhaustive review.",
+                      "This path route does not validate unrelated V2 reference indexes or product behavior."])
+        return "\n".join(lines)
     lines.extend(
         [
             "",
