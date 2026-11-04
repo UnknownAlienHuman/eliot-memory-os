@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.50 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.51 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -698,7 +698,10 @@ not `StreamInsert`, `StreamAdvance` and `ObservationInsert` as separate calls:
    replay allocates nothing. Do not queue unimplemented jobs.
 4. Check every statement and commit result, then decode the accepted observation ID,
    stream ID, sequence, original receipt time and hashes. Native redelivery returns the
-   stored observation ID, not the caller's new proposed ID. Verify exact open can read it.
+   stored observation ID, not the caller's new proposed ID. Matching operation readback
+   resolves commit; exact open separately reports current content availability (§7.3).
+   A later forbidden, erased or damaged body is not proof of rollback or permission to
+   repeat the mutation with a fresh identity.
 
 A duplicate-key/conflict result is not success: look up and compare the same immutable
 command/event. If a possible send lost its outcome, poison the socket and read back
@@ -728,20 +731,33 @@ with a new receipt time, ID or binding.
 Use closed selectors: observation ID; memory ID plus `current`; or memory ID plus an
 exact positive revision. Resolve `current` once and return that resolved revision.
 An explicit revision reads that version from current/history, never the newest substitute.
-Source/representation handles keep their exact identity. Empty selectors reject.
+Resolve and project within one consistent fixed read: a revision moving from current to
+history cannot become `missing` because two independent lookups straddled its replacement.
+Qualify that read's snapshot semantics on the selected engine; do not infer them from a
+socket or substitute the latest revision. Empty selectors reject.
 
-An authorized response includes requested/resolved identity, representation/revision,
-full body length/SHA-256, capture limitations, qualifications and a closed disposition:
-`complete`, `range`, `missing`, `forbidden`, `erased`, `damaged` or `unsupported`.
-Unavailable Store/transport is an operation error, not `missing`. Recheck current scope
-and suppression before returning content; forbidden responses disclose no source bytes.
+Content-bearing `complete`/`range` responses include requested/resolved identity,
+representation/revision, `body_length`, `body_sha256`, capture limitations and qualifications.
+For an observation, body means its exact accepted bytes. For a memory revision, body means
+the UTF-8 bytes of `content`; also return `revision_sha256`, SHA-256 of the complete
+canonical semantic revision DTO (§4.7), without a history wrapper or trailing LF.
+Current notice/access qualifications are outside those immutable bytes and hashes.
+Cognition's memory source hash uses `revision_sha256`, not the content-only body hash.
+Equal text with different conditions therefore does not identify the same semantic value.
+
+Other dispositions are `missing`, `forbidden`, `erased`, `damaged` or `unsupported`;
+return the requested selector and a bounded reason, not partial content, source hashes,
+lengths or private qualifications. Authorize the selector before disclosing existence.
+Unavailable Store/transport or notice authority is an operation error, not `missing`
+or an empty restriction set. Recheck current scope/suppression at the delivery boundary.
 
 Body ranges use unsigned byte offset and positive length within §4.5.1, with checked
 arithmetic. Return exact bytes as base64, range length/hash, total length and next offset
 (or absent at end). A text preview is separate; a UTF-8 code point split at a byte
 boundary is not damaged source. Offset at EOF yields an empty complete range; beyond EOF
-rejects. A continuation repeats the same identity/revision/full digest. Changed identity,
-length or digest rejects, not a new search. Metadata remains typed and size-bounded.
+rejects. Continuation uses the resolved exact ID/revision, never `current` again, and
+repeats body length/hash plus `revision_sha256` for memory. Changed identity, length or
+hash rejects, not a new search. Metadata remains typed and size-bounded.
 The full digest identifies the immutable object; a range digest verifies only the returned
 range, not the whole object. Verify full length/hash when publishing or opening the full
 body, and retain protected no-follow custody during range reads. Integrity failure reports
@@ -773,8 +789,19 @@ current, exact grounds/replacement links and the operation observation/result to
 Invalid scope, source, history or links abort the whole operation. Only implemented
 reverse-impact work may be coalesced; no empty successful job is created.
 
+Revision publication participates in the same affected-delivery fence as §10 notices:
+close new emissions using that memory, drain in-flight emission, then commit/reconcile
+the revision before reopening. This orders an acknowledged correction against context
+output; checking a revision only during packing leaves a race. No spool mutex is held
+across this Store/host work. Unknown publication keeps affected guidance withheld, not
+all unrelated capture stopped. The fence is an existing operation boundary, not a new
+queue or coordinator.
+
 Same command/digest returns its original result even after later revisions. Open that
-exact resulting revision through §7.3; never replace it with current. A changed command
+exact resulting revision through §7.3; never replace it with current. The operation
+result and the open disposition are separate: later denial, damage or an unavailable
+read cannot turn a confirmed revision into a failed write or trigger another revision.
+A changed command
 is identity conflict; a new command with stale expected revision is revision conflict.
 Possible commit with a lost reply is unknown until lookup by operation identity, not a
 second revision. The same-input reconciliation rule in §7.2 applies only to this complete
@@ -803,10 +830,13 @@ must agree; installation ID must match the selected installation, not a restored
 Unknown format, duplicate JSON keys, extra members, malformed size/hash tuples, reparse
 paths and missing/extra files reject. Inline bytes remain in the command; blob bytes
 are only in `body.bin`, whose exact length/hash must match. No path from input is opened.
-The same envelope can hold the reserved `memory_change` input, but only its authorized
-daemon front door may admit it; ordinary relay capture still rejects that kind. A kind
-or installation ID in a file is not a grant of authority. Replay checks current policy
-and dispatches to the owning capture or revision transaction, never generic inserts.
+The same envelope serves authorized operation-owned `memory_change`, `context_packet`
+and `context_handoff` records. Ordinary event capture rejects all three reserved kinds;
+the owning revision/context operation admits them. A kind or installation ID in a file
+is not authority. Apply the same closed dispatch before first send and during replay:
+revision uses §7.4's complete transaction; context provenance only stores its validated
+facts under Cognition §6.5; ordinary capture uses §7.2. No generic insert path may bypass
+an operation owner. Replaying packet/handoff storage never emits context or starts a job.
 
 **Publish before send.** All relay publishers and daemon cleanup use the same protected
 installation-scoped OS mutex, available even while the daemon is down. Validate policy,

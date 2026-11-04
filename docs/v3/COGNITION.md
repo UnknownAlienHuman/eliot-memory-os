@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.29 · 2026-11-04 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.30 · 2026-11-04 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -163,9 +163,17 @@ ID namespace; allocate it once before preparing the output.
 |---|---|
 | `binding` | `installation_id`, nonnegative integer `selection_generation`, `project`, `workspace_id`, `actor_id`, `session_id`, `host`, `host_version`, `adapter_version`, `event`; optional `task_id` and `native_request_key`. All other values are nonempty strings bounded by Implementation §4.5.1. The admitted adapter supplies versions/event mapping, not caller text. Missing task uses §2's session address. Missing session/work authority cannot fall back to a similar project's packet. |
 | `units` | At most 32 ordered units under §6.4. Each has `role`, `representation`, `text`, `source` and `qualifiers`, plus `span` only for an excerpt. Roles are `goal`, `constraint`, `progress`, `commitment`, `method`, `evidence`, `counterevidence`. Representations are `verbatim`, `excerpt`, `stored_reduction`, `live_input`. A stored reduction retains its own exact source identity; it is not generated while packing. |
-| `source` | For persisted units: `{kind:"observation",id,sha256}` or `{kind:"memory",id,revision,sha256}`. Observation hash identifies its accepted body; memory hash identifies the canonical complete semantic revision DTO, not the history envelope. Resolve `current` before packing; revision is positive and exact. Only `live_input` has `source=null`, meaning explicitly uncommitted caller input, not an invented citation. |
-| `qualifiers` | Closed projection of applicable source fields: `conditions_json`, `exceptions_json`, `valid_from_ms`, `valid_until_ms`, `support_state`, `exposure_state`, `influence_state`, `applicability`, `capture_limit_json`. Copy the source's complete conditions/exceptions/limitations; compute applicability by §3. Omit fields inapplicable to that source kind; do not replace missing required facts with permissive values. |
+| `source` | For persisted units: `{kind:"observation",id,sha256}` or `{kind:"memory",id,revision,sha256}`. Use exact-open `body_sha256` for an observation and `revision_sha256` for a memory ([Implementation §7.3](IMPLEMENTATION.md#73-exact-open-and-byte-ranges)); a memory content-only hash is insufficient. Resolve `current` before packing; revision is positive and exact. Only `live_input` has `source=null`, meaning explicitly uncommitted caller input, not an invented citation. |
+| `qualifiers` | Closed projection of applicable source fields: `conditions_json`, `exceptions_json`, `valid_from_ms`, `valid_until_ms`, `support_state`, `exposure_state`, `influence_state`, `applicability`, `capture_limit_json`, plus computed `current_withdrawal` for every persisted memory unit. Copy the source's complete conditions/exceptions/limitations; compute applicability by §3 and withdrawal by Implementation §10. Omit fields inapplicable to that source kind; do not replace missing required facts with permissive values. |
 | `coverage` | `{consistency:"per_query",arms:[{name,state}],gaps:[code...]}`. Names: `addressed`, `exact`, `lexical`, `relations`, `methods`, `vectors`; each appears once. States: `complete`, `partial`, `unavailable`, `disabled`, `not_requested`. This initial packet does not claim a coherent cut across independent queries. |
+
+`current_withdrawal` is `none | withdrawn`, evaluated from current notices inside the
+final delivery fence. It is not the stored `influence_state` and is not part of the source
+revision hash. A withdrawn item may appear only as explicitly qualified historical
+`evidence`/`counterevidence`, never as an active goal, constraint, progress, commitment or
+method; withdrawal does not itself refute its content. If the notice state cannot be
+established, withhold that unit with `qualification_missing`, not a default `none`.
+Erased/forbidden content is never packed. Preserve this live qualification when including an older exact revision.
 
 Gap codes are the bounded, sorted, duplicate-free set `binding_missing`, `capture_pending`,
 `source_missing`, `source_changed`, `source_damaged`, `scope_withheld`, `arm_unavailable`,
@@ -215,12 +223,15 @@ Immediately before output, recheck the live invocation/session/work binding, ins
 selection, current authorization/disclosure and suppression. A local host may forward
 context to a remote provider: local IPC permission alone does not authorize that
 forwarding. The admitted host profile must bound the allowed destination/disclosure;
-unknown destination keeps restricted content withheld. Revalidate selected source
-revisions/qualifications; a changed eligible result requires rebuilding and a new packet
-ID, never changing bytes under the old one. No retry follows an ambiguous prior emission.
+unknown destination keeps restricted content withheld. For a memory unit selected as current
+goal/constraint/progress/commitment/method, verify that the current revision still equals
+the selected revision; successfully opening its historical copy is not that check.
+Revalidate exact source hashes, qualifications and current notices. A changed eligible
+result requires rebuilding and a new packet ID, never changing bytes under the old one.
+No retry follows an ambiguous prior emission.
 
 The bounded emission participates in the existing affected-delivery fence used by
-withdrawal, erasure and cutover. Closing that fence rejects new emissions and drains
+revision publication, withdrawal, erasure and cutover. Closing that fence rejects new emissions and drains
 in-flight ones; a timeout leaves unresolved delivery, not completed erasure. Recheck
 inside the fence, not only while constructing the packet. Do not hold the spool
 publication mutex across host/Store I/O. Bytes already handed to the host cannot be
@@ -293,7 +304,8 @@ new reporting framework or declaring a docs example to be runtime evidence:
 | Case | Required result |
 |---|---|
 | Same text, different work/session | No cross-binding packet reuse; distinct occurrences remain distinct. |
-| Current revision/policy changes before output | Revalidate inside the delivery fence; rebuild or withhold, never send stale positive guidance. |
+| Current revision/policy changes before output | Revision publication and output share the affected fence; historical hydration cannot pass a current-revision check. Rebuild or withhold, never send stale positive guidance. |
+| Withdrawn historical source with stored influence active | Preserve the exact revision hash and add current withdrawal qualification; never promote it to positive guidance. Missing notice authority is not `none`. |
 | Oversized unit or exhausted retrieval arm | Preserve qualifiers or omit the unit with a gap; encode partial/unavailable truthfully and remain within the final-response cap. |
 | Relay exits or response/report is lost | Capture stays committed; handoff is unknown where appropriate; restart emits no old packet. |
 | Transcript replay / forged packet marker | No new evidence, method-success claim or model job from recaptured context; unverified attribution stays unknown. |
