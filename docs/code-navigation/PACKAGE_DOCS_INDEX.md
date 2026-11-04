@@ -4,9 +4,11 @@
 This committed file is a deterministic navigation projection, not architectural
 or source authority. Its denominator comes only from the root
 [`Cargo.toml`](../../Cargo.toml). Package-to-document mappings come from
-[`logical-blocks.toml`](logical-blocks.toml), the canonical
-[`handle-index.json`](../architecture/handle-index.json), and inherited
-`AGENTS.md` contracts. Do not edit it by hand.
+[`route-rules.toml`](../architecture/route-rules.toml) and declared package
+`contract_refs` for V3 targets; retained targets use
+[`logical-blocks.toml`](logical-blocks.toml) defaults. Source classifications
+below do not override V3 routes. Actual legacy references still require their
+index. Inherited `AGENTS.md` contracts remain checked. Do not edit by hand.
 
 ```powershell
 python scripts/code_navigation.py sync-index --root .

@@ -154,7 +154,7 @@ result does not validate the V3 specification; see [the consumer map](#legacy-do
 
 ### Code navigation
 
-Use the current path route, not the full retained-V2 index generator:
+For one task, use the path route rather than regenerating the whole index:
 
 ```text
 python scripts/code_navigation.py route --path docs/v3/IMPLEMENTATION.md --format json
@@ -172,14 +172,29 @@ Declare V3 `[package.metadata.eliot].contract_refs` as root-relative files with
 optional Markdown anchors. Update each referring manifest when its owner/heading
 moves, plus the existing route rule and logical block when adding a source family.
 The resolver checks actual file/anchor/case/path identity without a V2 index.
-The capsule resolver accepts the same file refs, but capsule generation remains a
-retained-V2 consumer, not a new V3 requirement.
+Full `check`/`sync-index` use the same route rules for each V3 target and include its
+package's declared refs. A retained sibling target keeps its own block defaults;
+forward and reverse indexes share this per-target relation. A reference does not
+relabel a source version. Do not change routing merely to hide a legacy failure.
+
+`logical-blocks.toml` keeps source/path coverage and retained defaults. Its existing
+`documentation_handles` accepts canonical file/anchor refs as well as retained
+numeric handles; empty or non-string declarations fail. Any actual legacy handle
+loads and validates the complete legacy index, regardless of a record's `source`
+label. `ELIOT_ARCHITECTURE:`/`ELIOT_IMPLEMENTATION:` must agree with the referenced
+source. Retained V2 package metadata remains under its existing capsule diagnostics;
+this change does not silently promote or repair those donors.
 
 For navigation-tool changes, run `python scripts/code_navigation.py self-test` and
-`python scripts/code_navigation.py check --root .`. The latter still validates all
-retained handles and both committed indexes. If an index is stale, inspect the
-source/manifest difference, run the existing `sync-index`, review only its generated
-diff, then repeat `check`. Never substitute the scoped route for this full result.
+`python scripts/code_navigation.py check --root .`. Full checking retains Cargo,
+dependency, target, inherited instruction and both committed-index checks. When an
+index is stale, inspect the source/manifest delta, run the existing `sync-index`,
+review the generated diff, then repeat `check`. After changing version selection,
+inspect the affected target in both directions; a sibling target must not acquire
+or lose its references. Never substitute a scoped route for the full result.
+
+`code_navigation.py capsules` is explicitly retained-V2 only; its presence or PASS
+is not a V3 requirement or acceptance result. Do not emit V2 triads for a V3 task.
 
 ### Operational references
 
@@ -443,8 +458,9 @@ schema catalogue or checker just to retire the first one.
 | `docs_shards_core.verify` through `docs_shards.py`, `verify-normative.ps1`/`.sh`, `verify.ps1` and `Justfile` | Both manifests, their fragments, V2 pair receipt and generated indexes | `verify_pair` validates the retained receipt/manifests, not literals in the V3 authority page. Missing/corrupt V2 input must fail. `verify --normative-only` reports `scope=retained-v2`; a pass is not V3 acceptance. |
 | `doc_code_conformance_lib/normative_references.audit`, called by `verify-doc-code-conformance.py` | Current file/heading targets; V2 numeric index only for numeric/Decision selectors, Decision Anchor index and A16.1 only for Decision selectors | [Scoped reference check](#operational-references) needs no unused V2 inputs. Full/mixed scans still validate every selected legacy reference. No directory-wide exclusion; remaining legacy references must migrate before their indexes are removed. |
 | `code_navigation.py route` / registry / contract destinations | Current V3 owner files from existing route rules; actual package `contract_refs` | V3 path scope no longer needs unused V2 indexes. Keep exact file/anchor and Cargo checks; mixed package refs still require their V2 input. See [the recipe](#code-navigation). |
-| Full code-navigation `check`, package indexes and capsule generation | Retained block handles, fragment bytes/anchors and V2 triad semantics | P4 must migrate or retire actual callers/declarations before corpus removal. Direct file-ref support does not make V2 capsule generation a V3 requirement. |
-| `docs_closure_audit.py`, called by `Justfile`/`verify.ps1`; repository-policy also constrains their wiring | V2 manifests, pair/index identities, original Git history and historical workstream assumptions | Classify the retained audit explicitly at each caller before retirement. A missing historical commit is not missing V3 implementation; a skipped audit is not PASS. Changes to CI/profile admission need their own reviewed scope. |
+| Full code-navigation `check` / `sync-index` | V3 per-target route owners and package refs; retained targets and block declarations still use their stated defaults | Same relation drives validation and both index directions. Full direct-file declarations need no V2 index; one real legacy handle retains full integrity checks. Existing donor declarations are not automatically rewritten. |
+| `code_navigation.py capsules` | V2 capability-cell/triad semantics and catalogue | Explicit retained-V2 scope; no V3 acceptance. Retire the actual generator/consumers as a unit, not by treating direct-ref support as migration of its semantics. |
+| `docs_closure_audit.py`, `Justfile` (`docs-closure-audit`, `quick`), `verify.ps1` (`documentation-closure-audit`, `normative-pair`) and repository-policy | V2 manifests, pair/index identities, original Git history and historical workstreams | Next P4 boundary: migrate the actual profile selection and policy wiring together. Preserve required checks for affected V2/shared inputs; a historical skip is not PASS. Missing Git history is not missing V3 implementation. Do not add another verifier/profile merely to obtain green CI. |
 
 Before editing a consumer, inspect its current callers and declared inputs:
 

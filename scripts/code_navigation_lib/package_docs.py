@@ -145,7 +145,7 @@ def target_relations(
     """Per-target documentation relation shared by validate and render (#690 P3/P4).
 
     Each record binds one target to the logical blocks selected for its own
-    path and the governing handles derived from exactly those blocks. Family
+    path and its current routed references or retained block handles. Family
     (package-level) evidence is reused but never replaces a target record:
     when the registry carries no block path globs (minimal synthetic
     registries), every target inherits the package block set.
@@ -164,12 +164,19 @@ def target_relations(
             _target_blocks(target_path, blocks) if globbed else list(package_blocks)
         )
         scoped = dict(package, logical_blocks=selected)
+        current_refs = package.get("target_contract_refs", {}).get(target_path)
+        if current_refs is not None and (
+            not isinstance(current_refs, list) or not current_refs
+            or any(not isinstance(ref, str) or not ref.strip() for ref in current_refs)
+        ):
+            raise NavigationError(f"invalid current target contract references: {target_path}")
         relations.append(
             {
                 "target": target,
                 "path": target_path,
                 "blocks": selected,
-                "handles": _handles(scoped, blocks),
+                "handles": (sorted(set(current_refs), key=natural_handle_key)
+                            if current_refs is not None else _handles(scoped, blocks)),
             }
         )
     return relations
@@ -229,7 +236,8 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
         logical_blocks = package.get("logical_blocks")
         if not isinstance(logical_blocks, list) or not logical_blocks:
             raise NavigationError(f"workspace package resolves no governing docs: {package_root}")
-        handles = _handles(package, blocks)
+        relations = target_relations(package, blocks)
+        handles = {ref for relation in relations for ref in relation["handles"]}
         if not handles:
             raise NavigationError(f"workspace package resolves no governing docs: {package_root}")
         for handle in handles:
@@ -240,7 +248,7 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
         # Per-target closure (issue #690 P3): every target reconciles its own
         # inherited AGENTS chain, block selection and governing handles. The
         # package-level evidence above is reused, never a replacement.
-        for relation in target_relations(package, blocks):
+        for relation in relations:
             target = relation["target"]
             relative = normalize_repo_path(str(target.get("path", "")))
             chain = nearest_agents(root, relation["path"])
@@ -309,9 +317,11 @@ def render(registry: dict[str, Any], root: Path | None = None) -> str:
         "This committed file is a deterministic navigation projection, not architectural",
         "or source authority. Its denominator comes only from the root",
         "[`Cargo.toml`](../../Cargo.toml). Package-to-document mappings come from",
-        "[`logical-blocks.toml`](logical-blocks.toml), the canonical",
-        "[`handle-index.json`](../architecture/handle-index.json), and inherited",
-        "`AGENTS.md` contracts. Do not edit it by hand.",
+        "[`route-rules.toml`](../architecture/route-rules.toml) and declared package",
+        "`contract_refs` for V3 targets; retained targets use",
+        "[`logical-blocks.toml`](logical-blocks.toml) defaults. Source classifications",
+        "below do not override V3 routes. Actual legacy references still require their",
+        "index. Inherited `AGENTS.md` contracts remain checked. Do not edit by hand.",
         "",
         "```powershell",
         "python scripts/code_navigation.py sync-index --root .",

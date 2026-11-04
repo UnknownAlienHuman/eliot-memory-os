@@ -233,14 +233,6 @@ def build_registry(
             raise NavigationError(f"V3 documentation route rejected: {exc}") from exc
         for item in current_route["required"]:
             resolve_repository_ref(root, item["path"])
-    else:
-        handle_index = read_json(root / DEFAULT_HANDLE_INDEX)
-        if handle_index.get("schema_version") != "eliot-handle-index-v1":
-            raise NavigationError("unsupported documentation handle index schema")
-        handles = handle_index.get("handles")
-        if not isinstance(handles, dict) or not handles:
-            raise NavigationError("documentation handle index is empty or invalid")
-        validate_handle_index(root, handles)
 
     for block in blocks:
         pattern_matches = {
@@ -267,17 +259,6 @@ def build_registry(
                 for path in matches
             }
         )
-        unknown_handles = [
-            handle
-            for handle in block["documentation_handles"]
-            if current_route is None and handle not in handles
-        ]
-        if unknown_handles:
-            raise NavigationError(
-                f"logical block {block['id']} has unknown documentation handles: "
-                + ", ".join(unknown_handles)
-            )
-
     for block in blocks:
         sample_paths = block["matched_files"][:1]
         matched = docs_router.matched_routes(
@@ -318,18 +299,40 @@ def build_registry(
             item["root_path"],
         ),
     )
+    # Full projections use the same path authority as the scoped route. Keep
+    # target-level mappings: a V3 target cannot relabel a sibling V2 target.
+    selected_refs: set[str] = set()
+    if current_route is None:
+        selected_refs.update(ref for block in blocks for ref in block["documentation_handles"])
+        for package in packages:
+            current_targets: dict[str, list[str]] = {}
+            for target in package["targets"]:
+                path = normalize_repo_path(package["root_path"] + "/" + target["path"])
+                if not hasattr(docs_router, "version_paths") or not docs_router.version_paths(docs_config, [path])["v3"]:
+                    continue
+                try:
+                    routed = docs_router.route_payload(root, docs_config, [path], "")
+                except docs_router.RouteError as exc:
+                    raise NavigationError(f"V3 target documentation route rejected: {exc}") from exc
+                refs = {item["path"] for item in routed["required"]} | set(package["contract_refs"])
+                current_targets[path] = sorted(refs)
+                selected_refs.update(refs)
+            if current_targets:
+                package["target_contract_refs"] = current_targets
+
     scoped_references: dict[str, Any] = {}
+    resolver = DestinationResolver(root)
     if current_route is not None:
-        resolver = DestinationResolver(root)
         selected_refs = {item["path"] for item in current_route["required"]}
         for path in documentation_paths:
             package = matching_package({"packages": packages}, path)
             if package:
                 selected_refs.update(package["contract_refs"])
-        resolved = [resolver.resolve(ref) for ref in sorted(selected_refs)]
-        if any(ref["source"] != "repository_file" for ref in resolved):
-            # A V3 package may still cite V2: do not silently discard that obligation.
-            validate_handle_index(root, read_json(root / DEFAULT_HANDLE_INDEX)["handles"])
+    resolved = [resolver.resolve(ref) for ref in sorted(selected_refs)]
+    if resolver.uses_legacy_index:
+        # One real legacy reference retains the complete index integrity check.
+        validate_handle_index(root, read_json(root / DEFAULT_HANDLE_INDEX)["handles"])
+    if current_route is not None:
         scoped_references = {
             "documentation_scope": "selected-v3-paths",
             "documentation_paths": list(documentation_paths),

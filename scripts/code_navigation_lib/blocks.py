@@ -47,10 +47,11 @@ def load_blocks(root: Path, relative: str = DEFAULT_BLOCKS) -> list[dict[str, An
             raise NavigationError(f"block {block_id} has an empty required field")
         if not isinstance(globs, list) or not globs:
             raise NavigationError(f"block {block_id}.path_globs must be non-empty")
-        if not isinstance(handles, list):
-            raise NavigationError(f"block {block_id}.documentation_handles must be an array")
+        if (not isinstance(handles, list) or not handles
+                or any(not isinstance(item, str) or not item.strip() for item in handles)):
+            raise NavigationError(f"block {block_id}.documentation_handles must be a nonempty string array")
         normalized_globs = [normalize_repo_path(str(item)) for item in globs]
-        normalized_handles = [str(item).strip() for item in handles if str(item).strip()]
+        normalized_handles = [item.strip() for item in handles]
         blocks.append(
             {
                 "id": block_id,

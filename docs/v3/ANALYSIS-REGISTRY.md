@@ -93,7 +93,7 @@ PARTIAL — неполное покрытие; BLOCKED — конкретная 
 | R-204 | Две swarm-страницы содержали 743 КБ устаревших task rows/operational diary, включая старые «действующие» правила и три ложных link destinations. | Текущие страницы заменены короткими historical pointers на полные оригиналы в Git; swarm README явно donor-only. Полный поиск имён нашёл только retained prose consumers; V2 source, checker и исторические данные не удалены. |
 | R-205 | Pure V3 router/reader/evidence требовали V2 metadata; projection могла пропускать изменённый prose. | `MERGED`: PR #5331 / main@d3f124cd. Pure V3 не читает V2 metadata; mixed scopes сохраняют их; оба порядка composed parts проверены. Не применять сохранённый старый патч повторно. |
 | R-206 | 56 generated section indexes дублировали book/handle indexes без tracked consumers. | `MERGED`: PR #5330 / main@9864cc75 удалил 18+38 индексов и единственный generator/call. 627 canonical fragments и оба manifest сохранены; повторно применять удаления нельзя. |
-| R-207 | У retained V2 corpus есть реальные потребители; проверки смешивали V3 authority/reference paths с обязательной загрузкой V2. | `PARTIAL`: P1/P2 слиты (#5332/#5333); P3 переводит path navigation и package contract refs на текущие файлы. Full legacy indexes/capsule callers и удаление корпуса остаются P4–P5 [ниже](#legacy-consumer-migration); 627 fragments пока сохранены. |
+| R-207 | У retained V2 corpus есть реальные потребители; проверки смешивали V3 authority/reference paths с обязательной загрузкой V2. | `PARTIAL`: P1–P3 слиты (#5332–#5334). P4 исправляет full per-target projections и явно ограничивает capsules версией V2. Profile/closure callers и удаление корпуса остаются открыты [ниже](#legacy-consumer-migration); 627 fragments сохранены. |
 
 ## Legacy consumer migration
 
@@ -105,8 +105,8 @@ R-207 продолжать по [карте потребителей](DEVELOPMEN
 |---|---|---|
 | P1. Разделить V2 integrity и V3 authority | `MERGED` | PR #5332 / main@c5318b2e: receipt/manifests/hashes сохранены, повторный migrate отказывается до записи. Повторно патч не применять. Независимое ревью не выполнилось из-за лимита; общий CI остановился на reading evidence, компиляция пропущена. |
 | P2. Разделить operational reference conformance | `MERGED` | PR #5333 / main@754b7dbc: `--references-only --path docs/v3`; actual refs выбирают indexes. V3 paths/anchors проверяются напрямую, mixed/unknown/missing V2 остаются FAIL. Полный default audit не сужен; пять исходных ошибок остаются открытыми. |
-| P3. Перенести code-navigation contract references | `IMPLEMENTED / CHECKED` | `route` берёт V3 owners из существующего route config; registry/destination/capsule reference resolution принимают file#anchor. Полный Cargo inventory сохранён; actual mixed package refs требуют V2. Full navigation/index check выполнен, пропущенные восемь Cargo targets возвращены штатной генерацией. Не навязывать V3 Code Graph или capsule triads. |
-| P4. Разделить вызовы legacy closure/profile | `OPEN / NEXT` | Проследить `Justfile`, `verify.ps1`, repository-policy, full package/prototype projections и capsule generator. Они ещё имеют реальные V2 inputs. Разделить current/retained вызовы в отдельной integration-scope правке; skipped historical audit не PASS, oracle не отключать. |
+| P3. Перенести code-navigation contract references | `MERGED` | PR #5334 / main@dfa83fbc: path route использует текущие owner files, Cargo inventory и actual mixed refs сохранены. Не применять предыдущий патч повторно. |
+| P4. Разделить вызовы legacy closure/profile | `PARTIAL / PROJECTIONS_CHECKED` | Full workspace/prototype indexes теперь используют V3 route + package refs для каждой цели, retained sibling сохраняет свои defaults. Убран дублирующий resolver; malformed refs и actual legacy corruption отвергаются. Capsules явно V2-only. Далее согласовать `Justfile`/`verify.ps1` profile selection с repository-policy и реальными closure/capsule consumers; oracle не отключать, skipped не PASS. |
 | P5. Убрать освобождённый корпус | `BLOCKED` P4 | Для каждого удаляемого набора нет исполняемых потребителей/активных ссылок, originals доступны по immutable revision. После удаления проходят ссылки, router и затронутые consumers; неизвестная зависимость блокирует только этот набор. |
 
 P2 проверен на полном восстановленном tracked tree `c5318b2e` (tree `f474f5ab`)
@@ -130,6 +130,14 @@ Topic-selected owners также входят в проверенный набо
 index был устаревшим (655 вместо 663 targets); baseline/current генераторы дали
 одинаковый результат, индекс обновлён без исключений. Это не независимое review,
 reading attestation, Rust/Clippy, общий CI или runtime acceptance.
+
+P4 projection increment проверен на точном tracked tree `dfa83fbc` плюс правка.
+Штатные 23 navigation self-checks и полный inventory/index check проходят; payload
+существующего retained registry не изменился. 30 временных адресных проверок включают
+оба full index generators без V2 inputs, mixed sibling targets, forward/reverse
+согласованность, actual package refs, corrupted/forged legacy input и stale index.
+Fixture не выдаётся за уже реализованный V3 package. Runtime/Rust, profile/closure
+миграция, общий CI и независимая приёмка этим результатом не подтверждены.
 
 ## Scenario preservation
 
