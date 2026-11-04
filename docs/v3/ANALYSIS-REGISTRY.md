@@ -12,7 +12,7 @@
 ## Documentation stages
 
 **Приоритет: законченный контракт → связанная реализация. Не очередная миграция V2 tools.**
-Работать от текущего `main`. Старые PR #5325/#5330–#5338 закрыты слиянием; их writer-ветки
+Работать от текущего `main`. Старые PR #5325/#5330–#5339 закрыты слиянием; их writer-ветки
 не возобновлять. Открытое/закрытое состояние issue #5324 не является результатом приёмки.
 
 | Этап | Состояние | Что продолжать / критерий завершения |
@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `PARTIAL` | Packet/handoff и notice codecs выбраны; writer/consumer и runtime не приняты. Далее backup bounds/codecs и semantic review; конкретный остаток ниже. |
+| D5. Сценарии | `PARTIAL` | Packet/handoff, notices и Base backup format/bounds выбраны. Далее перекрёстно проверить handoff Slice 0–2 и существующие сценарии; source/runtime и inference-specific snapshot остаются открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -41,15 +41,19 @@ Slice 0 проверяет прямой Store путь на disposable input; cr
 Контракт [отзыва/удаления](IMPLEMENTATION.md#101-notice-command-and-durable-encoding)
 выбран: точная цель, реактивация только названного отзыва, replay barriers и checkpoint
 в существующей installation authority. Реализация остаётся Slice 3, не prerequisite
-для первого Store пути. Следующая документационная задача — оставшиеся backup bounds/
-codecs в §8: plan/fence/manifest/terminal, конечные объёмы и проверяемый restore inventory.
-Не создавать новую ledger-систему и не возвращаться к общей модернизации V2 tools.
+для первого Store пути. [Base backup/restore](IMPLEMENTATION.md#83-base-format-and-complete-inventory)
+теперь имеет точные поля, состав, limits и cutover/readback. Source DTO/export/import,
+конфигурационный allowlist и Windows durability ещё реализовать; внешний inference
+snapshot не подменяется Base-профилем. Следующий проход документации — сверка уже
+написанных Slice 0–2 по цепочке задача → поля/query → результат/readback → потребитель.
+Исправлять найденные противоречия в owners; новых документов, реестров и модернизации
+V2 tools не требуется. Реализация Store/capture не ждёт этого общего прохода.
 
 ## Snapshot and evidence limits
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `0b73b1c29ad990d770ef7e8cb3bba8f56460b8ef`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
+| Memory main | `f057cc2e164802d17b4337f0b1bbf70ef0ae684f`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
 | Store PR #5327, предыдущее чтение | Head `a040bd408be39afa9789561595d2cac8bef177b3`, open/unmerged; перечитаны metadata, начало `queries.rs` и `lib.rs` | По-прежнему отдельные capture primitives и неполные projections. Это не новый аудит всего source PR или запуск компилятора/движка. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
@@ -117,7 +121,7 @@ Owner — [Implementation §4–7](IMPLEMENTATION.md#4-migration-0001-and-schema
 | R-174/R-182 | Исправить imports и table-target `FOR UPDATE`; native record-ID разрешать и перепроверять внутри одной transaction (§6). UNIQUE/CAS не обещают predicate lock. |
 | R-183/R-186 | Time/reuse/support/influence/job codecs и полный history envelope выбраны; DDL/DTO/query/backup source ещё согласовать. Историю не достраивать из current. |
 | R-184 | Pending coalesces; первый claim фиксирует tuple, последующие claims меняют generation, не исходный смысл или unknown call ID. Полная claim/settle реализация остаётся открытой. |
-| R-185 | `DECIDED / SOURCE_OPEN`: [§4.5.1](IMPLEMENTATION.md#451-first-base-limits) включает spool entry/aggregate limits. Pending/failed/tmp учитываются вместе; quota не разрешает eviction принятого input и не блокирует его readback/replay. Backup/job/inference aggregate bounds остаются открыты. |
+| R-185 | `DECIDED / SOURCE_OPEN`: [§4.5.1](IMPLEMENTATION.md#451-first-base-limits) задаёт ingress limits; [§8.4](IMPLEMENTATION.md#84-bounds-outcomes-and-connected-check) — Base backup/restore bytes, rows и parts. Узкая конфигурация не делает старые принятые данные нечитаемыми; overflow не разрешает truncation/eviction. Job/inference aggregate limits ещё отдельная работа. |
 | R-187 | Scope до arm limits, точная revision hydration; receipt-time cursor не change feed. Selected reuse требует membership writer/reader; иначе unavailable. |
 | R-188 | Expected catalog — canonical INFO clean exact-engine run, не копия DDL lines и не снимок проверяемой active DB. Probe true не заменяет capture/open. |
 
@@ -146,7 +150,7 @@ representations: исходное время отдельно от UTC projectio
 |---|---|
 | R-001–R-013, R-021–R-026, R-028–R-045 | Capture, work binding, correction, applicability/grounds, retrieval, packet и exact history: [Cognition](COGNITION.md). Base packing и packet/handoff описаны в §6; source writer/renderer/реальная выдача и проверки на установленном хосте остаются открыты. Не создавать копии контрактов в отдельном DTO-документе. |
 | R-002/R-023/R-083–R-116 | [Implementation §1–3, §6–8](IMPLEMENTATION.md#1-runtime-and-installation): process/credential admission, IPC, source custody, replay/recovery, coherent cut и rotation. Дизайн не Windows runtime evidence. |
-| R-019/R-020/R-101/R-107/R-141/R-144/R-147–R-149/R-157/R-181 | [§8–10](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle): cut, fence/manifest/terminal codecs, finite restore limits, lease, candidate/cutover и erasure/notice continuity. Полный набор ещё не реализован; unknown publication pins conservatively. |
+| R-019/R-020/R-101/R-107/R-141/R-144/R-147–R-149/R-157/R-181 | `DECIDED / SOURCE_OPEN` для [Base backup/restore](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle): один cut, шесть явных table counts, полная closure тел/spool/notices, manifest-last, terminal-before-delete и same-generation cutover readback. Неполный export не продолжается на новых данных. Source exporter/importer, config allowlist, реальный restart и Windows custody не приняты; inference-format остаётся отдельной capability. |
 | R-071–R-081 | Донорские capture/spool/packet/broad-read дефекты не объявлены исправленными в V2 и не оправдывают перенос его runtime. |
 | R-082/R-150–R-170 | [Store contract](IMPLEMENTATION.md#4-migration-0001-and-schema-authority): fixed bound queries, roles, IDs, absence, canonical schema, indexes и full decoder. SDK не выбран; source/parser findings не равны execution. |
 
@@ -170,11 +174,11 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 
 S-001–S-107 и предыдущие check counts — исторические evidence в закреплённом срезе,
 [AUDIT](AUDIT.md), [AUDIT-MAP](AUDIT-MAP.md) и PR, не повторно исполненные результаты.
-Текущая правка связывает control command → durable notice/checkpoint → запрет replay/
-delivery → очистку контролируемых копий. Прочитаны owning Implementation §1/6–10,
-Architecture, Cognition handoff и действующий реестр; внешний runtime не перепроверялся.
-Проверки точного diff и независимое review фиксируются в PR отдельно. Формат и правила
-не означают реализованные операции, Windows durability, Rust/Clippy или полный CI PASS.
+Текущий проход прочитал Implementation §4.5/7–10, owning Architecture/Cognition и
+Inference §8–10: согласован локальный cut, полный snapshot и изолированный restore.
+Ранее проверенные внешние API не объявлены перепроверенными. Локальные checks использовали
+исторический корпус; проверки полного текущего дерева и точного diff выполняются отдельно
+на GitHub и фиксируются в PR. Source/runtime, Rust/Clippy и Windows не исполнены этой правкой.
 
 ## Integration blockers
 
