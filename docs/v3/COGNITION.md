@@ -234,7 +234,10 @@ The bounded emission participates in the existing affected-delivery fence used b
 revision publication, withdrawal, erasure and cutover. Closing that fence rejects new emissions and drains
 in-flight ones; a timeout leaves unresolved delivery, not completed erasure. Recheck
 inside the fence, not only while constructing the packet. Do not hold the spool
-publication mutex across host/Store I/O. Bytes already handed to the host cannot be
+publication mutex across host/Store I/O. Once local output I/O has stopped or settled,
+release the delivery fence before queueing/persisting the handoff fact; its storage must
+not be what a waiting revision needs to drain. A still-running possible writer is not
+settled merely because its caller timed out. Bytes already handed to the host cannot be
 recalled by a later notice; host-owned transcripts/copies remain explicit cleanup limits.
 
 | Reported state | Required observation / recovery |

@@ -790,8 +790,9 @@ Invalid scope, source, history or links abort the whole operation. Only implemen
 reverse-impact work may be coalesced; no empty successful job is created.
 
 Revision publication participates in the same affected-delivery fence as §10 notices:
-close new emissions using that memory, drain in-flight emission, then commit/reconcile
-the revision before reopening. This orders an acknowledged correction against context
+close new emissions using that memory and drain in-flight emission before acquiring
+the shared Store client or a request lane needed by final context validation. Then
+commit/reconcile the revision before reopening. This orders an acknowledged correction against context
 output; checking a revision only during packing leaves a race. No spool mutex is held
 across this Store/host work. Unknown publication keeps affected guidance withheld, not
 all unrelated capture stopped. The fence is an existing operation boundary, not a new
