@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.48 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.49 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -69,6 +69,8 @@ Under the installation mutex, supervisor owns selection generation, stable Memor
 installation ID, current/previous roots, current/pending/previous Store credential
 references, expected schema format/generation/digest and maintenance state. Inference
 adds controller/client/token references without another installation registry.
+The same record owns the notice checkpoint and active erasure admission fence in §10;
+restoring a Store root never replaces or resets these outside-root facts.
 A new cutover/rotation waits while an earlier previous generation remains unretired.
 
 Parse configuration with the format's parser and validate the selected values. A missing
@@ -988,39 +990,164 @@ as a second adapter protocol here.
 
 ## 10. Erasure, rotation and observability
 
-Influence withdrawal and erasure have different effects but use the existing outside-
-rollback installation-notice path (`deletions/`), not a second registry. A typed notice
-retains operation identity, target identity, explicit scope (one revision or all revisions),
-kind and a closed reason, without the source body. Erasure also retains the affected
-command and stream/event identity digests needed to reject delayed capture/revision
-replay after rows are removed; deleting the content must not erase its replay barrier.
-Daemon owns its publication/readback;
-Store influence fields are projections, not the sole authority surviving rollback.
+Withdrawal stops guidance; erasure also denies content access and removes controlled
+copies. Both use the existing `deletions/` directory outside rollback roots. The daemon
+owns these operations; the supervisor owns the continuity checkpoint in existing
+`installation.toml`. No new table, queue, service or general mutation ledger is needed.
+Stored support/exposure/influence remain revision facts. Current notices overlay them;
+do not create a cosmetic revision or a second Store flag merely to mirror a notice.
+Exact open returns applicable withdrawal qualifications; erasure returns no target bytes.
 
-For withdrawal, close affected publication/delivery, durably publish/read back the notice,
-then update the canonical projection through the existing revision operation. A crash
-between these steps leaves effective suppression and an unfinished projection to reconcile,
-not permission to resume the advice. Never acknowledge success before durable notice
-readback. Startup/restore, context/method selection and delayed-result publication all
-check this authority. Explicit historical open may still return permitted withdrawn
-content with its withdrawal qualification; withdrawal is not erasure.
+### 10.1 Notice command and durable encoding
 
-Reactivation requires an explicitly authorized new operation against the current notice
-identity, durably reflected outside rollback roots. A restore, model proposal, pending
-packet or stale worker cannot retire a withdrawal. Reactivation never overrides erasure.
+Only the authorized control operation may withdraw, reactivate or erase. Captured text,
+a model proposal, a packet marker or an ID in a file grants no such authority. Freeze
+one command before possible publication; retries retain its operation ID and exact
+canonical bytes. Check an existing operation ID **before** looking up a possibly erased
+target: same command returns its recorded notice, changed command is identity conflict.
 
-Physical erasure first closes affected mutation/replay and delivery admission, then
-durably publishes/readbacks its notice. Drain and reconcile already accepted operations
-before deleting their storage; a possible late commit must not recreate removed content.
-Fence jobs and retain suppression while an outcome is unknown; erasure is incomplete,
-not failed-open. Publish notices under §7.5's spool mutex; publishers recheck notices there, including
-while the daemon is unavailable. Fix the cleanup inventory only after that publication,
-so a late relay cannot recreate accepted custody. After leases, terminalize dependent backups and
-delete their controlled content. Remove affected current/history rows, blobs, spool,
-packet/job copies; delete affected previous roots/candidates/backups wholly where safe
-selective offline rewriting is absent. Respect shared references and exact ownership.
-Caller cleanup or observed owner break-glass covers controller copies; missing authority
-leaves explicit debt. A marker is not deletion proof; provider-side copies remain external.
+`NoticeCommandV1` has exactly `format=1`, `installation_id`, `operation_id` (the existing
+`o_` grammar), `kind`, `target`, `reason`, and the conditional fields below. This command
+ID does not require a placeholder observation. `kind` is `withdraw`, `reactivate` or
+`erase`; `reason` is `owner_request`, `policy_change` or `correction`, not free text or
+permission. Use §4.5 canonical JSON, integer-only metadata and §4.3 identities.
+
+| Field | Closed representation / rule |
+|---|---|
+| `target` | `{kind:"memory",id,scope:"all_revisions"}`; `{kind:"memory",id,scope:"revision",revision}` with a positive revision; or `{kind:"observation",id}` for erase only. No wildcard, path, query, implicit current revision or similarity match. Resolve `current` before freezing a revision-specific command. |
+| `reactivates` | Only and always for reactivate: `{operation_id,notice_sha256}` naming one committed withdrawal with exactly the same target/scope. Resolve and check both values; no "clear everything" operation. |
+| `cause` | Only for daemon-generated erasure barriers on affected observations: `{operation_id,notice_sha256}` naming the root erase, which has no cause. This links cleanup to its authorized request; it does not broaden that request's content scope. |
+| `replay_keys` | Present exactly with `cause`: `{command,event}`. Derive `command=H("erased-command-v1",project,command_id)` and `event=H("erased-event-v1",project,stream_unique_key,event_key)` under §4.4, from verified captured identities. Both are lowercase SHA-256 hex; no body, excerpt, raw native key or mutable physical path is retained. |
+
+The durable `NoticeV1` is exactly `{format:1,sequence,previous_sha256,command}`.
+Sequence is a checked positive signed-64 integer; first is 1. Previous hash is null only
+for sequence 1, otherwise the SHA-256 of the complete preceding file. Write canonical
+UTF-8 plus one LF to `deletions/<20-digit-zero-padded-sequence>.json`; the filename must
+match the record. Hash exact file bytes, not a re-rendering or a field containing itself.
+Reject unknown/extra members, duplicate keys, invalid tuples and conflicting IDs.
+
+Initial build bounds are 16 KiB per file, 65,536 final files and 64 MiB aggregate final
+bytes; they are engineering limits, not measured capacity. Validate before allocation,
+publication and startup parsing. Stream the bounded directory; do not read a caller path.
+Capacity exhaustion leaves a named incomplete operation, never eviction of a barrier.
+Narrower configuration cannot make already accepted notices unreadable. A publisher keeps at most one
+16 KiB temporary file and reconciles abandoned temps before the next publication. They
+are cleanup debt, not notices; §6 owns their durability/custody.
+
+### 10.2 Effective scope and reactivation
+
+A withdrawal remains effective unless a committed reactivation names **that exact**
+withdrawal ID/hash. Replay of that reactivation cannot cancel a later withdrawal.
+Overlapping revision-specific and all-revision withdrawals are independent: cancelling
+one leaves every other applicable withdrawal in force. All-revision scope includes
+later revisions of the same memory ID. Changing an address or making a new revision
+cannot bypass it; do not recycle erased identities.
+
+Erasure is monotonic and dominates every withdrawal/reactivation, regardless of file
+order. Revision erasure denies that revision and its attributable copies, not unrelated
+revisions; all-revision erasure also forbids future writes under that memory ID. A new
+revision transaction checks its exact proposed revision and all-revision barriers before
+commit. Observation erasure also rejects either replay-key match, even when native-event
+redelivery proposes another observation ID or changed bytes. Do not compare only the
+body hash, or require a command digest match to enforce an erasure barrier.
+
+If a revision erase removes current (including after restore), do not promote a surviving
+historical version or reset the revision counter. Unaffected history remains exactly
+openable. Any memory erasure notice forbids a fresh create under that ID; revise requires
+a remaining non-erased current row. Resuming an item with no current row requires an
+explicitly authorized new memory ID, not an automatic replacement or replay.
+
+Reactivation removes a suppression fact; it does not make old content true, change its
+stored influence/support, restore erased bytes, publish a new revision or replay a job.
+Normal current scope, applicability and revision checks still apply. Invalid/missing
+reactivation references never mean permission. A matching but already reactivated
+withdrawal is a harmless recorded no-op, not a request to cancel newer withdrawals.
+
+### 10.3 Publication, continuity and recovery
+
+The existing installation record retains `notice_head={sequence,sha256}`; only a newly
+initialized installation has `{0,null}`. Supervisor alone advances it using the existing
+expected-generation installation writer. It never comes from a restored Store or backup.
+One daemon notice operation is outstanding at a time; cutover waits for it to reconcile.
+
+Close the affected publication/delivery admission and drain in-flight emission before
+publishing a restrictive notice. Under §7.5's spool publication mutex, validate the checked
+head and any tail, construct/flush/verify the next immutable file, no-replace publish it,
+flush the parent and read it back. Release that mutex **before** Store, host or supervisor
+IPC. A file/rename/flush ambiguity is unknown, not rejection or a fresh operation ID.
+
+The daemon asks the supervisor to advance the checkpoint with expected installation
+selection generation, expected old head and exact next file hash/sequence. Supervisor
+validates the retained file and predecessor under installation mutex → spool mutex,
+then durably replaces/readbacks `installation.toml`. No caller path or notice content
+is accepted on this privileged request. Lost reply reconciles that same file/head; a
+mismatched generation/head is not overwritten. No caller holds the spool mutex while
+waiting for the installation owner. Relays never publish notices or update checkpoints.
+
+A valid single uncheckpointed successor conservatively applies withdrawal/erasure but
+**not reactivation**. Do not start another notice, destructive cleanup or report committed
+notice publication until checkpoint readback. Startup adopts only that exact successor
+through the same owner protocol; absence of its reply is not reason to regenerate it.
+Missing predecessors, checkpoint/hash mismatch, multiple tails or malformed records
+make notice continuity unavailable. Do not skip a bad file and accept the remaining set.
+Consumers fail closed at the affected boundary; if scope cannot be established, withhold
+capture/replay/content delivery installation-wide while exposing non-content status.
+
+Startup and restore verify the chain through the current checkpoint before admitting
+content. Owned backup copies may repair missing files only when exact bytes reconstruct
+that retained checkpoint; never select a lower head or overwrite current notices with
+a backup set. Loss of the outside-root checkpoint itself is unknown continuity under
+§8.2, not a fresh empty installation. This detects missing/corrupt records relative to
+retained authority, not hostile replacement of the entire installation or secure erasure.
+
+### 10.4 Physical erasure and observable result
+
+Base serializes one erase through existing maintenance state. Before publishing its root
+notice, durably retain that operation and close new ingress while exact replay identities
+are being collected; relays obey this fence even when the daemon is down. Unreadable
+maintenance state is not open admission. Drain/reconcile possible Store and host effects,
+then walk affected source/derived copies in bounded pages. No late commit may recreate a
+row already cleared. Unknown effects retain suppression and explicit cleanup debt.
+
+Before deleting an affected observation or its only identity-bearing copy, publish and
+checkpoint its cause-linked erase barrier with both replay keys. Reuse an already checked
+matching barrier for the same root/target/keys after restart. Missing identity coverage
+blocks deletion of that last metadata and remains incomplete; do not invent keys from
+text or treat an empty lookup as proof. This applies to operation-owned correction,
+packet/handoff and other derived observations too. Their lineage identifies controlled
+copies, not permission to delete independent equal-text occurrences. If a whole retained
+root/backup must be discarded, first account for its affected occurrence identities.
+
+Once the complete affected identity set is barrier-covered and in-flight writes are
+resolved, the maintenance owner may reopen unrelated ingress; targeted admission remains
+closed permanently. Clear the persisted broad fence only after this readback. Retry or
+restart resumes this erase, never reactivates it. Insufficient capacity leaves the fence
+and the remaining work visible; do not throw away keys or split an unverified set into
+claimed-complete batches. Content cleanup may proceed per verified copy with debt for
+unresolved copies; a barrier is never itself a deletion certificate.
+
+After leases, terminalize dependent backups and remove controlled current/history rows,
+blobs, spool and packet/job copies. Remove previous roots/candidates/backups wholly where
+safe selective rewriting is absent. Respect shared references and exact ownership.
+Current notices remain outside that deletion set and survive backup retirement. Do not
+prune them merely because their target row or a backup has disappeared. A future bounded
+compaction needs its own continuity proof; no such compactor is required for Base.
+
+Report notice outcome `committed | rejected | unknown` separately from controlled cleanup
+`not_applicable | pending | complete | unknown` and external cleanup/authority debt through
+existing status/control. A rejected attempt cannot undo an earlier committed erasure. "Committed"
+means exact notice/checkpoint readback, not deletion. Controlled `complete` requires
+readback of all owned copies in the completed inventory and no unresolved local effect;
+Store outage, incomplete traversal or failed filesystem deletion cannot produce it.
+Controller cleanup uses caller authority or observed owner break-glass; absent authority
+is external debt. Already delivered host transcripts and provider copies are outside
+Memory's deletion guarantee; unlinking local files is not proof of media sanitization.
+
+When connecting this Slice 3 path, observe withdrawal W1 → reactivation(W1) → W2 → replay
+of reactivation(W1): W2 still suppresses. Also exercise overlapping scopes, erase followed
+by old capture/new-ID native redelivery, publication/checkpoint interruption and restore
+with a missing notice. Inspect the real consumer and controlled copies, not just marker
+existence. Source implementation and Windows durability qualification remain required.
 
 Store rotation closes sockets and restarts Store. Controller rotation uses its own
 contract and stable client identity; do not give daemon privileged credentials to repair

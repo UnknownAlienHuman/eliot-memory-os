@@ -12,7 +12,7 @@
 ## Documentation stages
 
 **Приоритет: законченный контракт → связанная реализация. Не очередная миграция V2 tools.**
-Работать от текущего `main`. Старые PR #5325/#5330–#5337 закрыты слиянием; их writer-ветки
+Работать от текущего `main`. Старые PR #5325/#5330–#5338 закрыты слиянием; их writer-ветки
 не возобновлять. Открытое/закрытое состояние issue #5324 не является результатом приёмки.
 
 | Этап | Состояние | Что продолжать / критерий завершения |
@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `PARTIAL` | Действующие маршруты требований сохранены. Packet/handoff codec выбран в Cognition §6.4.1–6.5; его реализация не принята. Далее notice/maintenance codecs и semantic review; конкретный остаток ниже. |
+| D5. Сценарии | `PARTIAL` | Packet/handoff и notice codecs выбраны; writer/consumer и runtime не приняты. Далее backup bounds/codecs и semantic review; конкретный остаток ниже. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -38,16 +38,18 @@ Slice 0 проверяет прямой Store путь на disposable input; cr
 Контракт [packet/handoff](COGNITION.md#641-base-packet-encoding) теперь выбран: точные
 источники, размер финального ответа, привязка к вызову и unknown без автоматической
 повторной выдачи. Это часть Slice 2, не новый prerequisite для Store/capture.
-Следующая документационная задача — notice codec в Implementation §10: точный target/
-revision, withdrawal/reactivation, replay barriers и восстановление непрерывности.
-Затем закрыть только оставшиеся backup bounds/codecs. Не создавать delivery-ledger
-и не возвращаться к общей модернизации V2 tools.
+Контракт [отзыва/удаления](IMPLEMENTATION.md#101-notice-command-and-durable-encoding)
+выбран: точная цель, реактивация только названного отзыва, replay barriers и checkpoint
+в существующей installation authority. Реализация остаётся Slice 3, не prerequisite
+для первого Store пути. Следующая документационная задача — оставшиеся backup bounds/
+codecs в §8: plan/fence/manifest/terminal, конечные объёмы и проверяемый restore inventory.
+Не создавать новую ledger-систему и не возвращаться к общей модернизации V2 tools.
 
 ## Snapshot and evidence limits
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `ac25bf00f320703639e73400846f2ec3b1348370`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
+| Memory main | `0b73b1c29ad990d770ef7e8cb3bba8f56460b8ef`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
 | Store PR #5327, предыдущее чтение | Head `a040bd408be39afa9789561595d2cac8bef177b3`, open/unmerged; перечитаны metadata, начало `queries.rs` и `lib.rs` | По-прежнему отдельные capture primitives и неполные projections. Это не новый аудит всего source PR или запуск компилятора/движка. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
@@ -99,7 +101,7 @@ Required checks не отключать; skipped historical audit не выда�
 |---|---|
 | R-189 | Exclusions до spool/blob/IPC; строгий current policy повторно проверяется перед replay. Failed custody не равна erasure; публикация spool не обходит закрытую admission boundary. |
 | R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §6.4.1–6.5](COGNITION.md#641-base-packet-encoding) задаёт packet и host handoff. Exact source/revision/qualifiers, current disclosure/fence, outcome facts в существующих observations; restart/restore не отправляют старые пакеты. Echo/поддельный marker не создаёт evidence или job. |
-| R-191 | Current notices доминируют над rollback. §8.2 не разрешает автоматический replay post-cut corrections; §10 закрывает admission до erasure и дожидается разрешения in-flight effects. Notice codec/atomic implementation остаются открыты. |
+| R-191 | `DECIDED / SOURCE_OPEN`: [§10.1–10.4](IMPLEMENTATION.md#101-notice-command-and-durable-encoding) задают NoticeV1, точный target/scope, отмену только названного отзыва, erasure replay keys и непрерывность через существующий installation checkpoint. Нет зеркальной Store-ревизии ради флага. Удаление current не переизбирает history и не обнуляет счётчик. Реализация, Windows durability и полная cleanup-инвентаризация открыты. |
 | R-192/R-196 | Поздние capabilities и все требования сохраняют owner routes; старый Operation/SDK путь не возвращается через rationale. |
 | R-193 | Supervisor различает alive/responsive/progress/outcome; конечный recovery budget, без retry неизвестного внешнего эффекта. |
 | R-194 | Coverage packet различает complete/partial/unavailable/disabled/not_requested по arm; пустые units не скрывают сбой. 32 KiB считается после host wrapping/escaping; token budget требует настоящего counter. Usage unknown не равен нулю. |
@@ -168,11 +170,11 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 
 S-001–S-107 и предыдущие check counts — исторические evidence в закреплённом срезе,
 [AUDIT](AUDIT.md), [AUDIT-MAP](AUDIT-MAP.md) и PR, не повторно исполненные результаты.
-Текущий проход прочитал owning Cognition/Architecture, границы durable ingress/rollback/
-erasure и официальный host output contract. Правка соединяет packet → конечные байты →
-конкретный вызов хоста → наблюдаемый результат; старые source findings не перепроверены.
-Проверки точного diff и независимое review фиксируются в PR отдельно. Версия установленного
-хоста, Rust/Clippy, Store и Windows runtime этой документационной правкой не квалифицированы.
+Текущая правка связывает control command → durable notice/checkpoint → запрет replay/
+delivery → очистку контролируемых копий. Прочитаны owning Implementation §1/6–10,
+Architecture, Cognition handoff и действующий реестр; внешний runtime не перепроверялся.
+Проверки точного diff и независимое review фиксируются в PR отдельно. Формат и правила
+не означают реализованные операции, Windows durability, Rust/Clippy или полный CI PASS.
 
 ## Integration blockers
 
