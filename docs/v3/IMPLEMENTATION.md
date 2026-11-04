@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.51 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.52 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -242,10 +242,18 @@ with SHA-256 and encode lowercase hex. No Unicode normalization or separators ar
 implied. Store readable components separately and verify the digest in the writer:
 
 ```text
-stream_unique_key  = H("stream-v1", project, source_kind, source_native_id)
+stream_unique_key  = H("stream-v1", project, workspace_id, source_kind, source_native_id)
 address_unique_key = H("memory-address-v1", origin_project, kind, address_kind, address_key)
 slot_key           = H("job-slot-v1", project, purpose, target_key, slot_kind)
 ```
+
+The stream key includes every component of its immutable identity, including workspace.
+Equal native source/event keys in different workspaces are distinct occurrences; a replay
+in the same workspace still resolves the original stream. An adapter namespaces native
+identifiers before freezing them; path, branch, text similarity and the currently active
+session cannot supply a missing identity. A changed workspace creates a different stream,
+not an in-place reassignment. This corrects the earlier draft key: update source bundle/
+query identities together, without fallback to the workspace-less key.
 
 Retained 3.3.4 source evidence says UNIQUE skips a tuple containing NONE or NULL. V3
 writes only NONE/omission for absent conditional keys; NULL is not an alternative
@@ -650,14 +658,59 @@ Previously emitted bytes cannot be recalled by a later policy change; report tha
 
 ### 7.2 Capture command, commit and replay
 
-`CaptureCommandV1` is a closed DTO, not arbitrary host JSON. Before first send/stage,
-freeze `format=1`, proposed `observation_id=command_id` (§4.3), the stream tuple
-`(project, source_kind, source_native_id, workspace_id)`, `kind`, source event identity,
-occurrence tuple, first `receipt_time_ms`, captured work/resource binding, locator,
-disclosure, policy revision/limitations, source relations, search excerpt and body
-length/SHA-256/location (§4.7). Host JSON stays in the accepted body. Command metadata
-has no floating-point fields. Internal native Store IDs and `ingest_seq` are not inputs.
-Reject disagreement between structured binding columns and their canonical projection.
+`CaptureCommandV1` is the shared input for the relay, durable spool and owning Store
+operation. Use this one typed envelope, not separate similar definitions in each module.
+Top-level fields are exactly those below; `?` means omitted when absent, never JSON null.
+Reject extra/duplicate fields and unsupported formats before payload custody. Raw host
+JSON belongs in the accepted body, not additional command fields. §4.5.1 limits apply
+to decoded fields **and** the final encoded envelope.
+
+| Field | Input and owner |
+|---|---|
+| `format` | Integer 1. No permissive old-format reader. |
+| `observation_id`, `command_id` | The same producer-retained `o_` ID (§4.3), frozen before first publication/send. |
+| `stream` | Exactly `{project,workspace_id,source_kind,source_native_id}`; nonempty canonical strings. Project/workspace come from admitted installation/host binding, not a prompt or cwd guess. Compute the complete key in §4.4. |
+| `kind` | Nonempty kind selected by the admitted adapter/operation. Ordinary event capture rejects §7.5's reserved kinds even when supplied in otherwise valid JSON. |
+| `native_event_key?` | Exact native occurrence key only when the admitted source contract establishes its stability. Absence selects command-derived identity; do not synthesize a native key from text or time. |
+| `occurrence` | Exactly §4.7.1's fields: required `occurrence_precision`/`occurrence_certainty`; optional `occurrence_source`, `occurrence_offset_seconds`, `occurrence_time_ms`. Preserve the source token/offset and distinguish an absent projection from zero. |
+| `receipt_time_ms` | Signed-64 Unix milliseconds assigned at first receipt, not regenerated on replay or used to infer source order. |
+| `binding` | Object with only optional `task_id`, `actor_id`, `session_id`, `call_id`, `parent_observation_id`, `resource_id`, `resource_version`. IDs are source-qualified by the adapter; parent uses the `o_` grammar. No duplicated project/workspace here. Missing task falls back only to an actual actor/session pair. Incomplete association remains captured with a gap, not assigned to similar work. Resource version requires resource ID. |
+| `locator_json?` | Canonical JSON object string containing attributed source locator data. Opaque to the capture writer: not an executable path, access grant or substitute for exact observation identity. Apply capture policy and metadata limits to it. |
+| `disclosure` | `local_only` or `external_allowed`, selected within current owner policy. Source text cannot broaden permission; replay/emission recheck current policy. |
+| `capture_limit_json` | Canonical string encoding exactly `{format:1,policy_revision,source_completeness,transformation,reasons}` as specified below. Required even for unchanged complete input. |
+| `relations_json` | Canonical string encoding the bounded source-relation array below; use `[]` for none. It is not a generic link mutation or a support/permission assertion. |
+| `search_excerpt` | Bounded derived text from the accepted body; empty is allowed when no admitted text projection exists. Never excerpt an excluded original or replace the accepted body with this search field. |
+| `body` | Exactly `{body_storage:"inline",body_inline,body_length,body_sha256}` or `{body_storage:"blob",blob_ref,body_length,body_sha256}`. Inline is a UTF-8 string; blob bytes use §7.5 body.bin. Length is a nonnegative signed-64 byte count; SHA-256 is lowercase hex. Verify actual bytes, not only tuple consistency. Blob key is `sha256:` plus that digest; never a filesystem path. |
+
+In capture limits, `policy_revision` is the bounded nonempty identity of the applied
+owner policy, not permission from the source. `source_completeness` is `complete`,
+`partial` or `unknown` relative to this source occurrence, not the whole conversation.
+`transformation` is `none`, `redacted` or `representation`. `reasons` is a sorted unique
+subset of `source_partial`, `source_completeness_unknown`, `policy_redaction`,
+`derived_representation`, exactly matching those non-default states. Missing evidence
+of completeness is unknown; accepting all received bytes alone does not establish it.
+No excluded original may survive in metadata, a search excerpt or a replay shadow (§7.1).
+
+A source relation has exactly `relation_kind`, `target_kind`, `target_id`, optional
+`target_revision` and optional canonical-object string `qualification_json`. Observation
+targets use `o_` and no revision; memory targets use `m_` and a positive exact revision.
+Sort unique descriptors by canonical UTF-8 bytes before freezing; at most 64 fit within
+the aggregate metadata cap. Ordinary event capture admits only `parent`, `reply_to`,
+`result_of`, `derived_from`; operation-owned records admit only their owner's declared
+relations. Unknown native relations remain attributed raw input, not invented active
+edges. These are source assertions: a missing target remains an unresolved qualification,
+not a fabricated source, independent support or permission to disclose it. The operation
+assigns link IDs and source identity; input cannot choose another row as the link source.
+
+Project nested fields into the existing explicit Store columns. Derive `binding_json`
+from `{project,workspace_id,...binding}` and require exact agreement on decode. Store
+`capture_format=format`, the two computed input digests and the complete capture-limit/
+relation/locator strings. Observation `created_at_ms` uses its frozen first receipt time.
+`stream_id`, `ingest_seq`, link IDs and operation results are owning-transaction outputs,
+not accepted caller fields. A reserved record still validates its owning body/result
+contract (§7.4 / Cognition §6.5); this envelope grants no generic mutation authority.
+All command metadata is integer-only. Absence, empty string, zero and unknown are not
+interchangeable; §4.4 owns the fixed optional-field mapping to Store NONE.
 
 The admitted host adapter selects occurrence identity, not the body hash:
 
@@ -669,15 +722,15 @@ The admitted host adapter selects occurrence identity, not the body hash:
 
 Store `command_sha256 = H("capture-command-v1", canonical command)` and
 `event_sha256 = H("capture-event-content-v1", canonical semantic projection)`.
-The latter excludes proposed observation/command IDs, receipt time and physical body
-location, but retains body length/hash, event/stream identity and every semantic field
-above, including policy and limitations. Hashes do not contain themselves. Body location
-is a checked inline value or owned blob key, never a caller-supplied filesystem path.
-For blob bodies the key is `sha256:` plus the 64 lowercase hex body digest, fixed before
-custody. The selected root and spool pathname are not command fields: copying bytes
-from spool to an admitted root does not change the command or either digest. A key is
-not authorization to read another project's bytes. A second delivery may have a
-different proposed ID/receipt time, not different meaning.
+For the latter, copy the decoded command, omit only `observation_id`, `command_id` and
+`receipt_time_ms`, and replace `body` with `{body_length,body_sha256}`; then canonicalize.
+Everything else, including workspace, occurrence, binding, policy/limitations and source
+relations, remains bound. Hashes and derived event/stream keys are not command members.
+A native redelivery may change its proposed ID/receipt time or equivalent body storage,
+not its semantic fields. A changed admitted representation/policy is an identity conflict,
+not permission to overwrite the original occurrence. Equal bytes alone never deduplicate.
+The selected root/spool pathname is not a command field; copying a blob into an admitted
+root changes neither digest. A blob key does not authorize another project's bytes.
 
 Production ingress first publishes the immutable command under §7.5, **before any
 possible Store send**, then verifies blob publication when needed. Spooling only after
