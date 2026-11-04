@@ -7,8 +7,8 @@ issue select documentation or implementation work. V1/V2 Memory source, architec
 shards, `workstreams/ACTIVE.toml` and their validators are retained donors, not a V3
 programme or a claim that the legacy machine registry/CI has been migrated.
 
-PR #5325 is merged and its writer branch is retired. The still-open issue #5324
-tracks remaining documentation checks; it neither revives that branch nor blocks
+PR #5325 is merged and its writer branch is retired. The registry linked from
+issue #5324 tracks remaining documentation checks; it neither revives that branch nor blocks
 separately assigned implementation. Start new work from current `main`. Continue an
 existing open source PR only after the root reconciles its base; never create a
 second writer for its files or revive a closed/superseded branch.

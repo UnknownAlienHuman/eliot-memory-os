@@ -52,6 +52,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .blocks import load_blocks
+from .handle_destinations import resolve_repository_ref
 from .cargo import (
     discover_manifests,
     expand_workspace_paths,
@@ -437,8 +438,8 @@ def _resolve_contract_ref(
     root: Path, ref: str, handles: dict[str, Any]
 ) -> tuple[dict[str, Any] | None, str]:
     """Resolve one declared `contract_refs` entry to an exact digest source."""
-    body = ref.split(":", 1)[1] if ref.startswith("ELIOT_") else ref
-    if HANDLE_BODY_RE.match(body):
+    body = ref.partition(":")[2] if ref.startswith("ELIOT_") else ref
+    if HANDLE_BODY_RE.fullmatch(body) or re.fullmatch(r"APPENDIX-[A-Z]", body):
         record = handles.get(body)
         if not isinstance(record, dict):
             return None, "handle_absent"
@@ -457,14 +458,15 @@ def _resolve_contract_ref(
             "sha256": actual,
         }, ""
     if "." in ref and not ref.startswith("http"):
-        candidate = normalize_repo_path(ref)
-        if (root / candidate).is_file():
-            return {
-                "ref": ref,
-                "resolved_as": "repository_file",
-                "path": candidate,
-                "sha256": sha256_file(root / candidate),
-            }, ""
+        try:
+            target = resolve_repository_ref(root, ref)
+        except NavigationError as exc:
+            return None, str(exc)
+        resolved = {"ref": ref, "resolved_as": "repository_file",
+                    "path": target["path"], "sha256": target["sha256"]}
+        if target["anchor"]:
+            resolved["anchor"] = target["anchor"]
+        return resolved, ""
     return None, "unresolvable"
 
 
@@ -2098,6 +2100,10 @@ def build_capsules(root: Path) -> dict[str, Any]:
     if not (root / "Cargo.toml").is_file():
         raise NavigationError(f"not a repository root: {root}")
     inventory = _package_inventory(root)
+    for record in inventory["packages"].values():
+        refs = record["metadata"].get("contract_refs", [])
+        if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+            raise NavigationError(f"contract_refs must be an array of nonempty strings: {record['manifest_path']}")
     handles = _contract_catalogue(root)
     blocks = load_blocks(root)
     boundaries = _boundaries(root)

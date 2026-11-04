@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Sequence
 
 from .blocks import load_blocks, load_docs_router
 from .cargo import (
@@ -32,9 +32,14 @@ from .common import (
     walk_files,
 )
 from .rust import module_locator
+from .handle_destinations import DestinationResolver, resolve_repository_ref
 
 
-def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[str, Any]:
+def build_registry(
+    root: Path, blocks_relative: str = DEFAULT_BLOCKS, *,
+    documentation_paths: Sequence[str] | None = None,
+    documentation_topic: str = "",
+) -> dict[str, Any]:
     root = root.resolve()
     root_manifest = root / "Cargo.toml"
     if not root_manifest.is_file():
@@ -95,6 +100,9 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
             raise NavigationError(f"package has no name: {manifest_relative}")
         package_root = relative_to_root(root, manifest_path.parent)
         metadata = package_metadata(payload)
+        refs = metadata.get("contract_refs", [])
+        if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+            raise NavigationError(f"contract_refs must be an array of nonempty strings: {manifest_relative}")
         package_by_root[package_root] = {
             "name": name,
             "manifest_path": manifest_relative,
@@ -109,9 +117,7 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
             "functional_cell_refs": list(metadata.get("functional_cell_refs", []))
             if isinstance(metadata.get("functional_cell_refs", []), list)
             else [],
-            "contract_refs": list(metadata.get("contract_refs", []))
-            if isinstance(metadata.get("contract_refs", []), list)
-            else [],
+            "contract_refs": list(refs),
             "targets": inferred_targets(
                 manifest_path.parent,
                 payload,
@@ -215,13 +221,26 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
         package_by_root[owner]["rust_files"].append(record)
 
     blocks = load_blocks(root, blocks_relative)
-    handle_index = read_json(root / DEFAULT_HANDLE_INDEX)
-    if handle_index.get("schema_version") != "eliot-handle-index-v1":
-        raise NavigationError("unsupported documentation handle index schema")
-    handles = handle_index.get("handles")
-    if not isinstance(handles, dict) or not handles:
-        raise NavigationError("documentation handle index is empty or invalid")
-    validate_handle_index(root, handles)
+    docs_router = load_docs_router(root)
+    docs_config = docs_router.load_config(root)
+    current_route = None
+    if documentation_paths is not None:
+        if not documentation_paths or docs_router.version_paths(docs_config, documentation_paths)["v2"]:
+            raise NavigationError("selected V3 reference scope requires only explicit V3 paths")
+        try:
+            current_route = docs_router.route_payload(root, docs_config, documentation_paths, documentation_topic)
+        except docs_router.RouteError as exc:
+            raise NavigationError(f"V3 documentation route rejected: {exc}") from exc
+        for item in current_route["required"]:
+            resolve_repository_ref(root, item["path"])
+    else:
+        handle_index = read_json(root / DEFAULT_HANDLE_INDEX)
+        if handle_index.get("schema_version") != "eliot-handle-index-v1":
+            raise NavigationError("unsupported documentation handle index schema")
+        handles = handle_index.get("handles")
+        if not isinstance(handles, dict) or not handles:
+            raise NavigationError("documentation handle index is empty or invalid")
+        validate_handle_index(root, handles)
 
     for block in blocks:
         pattern_matches = {
@@ -251,7 +270,7 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
         unknown_handles = [
             handle
             for handle in block["documentation_handles"]
-            if handle not in handles
+            if current_route is None and handle not in handles
         ]
         if unknown_handles:
             raise NavigationError(
@@ -259,8 +278,6 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
                 + ", ".join(unknown_handles)
             )
 
-    docs_router = load_docs_router(root)
-    docs_config = docs_router.load_config(root)
     for block in blocks:
         sample_paths = block["matched_files"][:1]
         matched = docs_router.matched_routes(
@@ -301,7 +318,25 @@ def build_registry(root: Path, blocks_relative: str = DEFAULT_BLOCKS) -> dict[st
             item["root_path"],
         ),
     )
+    scoped_references: dict[str, Any] = {}
+    if current_route is not None:
+        resolver = DestinationResolver(root)
+        selected_refs = {item["path"] for item in current_route["required"]}
+        for path in documentation_paths:
+            package = matching_package({"packages": packages}, path)
+            if package:
+                selected_refs.update(package["contract_refs"])
+        resolved = [resolver.resolve(ref) for ref in sorted(selected_refs)]
+        if any(ref["source"] != "repository_file" for ref in resolved):
+            # A V3 package may still cite V2: do not silently discard that obligation.
+            validate_handle_index(root, read_json(root / DEFAULT_HANDLE_INDEX)["handles"])
+        scoped_references = {
+            "documentation_scope": "selected-v3-paths",
+            "documentation_paths": list(documentation_paths),
+            "resolved_contract_refs": resolved,
+        }
     return {
+        **scoped_references,
         "schema_version": SCHEMA,
         "workspace_manifest": {
             "path": "Cargo.toml",

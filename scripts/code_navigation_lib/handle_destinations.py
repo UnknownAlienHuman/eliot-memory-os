@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import posixpath
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+import docs_shards as links
 
 from .common import (
     DEFAULT_HANDLE_INDEX,
     NavigationError,
     normalize_repo_path,
     read_json,
+    sha256_file,
 )
 
 SCHEMA = "eliot-handle-destinations-v1"
@@ -29,37 +31,46 @@ def natural_handle_key(handle: str) -> tuple[Any, ...]:
     return (prefix_order, *numbers)
 
 
-def _markdown_anchors(text: str) -> set[str]:
-    counts: dict[str, int] = {}
-    anchors: set[str] = set()
-    fenced = False
-    for line in text.splitlines():
-        fence = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
-        if fence:
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
-        heading = re.match(r"^\s{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", line)
-        if not heading:
-            continue
-        title = heading.group(1).strip()
-        base = re.sub(r"<[^>]+>", "", title.lower())
-        base = re.sub(r"[^\w\-\s]", "", base, flags=re.UNICODE)
-        base = re.sub(r"\s", "-", base)
-        count = counts.get(base, 0)
-        anchor = base if count == 0 else f"{base}-{count}"
-        counts[base] = count + 1
-        anchors.add(anchor)
-    return anchors
+def resolve_repository_ref(root: Path, ref: str) -> dict[str, Any]:
+    """Resolve a canonical repository file, optionally with a Markdown anchor."""
+    root = root.resolve()
+    path, separator, anchor = ref.partition("#")
+    if (not path or normalize_repo_path(path) != path or ":" in path
+            or "?" in path or "%" in ref or (separator and not anchor)):
+        raise NavigationError(f"non-canonical repository contract reference: {ref!r}")
+    status, target = links._case_resolution(root, root / path)
+    if status != "exact" or target is None:
+        raise NavigationError(f"contract reference {status}: {ref}")
+    if any((root / Path(*target.relative_to(root).parts[:index])).is_symlink()
+           for index in range(1, len(target.relative_to(root).parts) + 1)):
+        raise NavigationError(f"symlinked contract reference: {ref}")
+    if not target.is_file():
+        raise NavigationError(f"contract reference is not a file: {ref}")
+    if anchor:
+        if target.suffix.lower() not in (".md", ".markdown"):
+            raise NavigationError(f"contract anchor requires Markdown: {ref}")
+        try:
+            anchors = links.markdown_anchors(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            raise NavigationError(f"cannot read contract reference {ref}: {exc}") from exc
+        if anchor not in anchors:
+            raise NavigationError(f"contract anchor is absent: {ref}")
+    return {"path": path, "anchor": anchor, "sha256": sha256_file(target)}
 
 
 class DestinationResolver:
-    """Resolve documentation handles to immutable canonical fragment destinations."""
+    """Resolve current file references and lazily loaded retained V2 handles."""
 
     def __init__(self, root: Path, handle_index_relative: str = DEFAULT_HANDLE_INDEX) -> None:
         self.root = root.resolve()
         self.handle_index_path = self.root / handle_index_relative
+        self._handles: dict[str, dict[str, Any]] | None = None
+        self._owners: dict[str, str] = {}
+
+    def _load(self) -> None:
+        if self._handles is not None:
+            return
+        handle_index_relative = self.handle_index_path.relative_to(self.root).as_posix()
         if not self.handle_index_path.is_file():
             raise NavigationError(
                 f"canonical handle index is missing: {handle_index_relative}"
@@ -74,9 +85,13 @@ class DestinationResolver:
             raise NavigationError(
                 f"canonical handle index has no handle entries: {handle_index_relative}"
             )
-        self._handles: dict[str, dict[str, Any]] = {}
-        self._owners: dict[str, str] = {}
-        self._load_and_validate(raw_handles)
+        self._handles = {}
+        try:
+            self._load_and_validate(raw_handles)
+        except NavigationError:
+            self._handles = None
+            self._owners.clear()
+            raise
 
     def _load_and_validate(self, raw_handles: dict[str, Any]) -> None:
         for raw_handle, record in raw_handles.items():
@@ -128,18 +143,25 @@ class DestinationResolver:
             raise NavigationError("cannot resolve empty documentation handle")
         if "HANDLE_INDEX" in val:
             raise NavigationError(f"generic HANDLE_INDEX destination is rejected: {handle}")
-        record = self._handles.get(val)
+        if "/" in val or "#" in val or val.endswith((".md", ".markdown", ".toml")):
+            record = resolve_repository_ref(self.root, val)
+            return {**record, "handle": val, "title": val,
+                    "source": "repository_file", "direct_destination": val}
+        self._load()
+        key = val.partition(":")[2] if val.startswith("ELIOT_") else val
+        record = self._handles.get(key)
         if record is None:
             raise NavigationError(f"unknown documentation handle: {val}")
-        return dict(record)
+        return {**record, "sha256": sha256_file(self.root / record["path"])}
 
     def relative_link(self, from_doc: str, handle: str) -> str:
         record = self.resolve(handle)
         from_dir = str(PurePosixPath(normalize_repo_path(from_doc)).parent)
         rel_path = posixpath.relpath(record["path"], start=from_dir)
-        return f"{rel_path}#{record['anchor']}"
+        return rel_path + (f"#{record['anchor']}" if record["anchor"] else "")
 
     def all_handles(self) -> dict[str, dict[str, Any]]:
+        self._load()
         return dict(self._handles)
 
 
