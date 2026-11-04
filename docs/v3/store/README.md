@@ -42,17 +42,22 @@ The immediate #5326 assignment is **asset-package repair**, not all of Slice 0:
 1. Correct the missing constant imports in `src/queries.rs`, format the package and
    run its [package-local checks](../DEVELOPMENT.md#rust-source). Report actual failures;
    a compile fix does not close the remaining schema/semantic findings.
-2. Align DDL, fixed statements/projections, validators, catalog and digests with
+2. Align DDL, complete operation statements/projections, validators, catalog and digests with
    [R-174 and R-182–R-188](../ANALYSIS-REGISTRY.md#store-reconciliation). The selected
-   representations are in Implementation §4.7; do not invent aliases. Choose concrete
-   per-operation byte caps with the encoder/decoder, not a blanket larger limit.
+   representations are in Implementation §4.7; do not invent aliases. Use the selected
+   [first Base limits](../IMPLEMENTATION.md#451-first-base-limits), not another blanket
+   maximum. Implement [capture identity/transaction/readback](../IMPLEMENTATION.md#72-capture-command-commit-and-replay)
+   and [exact open](../IMPLEMENTATION.md#73-exact-open-and-byte-ranges) first; do not expose
+   the existing separate stream/observation primitives as a complete capture API.
 3. Publish the corrected asset increment with exact-engine/catalog gaps still named.
    `inspect` validates embedded assets; it does not establish a working Store.
 
 The **next connected runtime assignment** follows
 [Implementation §11](../IMPLEMENTATION.md#11-implementation-sequence): actual Store
-admission, one bounded client and a complete capture/open path with unknown-outcome
-readback. Select only the statements used by that path. It does not wait for inference
+admission, one bounded client and the inline capture/open path with unknown-outcome
+readback. [The planned single runtime package](../IMPLEMENTATION.md#111-source-placement-and-handoff)
+consumes these assets; it does not copy SQL or turn `inspect` into a daemon. Select only
+the statements used by that path. It does not wait for inference
 or the full backup campaign, and absent operations remain unavailable rather than stubs.
 
 Rust compile/Clippy checks source; exact-engine execution checks the selected DDL/query
