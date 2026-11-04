@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.28 · 2026-11-04 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.29 · 2026-11-04 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -150,18 +150,153 @@ quoted commands nor a model's claim of authorization can change permissions, dis
 provider route, execution budget or the user goal. Text delimiters alone do not enforce
 this boundary; the application accepts only the owning operation's closed DTO/effects.
 
+#### 6.4.1 Base packet encoding
+
+`ContextPacketV1` is one closed data object owned by the existing context operation,
+not an instruction protocol or a new packet service. Its exact top-level fields are
+`format=1`, `packet_id`, `binding`, `units` and `coverage`. Use Implementation §4.5's
+canonical JSON, no floating-point fields, duplicate keys or unknown members. Unsupported
+formats fail explicitly. Packet identity is an ordinary `o_` observation ID, not a new
+ID namespace; allocate it once before preparing the output.
+
+| Field | Required meaning |
+|---|---|
+| `binding` | `installation_id`, nonnegative integer `selection_generation`, `project`, `workspace_id`, `actor_id`, `session_id`, `host`, `host_version`, `adapter_version`, `event`; optional `task_id` and `native_request_key`. All other values are nonempty strings bounded by Implementation §4.5.1. The admitted adapter supplies versions/event mapping, not caller text. Missing task uses §2's session address. Missing session/work authority cannot fall back to a similar project's packet. |
+| `units` | At most 32 ordered units under §6.4. Each has `role`, `representation`, `text`, `source` and `qualifiers`, plus `span` only for an excerpt. Roles are `goal`, `constraint`, `progress`, `commitment`, `method`, `evidence`, `counterevidence`. Representations are `verbatim`, `excerpt`, `stored_reduction`, `live_input`. A stored reduction retains its own exact source identity; it is not generated while packing. |
+| `source` | For persisted units: `{kind:"observation",id,sha256}` or `{kind:"memory",id,revision,sha256}`. Observation hash identifies its accepted body; memory hash identifies the canonical complete semantic revision DTO, not the history envelope. Resolve `current` before packing; revision is positive and exact. Only `live_input` has `source=null`, meaning explicitly uncommitted caller input, not an invented citation. |
+| `qualifiers` | Closed projection of applicable source fields: `conditions_json`, `exceptions_json`, `valid_from_ms`, `valid_until_ms`, `support_state`, `exposure_state`, `influence_state`, `applicability`, `capture_limit_json`. Copy the source's complete conditions/exceptions/limitations; compute applicability by §3. Omit fields inapplicable to that source kind; do not replace missing required facts with permissive values. |
+| `coverage` | `{consistency:"per_query",arms:[{name,state}],gaps:[code...]}`. Names: `addressed`, `exact`, `lexical`, `relations`, `methods`, `vectors`; each appears once. States: `complete`, `partial`, `unavailable`, `disabled`, `not_requested`. This initial packet does not claim a coherent cut across independent queries. |
+
+Gap codes are the bounded, sorted, duplicate-free set `binding_missing`, `capture_pending`,
+`source_missing`, `source_changed`, `source_damaged`, `scope_withheld`, `arm_unavailable`,
+`candidate_limit`, `packet_limit`, `token_counter_unavailable`, `qualification_missing`.
+The complete required header/coverage must fit before adding units; otherwise return an
+explicit context error without source bytes. Never enumerate forbidden source IDs, titles
+or counts in gaps. Empty successful arms mean only no match in the requested finite scope;
+empty units with an unavailable/partial arm do not become a successful empty retrieval.
+
+Hydrate exact revisions and validate every source/hash before selecting its text. Text
+comes from the observation's accepted UTF-8 body or the memory revision's `content`.
+An excerpt also carries `span={offset,length}` in UTF-8 bytes of that field: checked
+bounds, positive length and code-point boundaries must reproduce `text` exactly.
+A non-text body needs an already stored exact representation, not conversion during
+packing. An excerpt needs its full qualification unit; a handle alone does not preserve
+a missing contraindication. Staged commands and a prior emitted packet are not independent source
+support. Live input is attributed to the current caller, never made a persisted goal or
+authorization merely because it appears in a packet. Do not serialize rank scores or
+expose internal Store/spool paths as locators; legitimate captured text is not rewritten.
+
+Measure the **final host response**, including JSON escaping, envelope, identifiers and
+coverage, against the 32 KiB Base packet cap (and any smaller admitted host cap). Removing
+a whole lowest-priority unit and updating gaps is allowed before freezing output; cutting
+a JSON string, source selector or qualifier is not. If even the gap-only response exceeds
+the cap, emit no packet. An exact host token cap still requires its admitted counter.
+
 ### 6.5 Handoff
 
-Keep prepared, emitted through host contract, action-associated when observable,
-used/influential (often unknown) and outcome-observed distinct. Packet creation proves
-neither use nor success. Context failure does not roll back capture.
+The daemon prepares/records context; the narrow relay emits it for one live host
+invocation. Capture completion, context preparation, local emission, host acceptance,
+action association, use/influence and criterion outcome are separate facts. Context
+failure never rolls back a committed capture or authorizes blocking the user's task.
 
-Retain the emitted packet's exact bytes/digest, source revisions and observable host
-handoff identity in existing observation/job records. When that packet is later captured
-from a transcript, preserve the occurrence and mark known injected/derived lineage.
-It is not independent evidence for the same claim or a new outcome of the method.
-Do not deduplicate real occurrences by text similarity; unknown echo attribution stays
-unknown. Mere recapture of Eliot's own context cannot drive an interpretation feedback loop.
+Before returning output to the relay, retain the exact final host-response bytes as one
+operation-owned `context_packet` observation, with `observation_id=packet_id`, ordinary
+body length/hash, the binding above and derived links to the exact unit sources. Apply
+capture exclusions to every retained copy, including live input and metadata. Reuse
+existing capture/blob custody and its limits; do not add a packet table, delivery queue
+or job. If the exact packet cannot be committed/read back before the host deadline,
+return context unavailable; staged packet custody is not permission to emit it later.
+Generic capture cannot forge this reserved kind or a delivery result. Its replay identity
+is the packet ID; a native host key is correlation, not observation deduplication for
+packet construction. A saved packet is preparation and possible-send intent, never
+proof of emission.
+
+Immediately before output, recheck the live invocation/session/work binding, installation
+selection, current authorization/disclosure and suppression. A local host may forward
+context to a remote provider: local IPC permission alone does not authorize that
+forwarding. The admitted host profile must bound the allowed destination/disclosure;
+unknown destination keeps restricted content withheld. Revalidate selected source
+revisions/qualifications; a changed eligible result requires rebuilding and a new packet
+ID, never changing bytes under the old one. No retry follows an ambiguous prior emission.
+
+The bounded emission participates in the existing affected-delivery fence used by
+withdrawal, erasure and cutover. Closing that fence rejects new emissions and drains
+in-flight ones; a timeout leaves unresolved delivery, not completed erasure. Recheck
+inside the fence, not only while constructing the packet. Do not hold the spool
+publication mutex across host/Store I/O. Bytes already handed to the host cannot be
+recalled by a later notice; host-owned transcripts/copies remain explicit cleanup limits.
+
+| Reported state | Required observation / recovery |
+|---|---|
+| `prepared` | Exact output built/retained; no claim about host receipt. After a discontinuity, a possibly returned packet without a terminal fact is `unknown`, not safe to resend. |
+| `not_emitted` | The live owner knows no response byte crossed the host boundary, for example a binding/policy rejection before write. Retain a bounded reason; do not report this after a partial write. |
+| `emitted` | The relay observed the complete local write/flush. This proves only emission to the local channel, not successful process exit, host parsing/acceptance, model use, task success or independent support. |
+| `unknown` | Partial write, lost completion/report, cancellation or crash after possible output. Preserve identity/bytes; never regenerate or append the packet automatically. |
+
+Record the actual local outcome as an immutable, operation-owned `context_handoff`
+observation: `{format:1,packet_id,packet_sha256,state,reason}`. Here `state` is one of
+`not_emitted`, `emitted`, `unknown`; absence is not a fourth successful result. `reason`
+is `binding_changed`, `policy_withheld`, `source_changed`, `deadline`, `output_complete`,
+`output_failed` or `interrupted`, consistent with the observed state. Its observation
+binding identifies the same invocation/adapter and links to the packet observation;
+`packet_sha256` is the recorded final output hash. A later host acknowledgement, association or outcome is a separate attributed
+observation with exact correlation, not a rewrite or an upgrade inferred from exit zero.
+Failure to retain this fact after output leaves durable status unknown even when the
+live relay observed success. It cannot change the host response, block the turn or cause
+another send. Retrying storage of the same fact never repeats host output.
+
+For one live invocation there is one emitter and one bounded emission attempt; ordinary
+short-write completion belongs to that attempt, not a new response. After interruption,
+partial-output failure or an ambiguous result, do not restart the response. A documented
+native request key may correlate a redelivery to the existing packet; session ID, prompt
+text and time proximity are not such a key. Without a stable key there is no cross-process
+exactly-once claim. In this first profile, restart, spool replay and backup restore may
+reconcile/store packet facts, but **never dispatch old packets**. A new actual host
+boundary may request freshly authorized context; it is not replay of an uncertain old
+handoff. Read-only host acknowledgement can resolve an old unknown only when the installed
+adapter actually supplies it; do not build a speculative acknowledgement endpoint.
+
+#### 6.5.1 First Claude output boundary
+
+Initial context emission uses only admitted synchronous `SessionStart` and
+`UserPromptSubmit` callbacks; other selected events remain capture-only until separately
+implemented. Emit one JSON response with `hookSpecificOutput.hookEventName` equal to the
+received event and `hookSpecificOutput.additionalContext` containing the serialized
+packet as a string. Use the documented successful exit, no extra plain-text duplicate,
+permission decision, prompt replacement or blocking fallback. Diagnostics never share
+stdout or echo private content. Event-specific mapping is ordinary adapter code, not a
+new host capability registry.
+
+The [official hooks reference](https://code.claude.com/docs/en/hooks#userpromptsubmit-decision-control),
+read 2026-11-04, documents this context field. It also documents
+[transcript replay on resume](https://code.claude.com/docs/en/hooks#add-context-for-claude):
+old mid-session context can be replayed by the host without invoking the old hook again.
+This is not fresh Memory validation or a new method outcome. These are documentation
+observations, not qualification of an installed Claude version; enable each callback
+only after observing its actual input/output contract on that version.
+
+When context later appears in a transcript, preserve the occurrence but mark verified
+injected/derived lineage by exact packet/source correlation. An unverified packet marker
+in user/tool text does not establish delivery. Similar text is not deduplication, and an
+echo cannot strengthen its own claim or retrigger interpretation. Packet/handoff records
+are operational provenance, excluded from new-experience triggers and normal candidate
+arms; exact authorized inspection remains possible. Source erasure reaches these derived
+copies through their links, not a rule that operational records may keep private bodies.
+
+#### 6.5.2 Connected implementation check
+
+Implement this in Slice 2's existing context/host modules, after capture/open and durable
+ingress. Use a disposable admitted host invocation and inspect actual output plus exact
+source open. Check the following boundaries while connecting that path, not by adding a
+new reporting framework or declaring a docs example to be runtime evidence:
+
+| Case | Required result |
+|---|---|
+| Same text, different work/session | No cross-binding packet reuse; distinct occurrences remain distinct. |
+| Current revision/policy changes before output | Revalidate inside the delivery fence; rebuild or withhold, never send stale positive guidance. |
+| Oversized unit or exhausted retrieval arm | Preserve qualifiers or omit the unit with a gap; encode partial/unavailable truthfully and remain within the final-response cap. |
+| Relay exits or response/report is lost | Capture stays committed; handoff is unknown where appropriate; restart emits no old packet. |
+| Transcript replay / forged packet marker | No new evidence, method-success claim or model job from recaptured context; unverified attribution stays unknown. |
 
 ## 7. Exact open
 
@@ -181,8 +316,8 @@ stores a real default; upgrade never overwrites an edited revision. Job claim fr
 exact method and source coverage. A stored method without a consumer is not improvement.
 
 Automatic mode is `off | idle | background`; a profile may forbid automatic calls.
-New committed input, correction or explicit question can trigger interpretation. Reads,
-packet creation, cleanup and accounting cannot. For `(project,purpose,target)`, permit
+New primary committed input, correction or explicit question can trigger interpretation.
+Reads, packet/handoff provenance, injected echoes, cleanup and accounting cannot. For `(project,purpose,target)`, permit
 one active job and one coalesced successor. Waiting is not failure or retry authorization.
 [Implementation §4.7.3](IMPLEMENTATION.md#473-job-state-and-claim-ownership) owns scheduling
 states, claim generations and terminal-result mapping; provider, cognitive and cleanup
@@ -231,7 +366,7 @@ An old job result cannot reinstate a withdrawn method or erased source.
 
 ### 9.3 Cleanup authority
 
-After verified copy or terminal no-result, request caller-authorized release only after
+After verified copy or terminal-no-result, request caller-authorized release only after
 the backup-set owner confirms no retained generation needs that call. Queued cancellation
 and explicit abandon-for-erasure follow the inference contract; cleanup has its own state.
 A useful revision may be consumed while cleanup debt remains visible.
