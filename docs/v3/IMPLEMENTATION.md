@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.46 · 2026-10-29 · design for the greenfield rewrite.**
+**Revision 1.0-draft.47 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -173,7 +173,9 @@ ordered UTF-8/LF DDL assets
 expected-catalog template
 ```
 
-Use one unambiguous, documented length-prefix encoding for these segments. Bind the
+Encode each segment as unsigned 64-bit big-endian byte length followed by its exact
+bytes, in the listed order (including each asset name before its contents); format
+numbers use canonical decimal ASCII. Bind the
 format/generation/digest values after hashing; the digest never contains itself.
 Migration assets contain DDL, not their own BEGIN/COMMIT or metadata wrapper. The runner
 adds exactly one wrapper and overwrites three metadata params in that transaction.
@@ -217,20 +219,25 @@ for a runtime fallback. Verify pinned source when changing a selected form.
 
 ### 4.3 Application ID generation
 
-Before mutation, daemon generates `<prefix>_<26 canonical Crockford Base32 chars>`.
+Before mutation, the owning producer generates `<prefix>_<26 canonical Crockford Base32 chars>`.
 Prefixes are `s` stream, `o` observation, `m` memory, `h` memory_history, `l` link and
 `j` job. Draw 128 OS-random bits; encode fixed-width uppercase with first digit `0..7`.
 Validate exact prefix/length/regex. These IDs contain no time ordering promise.
 
-Retain the selected ID in the immutable command/proposal before retryable mutation.
-Replay reuses it. A collision with another object is `ID_COLLISION`/integrity failure,
+For capture, the trusted relay (or daemon for direct local input) generates the proposed
+observation ID before the first send or spool publication; `command_id` is that same
+`o_` ID. It does not need a running daemon to stage input. The daemon allocates other
+object IDs when their owning operation first needs them. Retain IDs in the immutable
+command/transaction plan before mutation; replay reuses them. A collision with another object is `ID_COLLISION`/integrity failure,
 not silent regeneration after ownership transfer. Order by explicit time/sequence and
 ID tie-break, not the random ID alone.
 
 ### 4.4 Derived unique keys and absence
 
-Use domain-separated SHA-256 over length-prefixed UTF-8 components, never ambiguous
-concatenation. Store readable components separately and verify the digest in the writer:
+For `H(domain, components...)`, encode domain and then each component as unsigned
+64-bit big-endian UTF-8 byte length followed by exact bytes; hash the concatenation
+with SHA-256 and encode lowercase hex. No Unicode normalization or separators are
+implied. Store readable components separately and verify the digest in the writer:
 
 ```text
 stream_unique_key  = H("stream-v1", project, source_kind, source_native_id)
@@ -281,11 +288,36 @@ A response-size/decode failure after a possible mutation send is unknown until e
 readback. It is not proof of rejection and must not trigger a fresh mutation ID.
 Hashing `QuerySpec` limits does not enforce any of these checks.
 
+#### 4.5.1 First Base limits
+
+These are selected initial engineering limits, not measured capacity. Define them once
+in the owning Rust code and use them in the relay, Store writer/decoder and exact open.
+`KiB = 1024 bytes`; all text sizes are UTF-8 bytes, not characters or tokens.
+
+| Value | Initial maximum | Enforcement / oversize result |
+|---|---:|---|
+| One source/work/locator identifier | 256 bytes | Reject, never shorten identity. Generated IDs keep §4.3's stricter grammar. |
+| Capture metadata, excluding body and search excerpt | 32 KiB canonical JSON; 64 relation descriptors | Bound every element and aggregate before custody. |
+| Inline accepted text body / search excerpt | 16 KiB / 4 KiB | Excerpt is derived and labelled; raw body is never silently shortened. |
+| Accepted blob body | 16 MiB | Only after spool/blob/range readback is implemented; until then reject above inline capacity. |
+| Complete memory revision DTO | 64 KiB canonical JSON | Includes conditions, exceptions, scopes, cues and method body; history uses the same cap. |
+| One Store or local IPC request/response | 1 MiB serialized, including envelope | Check before send and while receiving; possible mutation send still means unknown on failure. |
+| Exact body range | 64 KiB decoded bytes | One identity-bound range; never buffer the entire blob to serve a range. |
+| Candidate page / emitted Base packet | 32 candidates / 32 KiB UTF-8 | Page also has an encoded-byte cap; packet omissions carry explicit gaps. |
+
+A capture above inline capacity uses the existing durable spool and bounded blob reads,
+not a 16 MiB IPC frame or a new upload service. One-row exact/history reads must fit
+with worst-case escaping; split candidate pages before the response cap. Configuration
+may narrow admission/selection limits, but must not strand already accepted data: keep
+build-bounded readers able to open it. An incompatible read cap rejects configuration.
+Backup/job/inference aggregate limits are separate later-operation decisions; these
+values neither enable those operations nor qualify their performance.
+
 ### 4.6 READONLY, row assertions and operation ownership
 
 Retained exact-tag evidence: READONLY allows initial and same-value assignment, but
 rejects later changed values. It does not generate identity or establish provenance.
-IDs and creation facts remain daemon-generated and command-retained.
+IDs and creation facts remain producer-owned and command-retained under §4.3.
 
 Field type coercion precedes ASSERT. Row context includes value/before/after/input;
 use only expressions whose exact behavior is established. Regex validation is string
@@ -306,7 +338,7 @@ not a generic CRUD method for every table.
 | Table | Identity and immutable facts | Mutable/projection state and consumer |
 |---|---|---|
 | `stream` | stream_id, project, source_kind/native_id, workspace_id, stream_unique_key, created_at_ms | last_ingest_seq, updated_at_ms; capture allocation and ordered replay |
-| `observation` | observation_id, stream/event/command/native-event identity, ingest_seq, source bytes, occurrence/receipt/creation facts and captured work binding | Immutable accepted observation; exact open, continuation and retrieval projections |
+| `observation` | observation_id, stream/event/command/native-event identity, command_sha256, event_sha256, capture_format, ingest_seq, source bytes, occurrence/receipt/creation facts and captured work binding | Immutable accepted observation; exact open/replay. An operation-owned observation may also contain immutable operation_result_json (§7.4). |
 | `memory` | memory_id, origin_project, created_at_ms | revision, kind, reuse_scope/reuse_projects, address tuple/key, content/search_text/exact_cues, disclosure, subject/aspect/perspective, conditions/exceptions, validity, support/exposure/influence, commitment/method state and updated_at_ms |
 | `memory_history` | history_id, memory_id, revision, exact semantic snapshot, replaced_at_ms | Immutable prior revision; historical open and provenance |
 | `link` | link_id, source/target kind+ID+optional revision, relation_kind, grounds_group, locator/qualification, created_at_ms | Immutable relation; bounded forward/reverse traversal |
@@ -565,9 +597,11 @@ revision CAS, claimed input and their dependent writes must share the same trans
 Check its complete result, including commit. Separate query calls do not retain a lock
 or transaction across the socket merely because one task owns that socket.
 
-Retry the entire immutable transaction only after a definite retryable conflict with
-no external effect. Unknown transport/shutdown/fsync reconciles first; an error under
-`sync=every` is not rollback proof. No partially executed multi-statement sequence may
+After a definite retryable conflict, retry the entire immutable transaction, never
+its remaining statements. Unknown transport/shutdown/fsync reconciles first; an error
+under `sync=every` is not rollback proof. The purely Store-owned idempotent capture
+completion in §7.2 may repeat the same command after exact lookup; this does not authorize
+repeating an external effect or replacing its identity. No partially executed multi-statement sequence may
 report committed capture. Nondeterministic UPSERT is not idempotency. Publish blobs
 before row transactions; never perform provider or filesystem effects inside them.
 
@@ -578,34 +612,15 @@ reconciliation. These are selected durability requirements, not qualified Window
 
 ## 7. Core operations and host
 
-Apply §7.1 admission before retaining the command or publishing any payload.
-Capture owns one immutable relay command. Publish its blob, then in one transaction
-resolve/recheck stream, read replay identities, reject changed bytes/binding, allocate
-the sequence, insert observation/relations and coalesce only implemented work. Matching
-readback establishes committed. Replay compares the complete immutable semantic command,
-including kind, work binding, disclosure and capture limitations; matching body bytes
-alone are insufficient. Capture never calls a model.
+Capture, exact open and direct revision have distinct transactions below. The relay
+cannot submit arbitrary table mutations or manufacture operation results. Apply §7.1
+before any payload-bearing file or IPC. Model calls are absent from all Base operations.
+Job claim/settle uses §4.7.3 only when its real worker exists.
 
-Private result is `committed | rejected | stage_required | unknown`. Relay stages the
-same command when direct ownership is unavailable/uncertain. One daemon replayer owns
-pending files; it removes one only after matching commit readback and supports bounded
-pause/drain for maintenance. Staged is durable custody, not a canonical Store commit.
-
-Revision preserves exact history and publishes current/links/original operation result
-atomically. Its writer must retain the command identity/result in the existing owning
-records; checking only the present revision cannot reconcile a lost reply after another
-revision. Reject reuse with changed semantic input, including scope/disclosure. Until
-that complete transaction and readback exist, primitive inserts/updates are not an API.
-Do not solve this gap with a general second mutation-ledger framework. Retain the
-change's cause/source and attributed actor (or explicit unknown) in the owning observation,
-links and history; a model proposal does not manufacture a human authorization.
-
-Job claim freezes finite input/method/limits/disclosure/profile under §4.7. Exact open
-resolves one handle/range; a historical handle never falls forward. Initial Claude relay
-supports SessionStart, UserPromptSubmit, PostToolUse/Failure, Stop, SubagentStop, PostCompact
-and SessionEnd only as verified against the installed host. Address work before search
-and emit actual packet content at admitted boundaries; prepared packet metadata alone is
-not delivery. Cognition owns selection/packing.
+The initial Claude relay enables only host events verified against the installed host
+contract. Address work before search; deliver actual context at supported boundaries.
+Unsupported events/operations are unavailable, not successful empty handlers. Cognition
+owns context selection and packing; host emission is not part of Store commit.
 
 ### 7.1 Capture policy before durable custody
 
@@ -626,6 +641,128 @@ withhold it and require cleanup; it must not rewrite bytes under the same identi
 re-introduce excluded/deleted input. Recheck current disclosure and suppression before
 context emission, external send and semantic publication, including delayed job results.
 Previously emitted bytes cannot be recalled by a later policy change; report that limit.
+
+### 7.2 Capture command, commit and replay
+
+`CaptureCommandV1` is a closed DTO, not arbitrary host JSON. Before first send/stage,
+freeze `format=1`, proposed `observation_id=command_id` (§4.3), the stream tuple
+`(project, source_kind, source_native_id, workspace_id)`, `kind`, source event identity,
+occurrence tuple, first `receipt_time_ms`, captured work/resource binding, locator,
+disclosure, policy revision/limitations, source relations, search excerpt and body
+length/SHA-256/location (§4.7). Host JSON stays in the accepted body. Command metadata
+has no floating-point fields. Internal native Store IDs and `ingest_seq` are not inputs.
+Reject disagreement between structured binding columns and their canonical projection.
+
+The admitted host adapter selects occurrence identity, not the body hash:
+
+- With a documented stable native event key, `event_key = H("native-event-v1", kind,
+  native_event_key)`. It is scoped by the resolved stream and project.
+- Without one, `event_key = H("capture-event-v1", command_id)`. Retrying the saved command
+  is idempotent; a new callback is a new occurrence. Do not promise host-redelivery
+  deduplication without a stable key or substitute text/time similarity.
+
+Store `command_sha256 = H("capture-command-v1", canonical command)` and
+`event_sha256 = H("capture-event-content-v1", canonical semantic projection)`.
+The latter excludes proposed observation/command IDs, receipt time and physical body
+location, but retains body length/hash, event/stream identity and every semantic field
+above, including policy and limitations. Hashes do not contain themselves. Body location
+is a checked inline value or owned blob key, never a caller-supplied filesystem path.
+A second delivery may have a different proposed ID/receipt time, not different meaning.
+
+After admission and verified blob publication when needed, execute **one** fixed Store
+transaction, not `StreamInsert`, `StreamAdvance` and `ObservationInsert` as separate calls:
+
+1. Resolve the stream by its unique key; compare its complete tuple. Resolve any matches
+   for `(project, command_id)` and `(project, stream_id, event_key)` before allocating
+   a sequence. Multiple matches pointing to different observations are an integrity error.
+2. A command match requires the original command digest; a native-event-only match requires
+   the event digest and semantic tuple. Return the original observation/sequence/result.
+   A mismatch is `identity_conflict`, not overwrite, a new ID or a second observation.
+3. Only a new occurrence creates the stream if absent, rechecks its exact record (§6),
+   checked-increments `last_ingest_seq` (first is 1), and inserts the observation and
+   supported source relations. All writes commit together. Signed-64 exhaustion rejects;
+   replay allocates nothing. Do not queue unimplemented jobs.
+4. Check every statement and commit result, then decode the accepted observation ID,
+   stream ID, sequence, original receipt time and hashes. Native redelivery returns the
+   stored observation ID, not the caller's new proposed ID. Verify exact open can read it.
+
+A duplicate-key/conflict result is not success: look up and compare the same immutable
+command/event. If a possible send lost its outcome, poison the socket and read back
+through a newly admitted connection. A matching committed row resolves the operation;
+absence alone does not prove rollback while the prior transaction may still commit.
+When lookup is authoritatively empty, the same admitted capture command may enter the
+idempotent transaction again: its unique identities must converge even if the earlier
+transaction finishes concurrently. This is completion under the same identity, not proof
+of rollback. Lookup failure stays unknown. Never mint replacement IDs or perform provider
+I/O on this retry. An unreferenced pre-published blob is cleanup debt, not committed capture.
+
+| Private result | Relay / replay action |
+|---|---|
+| `committed` | Return the recorded canonical identity. Remove a pending command only after matching readback. |
+| `rejected` | Return a definite validation/policy/identity error without echoing private input; do not retry changed input under this ID. |
+| `stage_required` | No Store claim. Publish the same admitted command and body to the existing spool. |
+| `unknown` | Preserve the same command for reconciliation; neither report committed nor infer rejection. |
+
+`stage_required` is not an acknowledgement. Relay reports **staged** only after exact
+file/directory durability and readback (§6); a spool write failure is not staged. One
+daemon replayer owns pending files, checks current policy/suppression and resumes the
+same command. The spool envelope preserves its version/bytes/hashes and body location;
+replay must not recapture input with a new receipt time, ID or binding.
+
+### 7.3 Exact open and byte ranges
+
+Use closed selectors: observation ID; memory ID plus `current`; or memory ID plus an
+exact positive revision. Resolve `current` once and return that resolved revision.
+An explicit revision reads that version from current/history, never the newest substitute.
+Source/representation handles keep their exact identity. Empty selectors reject.
+
+An authorized response includes requested/resolved identity, representation/revision,
+full body length/SHA-256, capture limitations, qualifications and a closed disposition:
+`complete`, `range`, `missing`, `forbidden`, `erased`, `damaged` or `unsupported`.
+Unavailable Store/transport is an operation error, not `missing`. Recheck current scope
+and suppression before returning content; forbidden responses disclose no source bytes.
+
+Body ranges use unsigned byte offset and positive length within §4.5.1, with checked
+arithmetic. Return exact bytes as base64, range length/hash, total length and next offset
+(or absent at end). A text preview is separate; a UTF-8 code point split at a byte
+boundary is not damaged source. Offset at EOF yields an empty complete range; beyond EOF
+rejects. A continuation repeats the same identity/revision/full digest. Changed identity,
+length or digest rejects, not a new search. Metadata remains typed and size-bounded.
+The full digest identifies the immutable object; a range digest verifies only the returned
+range, not the whole object. Verify full length/hash when publishing or opening the full
+body, and retain protected no-follow custody during range reads. Integrity failure reports
+damaged, never a claimed exact body.
+
+### 7.4 Direct revision and lost replies
+
+`create` and `revise(expected_revision)` are separate closed inputs. Create publishes
+revision 1 only when absent; revise requires the exact current positive revision and
+publishes its checked successor. The command freezes the target memory ID (a retained newly generated ID for create),
+a full replacement semantic DTO, attributed cause/source and a fresh `o_` command ID
+before send. No model is needed.
+
+Use an operation-owned `observation` with reserved kind `memory_change` and that command
+ID, not a new mutation table. Its immutable body records the permitted command/cause;
+`operation_result_json = {"format":1,"memory_id":...,"revision":...}` records the
+original result. Represent its admitted input as a `CaptureCommandV1` with this
+reserved kind; allocate its stream sequence and retain both digests under §7.2 in
+the same revision transaction. The result is output, not part of either input digest.
+Ordinary relay capture cannot write this kind/result. The row uses the same policy,
+size and provenance rules; do not modify an already captured observation.
+
+In one transaction: check the operation identity/digest **before** revision CAS; resolve
+create/expected revision; insert the prior full snapshot into history for revise; publish
+current, exact grounds/replacement links and the operation observation/result together.
+Invalid scope, source, history or links abort the whole operation. Only implemented
+reverse-impact work may be coalesced; no empty successful job is created.
+
+Same command/digest returns its original result even after later revisions. Open that
+exact resulting revision through §7.3; never replace it with current. A changed command
+is identity conflict; a new command with stale expected revision is revision conflict.
+Possible commit with a lost reply is unknown until lookup by operation identity, not a
+second revision. Erasure may suppress the old result, but must not make the operation
+eligible to run again (§10). Withdrawal/reactivation still use the outside-root notice
+authority in §10; a generic revision cannot bypass it.
 
 ## 8. Backup-set owner and lifecycle
 
@@ -750,7 +887,10 @@ as a second adapter protocol here.
 Influence withdrawal and erasure have different effects but use the existing outside-
 rollback installation-notice path (`deletions/`), not a second registry. A typed notice
 retains operation identity, target identity, explicit scope (one revision or all revisions),
-kind and a closed reason, without the source body. Daemon owns its publication/readback;
+kind and a closed reason, without the source body. Erasure also retains the affected
+command and stream/event identity digests needed to reject delayed capture/revision
+replay after rows are removed; deleting the content must not erase its replay barrier.
+Daemon owns its publication/readback;
 Store influence fields are projections, not the sole authority surviving rollback.
 
 For withdrawal, close affected publication/delivery, durably publish/read back the notice,
@@ -781,34 +921,59 @@ controller identity/cut/state when that integration actually exists.
 
 ## 11. Implementation sequence
 
-One coherent increment connects caller → operation → durable result/unknown → consumer
-and relevant restart/readback. The following are increments, not mandatory separate
-crates, issues, PRs or stages of a new manager. Runtime work needs its own authorization.
+Build one working path at a time. The rows below are implementation order, not new
+crates, registries, mandatory PRs or a requirement to repair the V2 toolchain first.
+Runtime work remains separately authorized; documentation changes do not implement it.
 
-| Increment | Implement now | Exit for that increment |
+| Increment | Connected change | Observable exit / do not include yet |
 |---|---|---|
-| Slice 0 — minimal Store path | Exact child/process/credential admission, selected schema, one bounded client, capture/open transactions and required file/ID helpers | A disposable input can be committed/read back through the real client; uncertain mutation is not falsely acknowledged. No model or backup implementation prerequisite. |
-| Slice 1 — capture and restart | Relay command, durable spool, single replay owner, exact identity/open and restart | One real input survives direct/staged ownership and restart; replay does not duplicate it. |
-| Slice 2 — useful host context | Selected host events, addressed continuation, exact/lexical retrieval, notes/corrections/commitments, packet emission | Host receives useful qualified context and can open exact sources/history. |
-| Slice 3 — Base maintenance | Coherent backup cut, fenced publication, terminal records, bounded restore/cutover, erasure, rotation and shutdown | Actual maintenance paths work with inference disabled; no user-data migration or destructive operation is enabled prematurely. |
-| Inference P1a | Scoped controller extension, persisted job/ID, verified result consumer and external cut/release/retention integration | One finite episode changes later context without hidden retries or rollback resubmission. |
-| Inference P1b and later | Credential rotation and independently selected vectors/views/documents/Research/hosts | Each feature has its own actual consumer; no unused adapter blocks Base. |
+| Asset repair (#5326/#5327) | Fix existing schema/query owner, selected codecs and bounds; replace capture primitives with a complete transaction and exact-open projection | Package fmt/Clippy and embedded inspection pass; still **not** a working Store. Do not add network/provider/backup machinery to `inspect`. |
+| Slice 0 — inline capture/open | Verified Store startup/admission → one bounded client → §7.2 transaction → §7.3 exact open | One admitted input is read back byte-for-byte with canonical ID/sequence. Same command changes nothing; changed input conflicts. Inline-only rejects larger bodies explicitly. No host/model/backup prerequisite. |
+| Slice 1 — durable ingress/restart | Relay → private spool/blob → single replay owner → Store/open after restart | With Store unavailable, a real input is staged, then replayed once and opened exactly. Lost response remains the same command. Same native event is deduplicated only under its documented adapter identity; equal bytes from distinct occurrences remain distinct. |
+| Slice 2 — useful context and corrections | Verified host boundary → addressed exact/lexical retrieval → deterministic packet → actual host emission; §7.4 direct update → later exact history/context | Host receives goal/constraints/qualified evidence and source handles. Correction survives another revision and a lost reply. Empty, unavailable and truncated retrieval differ. No generated summary or model required. |
+| Slice 3 — Base maintenance | Quiesced cut → backup/fence/manifest → isolated restore/cutover; notices → erasure; rotation/shutdown | Disposable data exercises actual paths with inference disabled. No user-data migration/destructive command is enabled before its own boundary works. |
+| Inference P1a | Accepted scoped controller extension → one persisted call → decoded revision → later context; dependency-aware backup/release | Unknown send is not repeated under a new ID. Only this row waits for controller decisions; do not scaffold it in Base. |
+| Inference P1b and later | Credential rotation, then independently selected vectors/views/documents/Research/hosts | Add each capability only with its real input, failure result and consumer. |
 
-Implement the invariants needed by each path with that path. Do not defer credential
-checks, exact mutation identity, size bounds or unknown handling to a final test phase.
-Conversely, do not require the complete DDL/crash/load/backup campaign before writing
-capture/open. Features absent from an increment are unavailable, not successful stubs.
+### 11.1 Source placement and handoff
 
-After coherent Rust increments run formatting and minimum changed-package Clippy:
+The only existing proposed V3 package is `crates/storage/eliot-v3-store-schema` in the
+separate source PR; it owns executable assets/digests. It is not present on this docs
+baseline. Reconcile current main into that existing writer branch, do not fork its owner.
+For the first runnable path use one planned package `bins/eliot-v3` (package `eliot-v3`,
+binary `eliot`) with an ordinary Rust library and modules. **It does not exist yet.**
+Create it with Slice 0's actual caller, not an empty architecture scaffold. Existing
+V1/V2 bins are donors, not an instruction to wire their whole runtime into V3.
+
+| Location | First responsibility / rule |
+|---|---|
+| Existing schema package: migration, wrapper, `src/queries.rs`, `src/lib.rs` | One executable SQL/bundle owner. Keep complete operation statements, projections, catalog and digests synchronized; no SQL copies in docs/runtime. |
+| Planned runtime `src/main.rs`, `src/lib.rs` | Select supervisor/daemon/relay mode and compose only implemented operations. No successful stubs for later modes. |
+| Planned runtime `src/store.rs` | One admitted client, bindings/decoders and operation calls using schema-package assets. No general SQL API. |
+| Planned runtime `src/capture.rs`, `src/open.rs` | §7.2 identities/outcomes and §7.3 exact reads, used immediately by the first caller. |
+| Later `src/spool.rs`, host/context and maintenance modules in that package | Add with their slice; reuse the same records, decoder and client. Split files when needed, not a crate/process per noun. |
+
+These are default source locations, not installed interfaces or a new module registry.
+A different location requires a concrete existing owner/caller advantage, not a new
+abstraction layer. The first source commit updates the source map to its actual paths.
+
+For each row, read only its linked owner rules, implement the caller/result/consumer,
+then format and run minimum changed-package Clippy. Run exact-engine execution only for
+the connected DDL/transaction/read path; record the actual environment and outcome.
+Use disposable input to observe the exit, not a new test/report factory. Broad crash,
+concurrency, Windows and load campaigns follow the assembled product.
 
 ```text
-cargo fmt --check
-cargo clippy -p <changed-package> -- -D warnings
+cargo fmt -p eliot-v3-store-schema --check
+cargo clippy -p eliot-v3-store-schema -- -D warnings
 ```
 
-No broad test factory is introduced by this documentation task. Follow the owner's
-code-first order; the complete deterministic/platform/crash/load campaign comes after
-the assembled product. The controller repository owns checks for its own runtime.
+These commands apply after the source package is present; add the same package-scoped
+checks for `eliot-v3` when it exists. Compilation is not the observable exit. Credential
+identity, privacy admission, byte limits, atomicity and unknown-outcome handling ship
+with their first effect, not as later hardening. An unavailable check is recorded, never
+relabelled PASS. Fix only a V2 tooling dependency that demonstrably blocks the assigned
+V3 operation; corpus retirement and generic validator modernization are not prerequisites.
 
 ## 12. Qualification ceiling
 

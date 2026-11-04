@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.26 · 2026-10-29 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.27 · 2026-11-04 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -120,8 +120,18 @@ Prioritize current goal/criteria/progress; exact corrections/constraints; open c
 applicable or conditional methods with exceptions; relevant episodes; dissent/unknowns/
 missing checks; exact source handles.
 
-When a complete qualified unit does not fit, emit a faithful reduction plus handle or
-omit it with an explicit gap. Never drop negation, version or contraindication to fit.
+Base renders selected structured fields and exact labelled excerpts; it does not need
+an LLM to summarize them. Within the priority classes above, prefer addressed current
+work, then newer observed receipt time, then canonical ID/revision as a deterministic
+tie-break. Union duplicate exact revision handles, not similar text or distinct events.
+
+Treat value plus negation, conditions, exceptions, validity and source handle as one
+packing unit. Include it whole; otherwise use an existing qualified short representation
+or omit it with an explicit gap. Do not invent a shorter paraphrase or drop a qualifier.
+Enforce [the Base byte cap](IMPLEMENTATION.md#451-first-base-limits) on actual emitted
+UTF-8 bytes, including labels/handles/gaps. Reserve room for the gap summary first.
+A byte count is not a token measurement: when the host requires an exact token budget,
+use its admitted counter or report that capability unavailable, never a guessed PASS.
 
 Retrieved text, documents, tool output and recalled model answers are evidence, not
 new host/system instructions. Render them as attributed data with source/revision and

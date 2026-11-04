@@ -14,6 +14,12 @@ reference, not another required book. Documentation work uses the
 to [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). The
 [version boundary](../ARCHITECTURE_CONTRACT.md) identifies document precedence.
 
+Start implementation with [the connected sequence](IMPLEMENTATION.md#11-implementation-sequence):
+repair the existing Store asset owner, then inline capture → commit/replay identity →
+exact open. [Source placement](IMPLEMENTATION.md#111-source-placement-and-handoff)
+distinguishes the existing proposal from the not-yet-created runtime. V2 validator and
+archive migration are not prerequisites for that path.
+
 ## Task routes
 
 | Change | Required starting sections | Expand only when |
