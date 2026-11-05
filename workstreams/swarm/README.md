@@ -1,17 +1,18 @@
-# Swarm handoff (2026-10-02)
+# Retained V2 swarm references
 
-Owner order 2026-10-02: "Block map, handoff и brief нужно будет запушить в main тоже." These files record the state of
-the ELIOT development swarm at its stop on 2026-10-02 and are the inputs of the continuation sprint (separate PR).
+This directory is historical material, not an active V3 workstream. Do not use its
+old issue counts, local paths, lane assignments or test/merge procedures as current
+instructions. Start V3 work from [START](../../START.md) and the
+[task map](../../docs/v3/README.md#task-routes).
 
-| File | What it is |
+| Reference | Historical use |
 |---|---|
-| `HANDOFF.md` | Root's handoff: where everything lives, entry points (scripts, loops, restart), lane states at the stop, open problems, decisions waiting for the owner. |
-| `LANE-HANDOFFS.md` | Every lane's own HANDOFF line, verbatim. |
-| `BLOCK-MAP.md` | Block map of all 577 open issues: summary, OR audit corrections, blockers by reach, per-blocker detail, FINISHABLE / BLOCKED / ALL-DONE tables. |
-| `BLOCK-MAP.tsv` | One row per issue: `issue, verdict, finishable, blocked, done, notes, producer, or_audit, or_correction`. |
-| `RECOMMENDATIONS.md` | Root's own recommendations (Russian): why the last sprint was slow, how to run the next one. |
-| `MANAGER-BRIEF.md` | The swarm operations manual and decision log (Russian). |
+| [Block-map pointer](BLOCK-MAP.md) | Exact retained 577-issue snapshot and its corrections; not a current queue. |
+| [Manager-guide pointer](MANAGER-BRIEF.md) | Old swarm operations and decision diary; not an agent instruction stack. |
+| [Handoff](HANDOFF.md) | Former lane/environment layout; referenced external scripts and paths may be unavailable. |
+| [Recommendations](RECOMMENDATIONS.md) | Observations about that former campaign; verify any claimed mechanism against the source selected for reuse. |
 
-These are records of one stop, not architecture authority: `main`'s canonical documentation and the issues outrank
-them. The block map was produced by the lanes per the brief quoted in `BLOCK-MAP.md` and audited by OR; ~23% of the
-audited rows were overturned, so re-audit before relying on a row (continuation step 2).
+The two large status/manual pages now point to their full original Git revision.
+No historical task was marked complete, no V2 source was deleted and no new scheduler
+or ledger was created. Current decisions and continuation belong to the
+[V3 registry](../../docs/v3/ANALYSIS-REGISTRY.md).

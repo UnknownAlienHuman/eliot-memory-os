@@ -14,23 +14,42 @@ reference, not another required book. Documentation work uses the
 to [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). The
 [version boundary](../ARCHITECTURE_CONTRACT.md) identifies document precedence.
 
+Start implementation with [the connected sequence](IMPLEMENTATION.md#11-implementation-sequence):
+repair the existing Store asset owner, then inline capture → commit/replay identity →
+exact open. [Source placement](IMPLEMENTATION.md#111-source-placement-and-handoff)
+distinguishes the existing proposal from the not-yet-created runtime. V2 validator and
+archive migration are not prerequisites for that path.
+
 ## Task routes
 
-| Change | Required starting sections | Expand only when |
-|---|---|---|
-| Entry pages, navigation or work registry | [AGENTS](../../AGENTS.md), [authority](../ARCHITECTURE_CONTRACT.md), affected index/registry row | A link or summary changes a product rule: read that owner section. |
-| Product boundary or new mechanism | [Architecture §1–3](ARCHITECTURE.md#1-purpose-and-completion) | Follow the mechanism into Implementation; do not create an owner per noun. |
-| Startup, processes, Windows IPC | [Implementation §1–3](IMPLEMENTATION.md#1-runtime-and-installation), [Architecture §2](ARCHITECTURE.md#2-ownership) | Identity, credentials, shutdown or restore custody changes. |
-| Store schema, IDs, query or transaction | [Implementation §4–6](IMPLEMENTATION.md#4-migration-0001-and-schema-authority), [Store source ownership](store/README.md) | Follow the changed field/query to its writer and reader; inspect exact pinned upstream semantics when relied on. |
-| Capture, spool, replay or host emission | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host), [Cognition §1–2](COGNITION.md#1-observations-claims-and-revisions) | Context construction: read Cognition §6; maintenance crossing: read Implementation §8. |
-| Retrieval, context, correction or learning | [Cognition §2–6](COGNITION.md#2-current-work-reconstruction), then the affected algorithm | Persistence: Implementation §4–7; external model call: Inference contract. |
-| Backup, restore, erasure or rotation | [Implementation §8–10](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle), [Architecture §7–8](ARCHITECTURE.md#7-backup-authority) | Controller copies, release or retention are involved: read the matching Inference clauses. |
-| Controller inference | [Inference contract](INFERENCE-CONTRACT.md), [current dependency finding](ANALYSIS-REGISTRY.md#controller-dependency) | Verify the live controller API/source before changing its adapter; current compatibility is unresolved. |
-| Requirements, donor reuse or rejected design | Relevant item in [AUDIT-MAP](AUDIT-MAP.md), then its pinned source | Open [AUDIT](AUDIT.md) only for the disputed rationale, not as a default prompt. |
+Root and applicable inherited instructions apply once under
+[AGENTS](../../AGENTS.md#select-the-version-and-task). Select the row for the actual
+change, not every row mentioning the same subsystem. Read the linked section and the
+definitions it uses; expand along changed data/effects, not every outgoing link.
 
-Section links are starting points, not permission to omit a boundary the change
-actually crosses. Record the sections inspected in the PR; a navigation result
-is not evidence that the text was understood.
+| Change | Start here | Expand for this dependency |
+|---|---|---|
+| Entry pages, navigation or registry | [Authority](../ARCHITECTURE_CONTRACT.md), affected instruction/index/registry row | Follow the route to its named owner/source/check; read product rules only when their meaning changes. |
+| Local source repair with unchanged behavior, such as a missing import | Applicable source instructions, failing symbol and its definition/caller; [package checks](DEVELOPMENT.md#rust-source) | Any changed field, query, public behavior or dependency selects its operation row below. A compile repair alone needs no whole Store book. |
+| Product boundary or new mechanism | [Architecture §1–3](ARCHITECTURE.md#1-purpose-and-completion) | Follow the mechanism into its owning operation; do not create an owner per noun. |
+| Startup, processes or Windows IPC | Relevant subsection of [Implementation §1–3](IMPLEMENTATION.md#1-runtime-and-installation) | [Architecture ownership](ARCHITECTURE.md#2-ownership) for moved responsibility; credentials, shutdown or restore only when crossed. |
+| Store schema, IDs or projections | Changed clause of [Implementation §4](IMPLEMENTATION.md#4-migration-0001-and-schema-authority), [Store source map](store/README.md) | Follow that field through its writer/decoder/history; query shape uses §5, atomicity §6, exact pinned upstream semantics when relied on. |
+| Store query or transaction | [Fixed operations](IMPLEMENTATION.md#5-fixed-query-corpus), [transactions](IMPLEMENTATION.md#6-transactions-and-durable-files), affected operation in §7 | Read that operation's fields/limits in §4 and actual writer/reader, not unrelated backup or inference contracts. |
+| Capture identity or replay result | [Capture command](IMPLEMENTATION.md#72-capture-command-commit-and-replay), [observations/binding](COGNITION.md#1-observations-claims-and-revisions) | Capture policy §7.1, ID/field definitions §4, transaction §6; durable host ingress adds §7.5. |
+| Spool custody or restart | [Durable ingress](IMPLEMENTATION.md#75-durable-ingress-and-replay), [durable files](IMPLEMENTATION.md#6-transactions-and-durable-files) | Its owning command/result (§7.2 or §7.4); restore rules only for rollback/cutover. |
+| Direct memory creation or correction | [Revision command/publication](IMPLEMENTATION.md#74-direct-revision-and-lost-replies), [direct updates](COGNITION.md#5-direct-updates) | Changed fields/limits §4; grounds Cognition §3; exact read §7.3; notice/context rules only for affected publication or delivery. |
+| Current-work binding, grounds or retrieval | Changed subsection of [Cognition §2–3](COGNITION.md#2-current-work-reconstruction) or [§6.1–6.4](COGNITION.md#61-decision-frame) | Scoped Store queries/projections and exact open; packet or emission only if their output changes. |
+| Exact source/history open | [Implementation §7.3](IMPLEMENTATION.md#73-exact-open-and-byte-ranges), actual projection/decoder | Relevant field/hash/history definitions and current authorization; not search or inference. |
+| Context packet or host emission | [Packet](COGNITION.md#641-base-packet-encoding) for encoding; [handoff](COGNITION.md#65-handoff) for emission | Packing/qualifiers and source open; custody, notices or cutover only where crossed. Verify the installed host boundary before enabling it. |
+| Episode coverage, jobs or learning | [Coverage](COGNITION.md#4-episode-membership-and-coverage), [job lifecycle](COGNITION.md#8-processing-methods-and-jobs) or [attribution](COGNITION.md#12-consolidation-disagreement-and-improvement), whichever changes | Scheduler/claim uses Implementation §4.7.3; publishing uses §7.4; an external call uses the matching Inference clause. |
+| Backup, restore, erasure or rotation | Affected subsection of [Implementation §8–10](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle) | [Architecture §7–8](ARCHITECTURE.md#7-backup-authority) for authority changes; Inference only for external copies, release or retention. |
+| Controller inference | [Prerequisites](INFERENCE-CONTRACT.md#0-authority-and-prerequisites), affected interface clause and [dependency finding](ANALYSIS-REGISTRY.md#controller-dependency) | Verify the live controller API/source before changing its adapter; do not substitute a historical claim. |
+| Requirements or donor reuse | Relevant [AUDIT-MAP](AUDIT-MAP.md) item, then its pinned source | Open [AUDIT](AUDIT.md) only for disputed rationale, not as a default prompt. |
+
+Use [one applicable check](DEVELOPMENT.md#checks) and the directly affected
+[companion updates](DEVELOPMENT.md#change-propagation). Record inspected sections and
+actual results in the existing PR. These human task routes do not change the machine
+reader's required set or waive [integration evidence](DEVELOPMENT.md#documentation-integration).
 
 ## Small implementation rule
 
@@ -68,6 +87,8 @@ Correct the owner rule, update its direct consumers, then update the existing
 registry row with remaining work and evidence. Indexes contain links and purpose,
 not duplicated schema, backup algorithms, revision lists or CI status. Keep
 chronology in Git and issue/PR discussion. No second ledger or errata document.
+Use the [retirement recipe](DEVELOPMENT.md#retiring-documentation) before removing legacy material;
+file count is not a reason to delete a real input or retain an orphan projection.
 
 Use the [change-propagation map](DEVELOPMENT.md#change-propagation) to update only affected
 owners, source projections and references. [Checks](DEVELOPMENT.md#checks) give exact

@@ -134,19 +134,20 @@ def assert_governing_fragments(
     does not actually contain the fragment governing the requested topic cannot
     pass, whatever the route claims.
     """
-    handles = docs_router.read_json(root / docs_router.DEFAULT_INDEX).get("handles", {})
-    if not isinstance(handles, dict) or not handles:
-        raise ReadError("handle index has no handles")
-    expected = docs_router.governing_handles(handles, str(route.get("topic", "")))
+    fresh = None
     if (root / docs_router.DEFAULT_CONFIG).is_file():
         config = docs_router.load_config(root)
         if docs_router.version_paths(config, route.get("paths", []))["v3"]:
-            # Reuse the one router to prove the V3 file-owner set. Trusting a
-            # route's claimed version or empty handles would permit omissions.
             fresh = docs_router.route_payload(root, config, route["paths"], route.get("topic", ""))
             if route != fresh:
                 raise ReadError("V3/mixed route is stale or incomplete; rerun the router")
-            expected = fresh["governing_handles"]
+            if not docs_router.version_paths(config, route["paths"])["v2"]:
+                return []
+    handles = docs_router.read_json(root / docs_router.DEFAULT_INDEX).get("handles", {})
+    if not isinstance(handles, dict) or not handles:
+        raise ReadError("handle index has no handles")
+    expected = (fresh["governing_handles"] if fresh is not None else
+                docs_router.governing_handles(handles, str(route.get("topic", ""))))
     if not expected:
         return []
     required = {
@@ -215,7 +216,8 @@ def build_read_bundle(root: Path, route: dict[str, Any]) -> tuple[str, dict[str,
     chunks = [
         "# ELIOT verified documentation read bundle\n\n",
         f"Route receipt: `{route.get('receipt_id', '')}`\n\n",
-        f"Normative pair: `{route.get('pair_key', '')}`\n\n",
+        (f"Documentation authority key: `{route['pair_key']}`\n\n" if route.get("authority_file")
+         else f"Normative pair: `{route.get('pair_key', '')}`\n\n"),
         "> Every item below was verified against the route immediately before rendering.\n",
     ]
     for item in required:

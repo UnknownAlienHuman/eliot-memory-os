@@ -11,9 +11,9 @@ The current review target is
 [PR #5327](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5327), owned by
 [issue #5326](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5326):
 
-- [Schema package at c5154b0](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/c5154b0ea352980279cd0d46ca3353148d4c8027/crates/storage/eliot-v3-store-schema)
+- [Schema package at a040bd4](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/a040bd408be39afa9789561595d2cac8bef177b3/crates/storage/eliot-v3-store-schema)
   owns DDL, one wrapper, source catalog metadata and their digests.
-- [Fixed queries](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/c5154b0ea352980279cd0d46ca3353148d4c8027/crates/storage/eliot-v3-store-schema/src/queries.rs)
+- [Fixed queries](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/a040bd408be39afa9789561595d2cac8bef177b3/crates/storage/eliot-v3-store-schema/src/queries.rs)
   are source fragments, not complete capture/revision/job operations or a connected client.
 
 That PR is separate and unmerged at this review. Naming its package as the sole asset
@@ -32,10 +32,65 @@ equally current formats. Do not restore or dynamically load them as a fallback.
 
 ## Next source increment
 
-Follow [Implementation §11](../IMPLEMENTATION.md#11-implementation-sequence), not the old
-all-in-one Slice 0 checklist. First connect the actual Store admission and one complete
-capture/open path with finite input/result bounds, exact identity and unknown readback.
-Select only statements used by that path; keep unimplemented operations unavailable.
+Use the contracts on current `main`. The root first reconciles that baseline into
+the existing open source PR; the package has one writer, not a new competing branch.
+Pinned links above identify the source inspected on 2026-11-04, not a frozen implementation
+base. Inspect the live head and preserve changes made since that observation.
+
+The immediate #5326 assignment is **asset-package repair**, not all of Slice 0:
+
+1. Correct the missing constant imports in `src/queries.rs`, format the package and
+   run its [package-local checks](../DEVELOPMENT.md#rust-source). Report actual failures;
+   a compile fix does not close the remaining schema/semantic findings.
+2. Align DDL, complete operation statements/projections, validators, catalog and digests with
+   [R-174 and R-182–R-188](../ANALYSIS-REGISTRY.md#store-reconciliation). The selected
+   representations are in Implementation §4.7; do not invent aliases. Use the selected
+   [first Base limits](../IMPLEMENTATION.md#451-first-base-limits), not another blanket
+   maximum. Implement [capture identity/transaction/readback](../IMPLEMENTATION.md#72-capture-command-commit-and-replay)
+   and [exact open](../IMPLEMENTATION.md#73-exact-open-and-byte-ranges) first; do not expose
+   the existing separate stream/observation primitives as a complete capture API.
+   Carry §7.2's exact input through identity lookup, complete insert and open together.
+
+   | Existing source | Required correction |
+   |---|---|
+   | `QUERY_STREAM_LOOKUP` / stream construction | Derive the complete workspace-qualified key and compare its whole tuple; no workspace-less fallback or replay-time rebinding. |
+   | `QUERY_CAPTURE_IDENTITY` / complete capture transaction | Compare command and event digests plus their semantic fields; the inspected identity projection lacks those digests. Do not accept matching body hashes alone. |
+   | `QUERY_OBSERVATION_INSERT`, `QUERY_OPEN_OBSERVATION` and their decoders | Carry capture format, complete occurrence/binding tuples and policy limitations. Add owning fields/projections, not defaults inferred from the current host, time or another observation. |
+
+   For native redelivery B of an event committed as A, compare §7.2's event semantics,
+   return canonical A and retire only B's pending entry under §7.5's selection check.
+   Do not require a canonical B row, overwrite A's command hash or create a duplicate.
+   Keep the actual transaction result and its decoder together; no separate receipt table.
+3. Publish the corrected asset increment with exact-engine/catalog gaps still named.
+   `inspect` validates embedded assets; it does not establish a working Store.
+
+The **next connected runtime assignment** follows
+[Implementation §11](../IMPLEMENTATION.md#11-implementation-sequence): actual Store
+admission, one bounded client and the inline capture/open path with unknown-outcome
+readback. [The planned single runtime package](../IMPLEMENTATION.md#111-source-placement-and-handoff)
+consumes these assets; it does not copy SQL or turn `inspect` into a daemon. Select only
+the statements used by that path. It does not wait for inference
+or the full backup campaign, and absent operations remain unavailable rather than stubs.
+
+**When Slice 2 connects direct updates**, use
+[the command and revision projection](../IMPLEMENTATION.md#741-command-body-and-revision-projection)
+and [the atomic publication rule](../IMPLEMENTATION.md#742-atomic-publication-and-replay-result).
+The inspected 31-query corpus has no complete create/revise operation. Add its statement
+and decoder with that caller, not generic CRUD or a second mutation table. Align
+`QUERY_OPEN_MEMORY_CURRENT`, `QUERY_OPEN_MEMORY_HISTORY`, `QUERY_BACKUP_MEMORY` and
+`QUERY_BACKUP_MEMORY_HISTORY` with the same complete projection; include original
+operation results in observation readback/backup. Full replacement must not inherit
+omitted fields or old grounds. Align time assertions with frozen receipt timestamps,
+not assumed wall-clock monotonicity. Capture/open remains the first source increment;
+this later revision work does not enlarge its assignment into all of Slice 2.
+
+The same Slice 2 handoff includes [current-work selection](../COGNITION.md#2-current-work-reconstruction):
+validate reserved work-view addresses in the revision writer and add their bounded exact
+lookup, without treating lexical or receipt-time continuation queries as that lookup.
+Commitments use existing create-operation binding/result plus current hydration, not a
+new membership table. Align the current projection, packet role/qualifier decoder and
+final delivery checks; include commitment_state and method_role where applicable.
+The existing task/session continuation queries must not become cross-task fallbacks.
 
 Rust compile/Clippy checks source; exact-engine execution checks the selected DDL/query
 and DTO boundary; restart/readback checks the connected behavior. One does not imply

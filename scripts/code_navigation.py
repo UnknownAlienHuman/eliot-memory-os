@@ -20,13 +20,6 @@ from code_navigation_lib import (
     route_payload,
     self_test,
 )
-from code_navigation_lib.capsules import (
-    CAPSULE_ROOT,
-    INDEX_PATH,
-    build_capsules,
-    check_capsules,
-    emit_capsules,
-)
 from code_navigation_lib.package_docs import (
     check as check_package_docs,
     self_test as package_docs_self_test,
@@ -71,15 +64,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     capsules_parser = sub.add_parser(
         "capsules",
         help=(
-            "Generate the mandatory I2.20 ModuleContractKit + CrateContextCapsule "
-            "+ ModuleTestCapsule triad for every declared functional capability cell"
+            "Inspect or regenerate retained V2 I2.20 capsule triads; "
+            "not a V3 requirement or acceptance check"
         ),
     )
     add_root(capsules_parser)
     capsules_parser.add_argument(
         "--emit",
         action="store_true",
-        help=f"write every artifact and the index under {CAPSULE_ROOT}/",
+        help="write retained V2 artifacts and their index under docs/code-navigation/capsules/",
     )
     capsules_parser.add_argument(
         "--check",
@@ -127,6 +120,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(render_route(payload))
         elif args.command == "capsules":
+            from code_navigation_lib.capsules import (
+                INDEX_PATH, build_capsules, check_capsules, emit_capsules,
+            )
+            print("CAPSULE_SCOPE: retained-v2; not V3 acceptance")
             if args.check:
                 failures = check_capsules(root)
                 if failures:

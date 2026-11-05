@@ -5,10 +5,12 @@ This committed file is a deterministic navigation projection for Cargo packages
 that exist in the repository but are not admitted by the root
 [`Cargo.toml`](../../Cargo.toml). Prototype presence is not workspace admission,
 implementation completion, runtime support, or Product acceptance. Package-to-
-documentation mappings come from [`logical-blocks.toml`](logical-blocks.toml),
-the canonical [`handle-index.json`](../architecture/handle-index.json), and the
-inherited [`crates/AGENTS.md`](../../crates/AGENTS.md) contract. Do not edit it
-by hand.
+documentation mappings use [`route-rules.toml`](../architecture/route-rules.toml)
+and declared `contract_refs` for V3 targets; retained targets use
+[`logical-blocks.toml`](logical-blocks.toml) defaults. Source classifications
+do not override V3 routes. Actual legacy references still require their index.
+The inherited [`crates/AGENTS.md`](../../crates/AGENTS.md) contract remains checked.
+Do not edit by hand.
 
 ```powershell
 python scripts/code_navigation.py sync-index --root .

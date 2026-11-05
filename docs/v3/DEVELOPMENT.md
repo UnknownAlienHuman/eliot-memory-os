@@ -12,6 +12,7 @@ fifth specification nor another backlog. Read only the section needed by your ta
 | Choose checks and interpret failure | [Checks](#checks) |
 | Update a contract, source or reference | [Change propagation](#change-propagation) |
 | Register or refresh the actual task | [Assignment registration](#assignment-registration) |
+| Retire old documentation safely | [Legacy consumers](#legacy-documentation-consumers) |
 | Deliver documentation to main | [Documentation integration](#documentation-integration) |
 
 ## Repository map
@@ -57,9 +58,10 @@ transactions and network/runtime wiring follow the owning implementation assignm
 
 ## One bounded task
 
-Read [AGENTS](../../AGENTS.md) and select one [task route](README.md#task-routes).
+Use the already selected [task route](README.md#task-routes) and applicable
+[AGENTS](../../AGENTS.md#select-the-version-and-task); do not restart entry-page reading.
 Use the existing issue/PR for an unfinished owner; do not start a competing writer.
-In that issue/PR, record only:
+The manager passes exact owner sections and source paths, not whole books. Record only:
 
 ```text
 Outcome: the concrete changed behavior or corrected document rule.
@@ -92,6 +94,15 @@ self-reading is useful, but is not an independent review or approval.
 
 ## Checks
 
+Select by the changed surface; this page is a menu, not a pipeline. Diff/scope review
+applies to every change. Ordinary V3 prose uses [scoped references](#operational-references)
+and semantic review. For a changed Markdown page outside the scoped checker's configured
+roots (for example `START.md`), use the [full link scan](#documentation-and-navigation);
+renames/deletions/changed anchors require it as well. Source uses changed-package
+fmt/Clippy and its [behavior row](#behavior-specific-review); navigation-tool edits use
+[their own checks](#code-navigation). Required CI and final-tree reading evidence remain
+separate obligations under [documentation integration](#documentation-integration).
+
 ### Checkout and diff
 
 Run in the manager-assigned checkout. Only the root manager refreshes upstream refs.
@@ -121,8 +132,12 @@ local snapshot must never be reported as a full-checkout verification.
 ### Documentation and navigation
 
 First check meaning: a rule has one owner, its consumer can find it, unresolved design
-is named, and implemented behavior is not inferred from prose. Then check local links
-from a **complete checkout** with the existing public module's link-only function:
+is named, and implemented behavior is not inferred from prose. For ordinary V3 edits,
+run [scoped references](#operational-references) on supported changed pages/consumers.
+A real changed Markdown page outside the configured roots, such as `START.md`, uses
+the full link scan below; do not omit it or expand configuration just for a prose edit.
+A rename, deletion, changed heading/anchor or assigned whole-repository check also needs
+this scan of incoming links from a **complete checkout**:
 
 ```text
 python -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); import docs_shards; print(docs_shards.verify_markdown_links(Path('.')))"
@@ -146,8 +161,87 @@ not proof that URLs in external issues or other repositories were checked. Inspe
 related open issues/PRs and pinned links separately. Keep historical links historical.
 
 Do not run `docs_shards.py migrate` or regenerate the V2 router/indexes for a V3 prose
-edit: they own different surfaces. Full shard/router/conformance checks are selected
-only when their actual surface changes or when required by integration.
+edit. The one-shot migration refuses an already-sharded tree before writing history
+or navigation. Full shard/router/conformance checks are selected only when their
+actual surface changes or when required by integration. A retained-V2 integrity
+result does not validate the V3 specification; see [the consumer map](#legacy-documentation-consumers).
+
+### Code navigation
+
+For one task, use the path route rather than regenerating the whole index:
+
+```text
+python scripts/code_navigation.py route --path docs/v3/IMPLEMENTATION.md --format json
+```
+
+Replace the path with the actual existing source/document; add `--topic` only when
+another boundary is relevant. `route-rules.toml` selects V3 by path. Confirm
+`documentation_scope`, package/admission, dependencies and `resolved_contract_refs`.
+The full Cargo inventory is still checked; only unrelated legacy documentation
+references are outside this path scope. Actual legacy refs in selected package
+metadata are not discarded. A malformed or unresolved ref is an error, not a
+reason to remove it or mark the package complete.
+
+Declare V3 `[package.metadata.eliot].contract_refs` as root-relative files with
+optional Markdown anchors. Update each referring manifest when its owner/heading
+moves, plus the existing route rule and logical block when adding a source family.
+The resolver checks actual file/anchor/case/path identity without a V2 index.
+Full `check`/`sync-index` use the same route rules for each V3 target and include its
+package's declared refs. A retained sibling target keeps its own block defaults;
+forward and reverse indexes share this per-target relation. A reference does not
+relabel a source version. Do not change routing merely to hide a legacy failure.
+
+`logical-blocks.toml` keeps source/path coverage and retained defaults. Its existing
+`documentation_handles` accepts canonical file/anchor refs as well as retained
+numeric handles; empty or non-string declarations fail. Any actual legacy handle
+loads and validates the complete legacy index, regardless of a record's `source`
+label. `ELIOT_ARCHITECTURE:`/`ELIOT_IMPLEMENTATION:` must agree with the referenced
+source. Retained V2 package metadata remains under its existing capsule diagnostics;
+this change does not silently promote or repair those donors.
+
+For navigation-tool changes, run `python scripts/code_navigation.py self-test` and
+`python scripts/code_navigation.py check --root .`. Full checking retains Cargo,
+dependency, target, inherited instruction and both committed-index checks. When an
+index is stale, inspect the source/manifest delta, run the existing `sync-index`,
+review the generated diff, then repeat `check`. After changing version selection,
+inspect the affected target in both directions; a sibling target must not acquire
+or lose its references. Never substitute a scoped route for the full result.
+
+`code_navigation.py capsules` is explicitly retained-V2 only; its presence or PASS
+is not a V3 requirement or acceptance result. Do not emit V2 triads for a V3 task.
+
+### Operational references
+
+For V3 file/heading references, use the existing conformance front door:
+
+```text
+python scripts/verify-doc-code-conformance.py --references-only --path docs/v3/COGNITION.md
+```
+
+Replace the example with the actual changed page and repeat `--path` for every changed
+page/consumer. Use `--path docs/v3` only when the whole V3 directory is the assigned
+scope. Scope must be inside the configured scan roots; missing, symlinked,
+wrong-case or empty selections fail. This checks current repository-relative
+`docs/v3/IMPLEMENTATION.md#4-migration-0001-and-schema-authority` references and local Markdown links in selected V3 pages.
+External pinned URLs are not fetched or reinterpreted as current local files.
+
+For `DCC-017` specifically reporting a real edited Markdown page outside configured
+reference roots, use [the full link scan](#documentation-and-navigation). That fallback
+does not excuse a nonexistent path, wrong case, symlink or malformed reference; repair
+those errors. Without a complete checkout, report the full check as NOT_EXECUTED and
+retain the page in the review scope.
+
+Indexes are loaded from actual references, not from a claimed version: a legacy
+numeric selector still needs its numeric index; an `ARCH-*` reference also needs
+the Decision Anchor projection. A mixed file cannot hide a broken V2 reference
+by living under `docs/v3`. Unknown selectors and missing required inputs fail.
+
+The output explicitly says `scope=references-only`; it is not full conformance,
+reader evidence, semantic review or product acceptance. Run the unqualified
+`python scripts/verify-doc-code-conformance.py` when the full repository check is
+assigned. Its configured denominator and other detectors are unchanged. Use the
+full [link scan](#documentation-and-navigation) after renames/deletions: a selected
+outgoing-reference check alone cannot find unselected incoming references.
 
 ### Rust source
 
@@ -265,10 +359,17 @@ paths retain V2 obligations. A mixed change includes both sets under the same co
 byte limit. Inspect `required` against the task route: a route name is not coverage.
 An existing edited V3 Markdown file is also read; deleted paths remain in the scope.
 
-Route configuration uses `eliot-doc-route-config-v2`, so an older router rejects it
-instead of ignoring version fields. Route/read receipt formats are unchanged. Their
-retained V2 pair key is compatibility metadata, not V3 architectural authority.
-The reader recomputes the V3/mixed route before accepting its owner-file set.
+Route configuration uses `eliot-doc-route-config-v3`; older loaders reject it.
+The `authority_file` is the existing architecture-authority page. Its exact SHA-256
+is the shared `pair_key` in both single and composed receipts (historical wire name,
+not adoption of V2). Pure V3 route/read/evidence needs no V2 handle index or pair
+receipt. V2 and mixed scopes still require and verify them. The reader recomputes
+the exact V3/mixed route before accepting the owner-file set.
+
+Final-tree projection must include the V3 baseline and every existing changed V3
+Markdown file, even one not individually named by a route. Check projected/full-tree
+receipt equality after changing this dependency set; an omitted file is not an
+optimization. Deletions remain in the changed-path denominator.
 
 When an authorized task changes path ownership, update the existing
 [route rules](../architecture/route-rules.toml), add a bounded coverage example naming
@@ -341,6 +442,60 @@ the machine catalogue; ANALYSIS-REGISTRY remains the sole V3 work ledger.
 Membership fixes only the assignment lookup. The actual PR still needs its own recorded
 checklist bound to the final candidate tree, genuine reading evidence and independent
 review. A local counterexample using synthetic tree IDs is never that evidence.
+
+### Routing metadata
+
+After the reader has generated a receipt for the **complete changed-path set**,
+print the metadata from the same checkout, using the existing verifier helper:
+
+```text
+python -c "import json; from pathlib import Path; from scripts.work_unit_gate import doc_read_evidence as e; r=json.loads(Path('.eliot/docs-read-receipt.json').read_text(encoding='utf-8')); print(json.dumps(e._contract_inputs(Path('.'), r['paths']), indent=2))"
+```
+
+Copy that exact object into `contract_inputs`. Pure V3 has route-rules and authority
+path/hash pairs plus reader/router identities; V2/mixed adds handle-index and
+normative-pair path/hash pairs. For composed evidence use the union of all part paths,
+not just the first part. Do not retain extra legacy keys for a pure V3 task or omit
+them for a mixed task. The candidate verifier independently recomputes the selection.
+This command generates metadata, not an attestation that someone read the bundle.
+Any candidate/base change still requires final-candidate verification below.
+
+### Retiring documentation
+
+Remove an index only after checking tracked links, string/path consumers and its
+producer. The removed `architecture/sections/` and `implementation/sections/` pages
+were orphan projections: the two book indexes and handle index already supply their
+links. Their generator was removed too. Complete originals remain at
+[the pre-cleanup revision](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/e708e4aa67413bfde24b1115a95e181f4db7151c/docs/architecture).
+
+### Legacy documentation consumers
+
+These are real dependencies, not permission to resume V2. Change the named consumer
+and its callers before deleting its input. Keep one routing owner; do not add another
+schema catalogue or checker just to retire the first one.
+
+| Consumer and callers | Retained input actually read | Migration boundary / check |
+|---|---|---|
+| `docs_shards_core.verify` through `docs_shards.py`, `verify-normative.ps1`/`.sh`, `verify.ps1` and `Justfile` | Both manifests, their fragments, V2 pair receipt and generated indexes | `verify_pair` validates the retained receipt/manifests, not literals in the V3 authority page. Missing/corrupt V2 input must fail. `verify --normative-only` reports `scope=retained-v2`; a pass is not V3 acceptance. |
+| `doc_code_conformance_lib/normative_references.audit`, called by `verify-doc-code-conformance.py` | Current file/heading targets; V2 numeric index only for numeric/Decision selectors, Decision Anchor index and A16.1 only for Decision selectors | [Scoped reference check](#operational-references) needs no unused V2 inputs. Full/mixed scans still validate every selected legacy reference. No directory-wide exclusion; remaining legacy references must migrate before their indexes are removed. |
+| `code_navigation.py route` / registry / contract destinations | Current V3 owner files from existing route rules; actual package `contract_refs` | V3 path scope no longer needs unused V2 indexes. Keep exact file/anchor and Cargo checks; mixed package refs still require their V2 input. See [the recipe](#code-navigation). |
+| Full code-navigation `check` / `sync-index` | V3 per-target route owners and package refs; retained targets and block declarations still use their stated defaults | Same relation drives validation and both index directions. Full direct-file declarations need no V2 index; one real legacy handle retains full integrity checks. Existing donor declarations are not automatically rewritten. |
+| `code_navigation.py capsules` | V2 capability-cell/triad semantics and catalogue | Explicit retained-V2 scope; no V3 acceptance. Retire the actual generator/consumers as a unit, not by treating direct-ref support as migration of its semantics. |
+| `docs_closure_audit.py`, `Justfile` (`docs-closure-audit`, `quick`), `verify.ps1` (`documentation-closure-audit`, `normative-pair`) and repository-policy | V2 manifests, pair/index identities, original Git history and historical workstreams | Only for an explicitly assigned migration: change the actual profile selection and policy wiring together. R-207 in the registry owns priority; this row assigns no next task. Preserve required checks for affected V2/shared inputs; a historical skip is not PASS. Missing Git history is not missing V3 implementation. Do not add another verifier/profile merely to obtain green CI. |
+
+Before editing a consumer, inspect its current callers and declared inputs:
+
+```text
+git grep -n -F -e 'verify_pair' -e 'docs_shards' -e 'verify-normative' -- scripts Justfile .github
+git grep -n -F -e 'normative_references' -e 'DEFAULT_HANDLE_INDEX' -e 'docs_closure_audit' -- scripts config Justfile .github
+```
+
+Then run the existing check for that boundary on intact and deliberately missing
+input, plus the full local-link/router checks after path changes. Temporary negative
+inputs stay outside tracked files. Do not modify hashes or suppress failures to admit
+missing data. Preserve originals by immutable Git revision, not another archive tree.
+The [R-207 continuation](ANALYSIS-REGISTRY.md#legacy-consumer-migration) owns status and
+order; this table owns file responsibilities, not a duplicate backlog.
 
 ### Final-candidate verification
 

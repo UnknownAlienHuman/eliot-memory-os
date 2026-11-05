@@ -10,25 +10,34 @@ removal path is retired rather than kept as archaeology. Generated reports,
 receipts, bundles, caches, and runtime state are local/CI evidence and are not
 committed as repository authority.
 
+## Select V3 or retained V2
+
+For V3, use the [task-specific checks](../docs/v3/DEVELOPMENT.md#checks), not every
+script listed here. Router/reader and navigation projections select current owners
+by path. Shard/pair checks, retained navigation declarations, capsule generation
+and the historical closure audit still consume V2; they do not certify V3 design
+or runtime. See the
+[consumer map](../docs/v3/DEVELOPMENT.md#legacy-documentation-consumers) before retirement.
+
 ## Repository verification and documentation pipeline
 
 | Script | Purpose | Proof ceiling |
 |---|---|---|
 | `verify.ps1` | Windows developer verification for documentation, normative identity, architecture boundaries, agent guardrails/routes, source hygiene, protocol policy, Cargo metadata, formatting, and workspace check | Source/build candidate only |
 | `verify.sh` | Unix entrypoint for the same PowerShell-owned bounded verification profile | Source/build candidate only |
-| `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
-| `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
-| `docs_shards.py` | Public documentation front door: generate/check routed instruction surfaces and verify reconstructed shards, Markdown paths, anchors, exclusions, and exact path case | Normative content/layout and Markdown-link integrity only |
+| `verify-normative.ps1` | Recompute retained V2 book digests and pair key; reject predecessor copies | Retained V2 integrity only, not current V3 authority |
+| `verify-normative.sh` | Unix wrapper for the same retained-V2 check | Retained V2 integrity only |
+| `docs_shards.py` | Shared Markdown link checks and explicit retained-V2 shard verification; `migrate` is historical one-shot conversion | Selected link/layout integrity only; no V3 readiness verdict |
 | `docs_shards_core.py` | Byte-preserved sharding/reconstruction implementation called by `docs_shards.py`; not a separate operator entrypoint | Internal documentation implementation |
 | `docs_router.py` | Public router front door: reject unsafe paths, include deletions in changed-path routing, and emit bounded content-addressed route receipts | Documentation routing evidence only |
 | `docs_router_core.py` | Byte-preserved router implementation called by `docs_router.py`; not a separate operator entrypoint | Internal documentation implementation |
 | `docs_read.py` | Verify routed files/fragments by hash and byte count, materialize a bounded bundle, and emit a read receipt | Documentation reading evidence only |
-| `docs_closure_audit.py` | Temporary independent audit of shard reconstruction, original Git blobs, generated indexes, operational references, and workstream issue-state parity | Audit evidence for the current documentation closure only; remove after closure |
+| `docs_closure_audit.py` | Retained V2 audit of shards, Git history, indexes, references and old workstreams; still called by verification entrypoints | Historical closure evidence only; migrate callers before removal |
 | `verify-work-unit.py` | Retired legacy source-shape diagnostic for one capability cell: reads `[acceptance]` from the crate's `module.toml` for hints only; always reports completion=NOT_VERIFIED and never accepts a work unit — acceptance is decided by the owning contract plus independent review | Hints only; no work unit is accepted by this entrypoint |
-| `code_navigation.py` | Navigate current Cargo packages, Rust files, logical blocks, and documentation routes (supported commands: `check`, `sync-index`, `package-docs-self-test`, `prototype-docs-self-test`, `self-test`, `list`, `route`) | Repository navigation and static path/dependency consistency only |
+| `code_navigation.py` | Cargo/source inventory; route and full indexes use V3 per-target owner/package refs or actual retained defaults. `capsules` remains explicitly V2-only | Static navigation only; [scope and update recipe](../docs/v3/DEVELOPMENT.md#code-navigation), no runtime/reading acceptance |
 | `verify-standalone-crates.py` | Runs fmt, clippy and tests for every crate that declares its own `[workspace]` and is neither a workspace member nor an excluded capability cell, and proves the workspace member set and the standalone-crate set agree as two independent declared sets | Package proof for crates no other gate reaches; admits nothing to the workspace |
 | `verify-cognitive-donor-dispositions-816.py` | Compares every `cognitive-donor-map.toml` donor and topology-donor disposition against current source, holds them to one current base, and refuses a topology donor promoted past its authority ceiling | Static metadata evidence at the donor map's declared proof ceiling; never runtime or product evidence |
-| `verify-doc-code-conformance.py` | Public conformance front door for reader instructions, workflow claims, retired/nonexistent references, script/binary maps, owner bindings, and documentation-pipeline integrity | Static repository path/inventory/instruction consistency only |
+| `verify-doc-code-conformance.py` | Public conformance front door; `--references-only --path <file-or-directory>` selects only operational-reference checks without changing the default full audit | Explicitly scoped reference consistency or full static conformance; neither is runtime acceptance |
 | `verify-process-deadline-owner.py` | Source-shape discriminator for the #83 failure where a resumed process receives a start receipt while the wall-deadline owner thread is never spawned | Static source-shape evidence only; not Windows containment or wall-time proof |
 | `doc_code_conformance_core.py` | Established deterministic DCC-001…DCC-007 implementation called by the public conformance front door | Internal conformance implementation |
 | `audit-architecture-boundaries.py` | Detect forbidden dependencies, SurrealDB leakage, untracked direct process launch, placeholders, and exact tracked debt | Static source/build architecture evidence only |
@@ -69,18 +78,23 @@ Their `*_core.py` modules retain the established implementations while the front
 doors own security/portability checks and focused negative fixtures. Call the
 public filenames, not the core modules.
 
-Run the documentation checks locally from the exact candidate checkout:
+Select checks from the [development guide](../docs/v3/DEVELOPMENT.md#checks).
+For an assigned retained-V2 integrity change, the existing narrow commands are:
 
-```powershell
-python -m py_compile scripts/docs_shards.py scripts/docs_shards_core.py scripts/docs_router.py scripts/docs_router_core.py scripts/docs_read.py scripts/verify-doc-code-conformance.py scripts/doc_code_conformance_core.py
+```text
 python scripts/docs_shards.py self-test
-python scripts/docs_shards.py verify --root .
-python scripts/docs_router.py self-test
-python scripts/docs_router.py check --root .
-python scripts/docs_read.py self-test
-python scripts/verify-doc-code-conformance.py --self-test
-python scripts/verify-doc-code-conformance.py --root . --json-out .eliot/doc-code-conformance.json
+python scripts/docs_shards.py verify --root . --normative-only
 ```
+
+The second command validates the retained receipt, source reconstruction and generated
+indexes, not V3 authority or all repository links. Omit `--normative-only` to include
+the link scan. Never use `migrate` to repair V3 or a partially missing shard set:
+recover the exact missing input from Git instead. Repository-wide conformance and
+code-navigation commands are separate checks, not prerequisites for V3 prose edits.
+
+For a current-only reference check, follow the [scoped recipe](../docs/v3/DEVELOPMENT.md#operational-references).
+Legacy inputs are loaded only when selected content actually references them.
+The full command and its other checks remain unchanged; a scoped PASS is not a full PASS.
 
 The conformance policy introduced by issue #291 lives at
 `config/doc-code-conformance.toml`; findings fail nonzero:
@@ -101,10 +115,12 @@ The conformance policy introduced by issue #291 lives at
 - `DCC-015` — unknown numeric `A*`/`I*` handle or handle range in a code span or
   path-qualified reference;
 - `DCC-016` — unknown `ARCH-*` Decision Anchor;
-- `DCC-017` — generated normative/Decision-Anchor index missing, symlinked, or
-  drifted from its canonical projection;
+- `DCC-017` — invalid reference scope/configuration or a required legacy index
+  missing, symlinked, or drifted from its canonical projection;
 - `DCC-018` — stale documentation provenance or authority prose anywhere under the
-  declared production/current-documentation roots. See the section below.
+  declared production/current-documentation roots. See the section below;
+- `DCC-019` — missing/wrong-case/symlinked current document target, missing heading,
+  unreadable target or repository escape in a current reference.
 
 ### DCC-018 — stale documentation provenance (issue #1147)
 
