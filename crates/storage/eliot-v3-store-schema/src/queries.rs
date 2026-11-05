@@ -1,4 +1,4 @@
-use crate::{QueryBounds, QueryClass, QueryId, QuerySpec};
+use crate::{BACKUP_PAGE, PAGE_READ, QueryClass, QueryId, QuerySpec, SCHEMA_READ, SMALL_READ};
 
 const QUERY_STORE_PROBE: &str = r#"RETURN { probe: "eliot-v3-store", ok: true };
 "#;
@@ -244,36 +244,198 @@ macro_rules! query {
 }
 
 pub const QUERIES: &[QuerySpec] = &[
-    query!(StoreProbe, "store_probe", Read, QUERY_STORE_PROBE, SMALL_READ),
-    query!(StreamLookup, "stream_lookup", Read, QUERY_STREAM_LOOKUP, SMALL_READ),
-    query!(StreamInsert, "stream_insert", Mutation, QUERY_STREAM_INSERT, SMALL_READ),
-    query!(StreamLock, "stream_lock", Mutation, QUERY_STREAM_LOCK, SMALL_READ),
-    query!(StreamAdvance, "stream_advance", Mutation, QUERY_STREAM_ADVANCE, SMALL_READ),
-    query!(CaptureIdentity, "capture_identity", Read, QUERY_CAPTURE_IDENTITY, SMALL_READ),
-    query!(ObservationInsert, "observation_insert", Mutation, QUERY_OBSERVATION_INSERT, SMALL_READ),
-    query!(ContinuationTask, "continuation_task", Read, QUERY_CONTINUATION_TASK, PAGE_READ),
-    query!(ContinuationSession, "continuation_session", Read, QUERY_CONTINUATION_SESSION, PAGE_READ),
-    query!(OpenMemoryCurrent, "open_memory_current", Read, QUERY_OPEN_MEMORY_CURRENT, SMALL_READ),
-    query!(OpenMemoryHistory, "open_memory_history", Read, QUERY_OPEN_MEMORY_HISTORY, SMALL_READ),
-    query!(OpenObservation, "open_observation", Read, QUERY_OPEN_OBSERVATION, SMALL_READ),
-    query!(LinksForward, "links_forward", Read, QUERY_LINKS_FORWARD, PAGE_READ),
-    query!(LinksReverse, "links_reverse", Read, QUERY_LINKS_REVERSE, PAGE_READ),
-    query!(LexicalObservation, "lexical_observation", Read, QUERY_LEXICAL_OBSERVATION, PAGE_READ),
-    query!(LexicalMemory, "lexical_memory", Read, QUERY_LEXICAL_MEMORY, PAGE_READ),
+    query!(
+        StoreProbe,
+        "store_probe",
+        Read,
+        QUERY_STORE_PROBE,
+        SMALL_READ
+    ),
+    query!(
+        StreamLookup,
+        "stream_lookup",
+        Read,
+        QUERY_STREAM_LOOKUP,
+        SMALL_READ
+    ),
+    query!(
+        StreamInsert,
+        "stream_insert",
+        Mutation,
+        QUERY_STREAM_INSERT,
+        SMALL_READ
+    ),
+    query!(
+        StreamLock,
+        "stream_lock",
+        Mutation,
+        QUERY_STREAM_LOCK,
+        SMALL_READ
+    ),
+    query!(
+        StreamAdvance,
+        "stream_advance",
+        Mutation,
+        QUERY_STREAM_ADVANCE,
+        SMALL_READ
+    ),
+    query!(
+        CaptureIdentity,
+        "capture_identity",
+        Read,
+        QUERY_CAPTURE_IDENTITY,
+        SMALL_READ
+    ),
+    query!(
+        ObservationInsert,
+        "observation_insert",
+        Mutation,
+        QUERY_OBSERVATION_INSERT,
+        SMALL_READ
+    ),
+    query!(
+        ContinuationTask,
+        "continuation_task",
+        Read,
+        QUERY_CONTINUATION_TASK,
+        PAGE_READ
+    ),
+    query!(
+        ContinuationSession,
+        "continuation_session",
+        Read,
+        QUERY_CONTINUATION_SESSION,
+        PAGE_READ
+    ),
+    query!(
+        OpenMemoryCurrent,
+        "open_memory_current",
+        Read,
+        QUERY_OPEN_MEMORY_CURRENT,
+        SMALL_READ
+    ),
+    query!(
+        OpenMemoryHistory,
+        "open_memory_history",
+        Read,
+        QUERY_OPEN_MEMORY_HISTORY,
+        SMALL_READ
+    ),
+    query!(
+        OpenObservation,
+        "open_observation",
+        Read,
+        QUERY_OPEN_OBSERVATION,
+        SMALL_READ
+    ),
+    query!(
+        LinksForward,
+        "links_forward",
+        Read,
+        QUERY_LINKS_FORWARD,
+        PAGE_READ
+    ),
+    query!(
+        LinksReverse,
+        "links_reverse",
+        Read,
+        QUERY_LINKS_REVERSE,
+        PAGE_READ
+    ),
+    query!(
+        LexicalObservation,
+        "lexical_observation",
+        Read,
+        QUERY_LEXICAL_OBSERVATION,
+        PAGE_READ
+    ),
+    query!(
+        LexicalMemory,
+        "lexical_memory",
+        Read,
+        QUERY_LEXICAL_MEMORY,
+        PAGE_READ
+    ),
     query!(DueJobs, "due_jobs", Read, QUERY_DUE_JOBS, PAGE_READ),
     query!(ClaimJob, "claim_job", Mutation, QUERY_CLAIM_JOB, SMALL_READ),
-    query!(BackupStream, "backup_stream", Read, QUERY_BACKUP_STREAM, BACKUP_PAGE),
-    query!(BackupObservation, "backup_observation", Read, QUERY_BACKUP_OBSERVATION, BACKUP_PAGE),
-    query!(BackupMemory, "backup_memory", Read, QUERY_BACKUP_MEMORY, BACKUP_PAGE),
-    query!(BackupMemoryHistory, "backup_memory_history", Read, QUERY_BACKUP_MEMORY_HISTORY, BACKUP_PAGE),
-    query!(BackupLink, "backup_link", Read, QUERY_BACKUP_LINK, BACKUP_PAGE),
+    query!(
+        BackupStream,
+        "backup_stream",
+        Read,
+        QUERY_BACKUP_STREAM,
+        BACKUP_PAGE
+    ),
+    query!(
+        BackupObservation,
+        "backup_observation",
+        Read,
+        QUERY_BACKUP_OBSERVATION,
+        BACKUP_PAGE
+    ),
+    query!(
+        BackupMemory,
+        "backup_memory",
+        Read,
+        QUERY_BACKUP_MEMORY,
+        BACKUP_PAGE
+    ),
+    query!(
+        BackupMemoryHistory,
+        "backup_memory_history",
+        Read,
+        QUERY_BACKUP_MEMORY_HISTORY,
+        BACKUP_PAGE
+    ),
+    query!(
+        BackupLink,
+        "backup_link",
+        Read,
+        QUERY_BACKUP_LINK,
+        BACKUP_PAGE
+    ),
     query!(BackupJob, "backup_job", Read, QUERY_BACKUP_JOB, BACKUP_PAGE),
-    query!(InfoDatabase, "info_database", SchemaRead, QUERY_INFO_DATABASE, SCHEMA_READ),
-    query!(InfoStream, "info_stream", SchemaRead, QUERY_INFO_STREAM, SCHEMA_READ),
-    query!(InfoObservation, "info_observation", SchemaRead, QUERY_INFO_OBSERVATION, SCHEMA_READ),
-    query!(InfoMemory, "info_memory", SchemaRead, QUERY_INFO_MEMORY, SCHEMA_READ),
-    query!(InfoMemoryHistory, "info_memory_history", SchemaRead, QUERY_INFO_MEMORY_HISTORY, SCHEMA_READ),
-    query!(InfoLink, "info_link", SchemaRead, QUERY_INFO_LINK, SCHEMA_READ),
+    query!(
+        InfoDatabase,
+        "info_database",
+        SchemaRead,
+        QUERY_INFO_DATABASE,
+        SCHEMA_READ
+    ),
+    query!(
+        InfoStream,
+        "info_stream",
+        SchemaRead,
+        QUERY_INFO_STREAM,
+        SCHEMA_READ
+    ),
+    query!(
+        InfoObservation,
+        "info_observation",
+        SchemaRead,
+        QUERY_INFO_OBSERVATION,
+        SCHEMA_READ
+    ),
+    query!(
+        InfoMemory,
+        "info_memory",
+        SchemaRead,
+        QUERY_INFO_MEMORY,
+        SCHEMA_READ
+    ),
+    query!(
+        InfoMemoryHistory,
+        "info_memory_history",
+        SchemaRead,
+        QUERY_INFO_MEMORY_HISTORY,
+        SCHEMA_READ
+    ),
+    query!(
+        InfoLink,
+        "info_link",
+        SchemaRead,
+        QUERY_INFO_LINK,
+        SCHEMA_READ
+    ),
     query!(InfoJob, "info_job", SchemaRead, QUERY_INFO_JOB, SCHEMA_READ),
 ];
 
@@ -314,5 +476,7 @@ pub fn query(id: QueryId) -> &'static QuerySpec {
 }
 
 pub fn query_by_name(name: &str) -> Option<&'static QuerySpec> {
-    QUERIES.iter().find(|specification| specification.name == name)
+    QUERIES
+        .iter()
+        .find(|specification| specification.name == name)
 }

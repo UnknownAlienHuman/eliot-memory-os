@@ -1,8 +1,8 @@
 #![allow(clippy::print_stdout)]
 
 use eliot_v3_store_schema::{
-    bundle_digest_hex, expected_catalog, metadata_bindings, query_corpus_digest_hex,
-    validate_assets, MIGRATIONS, QUERIES,
+    MIGRATIONS, QUERIES, bundle_digest_hex, expected_catalog, metadata_bindings,
+    query_corpus_digest_hex, validate_assets,
 };
 use std::error::Error;
 

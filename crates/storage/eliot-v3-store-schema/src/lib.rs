@@ -9,7 +9,7 @@ use std::fmt;
 
 mod queries;
 
-pub use queries::{query, query_by_name, QUERIES};
+pub use queries::{QUERIES, query, query_by_name};
 
 pub const SCHEMA_BUNDLE_FORMAT: u32 = 1;
 pub const RUNNER_PROTOCOL: u32 = 1;
@@ -147,26 +147,52 @@ pub enum BundleError {
     AssetTooLarge(&'static str),
     InvalidGoldenDigest,
     InvalidQueryGoldenDigest,
-    GoldenDigestMismatch { expected: [u8; 32], actual: [u8; 32] },
-    QueryGoldenDigestMismatch { expected: [u8; 32], actual: [u8; 32] },
+    GoldenDigestMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    QueryGoldenDigestMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
 }
 
 impl fmt::Display for BundleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingFinalNewline(name) => write!(formatter, "asset {name} has no final newline"),
-            Self::ContainsCarriageReturn(name) => write!(formatter, "asset {name} contains a carriage return"),
+            Self::MissingFinalNewline(name) => {
+                write!(formatter, "asset {name} has no final newline")
+            }
+            Self::ContainsCarriageReturn(name) => {
+                write!(formatter, "asset {name} contains a carriage return")
+            }
             Self::ContainsNul(name) => write!(formatter, "asset {name} contains a NUL byte"),
-            Self::DuplicateAssetName(name) => write!(formatter, "duplicate migration asset name: {name}"),
+            Self::DuplicateAssetName(name) => {
+                write!(formatter, "duplicate migration asset name: {name}")
+            }
             Self::DuplicateQueryName(name) => write!(formatter, "duplicate query name: {name}"),
-            Self::MissingMigrationPlaceholder => formatter.write_str("wrapper has no migration placeholder"),
+            Self::MissingMigrationPlaceholder => {
+                formatter.write_str("wrapper has no migration placeholder")
+            }
             Self::MalformedCatalogLine(line) => write!(formatter, "malformed catalog line: {line}"),
-            Self::MissingCatalogDefinition(name) => write!(formatter, "missing catalog definition: {name}"),
-            Self::DuplicateCatalogDefinition(name) => write!(formatter, "duplicate catalog definition: {name}"),
-            Self::UnlistedCatalogDefinition(line) => write!(formatter, "unlisted catalog definition: {line}"),
-            Self::AssetTooLarge(name) => write!(formatter, "asset {name} exceeds the u64 length prefix"),
-            Self::InvalidGoldenDigest => formatter.write_str("bundle.sha256 is not one lowercase SHA-256 digest"),
-            Self::InvalidQueryGoldenDigest => formatter.write_str("query-corpus.sha256 is not one lowercase SHA-256 digest"),
+            Self::MissingCatalogDefinition(name) => {
+                write!(formatter, "missing catalog definition: {name}")
+            }
+            Self::DuplicateCatalogDefinition(name) => {
+                write!(formatter, "duplicate catalog definition: {name}")
+            }
+            Self::UnlistedCatalogDefinition(line) => {
+                write!(formatter, "unlisted catalog definition: {line}")
+            }
+            Self::AssetTooLarge(name) => {
+                write!(formatter, "asset {name} exceeds the u64 length prefix")
+            }
+            Self::InvalidGoldenDigest => {
+                formatter.write_str("bundle.sha256 is not one lowercase SHA-256 digest")
+            }
+            Self::InvalidQueryGoldenDigest => {
+                formatter.write_str("query-corpus.sha256 is not one lowercase SHA-256 digest")
+            }
             Self::GoldenDigestMismatch { expected, actual } => write!(
                 formatter,
                 "bundle digest mismatch: expected {} actual {}",
@@ -215,13 +241,19 @@ fn validate_source_assets() -> Result<(), BundleError> {
 
     for (index, asset) in MIGRATIONS.iter().enumerate() {
         validate_text(asset.name, asset.sql)?;
-        if MIGRATIONS[..index].iter().any(|prior| prior.name == asset.name) {
+        if MIGRATIONS[..index]
+            .iter()
+            .any(|prior| prior.name == asset.name)
+        {
             return Err(BundleError::DuplicateAssetName(asset.name));
         }
     }
     for (index, query) in QUERIES.iter().enumerate() {
         validate_text(query.name, query.sql)?;
-        if QUERIES[..index].iter().any(|prior| prior.name == query.name) {
+        if QUERIES[..index]
+            .iter()
+            .any(|prior| prior.name == query.name)
+        {
             return Err(BundleError::DuplicateQueryName(query.name));
         }
     }
@@ -260,15 +292,15 @@ pub fn bundle_preimage() -> Result<Vec<u8>, BundleError> {
         push_segment(&mut bytes, asset.name, asset.name.as_bytes())?;
         push_segment(&mut bytes, asset.name, asset.sql.as_bytes())?;
     }
-    push_segment(&mut bytes, "expected_catalog.tsv", EXPECTED_CATALOG.as_bytes())?;
+    push_segment(
+        &mut bytes,
+        "expected_catalog.tsv",
+        EXPECTED_CATALOG.as_bytes(),
+    )?;
     Ok(bytes)
 }
 
-fn push_segment(
-    target: &mut Vec<u8>,
-    name: &'static str,
-    value: &[u8],
-) -> Result<(), BundleError> {
+fn push_segment(target: &mut Vec<u8>, name: &'static str, value: &[u8]) -> Result<(), BundleError> {
     let length = u64::try_from(value.len()).map_err(|_| BundleError::AssetTooLarge(name))?;
     target.extend_from_slice(&length.to_be_bytes());
     target.extend_from_slice(value);
@@ -311,7 +343,8 @@ fn parse_golden_digest() -> Result<[u8; 32], BundleError> {
     let mut digest = [0_u8; 32];
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk).map_err(|_| BundleError::InvalidGoldenDigest)?;
-        digest[index] = u8::from_str_radix(text, 16).map_err(|_| BundleError::InvalidGoldenDigest)?;
+        digest[index] =
+            u8::from_str_radix(text, 16).map_err(|_| BundleError::InvalidGoldenDigest)?;
     }
     Ok(digest)
 }
@@ -328,7 +361,8 @@ fn parse_query_golden_digest() -> Result<[u8; 32], BundleError> {
     let mut digest = [0_u8; 32];
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk).map_err(|_| BundleError::InvalidQueryGoldenDigest)?;
-        digest[index] = u8::from_str_radix(text, 16).map_err(|_| BundleError::InvalidQueryGoldenDigest)?;
+        digest[index] =
+            u8::from_str_radix(text, 16).map_err(|_| BundleError::InvalidQueryGoldenDigest)?;
     }
     Ok(digest)
 }
@@ -347,7 +381,11 @@ pub fn query_corpus_preimage() -> Result<Vec<u8>, BundleError> {
         QUERY_CORPUS_FORMAT.to_string().as_bytes(),
     )?;
     for specification in QUERIES {
-        push_segment(&mut bytes, specification.name, specification.name.as_bytes())?;
+        push_segment(
+            &mut bytes,
+            specification.name,
+            specification.name.as_bytes(),
+        )?;
         push_segment(
             &mut bytes,
             specification.name,
@@ -397,7 +435,11 @@ pub fn metadata_bindings() -> Result<MetadataBindings, BundleError> {
 
 pub fn render_transaction() -> Result<String, BundleError> {
     validate_assets()?;
-    let migrations = MIGRATIONS.iter().map(|asset| asset.sql).collect::<Vec<_>>().join("\n");
+    let migrations = MIGRATIONS
+        .iter()
+        .map(|asset| asset.sql)
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(WRAPPER_TEMPLATE.replacen("{{MIGRATION_ASSETS}}", &migrations, 1))
 }
 
@@ -418,7 +460,9 @@ pub fn expected_catalog() -> Result<Vec<CatalogEntry>, BundleError> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (category, name) = line.split_once('\t').ok_or(BundleError::MalformedCatalogLine(line))?;
+        let (category, name) = line
+            .split_once('\t')
+            .ok_or(BundleError::MalformedCatalogLine(line))?;
         if category.is_empty() || name.is_empty() || name.contains('\t') {
             return Err(BundleError::MalformedCatalogLine(line));
         }
@@ -426,7 +470,9 @@ pub fn expected_catalog() -> Result<Vec<CatalogEntry>, BundleError> {
             .iter()
             .flat_map(|asset| asset.sql.lines())
             .filter(|definition| catalog_definition_matches(definition, category, name));
-        let definition = matches.next().ok_or(BundleError::MissingCatalogDefinition(name))?;
+        let definition = matches
+            .next()
+            .ok_or(BundleError::MissingCatalogDefinition(name))?;
         if matches.next().is_some() {
             return Err(BundleError::DuplicateCatalogDefinition(name));
         }
@@ -458,7 +504,11 @@ fn catalog_definition_matches(definition: &str, category: &str, name: &str) -> b
         "tables" => words.next() == Some("TABLE") && words.next() == Some(name),
         "analyzers" => words.next() == Some("ANALYZER") && words.next() == Some(name),
         "fields" | "indexes" => {
-            let expected_kind = if category == "fields" { "FIELD" } else { "INDEX" };
+            let expected_kind = if category == "fields" {
+                "FIELD"
+            } else {
+                "INDEX"
+            };
             if words.next() != Some(expected_kind) {
                 return false;
             }
