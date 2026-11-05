@@ -58,9 +58,10 @@ transactions and network/runtime wiring follow the owning implementation assignm
 
 ## One bounded task
 
-Read [AGENTS](../../AGENTS.md) and select one [task route](README.md#task-routes).
+Use the already selected [task route](README.md#task-routes) and applicable
+[AGENTS](../../AGENTS.md#select-the-version-and-task); do not restart entry-page reading.
 Use the existing issue/PR for an unfinished owner; do not start a competing writer.
-In that issue/PR, record only:
+The manager passes exact owner sections and source paths, not whole books. Record only:
 
 ```text
 Outcome: the concrete changed behavior or corrected document rule.
@@ -93,6 +94,15 @@ self-reading is useful, but is not an independent review or approval.
 
 ## Checks
 
+Select by the changed surface; this page is a menu, not a pipeline. Diff/scope review
+applies to every change. Ordinary V3 prose uses [scoped references](#operational-references)
+and semantic review. For a changed Markdown page outside the scoped checker's configured
+roots (for example `START.md`), use the [full link scan](#documentation-and-navigation);
+renames/deletions/changed anchors require it as well. Source uses changed-package
+fmt/Clippy and its [behavior row](#behavior-specific-review); navigation-tool edits use
+[their own checks](#code-navigation). Required CI and final-tree reading evidence remain
+separate obligations under [documentation integration](#documentation-integration).
+
 ### Checkout and diff
 
 Run in the manager-assigned checkout. Only the root manager refreshes upstream refs.
@@ -122,8 +132,12 @@ local snapshot must never be reported as a full-checkout verification.
 ### Documentation and navigation
 
 First check meaning: a rule has one owner, its consumer can find it, unresolved design
-is named, and implemented behavior is not inferred from prose. Then check local links
-from a **complete checkout** with the existing public module's link-only function:
+is named, and implemented behavior is not inferred from prose. For ordinary V3 edits,
+run [scoped references](#operational-references) on supported changed pages/consumers.
+A real changed Markdown page outside the configured roots, such as `START.md`, uses
+the full link scan below; do not omit it or expand configuration just for a prose edit.
+A rename, deletion, changed heading/anchor or assigned whole-repository check also needs
+this scan of incoming links from a **complete checkout**:
 
 ```text
 python -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); import docs_shards; print(docs_shards.verify_markdown_links(Path('.')))"
@@ -201,14 +215,21 @@ is not a V3 requirement or acceptance result. Do not emit V2 triads for a V3 tas
 For V3 file/heading references, use the existing conformance front door:
 
 ```text
-python scripts/verify-doc-code-conformance.py --references-only --path docs/v3
+python scripts/verify-doc-code-conformance.py --references-only --path docs/v3/COGNITION.md
 ```
 
-Repeat `--path` for the exact files/directories being checked, including source
-consumers. Scope must be inside the configured scan roots; missing, symlinked,
+Replace the example with the actual changed page and repeat `--path` for every changed
+page/consumer. Use `--path docs/v3` only when the whole V3 directory is the assigned
+scope. Scope must be inside the configured scan roots; missing, symlinked,
 wrong-case or empty selections fail. This checks current repository-relative
 `docs/v3/IMPLEMENTATION.md#4-migration-0001-and-schema-authority` references and local Markdown links in selected V3 pages.
 External pinned URLs are not fetched or reinterpreted as current local files.
+
+For `DCC-017` specifically reporting a real edited Markdown page outside configured
+reference roots, use [the full link scan](#documentation-and-navigation). That fallback
+does not excuse a nonexistent path, wrong case, symlink or malformed reference; repair
+those errors. Without a complete checkout, report the full check as NOT_EXECUTED and
+retain the page in the review scope.
 
 Indexes are loaded from actual references, not from a claimed version: a legacy
 numeric selector still needs its numeric index; an `ARCH-*` reference also needs
@@ -460,7 +481,7 @@ schema catalogue or checker just to retire the first one.
 | `code_navigation.py route` / registry / contract destinations | Current V3 owner files from existing route rules; actual package `contract_refs` | V3 path scope no longer needs unused V2 indexes. Keep exact file/anchor and Cargo checks; mixed package refs still require their V2 input. See [the recipe](#code-navigation). |
 | Full code-navigation `check` / `sync-index` | V3 per-target route owners and package refs; retained targets and block declarations still use their stated defaults | Same relation drives validation and both index directions. Full direct-file declarations need no V2 index; one real legacy handle retains full integrity checks. Existing donor declarations are not automatically rewritten. |
 | `code_navigation.py capsules` | V2 capability-cell/triad semantics and catalogue | Explicit retained-V2 scope; no V3 acceptance. Retire the actual generator/consumers as a unit, not by treating direct-ref support as migration of its semantics. |
-| `docs_closure_audit.py`, `Justfile` (`docs-closure-audit`, `quick`), `verify.ps1` (`documentation-closure-audit`, `normative-pair`) and repository-policy | V2 manifests, pair/index identities, original Git history and historical workstreams | Next P4 boundary: migrate the actual profile selection and policy wiring together. Preserve required checks for affected V2/shared inputs; a historical skip is not PASS. Missing Git history is not missing V3 implementation. Do not add another verifier/profile merely to obtain green CI. |
+| `docs_closure_audit.py`, `Justfile` (`docs-closure-audit`, `quick`), `verify.ps1` (`documentation-closure-audit`, `normative-pair`) and repository-policy | V2 manifests, pair/index identities, original Git history and historical workstreams | Only for an explicitly assigned migration: change the actual profile selection and policy wiring together. R-207 in the registry owns priority; this row assigns no next task. Preserve required checks for affected V2/shared inputs; a historical skip is not PASS. Missing Git history is not missing V3 implementation. Do not add another verifier/profile merely to obtain green CI. |
 
 Before editing a consumer, inspect its current callers and declared inputs:
 

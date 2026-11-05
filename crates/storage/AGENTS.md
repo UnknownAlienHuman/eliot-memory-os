@@ -2,10 +2,14 @@
 
 ## V3 Store work
 
-For separately assigned V3 Store work, use [root instructions](../../AGENTS.md),
-[Implementation §4–7](../../docs/v3/IMPLEMENTATION.md#4-migration-0001-and-schema-authority)
-and the [Store source owner](../../docs/v3/store/README.md). Continue its actual
-issue/branch; do not create another writer or copy the package into the docs branch.
+For separately assigned V3 Store work, apply [root](../../AGENTS.md) and inherited
+[crate instructions](../AGENTS.md#select-the-source-version), then select the matching
+[V3 task row](../../docs/v3/README.md#task-routes) and [Store source owner](../../docs/v3/store/README.md).
+Read the changed operation and its field definitions, not all of Implementation §4–7
+for every repair. A missing import starts at the symbol/definition and package checks;
+changing a query or its semantics also requires its operation/transaction contract.
+Continue the actual issue/branch; do not create another writer or copy the package into
+the docs branch. Re-entry links do not restart routing under the root stop rule.
 
 The [source-file map](../../docs/v3/DEVELOPMENT.md#store-package-files) identifies
 which DDL, wrapper, query, catalog and digest files change together. Follow the

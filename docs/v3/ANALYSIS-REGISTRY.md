@@ -18,7 +18,7 @@
 | Этап | Состояние | Что продолжать / критерий завершения |
 |---|---|---|
 | D0. Версии и владельцы | `CHECKED` на снимках ниже | Проверять новую внешнюю версию только при изменении зависимого контракта. Не смешивать донор, дизайн и поддержку runtime. |
-| D1. Вход и маршруты | `IMPLEMENTED / REVIEW_PENDING` | START → задача → owner → исходник/проверка. Независимая проверка всего instruction chain ещё открыта; новых индексов для неё не нужно. |
+| D1. Вход и маршруты | `SCOPED_CHECK / REVIEW_IN_PR` | Проверены START → task map → development и root → crates → storage. Маршруты разделены по операциям; локальная source-правка не требует всех §4–7. Определены конец навигации и выбор одной проверки. Итоговое независимое review — в PR; прочие source families и machine evidence не объявлены проверенными. |
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
@@ -47,16 +47,18 @@ Episode/coverage и attribution теперь уточнены в существ�
 и [§12](COGNITION.md#12-consolidation-disagreement-and-improvement): фиксированный знаменатель,
 неполный вход не no_change, повторные отчёты не независимые попытки. Владельцы — текущие
 job/revision/context операции; новых таблиц и счётчиков успеха не требуется.
-Следующая документационная задача — D1: пройти START → узкая задача → owner → source/check
-глазами исполнителя и убрать противоречивые/лишние обязательные чтения. Purpose-specific
-job codecs/aggregate limits остаются R-185 перед включением соответствующей capability,
-а не prerequisite для Store/capture. Общий проход не блокирует его реализацию.
+D1 пройден для prose и первого Store пути: точные секции вместо общей обязательной
+цепочки книг, inherited instructions без перезапуска индексов, проверка по changed surface.
+Не продолжать улучшать маршруты без конкретного сбоя исполнителя. Следующая работа —
+D4/source handoff выше; документационный остаток D5 проверять по затронутому контракту
+при его реализации. R-185 (purpose codecs/aggregate limits) требуется до включения той
+capability, а не до первого Store/capture. Общей новой серии документационных задач нет.
 
 ## Snapshot and evidence limits
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `1f8e0ae8764b8a7613c81b16986ddbefa7355039`, перечитан 2026-11-05 | Документационная база и предыдущие слияния, не работоспособность V3. |
+| Memory main | `1199a52e7221f395f0f1884e636e52b515492652`, перечитан 2026-11-05 | Документационная база и предыдущие слияния, не работоспособность V3. |
 | Store PR #5327, чтение 2026-11-04 | Head `a040bd408be39afa9789561595d2cac8bef177b3`; дополнительно прочитаны memory/history DDL и `queries.rs` 210–315 | В перечне 31 queries нет полной create/revise transaction; старые поля, projections и временные ASSERT ещё согласовать. Это чтение source, не компиляция, execution или полный аудит PR. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
@@ -76,7 +78,7 @@ restore использует read-only lookup, не mutation-probe. **Блоки
 
 | ID | Действующее решение / остаток |
 |---|---|
-| R-172/R-173/R-195/R-197/R-199 | Вход, вложенные инструкции, аудит и маршруты отделены от обязательств V2. Читать owner по задаче; независимое semantic review остаётся открытым. |
+| R-172/R-173/R-195/R-197/R-199 | D1 устраняет обязательные §4–7 из storage entry и общий маршрут correction/retrieval/learning; root задаёт конец навигации, development — проверки по scope. Generated V2 blocks и machine reader не изменены. Review точной правки — в PR, не приёмка всех инструкций/контрактов. |
 | R-175/R-176/R-204 | Старые active programmes и сохранённые отчёты не являются V3 roadmap. Blanket «всё согласовано» запрещён; исторические источники доступны в Git. |
 | R-177/R-202 | Asset repair не равен всему Slice 0. Порядок и source handoff теперь конкретны; будущие capabilities не требуют предварительных каркасов. |
 | R-198/R-200/R-201 | Предыдущие docs слиты, задача зарегистрирована, synthetic descriptor удалён только из active directory. Остались реальные integration checks, не повторная регистрация/создание реестра. |
@@ -177,12 +179,13 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 
 S-001–S-107 и предыдущие check counts — исторические evidence в закреплённом срезе,
 [AUDIT](AUDIT.md), [AUDIT-MAP](AUDIT-MAP.md) и PR, не повторно исполненные результаты.
-Сверены Cognition §4/8/9.2/12 с Implementation §4.7.3 и сохранёнными EPI-04,
-UND-02/LEARN-01/LEARN-02/T15/T22. Исправлены знаменатель завершения и условия attribution,
-без объявления scope/replay/host acceptance одним success. Маршруты AUDIT-MAP сохранены.
-Два изменяемых файла сверены с Git blob SHA текущего main; это не полный checkout.
-Проверки точных bytes/diff/anchors и независимое review относятся только к кандидату в PR.
-Все архивы, внешние API, Store source, Rust/Clippy и Windows runtime заново не проверялись.
+Текущий D1 проход: START, root AGENTS/README/WORKFLOW, authority, task map,
+development и inherited crates/storage. Сопоставлены маршруты локального import repair,
+capture, direct revision и packet prose с владельцами и check recipes. Контракты продукта,
+AUDIT-MAP и generated V2 blocks не менялись; остальные source families не аудитированы.
+Шесть изменяемых baseline файлов сверены с Git blob SHA текущего main; это частичный
+checkout. Точные diff/anchors/links и независимое review фиксируются в PR. Machine evidence,
+весь Store source, внешний API и runtime не становятся PASS от сокращения human reading.
 
 ## Integration blockers
 
