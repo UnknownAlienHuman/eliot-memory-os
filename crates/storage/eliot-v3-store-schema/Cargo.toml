@@ -1,0 +1,13 @@
+[package]
+name = "eliot-v3-store-schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic V3 Memory Store schema bundle and fixed SurrealQL query corpus"
+
+[dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

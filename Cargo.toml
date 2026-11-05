@@ -39,6 +39,7 @@ members = [
   "crates/storage/eliot-store-api",
   "crates/storage/eliot-store-memory",
   "crates/storage/eliot-store-surreal-adapter",
+  "crates/storage/eliot-v3-store-schema",
   "crates/storage/eliot-blob-api",
   "crates/storage/eliot-blob",
   "crates/instrument/eliot-graph-api",
