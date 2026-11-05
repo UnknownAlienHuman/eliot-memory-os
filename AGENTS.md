@@ -15,11 +15,16 @@ second writer for its files or revive a closed/superseded branch.
 
 Start with [the V3 task map](docs/v3/README.md). Documentation tasks select an existing
 [stage/finding](docs/v3/ANALYSIS-REGISTRY.md#documentation-stages); implementation tasks
-follow [Implementation §11](docs/v3/IMPLEMENTATION.md#11-implementation-sequence) and
-the assigned source scope. Read only the owning sections and source for that decision.
-Architecture, Implementation, Cognition, Inference and the audit are not a mandatory reading
-stack for every task. Read an adjacent contract when the changed behavior crosses
-its boundary. Follow the nearest `AGENTS.md` for any source path being changed.
+use their assigned source scope. Use [Implementation §11](docs/v3/IMPLEMENTATION.md#11-implementation-sequence)
+when selecting or expanding an implementation increment, not to enlarge a local repair.
+Read the owning sections, their needed definitions and actual source for that decision.
+Architecture, Implementation, Cognition, Inference and the audit are not a mandatory
+reading stack. Apply root, inherited and nearest `AGENTS.md` to each mutable path.
+
+**Finish routing when the assignment, owner section, mutable paths, caller/consumer and
+first applicable check are known.** Start the change; an index linking back to an already
+read page is not another reading step. Reopen a document when its bytes or the affected
+boundary change. A narrow route never permits ignoring a dependency of the changed rule.
 
 ## Make the change
 
