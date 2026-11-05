@@ -1,7 +1,7 @@
 //! Deterministic V3 Memory Store schema and fixed `SurrealQL` query corpus.
 //!
 //! This crate owns bytes and metadata only. It does not open a database connection,
-//! execute arbitrary queries, or claim that SurrealDB 3.3.4 has qualified the bundle.
+//! execute arbitrary queries, or claim that `SurrealDB` 3.3.4 has qualified the bundle.
 
 use sha2::{Digest, Sha256};
 use std::error::Error;

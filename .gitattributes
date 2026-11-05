@@ -7,3 +7,6 @@
 *.jsonl text eol=lf
 *.surql text eol=lf
 *.ps1 text eol=crlf
+
+# Embedded schema bytes and golden digests must survive Windows checkout unchanged.
+crates/storage/eliot-v3-store-schema/assets/** text eol=lf
