@@ -72,6 +72,18 @@ consumes these assets; it does not copy SQL or turn `inspect` into a daemon. Sel
 the statements used by that path. It does not wait for inference
 or the full backup campaign, and absent operations remain unavailable rather than stubs.
 
+**When Slice 2 connects direct updates**, use
+[the command and revision projection](../IMPLEMENTATION.md#741-command-body-and-revision-projection)
+and [the atomic publication rule](../IMPLEMENTATION.md#742-atomic-publication-and-replay-result).
+The inspected 31-query corpus has no complete create/revise operation. Add its statement
+and decoder with that caller, not generic CRUD or a second mutation table. Align
+`QUERY_OPEN_MEMORY_CURRENT`, `QUERY_OPEN_MEMORY_HISTORY`, `QUERY_BACKUP_MEMORY` and
+`QUERY_BACKUP_MEMORY_HISTORY` with the same complete projection; include original
+operation results in observation readback/backup. Full replacement must not inherit
+omitted fields or old grounds. Align time assertions with frozen receipt timestamps,
+not assumed wall-clock monotonicity. Capture/open remains the first source increment;
+this later revision work does not enlarge its assignment into all of Slice 2.
+
 Rust compile/Clippy checks source; exact-engine execution checks the selected DDL/query
 and DTO boundary; restart/readback checks the connected behavior. One does not imply
 the others. Add broader rollback/concurrency/platform/load coverage after the connected

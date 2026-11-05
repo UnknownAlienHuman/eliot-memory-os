@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.52 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.53 · 2026-11-04 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -377,7 +377,8 @@ time. Outer and inner identity/revision must agree. Include all scopes, target m
 conditions, exceptions, disclosure, validity, cues and method/commitment states. Do not
 maintain duplicate flattened history columns or fill missing fields from current state.
 Historical open, backup and restore share this decoder. The source candidate's unversioned
-string does not yet implement it.
+string does not yet implement it. [§7.4.1](#741-command-body-and-revision-projection)
+defines the complete Base revision fields and their command-to-result projection.
 
 The following spellings are the selected fresh-V3 codecs, not aliases for the retired
 pack or source candidate. Writers, queries, DTOs and history must agree with the admitted
@@ -820,27 +821,125 @@ damaged, never a claimed exact body.
 
 `create` and `revise(expected_revision)` are separate closed inputs. Create publishes
 revision 1 only when absent; revise requires the exact current positive revision and
-publishes its checked successor. The command freezes the target memory ID (a retained newly generated ID for create),
-a full replacement semantic DTO, attributed cause/source and a fresh `o_` command ID
-before send. Before the first Store send, the authorized revision owner durably
-publishes this complete command through §7.5; a process-local variable does not survive
-a lost reply followed by restart. Use command-derived event identity, not native-event
-deduplication for the attributed cause. No model is needed.
+publishes its checked successor. The authorized revision entrypoint freezes one target,
+full replacement, attributed cause and fresh `o_` command ID before durable custody.
+Before the first Store send, publish the complete command through §7.5; a process-local
+variable does not survive a lost reply followed by restart. Use command-derived event
+identity, never native-event deduplication of the attributed cause. No model is needed.
 
 Use an operation-owned `observation` with reserved kind `memory_change` and that command
-ID, not a new mutation table. Its immutable body records the permitted command/cause;
+ID, not a new mutation table. Its body is the canonical `MemoryChangeV1` below;
 `operation_result_json = {"format":1,"memory_id":...,"revision":...}` records the
-original result. Represent its admitted input as a `CaptureCommandV1` with this
-reserved kind; allocate its stream sequence and retain both digests under §7.2 in
-the same revision transaction. The result is output, not part of either input digest.
-Ordinary relay capture cannot write this kind/result. The row uses the same policy,
-size and provenance rules; do not modify an already captured observation.
+original result. Wrap the body in `CaptureCommandV1` with `native_event_key` absent;
+allocate its stream sequence and retain both input digests under §7.2 in the same
+revision transaction. The result is output, not part of either input digest. Ordinary
+relay capture cannot write this kind/result. All copies obey §7.1; do not modify an
+already captured observation or silently redact a frozen semantic update into another edit.
 
-In one transaction: check the operation identity/digest **before** revision CAS; resolve
-create/expected revision; insert the prior full snapshot into history for revise; publish
-current, exact grounds/replacement links and the operation observation/result together.
-Invalid scope, source, history or links abort the whole operation. Only implemented
-reverse-impact work may be coalesced; no empty successful job is created.
+#### 7.4.1 Command body and revision projection
+
+`MemoryChangeV1` has exactly the fields below. Use §4.5 canonical JSON without a trailing
+LF; `?` means omitted, never null. Reject unknown members, duplicate keys, wrong types
+and unsupported formats. This is the body of the existing operation, not another RPC,
+queue or generic patch language. One command changes one memory item.
+
+| Field | Meaning and validation |
+|---|---|
+| `format` | Integer 1. |
+| `mode` | `create` or `revise`. |
+| `memory_id` | Retained `m_` identity. The revision owner allocates it for create before staging; revise names the existing item. No address-based upsert or automatic replacement ID. |
+| `expected_revision?` | Absent for create; positive signed-64 for revise, below its maximum so the successor is representable. It is never `current`, zero or a caller-selected new revision. |
+| `replacement` | Complete mutable value in the table below, not a partial field patch. Required empty arrays stay explicit. Omitting an optional field removes it in the new revision; it never means inherit from current. |
+| `cause` | Nonempty attributed explanation, at most 4 KiB UTF-8. The authenticated operation/binding identifies the requester; this text does not grant authority or prove the claim true. |
+| `grounds` | Complete intended grounds for the new revision. Each entry is `{relation_kind,target,grounds_group?}`; kind is `supports`, `refutes` or `derived_from`. Target is an exact persisted source selector below. A group is a nonempty identifier, permitted only for supports; §3 of Cognition owns conjunctive/alternative interpretation. |
+| `replacements` | Exact persisted memory selectors replacing this item. Nonempty exactly when replacement influence is `superseded`; otherwise empty. This operation does not mutate those targets or implement an atomic multi-item split. |
+
+A source selector is `{kind:"observation",id,sha256}` or
+`{kind:"memory",id,revision,sha256}`, with §7.3's body/revision hash respectively.
+No `current`, unresolved alias, path or future/pending result is accepted. Before a new
+publication, resolve and authorize each selector and verify the exact bytes/revision;
+missing, damaged, erased or unreadable required grounds reject that publication rather
+than being dropped. Resolve a matching original operation result before revalidating
+now-unavailable grounds: later source loss cannot authorize repeating a committed edit.
+
+The source lists together allow at most 64 entries and 32 KiB canonical JSON. Sort each
+list by canonical UTF-8 bytes and reject duplicate descriptors. Empty grounds means no
+asserted support, not verified truth. The command's own observation is attribution, not
+independent support for itself. A referenced private source does not permit broadening
+the replacement's disclosure or reuse. Authorization applies to the existing item's
+origin project, requested fields and sources, not merely to a readable reused copy.
+For revise, the admitted command's stream.project must equal that immutable origin;
+access through another project's reuse scope grants neither write authority nor rebinding.
+
+`replacement` has precisely these fields. All sizes are UTF-8 bytes; §4.5.1's 64 KiB
+limit applies to the **complete resulting revision**, including generated fields.
+The additional collection limits here are initial engineering choices, not measurements.
+
+| Fields | Base value |
+|---|---|
+| `kind` | `note`, `claim`, `explanation`, `prediction`, `commitment`, `project_view` or `method`. An unimplemented kind-specific consumer remains unavailable; storing its data does not execute it. |
+| `content` | Exact nonempty text; never a caller path or deferred body-fetch request. It includes the instruction body when the item is a method. |
+| `search_text`, `exact_cues` | Bounded derived search text, at most 4 KiB, and a sorted unique array of at most 64 nonempty cues, each at most 256 bytes. Search text derives only from permitted replacement data; it is not extra hidden content or an authority. |
+| `reuse_scope`, `reuse_projects` | §4.7.2 values; at most 64 project identifiers, each within §4.5.1. Required even when the list is empty. |
+| `disclosure` | `local_only` or `external_allowed`, within current owner policy. An explicit value does not itself confer permission. |
+| `conditions_json`, `exceptions_json` | Each is a canonical JSON string encoding an array of at most 32 nonempty qualification strings, each at most 2 KiB; `[]` is explicitly none. Base preserves these as data, not an executable expression language. A material unevaluated condition/exception keeps applicability conditional_or_unknown; matching text is not evaluation. |
+| `support_state`, `exposure_state`, `influence_state` | Exactly §4.7.2's three independent vocabularies; all required. No confidence/rank-to-support conversion or default active state on decode. |
+| `address_kind?`, `address_key?` | Both present or both absent; nonempty identifiers within §4.5.1. The writer derives address_unique_key under §4.4. A conflicting unique address rejects; it never updates a different item. |
+| `subject?`, `aspect?`, `perspective?` | Nonempty bounded identifiers, at most 256 bytes each. Absence is distinct from an empty label. |
+| `valid_from_ms?`, `valid_until_ms?` | Signed-64 UTC milliseconds; when both exist require from <= until. An absent endpoint is unbounded, not zero or the machine's current time. |
+| `commitment_state?` | Exactly for kind commitment: `open`, `resolved` or `cancelled`. Resolution is an attributed explicit update, not inferred from a reminder, due date or display. |
+| `method_role?`, `processing_purpose?` | Role is present exactly for kind method: `advice` or `processing`. Purpose is a nonempty bounded identifier present exactly for processing. A processing consumer must validate its purpose-specific instruction/input/result contract before use; method text cannot alter execution permissions or budgets. |
+
+No memory ID, origin, revision counter, timestamp, derived key or current notice overlay
+is accepted inside replacement. The writer constructs `MemoryRevisionV1` by adding
+`memory_id`, `origin_project`, `revision`, `created_at_ms`, `updated_at_ms` and, only for
+an addressed item, `address_unique_key` to those exact fields. Create takes origin from
+the admitted command's stream.project, revision 1 and creation/update time from its frozen
+receipt time. Revise preserves origin/creation from the compared current row, increments
+the expected revision and uses the command's frozen receipt time for updated_at_ms and
+the history row's replaced_at_ms. Wall-clock order is not revision order; replay never
+regenerates timestamps.
+
+Current open, history's inner memory object, revision_sha256 and typed backup all use
+this same complete projection. History stores the **previous** projection without
+recomputing its search text, filling omissions or applying current notices to its hash.
+Grounds/replacement links are immutable and keyed to the exact new revision; old links
+remain historical, never inherited as the new revision's grounds. Their complete set is
+separate from the row hash. Publishing different grounds requires a new revision, not
+late amendment of a published revision's declared support. Preserve source lineage for
+the operation observation too, so §10 erasure reaches its derived command body.
+
+The complete MemoryChangeV1 body has a 128 KiB build cap. A body above the 16 KiB inline
+limit uses §7.5's existing body.bin/blob custody; until that path exists reject it before
+staging, not after changing memory. Validate the complete serialized transaction and
+history/read/backup projections against §4.5, including nested JSON escaping. Check the
+old history snapshot as well as the proposed replacement. No silent shortening, partial
+history, larger IPC frame or second correction store is allowed.
+
+#### 7.4.2 Atomic publication and replay result
+
+Before a new mutation, the daemon validates policy/notices and immutable bodies under
+the existing affected-publication admission, covering the target and selected sources.
+Keep that admission and source custody through commit/reconciliation; erasure, policy
+replacement or cutover cannot pass between validation and publication. This preflight
+is not filesystem/host/controller I/O inside a database transaction.
+
+In one fixed Store transaction: look up operation identity/digest **before** revision CAS;
+return an already committed matching result without rewriting anything. Otherwise
+recheck exact target/source row identities and expected revision, insert the previous
+full snapshot for revise, then publish current, exact grounds/replacement links and the
+operation observation/result together. Invalid rows, scope, history or links abort all
+these writes. No provider/filesystem effects or delayed source-validation job belong in
+that transaction. Only implemented reverse-impact work may be coalesced; no empty
+successful job is created.
+
+A new explicit revise with the same semantic value still creates its one successor and
+attributed cause; exact command replay does not. A stale new command conflicts even if
+its replacement happens to equal current. Never silently rebase expected_revision, merge
+fields from a newer revision, remove an exception to fit, or retry changed bytes under
+the original operation ID. The owner must submit a new explicit edit after resolving
+the conflict. Auxiliary history/link identities remain owned by §4.3's retained plan,
+not arbitrary caller-selected mutations or a second command ledger.
 
 Revision publication participates in the same affected-delivery fence as §10 notices:
 close new emissions using that memory and drain in-flight emission before acquiring
@@ -855,14 +954,21 @@ Same command/digest returns its original result even after later revisions. Open
 exact resulting revision through §7.3; never replace it with current. The operation
 result and the open disposition are separate: later denial, damage or an unavailable
 read cannot turn a confirmed revision into a failed write or trigger another revision.
-A changed command
-is identity conflict; a new command with stale expected revision is revision conflict.
-Possible commit with a lost reply is unknown until lookup by operation identity, not a
-second revision. The same-input reconciliation rule in §7.2 applies only to this complete
-idempotent transaction, with original-result lookup before CAS. A pending proposal is not
-a committed revision on which another edit may base its expected revision. Erasure may suppress the old result, but must not make the operation
-eligible to run again (§10). Withdrawal/reactivation still use the outside-root notice
-authority in §10; a generic revision cannot bypass it.
+A changed command is identity conflict; a new command with stale expected revision is
+revision conflict. Possible commit with a lost reply is unknown until lookup by operation
+identity, not a second revision. The same-input reconciliation rule in §7.2 applies only
+to this complete idempotent transaction, with original-result lookup before CAS. A pending
+proposal is not a committed revision on which another edit may base its expected revision.
+Erasure may suppress the old result, but must not make the operation eligible to run again
+(§10). Withdrawal/reactivation still use the outside-root notice authority in §10; writing
+influence_state=active cannot clear a current withdrawal. Post-cut commands follow §8.2.
+
+Connect this in Slice 2 with the existing revision/open/context owners: create; revise
+with an omitted optional field and explicit empty grounds; two edits against the same
+revision; lost reply followed by a later revision and replay of the original ID; changed
+exceptions with unchanged text; an oversized inline command; and unavailable/erased
+required grounds. Inspect the original result, both exact revisions and later context.
+These are acceptance cases for that path, not a new test framework or runtime evidence.
 
 ### 7.5 Durable ingress and replay
 
