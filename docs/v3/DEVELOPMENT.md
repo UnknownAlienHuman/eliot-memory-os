@@ -96,8 +96,9 @@ self-reading is useful, but is not an independent review or approval.
 
 Select by the changed surface; this page is a menu, not a pipeline. Diff/scope review
 applies to every change. Ordinary V3 prose uses [scoped references](#operational-references)
-and semantic review. Renames/deletions/changed anchors additionally need the
-[full inbound-link scan](#documentation-and-navigation). Source uses changed-package
+and semantic review. For a changed Markdown page outside the scoped checker's configured
+roots (for example `START.md`), use the [full link scan](#documentation-and-navigation);
+renames/deletions/changed anchors require it as well. Source uses changed-package
 fmt/Clippy and its [behavior row](#behavior-specific-review); navigation-tool edits use
 [their own checks](#code-navigation). Required CI and final-tree reading evidence remain
 separate obligations under [documentation integration](#documentation-integration).
@@ -132,9 +133,11 @@ local snapshot must never be reported as a full-checkout verification.
 
 First check meaning: a rule has one owner, its consumer can find it, unresolved design
 is named, and implemented behavior is not inferred from prose. For ordinary V3 edits,
-run [scoped references](#operational-references) on every changed page/consumer. For a
-rename, deletion, changed heading/anchor or an assigned whole-repository check, scan
-incoming links from a **complete checkout** with the existing link-only function:
+run [scoped references](#operational-references) on supported changed pages/consumers.
+A real changed Markdown page outside the configured roots, such as `START.md`, uses
+the full link scan below; do not omit it or expand configuration just for a prose edit.
+A rename, deletion, changed heading/anchor or assigned whole-repository check also needs
+this scan of incoming links from a **complete checkout**:
 
 ```text
 python -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); import docs_shards; print(docs_shards.verify_markdown_links(Path('.')))"
@@ -221,6 +224,12 @@ scope. Scope must be inside the configured scan roots; missing, symlinked,
 wrong-case or empty selections fail. This checks current repository-relative
 `docs/v3/IMPLEMENTATION.md#4-migration-0001-and-schema-authority` references and local Markdown links in selected V3 pages.
 External pinned URLs are not fetched or reinterpreted as current local files.
+
+For `DCC-017` specifically reporting a real edited Markdown page outside configured
+reference roots, use [the full link scan](#documentation-and-navigation). That fallback
+does not excuse a nonexistent path, wrong case, symlink or malformed reference; repair
+those errors. Without a complete checkout, report the full check as NOT_EXECUTED and
+retain the page in the review scope.
 
 Indexes are loaded from actual references, not from a claimed version: a legacy
 numeric selector still needs its numeric index; an `ARCH-*` reference also needs
