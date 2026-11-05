@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**2026-11-04. Действующий план документации и открытых разрывов. Реализация не принята.**
+**2026-11-05. Действующий план документации и открытых разрывов. Реализация не принята.**
 
 Это единственный реестр V3. Правила — в [четырёх контрактах](../ARCHITECTURE_CONTRACT.md),
 исходники/команды — в [DEVELOPMENT](DEVELOPMENT.md), требования — в [AUDIT-MAP](AUDIT-MAP.md).
@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `PARTIAL` | Адресный current-work путь выбран в [Cognition §2–6](COGNITION.md#2-current-work-reconstruction): task/session slots, отдельные commitments, exact-revision grounds и packet states. Нет расширения пустой задачи до сессии или подмены plan выполненным progress. Остальные сценарии и runtime открыты. |
+| D5. Сценарии | `PARTIAL` | Current-work и packet правила сохранены. [Cognition §4/9.2/12](COGNITION.md#4-episode-membership-and-coverage) согласуют frozen coverage, partial/no_change и учёт одного действия по нескольким отчётам. Полнота выборки не полнота задачи; критерий/метод привязаны к точной версии. Purpose-specific codecs/limits, остальные сценарии и runtime открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -43,16 +43,20 @@
 [Base backup](IMPLEMENTATION.md#83-base-format-and-complete-inventory) остаются последующим
 Slice 3; их реализация, config allowlist и Windows durability открыты.
 
-Следующая документационная сверка — конечные episode/coverage и attribution из
-Cognition §4/12: фактический исход отдельно от повторного отчёта, предложенного метода
-и приёмки внешней задачи. Проверять существующие требования AUDIT-MAP, без нового
-реестра, evaluator DSL или V2 tooling programme. Общий проход не блокирует Store/capture.
+Episode/coverage и attribution теперь уточнены в существующих [§4](COGNITION.md#4-episode-membership-and-coverage)
+и [§12](COGNITION.md#12-consolidation-disagreement-and-improvement): фиксированный знаменатель,
+неполный вход не no_change, повторные отчёты не независимые попытки. Владельцы — текущие
+job/revision/context операции; новых таблиц и счётчиков успеха не требуется.
+Следующая документационная задача — D1: пройти START → узкая задача → owner → source/check
+глазами исполнителя и убрать противоречивые/лишние обязательные чтения. Purpose-specific
+job codecs/aggregate limits остаются R-185 перед включением соответствующей capability,
+а не prerequisite для Store/capture. Общий проход не блокирует его реализацию.
 
 ## Snapshot and evidence limits
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `7feacb252cc1e5ea422e907a045da1c6fa9995ae`, перечитан 2026-11-04 | Документационная база и предыдущие слияния, не работоспособность V3. |
+| Memory main | `1f8e0ae8764b8a7613c81b16986ddbefa7355039`, перечитан 2026-11-05 | Документационная база и предыдущие слияния, не работоспособность V3. |
 | Store PR #5327, чтение 2026-11-04 | Head `a040bd408be39afa9789561595d2cac8bef177b3`; дополнительно прочитаны memory/history DDL и `queries.rs` 210–315 | В перечне 31 queries нет полной create/revise transaction; старые поля, projections и временные ASSERT ещё согласовать. Это чтение source, не компиляция, execution или полный аудит PR. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
@@ -119,7 +123,7 @@ Owner — [Implementation §4–7](IMPLEMENTATION.md#4-migration-0001-and-schema
 | R-171 | `DECIDED / SOURCE_OPEN`: [§7.2–7.5](IMPLEMENTATION.md#72-capture-command-commit-and-replay) задают полный CaptureCommandV1, точную event projection и единый owner dispatch. Stream identity теперь включает workspace. Native redelivery возвращает сохранённую occurrence, не новый proposed ID; поздний forbidden/erased/damaged open не разрешает новую mutation. Source fields, complete transaction, decoder и custody/readback ещё реализовать. |
 | R-174/R-182 | Исправить imports и table-target `FOR UPDATE`; native record-ID разрешать и перепроверять внутри одной transaction (§6). UNIQUE/CAS не обещают predicate lock. |
 | R-183/R-186 | `DECIDED / SOURCE_OPEN`: [§7.4.1](IMPLEMENTATION.md#741-command-body-and-revision-projection) задаёт MemoryChangeV1 и полный MemoryRevisionV1 для current/history/hash/backup. Optional omission удаляет поле; grounds принадлежат новой exact revision, не наследуются молча. Текущие notice overlays вне immutable hash. Полная transaction, DTO/DDL/projections и consumer ещё реализовать. |
-| R-184 | Pending coalesces; первый claim фиксирует tuple, последующие claims меняют generation, не исходный смысл или unknown call ID. Полная claim/settle реализация остаётся открытой. |
+| R-184 | Pending coalesces; claim фиксирует tuple. [Cognition §4/9.2](COGNITION.md#4-episode-membership-and-coverage) привязывает coverage к exact selected input, purpose и method revision; remaining включает unavailable, no_change требует полного required input. Reclaim/replay не меняют знаменатель и не создают новый опыт. Полная claim/settle реализация и purpose codecs открыты. |
 | R-185 | `DECIDED / SOURCE_OPEN`: [§4.5.1](IMPLEMENTATION.md#451-first-base-limits) задаёт ingress/revision limits; [§7.4.1](IMPLEMENTATION.md#741-command-body-and-revision-projection) — bounded change body и переход на существующий blob path выше inline cap; [§8.4](IMPLEMENTATION.md#84-bounds-outcomes-and-connected-check) — Base backup/restore. Узкая конфигурация не делает старые данные нечитаемыми; overflow не разрешает truncation/eviction. Job/inference aggregate limits ещё отдельная работа. |
 | R-187 | `DECIDED / SOURCE_OPEN`: task/session addresses включают workspace; reuse не membership, пустой task lookup не расширяет scope. Grounds читаются для выбранной exact revision, failed/truncated не пустой набор. Receipt-time cursor не change feed. Lookup/projections/decoder и ограничения реального reader ещё реализовать. |
 | R-188 | Expected catalog — canonical INFO clean exact-engine run, не копия DDL lines и не снимок проверяемой active DB. Probe true не заменяет capture/open. |
@@ -173,12 +177,12 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 
 S-001–S-107 и предыдущие check counts — исторические evidence в закреплённом срезе,
 [AUDIT](AUDIT.md), [AUDIT-MAP](AUDIT-MAP.md) и PR, не повторно исполненные результаты.
-Сопоставлены current-work/retrieval/packet и owning identity, revision, guidance-state,
-exact-open правила. CORE-01/CTX-01/T25 остаются в прежних маршрутах AUDIT-MAP; новые
-правила не заявляют повторного чтения всего первичного корпуса. Локальные копии трёх
-изменяемых файлов сверены с Git blob SHA текущего main; это не полный checkout.
-Точные проверки diff/anchors и независимое review относятся только к кандидату в PR.
-Внешние API, весь Store PR, Rust/Clippy, Store/Windows runtime здесь не перепроверены.
+Сверены Cognition §4/8/9.2/12 с Implementation §4.7.3 и сохранёнными EPI-04,
+UND-02/LEARN-01/LEARN-02/T15/T22. Исправлены знаменатель завершения и условия attribution,
+без объявления scope/replay/host acceptance одним success. Маршруты AUDIT-MAP сохранены.
+Два изменяемых файла сверены с Git blob SHA текущего main; это не полный checkout.
+Проверки точных bytes/diff/anchors и независимое review относятся только к кандидату в PR.
+Все архивы, внешние API, Store source, Rust/Clippy и Windows runtime заново не проверялись.
 
 ## Integration blockers
 

@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.31 · 2026-11-04 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.32 · 2026-11-05 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -115,10 +115,49 @@ pretend that no additional affected conclusion exists.
 
 ## 4. Episode membership and coverage
 
-An episode is a finite grouping over actual session/task/call/result relations. Freeze
-job inputs and distinguish selected, supplied, processed, unavailable and remaining.
-There is no global processed bit. Partial output does not complete omitted material;
-replay of an occurrence is not new experience.
+An episode is a finite selection of existing observations, not a new table or lifecycle.
+Its owning retrieval/job fixes the work address (§2), purpose, selection bounds and exact
+source handles. Task membership alone does not join a tool result to an action: use the
+captured call/parent/result relation. A late result keeps its issue-time binding. Missing
+or contradictory correlation remains a gap, not a match by text or arrival proximity.
+
+For a job, the first claim records that finite selection in existing `frozen_input_json`
+under Implementation §4.7.3; `coverage_json` records its disposition. Each selected entry
+names an exact observation or memory revision/hash and, for an excerpt, its byte range.
+Memory/method revisions are contextual inputs, not additional episode occurrences. The
+original object's hash does not claim that omitted bytes were supplied. Never replace
+an exact input with `current`, a summary or a newly expanded search on reclaim. New input
+belongs to the existing pending successor, not to a mutation of the claimed selection.
+
+| Coverage term | Required meaning |
+|---|---|
+| `selected` | Unique exact entries in the frozen required input; the denominator for this job, not every event in the session. |
+| `supplied` | Selected entries whose declared bytes are in the retained processor input, with their source mapping. Request construction does not prove provider receipt or internal model attention. |
+| `processed` | Supplied entries accounted for by a decoded, accepted purpose-specific result. Neither a citation, transport success nor a model's unsupported completion claim adds an entry. |
+| `unavailable` | Selected, unprocessed entries that cannot be supplied/used, with a bounded reason such as missing, damaged, denied or unsupported. Do not substitute another source. |
+| `remaining` | Exactly selected minus processed, including unavailable entries. Derive it from identities; do not subtract unrelated counts or count unavailable twice. |
+
+Thus processed is a subset of supplied, supplied of selected, and unavailable of
+remaining. Repeated handles do not increase coverage; overlapping ranges never count
+shared bytes twice or imply whole-body coverage. The decoder rejects unknown/out-of-set
+processed entries and inconsistent totals rather than trusting a generated percentage.
+Purpose-specific limits must bound both references and encoded input/result bytes before
+that capability is enabled; a candidate-page cap alone is not an aggregate job limit.
+
+Retain discovery limits separately from the frozen denominator. A complete finite
+selection is not the complete conversation, task or all possible evidence. Unknown
+unseen counts stay unknown; forbidden identities/counts do not leak in public coverage.
+A deliberate narrower assignment may finish for that scope. Runtime truncation of its
+required input cannot be relabelled a smaller successful job. Partial results preserve
+useful accepted changes and exact remaining work; only complete required input permits
+`changes` or `no_change` as a successful cognitive outcome (§9.2). For episode processing, an
+authoritatively empty selection is local no-work, not a fabricated call or learned lesson.
+
+There is no global processed bit. Coverage is relative to purpose, frozen method revision
+and input, not an irreversible mark on observations. Reconciliation/replay preserves the
+original result and coverage; re-analysis may revise knowledge but adds no new occurrence
+or independent trial. Unresolved external effects still follow §9.1, not an automatic
+replacement call because remaining work is nonempty.
 
 ## 5. Direct updates
 
@@ -422,8 +461,12 @@ decode_failed
 operational_failed
 ```
 
-No-change requires completed cognitive work over supplied input. A refused profile,
+No-change requires an accepted purpose-specific result covering the entire frozen
+required input under §4, with no semantic change to publish. Covering only the supplied
+subset cannot complete omitted or unavailable selected entries. A refused profile,
 missing result, unknown call, truncated input/output or failed decoder is not no-change.
+A terminal partial result maps to Implementation §4.7.3's failed/partial outcome; unknown
+admission/commit remains reconciliation, not a terminal failure used to release the slot.
 The call's technical success does not prove the interpretation is supported.
 
 Before publication, resolve cited source IDs/ranges against admitted supplied input or
@@ -487,9 +530,43 @@ Disagreement belongs to a question, scope and time. Preserve alternatives and gr
 select the cheapest discriminating observation. Voting is not evidence. Predictions
 retain expected observations before action.
 
-Attribution distinguishes method offered, handoff evidence, action observed, adherence
-known/inferred/unknown, criterion outcome and comparative benefit. An attributable
-attempt/criterion contributes once, not once per repeated report.
+Attribution uses existing source observations and exact revision links, not a success
+counter or another acceptance authority. Its consumer is the ordinary method/claim
+revision and later qualified context. Keep these facts separate:
+
+| Fact | Evidence and limit |
+|---|---|
+| Method offered | Exact method revision and packet/invocation correlation; preparation/emission is only §6.5's fact, not use. |
+| Action observed | Original execution/call identity and attributable action/result observations, with issue-time work binding. A proposed action is not an executed attempt. |
+| Adherence | `known`, `inferred` or `unknown`, with its sources. Co-occurrence of advice and action does not establish following the method. |
+| Criterion outcome | Exact criterion version, evaluated target/resource version and attributable result. A tool's exit/result and host acceptance of the task are separate observations. |
+| Comparative benefit | An explicit comparison with its conditions and limitations. One success after advice does not establish that the advice caused it or outperformed an alternative. |
+
+For repeat accounting, resolve the original action attempt from the admitted native
+execution identity or canonical action-start observation; pair it with the exact criterion
+source/version. Reports, transcript copies and later summaries of that pair remain source
+records, but contribute one assessed attempt, not independent successes. Additional
+criteria or method associations do not multiply physical trials. A real separately
+observed execution is a new attempt even with equal input/output; repeated capture is not.
+Without stable correlation, retain the qualified report and unknown association rather
+than minting trial identities from report IDs, text similarity or timestamps.
+
+Bind method credit to the revision actually offered/used, not the latest revision at
+settlement. Preserve conflicting results and distinguish an attributable correction from
+an unrelated newer report; arrival order, report count and a majority do not resolve the
+conflict. Revise the assessment with its exact sources rather than adding another success.
+A missing result, uncertain effect or missing acceptance is unknown, not evidence of
+failure, success or cancellation. Owner acceptance cannot be inferred from a model's
+self-report; a task's known partial result remains useful without accepting the whole task.
+Predictions/comparisons keep the criterion chosen before action; post-hoc criteria remain
+labelled retrospective, not evidence of a successful prior prediction.
+
+When connecting the existing job/revision/context path, inspect: three reports of one
+action versus two real attempts; conflicting criterion results; a criterion changed after
+action; a method revised before a late result; and a frozen three-source input with one
+unavailable source. Expected results are one assessed attempt, separate real attempts,
+qualified conflict/retrospective/old-method attribution, and incomplete coverage—not a
+fabricated all-success report. These are semantic cases, not an additional test system.
 
 Improvement identifies the failed edge/revision, retains a counterexample, changes
 conditions/body or scoped negative memory, preserves history and checks that later
