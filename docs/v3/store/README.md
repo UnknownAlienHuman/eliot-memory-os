@@ -84,6 +84,14 @@ omitted fields or old grounds. Align time assertions with frozen receipt timesta
 not assumed wall-clock monotonicity. Capture/open remains the first source increment;
 this later revision work does not enlarge its assignment into all of Slice 2.
 
+The same Slice 2 handoff includes [current-work selection](../COGNITION.md#2-current-work-reconstruction):
+validate reserved work-view addresses in the revision writer and add their bounded exact
+lookup, without treating lexical or receipt-time continuation queries as that lookup.
+Commitments use existing create-operation binding/result plus current hydration, not a
+new membership table. Align the current projection, packet role/qualifier decoder and
+final delivery checks; include commitment_state and method_role where applicable.
+The existing task/session continuation queries must not become cross-task fallbacks.
+
 Rust compile/Clippy checks source; exact-engine execution checks the selected DDL/query
 and DTO boundary; restart/readback checks the connected behavior. One does not imply
 the others. Add broader rollback/concurrency/platform/load coverage after the connected

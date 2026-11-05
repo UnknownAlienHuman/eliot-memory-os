@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.30 · 2026-11-04 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.31 · 2026-11-04 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -39,13 +39,42 @@ identities and explicit links.
 
 ## 2. Current-work reconstruction
 
-Prefer `project + workspace + actual host task identity`; fall back to
-`project + workspace + actor/session`. Path, branch, commit and resource version are
-environment, not task identity.
+Choose one admitted work address: `project + workspace + task_id` when the host supplies
+an actual task; otherwise `project + workspace + actor_id + session_id`. IDs are already
+source-qualified by the adapter. Fall back only when task identity is absent, never when
+a task lookup is empty, denied or unavailable. Incomplete binding yields `binding_missing`,
+not a project-wide search for a substitute goal. Path/branch/resource similarity and reuse
+permission are not work membership; related experience remains separately qualified.
 
-Resolve captured binding → open current addressed goal/plan/progress/commitments → add
-later observations of that work → apply explicit correction/withdrawal/supersession →
-mark association/environment gaps → only then retrieve related experience.
+Use the existing memory address fields for the three singleton current-work views:
+
+| Mode | `address_key`, using Implementation §4.4's H | Exact `address_kind` → packet role |
+|---|---|---|
+| Task | `H("work-task-v1", project, workspace_id, task_id)` | `work_task_goal` → `goal`; `work_task_plan` → `plan`; `work_task_progress` → `progress` |
+| Session | `H("work-session-v1", project, workspace_id, actor_id, session_id)` | `work_session_goal` → `goal`; `work_session_plan` → `plan`; `work_session_progress` → `progress` |
+
+These six reserved address kinds require `memory.kind=project_view`. The revision writer
+checks the key against the admitted command binding before custody; the operation's
+observation retains the readable tuple. The normal address_unique_key enforces one item
+per slot. Lookup compares origin project, kind and both address fields, not a prefix or
+bare task ID. Content is exact view text, not a JSON subdocument or model-parsed goal.
+Missing/unavailable slots remain missing/unavailable; another kind, old revision, shared
+view or similarly worded note cannot fill them. A stored plan is not completed progress.
+
+Multiple commitments remain separate `commitment` items, not singleton view slots. For
+this Base direct-update path, their work membership comes from the canonical create
+`memory_change` observation's captured binding and original result (revision 1). The
+scoped reader resolves those memory IDs and hydrates their current revisions; a later
+editor's session does not move them. This internal membership lookup is not an evidence
+or learning trigger. Missing/damaged creation binding withholds the association with
+`qualification_missing`; do not invent it from text, reuse scope or the latest edit.
+
+Resolve binding → current work slots and associated commitments → exact qualifications/
+grounds → bounded observations of that work → current corrections/notices → related
+experience. Receipt-time pagination is not a completeness checkpoint: delayed spool
+inserts can sort before it (Implementation §5.2). Re-evaluate current slots on each new
+invocation, and report bounded/truncated observation coverage rather than claiming all
+intervening events were seen. Arrival order cannot overwrite a selected current view.
 
 A similar cancelled direction is not current work. Late results retain issue-time
 binding. Fork/transfer creates explicit relations, not silent renaming. A model summary
@@ -64,10 +93,18 @@ Replay after an outage must not silently invent a newer user goal from arrival o
 For one conclusion revision, links in a non-null grounds group are conjunctive;
 different groups are alternatives; ungrouped support is advisory. Navigation is not
 evidence; cycles add no independent support. Unknown composition stays unknown.
+Load links for the selected exact conclusion revision, never combine current text with
+historical grounds. An explicitly empty complete set differs from a failed/truncated
+relation read. Persisted support_state records an assessment, not proof that its grounds
+are currently available; a consumer relying on a group must resolve that complete group.
 
 Applicability is `applicable | inapplicable | conditional_or_unknown`. Evaluate material
 selectors, validity, work/resource version and exceptions. Token/vector similarity is
-not sufficient. Methods and contraindications travel together.
+not sufficient. Methods and contraindications travel together. Base checks typed time,
+work and resource facts; free-text conditions/exceptions remain data. A material condition
+or exception not actually resolved keeps applicability `conditional_or_unknown`, not
+`applicable` from an empty evaluator, keyword match or missing field. No evaluator DSL
+or model call is required just to preserve that uncertainty.
 [Implementation §4.7.2](IMPLEMENTATION.md#472-reuse-and-guidance-states) owns the persisted
 reuse/support/exposure/influence vocabulary. Conditional applicability is not withdrawal;
 a supported but withdrawn method is not eligible advice.
@@ -126,9 +163,18 @@ Exact SQL belongs to [Implementation §5.1](IMPLEMENTATION.md#51-exact-full-text
 
 ### 6.4 Packing
 
-Prioritize current goal/criteria/progress; exact corrections/constraints; open commitments;
-applicable or conditional methods with exceptions; relevant episodes; dissent/unknowns/
-missing checks; exact source handles.
+Prioritize current goal/criteria/plan/progress; exact corrections/constraints; open
+commitments; applicable or conditional advice with exceptions; relevant episodes;
+dissent/unknowns/missing checks; exact source handles.
+
+Apply Implementation §4.7.2's eligibility before assigning a positive role. Hidden items
+are excluded from automatic packets, not made public by relabeling them evidence.
+Only a current `commitment` with `commitment_state=open` gets role `commitment`; resolved
+or cancelled items may appear as qualified history, never an outstanding obligation.
+Role `method` requires `method_role=advice`; processing recipes belong to §8's owning
+job and cannot become ordinary recommendations. Persisted goal/plan/progress guidance
+uses §2's current views, not a text classifier; live input stays explicitly uncommitted.
+Missing required state withholds the unit with a gap, not a default.
 
 Base renders selected structured fields and exact labelled excerpts; it does not need
 an LLM to summarize them. Within the priority classes above, prefer addressed current
@@ -162,15 +208,15 @@ ID namespace; allocate it once before preparing the output.
 | Field | Required meaning |
 |---|---|
 | `binding` | `installation_id`, nonnegative integer `selection_generation`, `project`, `workspace_id`, `actor_id`, `session_id`, `host`, `host_version`, `adapter_version`, `event`; optional `task_id` and `native_request_key`. All other values are nonempty strings bounded by Implementation §4.5.1. The admitted adapter supplies versions/event mapping, not caller text. Missing task uses §2's session address. Missing session/work authority cannot fall back to a similar project's packet. |
-| `units` | At most 32 ordered units under §6.4. Each has `role`, `representation`, `text`, `source` and `qualifiers`, plus `span` only for an excerpt. Roles are `goal`, `constraint`, `progress`, `commitment`, `method`, `evidence`, `counterevidence`. Representations are `verbatim`, `excerpt`, `stored_reduction`, `live_input`. A stored reduction retains its own exact source identity; it is not generated while packing. |
+| `units` | At most 32 ordered units under §6.4. Each has `role`, `representation`, `text`, `source` and `qualifiers`, plus `span` only for an excerpt. Roles are `goal`, `plan`, `constraint`, `progress`, `commitment`, `method`, `evidence`, `counterevidence`. Representations are `verbatim`, `excerpt`, `stored_reduction`, `live_input`. A stored reduction retains its own exact source identity; it is not generated while packing. |
 | `source` | For persisted units: `{kind:"observation",id,sha256}` or `{kind:"memory",id,revision,sha256}`. Use exact-open `body_sha256` for an observation and `revision_sha256` for a memory ([Implementation §7.3](IMPLEMENTATION.md#73-exact-open-and-byte-ranges)); a memory content-only hash is insufficient. Resolve `current` before packing; revision is positive and exact. Only `live_input` has `source=null`, meaning explicitly uncommitted caller input, not an invented citation. |
-| `qualifiers` | Closed projection of applicable source fields: `conditions_json`, `exceptions_json`, `valid_from_ms`, `valid_until_ms`, `support_state`, `exposure_state`, `influence_state`, `applicability`, `capture_limit_json`, plus computed `current_withdrawal` for every persisted memory unit. Copy the source's complete conditions/exceptions/limitations; compute applicability by §3 and withdrawal by Implementation §10. Omit fields inapplicable to that source kind; do not replace missing required facts with permissive values. |
+| `qualifiers` | Closed projection of applicable source fields: `conditions_json`, `exceptions_json`, `valid_from_ms`, `valid_until_ms`, `support_state`, `exposure_state`, `influence_state`, `applicability`, `capture_limit_json`, plus required `commitment_state` for commitment sources, required `method_role` for method sources (`processing_purpose` exactly for processing), and computed `current_withdrawal` for every persisted memory unit. Copy the source's complete conditions/exceptions/limitations; compute applicability by §3 and withdrawal by Implementation §10. Omit fields inapplicable to that source kind; do not replace missing required facts with permissive values. |
 | `coverage` | `{consistency:"per_query",arms:[{name,state}],gaps:[code...]}`. Names: `addressed`, `exact`, `lexical`, `relations`, `methods`, `vectors`; each appears once. States: `complete`, `partial`, `unavailable`, `disabled`, `not_requested`. This initial packet does not claim a coherent cut across independent queries. |
 
 `current_withdrawal` is `none | withdrawn`, evaluated from current notices inside the
 final delivery fence. It is not the stored `influence_state` and is not part of the source
 revision hash. A withdrawn item may appear only as explicitly qualified historical
-`evidence`/`counterevidence`, never as an active goal, constraint, progress, commitment or
+`evidence`/`counterevidence`, never as an active goal, plan, constraint, progress, commitment or
 method; withdrawal does not itself refute its content. If the notice state cannot be
 established, withhold that unit with `qualification_missing`, not a default `none`.
 Erased/forbidden content is never packed. Preserve this live qualification when including an older exact revision.
@@ -224,8 +270,11 @@ selection, current authorization/disclosure and suppression. A local host may fo
 context to a remote provider: local IPC permission alone does not authorize that
 forwarding. The admitted host profile must bound the allowed destination/disclosure;
 unknown destination keeps restricted content withheld. For a memory unit selected as current
-goal/constraint/progress/commitment/method, verify that the current revision still equals
-the selected revision; successfully opening its historical copy is not that check.
+goal/plan/constraint/progress/commitment/method, verify that the current revision still
+equals the selected revision and still passes the role's eligibility. For an addressed
+view, recheck that the requested work slot resolves to that same item/revision; for a
+commitment, recheck its creation binding and current permission to use that membership.
+Historical open is not either check.
 Revalidate exact source hashes, qualifications and current notices. A changed eligible
 result requires rebuilding and a new packet ID, never changing bytes under the old one.
 No retry follows an ambiguous prior emission.
@@ -307,6 +356,10 @@ new reporting framework or declaring a docs example to be runtime evidence:
 | Case | Required result |
 |---|---|
 | Same text, different work/session | No cross-binding packet reuse; distinct occurrences remain distinct. |
+| Same task key in different workspaces, or two tasks in one session | Distinct work addresses; an empty/failed task lookup never widens to the whole session. |
+| Resolved commitment or processing recipe selected as advice | Reclassify as qualified history or omit; preserve commitment/method state, never emit it as active work/advice. |
+| Plan exists but progress slot is empty | Return plan as plan; do not claim execution, completion or an invented progress view. |
+| Missing/truncated grounds or unevaluated exception | Not an empty successful assessment or unconditional advice; preserve the uncertainty and applicable coverage gap. |
 | Current revision/policy changes before output | Revision publication and output share the affected fence; historical hydration cannot pass a current-revision check. Rebuild or withhold, never send stale positive guidance. |
 | Withdrawn historical source with stored influence active | Preserve the exact revision hash and add current withdrawal qualification; never promote it to positive guidance. Missing notice authority is not `none`. |
 | Oversized unit or exhausted retrieval arm | Preserve qualifiers or omit the unit with a gap; encode partial/unavailable truthfully and remain within the final-response cap. |
@@ -315,13 +368,13 @@ new reporting framework or declaring a docs example to be runtime evidence:
 
 ## 7. Exact open
 
-Require one exact handle/locator and optional bounded range. Do not rerun search,
-conversion, Research or inference to satisfy a historical handle. Empty selector is not
-broad retrieval; history never falls forward.
-
-Return requested/resolved identity, revision/representation, range/digest, current/history
-disposition, capture limitations, qualifications, relation descriptors, expansion handles,
-continuation and explicit missing/forbidden/erased/damaged/unsupported state.
+Use [Implementation §7.3](IMPLEMENTATION.md#73-exact-open-and-byte-ranges) for closed
+selectors, byte ranges, complete revision hashes and disposition-specific responses.
+Do not rerun search, conversion, Research or inference to satisfy a historical handle.
+An opaque locator is not another selector or permission; history never falls forward.
+Non-content results do not expose source hashes, lengths or private qualifications;
+Store/notice unavailability is an operation error, not `missing`. Relation expansion
+uses the selected exact revision and its own bounded coverage, not guessed empty links.
 
 ## 8. Processing methods and jobs
 
