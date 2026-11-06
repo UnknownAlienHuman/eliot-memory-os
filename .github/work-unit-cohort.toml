@@ -91,20 +91,27 @@ body_sha256 = "020be359b5d07de99dc55ef1472f3a6a96c49b9cd8b10af48b1b58c223d56e1e"
 disposition = "blocked"
 prerequisites = []
 
+[[row]]
+issue = 5348
+unit = "V3-CONTEXT-DENSITY"
+body_sha256 = "8e0e7ae05b4b5e466f8db291438ee31a095368070cc280cf2495c11290877949"
+disposition = "blocked"
+prerequisites = []
+
 [aggregate]
-issues = [728, 748, 750, 818, 838, 839, 843, 846, 859, 974, 994, 5324]
+issues = [728, 748, 750, 818, 838, 839, 843, 846, 859, 974, 994, 5324, 5348]
 numeric_descriptors = []
 matrix_cases = 0
 assigned = 0
-blocked = 6
+blocked = 7
 planned = 0
 nonexecutable = 2
 superseded = 2
 accepted_historical = 2
-sha256 = "842457314bbf6696861ae56f070170c3d463797a6ba146914e6f2c79e07c1806"
+sha256 = "e52a9cedee8ad2d3a6507aeeb6b4973a5c0d11f63f6fc261252107a8c3283406"
 
 [provenance]
-base_commit = "4af7df71959d50ae431761e3989040e2d1870aef"
-acquired_at = "2026-10-30T20:42:28Z"
-acquisition = "GitHub connector: exact catalogue blob c7c657c3944fb530f50f6bc59185c4424d702467, work-units tree 699c8a87ebd195bdfb7d2174f77d56fa683ea74a, and issue #5324 owner update/readback; scope comments 6532944200 and 6533001109"
-note = "D6 catalogue extension at 4af7df7. Only #5324 was acquired live (issue updated_at 2026-10-30T20:42:22Z); its blocked disposition is declared by the root-owned assignment. The other 11 rows are byte-for-field retained from blob c7c657c3944fb530f50f6bc59185c4424d702467, whose observations date to 2026-09-25/26 at base 46d645f2c6ece125842e8deefdb661797c0fa0e9; they are not freshly qualified. Active numeric descriptors are empty after removing the exact duplicate of the retained #837 testdata fixture. Catalogue integrity does not imply task completion, current full-project authority or runtime acceptance."
+base_commit = "6b7926335393cf3a292d5c40e9220caf0445c230"
+acquired_at = "2026-11-06T00:06:15Z"
+acquisition = "GitHub API issue #5348 exact body readback (2026-11-06T00:05:49Z); inherited catalogue blob 643d2b0f96a5f3a806713ac12ee483c4f93dbb67; local tracked descriptor inventory"
+note = "Add only #5348, blocked pending independent integration review. Retain the other 12 rows field-for-field from blob 643d2b0f96a5f3a806713ac12ee483c4f93dbb67, which preserves their full prior provenance: #5324 acquired 2026-10-30 at 4af7df71959d50ae431761e3989040e2d1870aef; the other 11 observed 2026-09-25/26 at 46d645f2c6ece125842e8deefdb661797c0fa0e9. No inherited row was freshly qualified. Coverage is this complete selected catalogue and the actual descriptor directory, not a whole-GitHub inventory or runtime acceptance."
