@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.38 · 2026-11-06 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.39 · 2026-11-06 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -605,13 +605,16 @@ consumer, without speculative archive-wide synthesis:
 5. **Publish.** Use §9.2 and the ordinary revision writer; the next context lookup consumes
    prepared text without inference.
 
-Automatic mode is `off | idle | background`. New primary outcomes, test results, corrections
-or agent-authored task handoffs coalesce into the work/view-targeted refresh. Repeated polling, packets,
-injected echoes, cleanup and accounting cannot trigger it. Prefer current-work changes
-and known repeated needs to speculative generalization; reuse and refresh cost determine
-whether further preparation is worth doing, not a promise that background compute is free.
-Capture/context retain foreground capacity. A burst updates one pending intent, not one
-model call per event. Unused derived material may lose exposure without erasing its source.
+Automatic mode is `off | idle | background`. In enabled modes, new committed user/task
+input, outcomes/tests, corrections and agent-authored handoffs coalesce preparation for
+the admitted work address (Implementation §7.6). Input can seed a missing view before any
+outcome or failed lookup. The adapter uses event kind/identity, not semantic classification.
+Start/resume alone, replay, polling, packets/echoes, cleanup and accounting add no input.
+
+Queueing is not a model call. Existing scheduling batches a burst into one pending intent;
+capture/context retain foreground capacity. Prioritize current work and repeated needs
+within configured capacity/cost, accounting for reuse and refresh cost. Unused derived
+material may lose exposure without erasing its source.
 
 `off` disables automatic preparation, not an explicit research request admitted by the
 configured inference profile. For `(project,purpose,target)`, permit one active job and one

@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.59 · 2026-11-06 · design for the greenfield rewrite.**
+**Revision 1.0-draft.60 · 2026-11-06 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -1109,7 +1109,7 @@ part of the inference increment, not a model call hidden inside Base retrieval.
 
 | Caller | Operation and result |
 |---|---|
-| New primary outcome/correction/task handoff | Coalesce exact source references for `purpose=prepare`, target=current work/view, in the owning capture/revision transaction. Context packet/handoff receipts are not primary input. One active job plus one pending successor. |
+| New user/task input, outcome/correction/handoff | With automatic mode enabled, coalesce exact sources for `purpose=prepare`, `target_key`=Cognition §2's work `address_key`, in the capture/revision transaction. This key exists before any view and survives its creation. No admitted address means no automatic job, never project-wide fallback. |
 | Agent asks Dreamer | Submit a captured question with `purpose=research`, target=that request observation ID; return the original request/job identity and scheduling state. Distinct questions have distinct targets, even on the same work. |
 | Agent reads / follows up | Read bounded job status and accepted answer revision references; ordinary exact open supplies content. A follow-up submits another question with an exact `reply_to`; no transcript/session store. |
 | Agent cancels | Existing job cancellation/readback; timeout or a new question is not proof of cancellation. |
