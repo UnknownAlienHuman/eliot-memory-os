@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.36 · 2026-11-06 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.37 · 2026-11-06 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -260,6 +260,11 @@ its necessary state/qualifiers. A required premise is a supplied selector or an
 attributed source claim, not an automatically invented checklist. Missing address,
 model or source coverage stays explicit.
 
+Keep receipt/occurrence, validity and mentioned-event time distinct (Implementation §4.7.1).
+Explicit time filters use the matching known axis; model-inferred ranges remain cues.
+Unknown mentioned-event dates cannot exclude otherwise relevant candidates. Timed wake-up
+belongs to the host; without that event, recall waits for the next supported boundary.
+
 ### 6.2 Candidate arms
 
 Use staged disclosure within one request budget, not every retrieval arm on every hook:
@@ -321,19 +326,15 @@ Exact SQL belongs to [Implementation §5.1](IMPLEMENTATION.md#51-exact-full-text
 
 ### 6.4 Packing
 
-Prioritize decision-changing corrections/constraints, current goal/model/state/next step,
-open commitments and matching failed attempts; then applicable advice, discriminating
-evidence and related history. Unknowns, counterevidence, qualifiers and source handles
-travel with the claim they qualify, not as disposable low-priority context.
+Rank corrections/constraints, current goal/model/state/next step, open commitments and
+matching failures; then applicable advice, discriminating evidence and history. Keep
+unknowns, counterevidence, qualifiers and handles with the claims they qualify.
 
-Apply Implementation §4.7.2's eligibility before assigning a positive role. Hidden items
-are excluded from automatic packets, not made public by relabeling them evidence.
-Only a current `commitment` with `commitment_state=open` gets role `commitment`; resolved
-or cancelled items may appear as qualified history, never an outstanding obligation.
-Role `method` requires `method_role=advice`; processing recipes belong to §8's owning
-job and cannot become ordinary recommendations. Persisted goal/plan/progress guidance
-uses §2's current views, not a text classifier; live input stays explicitly uncommitted.
-Missing required state withholds the unit with a gap, not a default.
+Apply Implementation §4.7.2 before roles. Hidden items never enter automatic packets.
+Only current open commitments get role `commitment`; resolved/cancelled items are history.
+Only `method_role=advice` gets role `method`; processing recipes stay in §8 jobs. §2's slots
+supply goal/plan/progress, not a text classifier; live input remains uncommitted.
+Missing required state withholds that unit with a gap, never a default.
 
 Base renders existing concise views or exact labelled excerpts. Dense semantic reductions
 come from §2.1's explicit revision or §8's Dreamer preparation, never a hidden model call
@@ -344,6 +345,13 @@ or distinct events. Do not repeat the live prompt, generic instructions or unrel
 Treat value plus negation, conditions, exceptions, validity and source handle as one
 packing unit. Include it whole; otherwise use an existing qualified short representation
 or omit it with an explicit gap. Do not invent a shorter paraphrase or drop a qualifier.
+When a material premise/condition/counterexample occupies another selected unit, retain
+its dependency with the guidance it qualifies. After any cut, keep that dependency complete,
+use an existing short form carrying the decisive meaning, or omit the dependent guidance
+with `packet_limit`. A bare uncertainty label/handle cannot replace a missing caveat.
+Track only bounded presentation dependencies from selection's exact links; no inferred
+edges or persisted group. Resolve support under §3 without loading every ground's body
+into context. Independent useful units remain available.
 Enforce [the Base byte cap](IMPLEMENTATION.md#451-first-base-limits) on actual emitted
 UTF-8 bytes, including labels/handles/gaps. Reserve room for the gap summary first.
 A byte count is not a token measurement: when the host requires an exact token budget,
@@ -407,11 +415,10 @@ support. Live input is attributed to the current caller, never made a persisted 
 authorization merely because it appears in a packet. Do not serialize rank scores or
 expose internal Store/spool paths as locators; legitimate captured text is not rewritten.
 
-Measure the **final host response**, including JSON escaping, envelope, identifiers and
-coverage, against the 32 KiB Base packet cap (and any smaller admitted host cap). Removing
-a whole lowest-priority unit and updating gaps is allowed before freezing output; cutting
-a JSON string, source selector or qualifier is not. If even the gap-only response exceeds
-the cap, emit no packet. An exact host token cap still requires its admitted counter.
+Measure the **final host response**, including escaping/envelope/identifiers/coverage,
+against 32 KiB and any smaller admitted host cap. Every removal rechecks §6.4's presentation
+dependencies before freezing output; never cut a string, selector or qualifier. If even
+gap-only output exceeds the cap, emit no packet. Exact token caps require the admitted counter.
 
 #### 6.4.2 Compact model-facing rendering
 
@@ -419,14 +426,13 @@ the cap, emit no packet. An exact host token cap still requires its admitted cou
 projection, not nested packet JSON. The existing context operation owns a deterministic
 renderer; no second store, mutable alias registry or summarizer is needed.
 
-1. Header: `Memory context (attributed data)`, presentation mode and current work address.
-   Packet ID, installation/adapter versions, hashes and ranking diagnostics stay internal.
-2. In packet order, render `role [n]: text`; `text` is the unit's exact JSON-quoted string.
-   Mark an excerpt or stored reduction once; use `[live]` for uncommitted input. Assign source numbers by
-   first appearance. Group complete action/result units when their captured relation proves
-   the pairing; grouping neither creates a causal assertion nor merges their identities.
-   An update labels current guidance with its exact memory revision and states that it
-   supersedes earlier guidance for that item; historical evidence is never labelled current.
+1. Header: `Memory context (attributed data)`, mode and work address. Packet ID,
+   installation/adapter versions, hashes and rank diagnostics stay internal.
+2. Render packet order as `role [n]: text`, with exact JSON-quoted text. Mark excerpt/reduction
+   once and uncommitted input `[live]`. Number exact sources by first appearance. Group complete
+   action/result units by captured pairing; retain identities and do not infer cause.
+   Updates name the current guidance's exact revision and supersede earlier guidance for
+   that item; history is never labelled current.
 3. Render decision-relevant qualifications next to the unit: supplied perspective and
    actual/hypothetical scope, full nonempty conditions/exceptions, validity,
    uncertain/disputed/refuted support, conditional applicability,
@@ -434,15 +440,13 @@ renderer; no second store, mutable alias registry or summarizer is needed.
    qualifications may appear once for an explicitly delimited group. Empty arrays and normal/
    active/non-withdrawn defaults stay internal; roles already express an open commitment or
    advice method. This is a fixed projection, not semantic paraphrasing or hidden qualification loss.
-4. End with one source dictionary: `[n]=observation:<id>` or `memory:<id>@<revision>`;
-   include each unit's excerpt offset/length next to that unit. Reuse the number only
-   for the same exact source; live input has no source alias. Resolve `[n]` locally to
-   the displayed immutable selector, then call ordinary exact open. Never send `[n]`
-   as an API selector, resolve it through a packet service or replace the revision with `current`.
-5. Show only gaps that affect the supplied answer or requested scope. Complete arm states
-   and gap codes remain in the internal packet for explicitly requested diagnostics;
-   unused backend/status inventory is not agent context. Recount wrapped bytes; omit whole
-   units, never cut meaning or qualifications to fit.
+4. End with `[n]=observation:<id>` or `memory:<id>@<revision>`; put excerpt offset/length beside
+   its unit. Reuse aliases only for the same exact source; live input has none. Resolve locally
+   to that immutable selector for ordinary exact open, never send `[n]` to a packet service/API
+   or substitute `current`.
+5. Show answer/scope-relevant gaps; full arm/gap diagnostics stay internal unless requested.
+   Recount wrapped bytes and recheck §6.4 dependencies after trimming; no isolated cut may
+   leave advice without its decisive qualification.
 
 A baseline is self-contained after lost context; an update follows §6.2.1 and uses only
 its own source aliases. Explicit diagnostics may return the internal packet. If §6.5's

@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.57 · 2026-11-06 · design for the greenfield rewrite.**
+**Revision 1.0-draft.58 · 2026-11-06 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -407,6 +407,10 @@ Source-format conversion is adapter code, not model inference. For example, an e
 remain different tuples. Receipt time and stream sequence still describe capture/order;
 none of these fields makes a wall-clock change feed.
 
+These fields date the captured occurrence. Dates mentioned inside its body remain
+attributed content unless an admitted source format binds them to that occurrence.
+Validity intervals do not supply event time or an obligation deadline.
+
 #### 4.7.2 Reuse and guidance states
 
 `origin_project` never changes. The revision writer owns `reuse_scope` and the bounded,
@@ -664,7 +668,7 @@ Use existing fields/indexes, not another cue service/table.
 host. Event → accepted capture/spool → addressed/cue reads → qualified baseline/update →
 source recheck → output. Reuse one Store client, batch independent fixed reads, hydrate
 selected revisions once, then revalidate live pointers/notices under the delivery fence.
-No model/embedding/Research/search call, corpus scan, graph rebuild or background join.
+No model/embedding/Research or external-search call, corpus scan, graph rebuild or background join.
 
 The relay's absolute deadline covers capture, reads, checks and output. Initial targets:
 configurable **250 ms automatic wait**, **warm p95 ≤100 ms** from event receipt through local
