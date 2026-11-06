@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.22 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
+**Revision 1.0-draft.23 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
 
 V1/V2 Memory implementations are donors. This document owns purpose, responsibility
 and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store, maintenance
@@ -10,14 +10,9 @@ and build order; [Cognition](COGNITION.md) owns algorithms; the
 
 ## 0. External dependency
 
-Controller foundation and Memory inference are different capabilities. The inspected
-controller has an implemented foundation but lacks the Memory principal and inference
-handlers; exact source and adaptation requirements are maintained in
-[Inference §0](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
-
-Base has no controller dependency. Model-assisted learning requires the scoped inference
-extension, not another implementation of controller L0/L1 or an Agent-binding programme.
-Never route around missing inference through owner credentials, Agent tasks or legacy V1.
+Base works locally without a controller. Dreamer adds semantic preparation through the
+scoped controller extension; its actual missing interfaces and adaptation boundary are
+owned by [Inference §0](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
 
 ## 1. Purpose and completion
 
@@ -25,6 +20,15 @@ Eliot reconstructs the smallest useful model of the work: **goal/criterion, how 
 relevant part works, current state, attempts/results, uncertainty and next step**.
 The agent should recover why a decision follows, what would change it and where to
 check the evidence. A transcript summary or list of similar facts alone is insufficient.
+
+| Agent problem | Required behavior |
+|---|---|
+| Context lost after compaction, restart or handoff | Rebuild the current goal, decisions, attempts and next step from retained sources. |
+| Context fills with repeated or unrelated material | Keep a small active view; inject useful changes at the next decision boundary and open detail on demand. |
+| The agent does not know what to recall | A touched artifact, error, result or changed premise activates prepared knowledge and relevant counterexamples. |
+| A familiar failure recurs | Supply its conditions, attempted repair and what would justify a different next attempt. |
+| Old knowledge survives a code/API/goal change | Requalify the affected model and advice; expose the current fact and unresolved conflict. |
+| Experience accumulates without improving work | Revise the knowledge or processing method actually consumed by later decisions. |
 
 The loop is observation → working model → decision context → action/result → revision
 → later use. Memory supplies grounded premises; the agent reasons and the host executes.
@@ -49,12 +53,8 @@ and [the research map](AUDIT-MAP.md#5-из-исследований-в-реал�
 | Goals, permissions and acceptance | Human and host/controller |
 | Agent/task/tool execution | Host/controller |
 | Event translation and actual context emission | Narrow host relay |
-| Observations, revisions, retrieval, context, outcomes and finite jobs | Memory daemon |
-| Store mutations, replay and quiesce | Memory daemon |
-| External-call serialization and backup dependency checks | Daemon controller-mutation owner |
-| Backup records, transitions, bounded restore leases and cleanup | Daemon backup-set owner |
+| Memory, retrieval/context, finite learning jobs, mutations/replay and backup dependency/record operations | One Memory daemon; ordinary modules own these operations |
 | Executable/root identity, Store root/Owner credentials, migration, candidate and cutover | Supervisor/installer |
-| Interpretation, consolidation and method improvement | Memory learning handlers |
 | Scoped one-shot call, provider execution/readback and private inference copies | Controller extension |
 | Persistence, indexes and transactions | Private SurrealDB Store |
 
@@ -107,10 +107,10 @@ on web acquisition; optional acquisition/vectors/documents reuse existing owners
 
 ### 3.3 First host is narrow
 
-The first Claude relay captures selected lifecycle/tool outcomes and emits context at
-synchronous SessionStart (including resume/compact) and UserPromptSubmit boundaries.
-Final messages are retained directly; compaction summaries are derived. Event mapping
-and installed-host verification belong to [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary).
+The first Claude relay captures host events and supplies context at start/resume/compact,
+user prompts and supported tool-result boundaries. One batch update is preferred to
+duplicate per-tool injections. Final messages are retained directly; compaction summaries
+are derived. [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary) owns the exact mapping.
 Additional hosts translate the same operations; their event names do not alter domain state.
 Memory failure withholds unavailable context and leaves host execution available.
 
@@ -134,16 +134,21 @@ reintroduction/inventory/restore claims; none is physical deletion proof.
 
 ## 5. Retrieval, context and learning
 
-Start with addressed work, its current qualifications and linked attempts. Expand exact
-cues, lexical/relations/methods and optional vectors only for a named question or missing
-premise. Scope each requested arm before its limit; union before selection. Unrequested
-arms remain explicit. BM25 ranks one query snapshot, not truth or a cross-call cursor.
+Start with addressed work and the current event's exact artifact/error cues. Follow known
+decision dependencies and failed attempts, even when their wording differs from the query.
+Expand lexical/relations/methods and optional vectors for a remaining question. Scope before
+limits and select from the union; rank is neither truth nor applicability.
 
-The default output is a small, self-contained work model with exact sources for detail.
+The baseline is a small, self-contained work model with exact sources for detail.
 Preserve mechanism/attempts, corrections, commitments, exceptions and unresolved evidence.
 Keep only what changes the action, expected consequence or verification. Internal defaults,
 backend inventories and diagnostic bookkeeping stay out of the model's prompt; meaningful
 qualifications remain visible. [Cognition §6](COGNITION.md#6-retrieval-and-context) owns the codec.
+
+A new or uncertain context gets a self-contained baseline; an ongoing context gets only
+useful changes and their necessary premises. A small volatile presentation cache reduces
+repetition. It never establishes truth, delivery, use or permission. Source validation
+precedes output; failure to record optional packet telemetry does not withhold valid context.
 
 Do not turn missing evidence, low similarity or an optional backend failure into a global
 task gate. Qualify/omit the affected claim; keep useful independent context and exact open.

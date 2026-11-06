@@ -1,6 +1,6 @@
 # Eliot V3 — решения по исходным требованиям и границы охвата
 
-**Маршруты требований: 2026-10-28; целевой research update: 2026-11-05 (§5.1). Не runtime registry.**
+**Маршруты требований: 2026-10-28; целевая сверка старых требований, дефектов и исследований: 2026-11-06 (§5.1–5.3). Не runtime registry.**
 
 Ищите конкретный ID и переходите в колонку «Текущий owner». Владелец задаёт действующее
 правило; эта карта сохраняет требование, осознанное отклонение и источник, но не создаёт
@@ -53,7 +53,7 @@
 | MOD-03 | у состояния один владелец | Один Store writer; views читают его данные. Не отдельный guard registry ради этого правила. | [Architecture §2](ARCHITECTURE.md#2-ownership) |
 | PORT-01 | органы заменяемы | Настоящие adapters, network SDK и export; не универсальный backend framework. | [Architecture §3](ARCHITECTURE.md#3-product-shape) |
 | SCOPE-01 | область прежде повторного использования | Источник отдельно от reuse scope; проекты и общие методы фильтруются до top-k. | [Implementation §5.1](IMPLEMENTATION.md#51-exact-full-text-shape) |
-| MEM-01 | захват прежде организации | Сохранить permitted raw до модели, точность/полноту захвата обозначить. | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host); [Implementation §7.1](IMPLEMENTATION.md#71-capture-policy-before-durable-custody) |
+| MEM-01 | захват прежде организации | Обычный текст + известные sources; adapter заполняет внутренние поля, неизвестная классификация не мешает capture. | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host); [Implementation §7.1](IMPLEMENTATION.md#71-capture-policy-before-durable-custody) |
 | MEM-02 | ошибки памяти исправимы | Редакция конкретного item и история; current row не вечная append-only проекция. | [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host) |
 | MEM-03 | производное хранит источники | Реальные адресуемые источники и версия; модель не создаёт source contents одним ID. | [Cognition §1](COGNITION.md#1-observations-claims-and-revisions); [Cognition §9.2](COGNITION.md#92-result-and-cognitive-states) |
 | MEM-04 | извлечение не подкрепляет | Retrieval не support. Rank допускает relevance/recency, но не выдаёт популярность за истинность. | [Cognition §3](COGNITION.md#3-grounds-and-applicability); [Cognition §6.5](COGNITION.md#65-handoff) |
@@ -67,8 +67,8 @@
 | GROUND-01 | опора на артефакты | Конкретные source spans, ресурсы и реальные изменения; aliases не exact identity. | [Cognition §1](COGNITION.md#1-observations-claims-and-revisions); [Cognition §9.2](COGNITION.md#92-result-and-cognitive-states) |
 | SELF-01 | ELIOT знает себя | Eliot читает собственные документы/данные теми же средствами; status отражает реальные jobs/results. | [Implementation §10](IMPLEMENTATION.md#10-erasure-rotation-and-observability); [Cognition §15](COGNITION.md#15-additive-capabilities-and-their-consumers) |
 | CTX-01 | достаточность прежде размера | Основание и существенное исключение упаковываются вместе; handles раскрывают детали. | [Cognition §6.4](COGNITION.md#64-packing) |
-| CTX-02 | проактивность от наблюдаемого | Триггеры от реальных доступных host/source events, не модель перед каждым событием. | [Cognition §8](COGNITION.md#8-processing-methods-and-jobs) |
-| CTX-03 | доставка рядом с решением | Доставка на фактической границе решения; PreToolUse advice не отменяет уже выбранное действие. | [Cognition §6.5](COGNITION.md#65-handoff) |
+| CTX-02 | проактивность от наблюдаемого | Artifact/error/result cues активируют подготовленные зависимости без inference; фон обновляет смысл по новым primary outcomes. | [Cognition §6.2.1/8.1](COGNITION.md#621-proactive-attention-without-repeated-context) |
+| CTX-03 | доставка рядом с решением | Baseline после потери контекста; полезные изменения перед следующим model call. Проверка источников обязательна, запись receipt не блокирует выдачу. | [Cognition §6.5](COGNITION.md#65-handoff) |
 | CTX-04 | поиск предлагает, сборщик допускает | Candidate selection и смысловая применимость; не обязательный permission score или запись лога до ответа. | [Cognition §6.2](COGNITION.md#62-candidate-arms) |
 | ATTN-01 | обязательство — состояние | Обязательство — ordinary memory state; показ/ack не resolution и не сообщение на каждом входе. | [Cognition §5](COGNITION.md#5-direct-updates) |
 | SKL-01 | Skills короткие | Полезный компактный метод + раскрытие; сорок строк не универсальный предел. | [Cognition §8](COGNITION.md#8-processing-methods-and-jobs) |
@@ -288,6 +288,21 @@ LightMem, procedural skills и dependency repair на том же `fe7c0c8`; н�
 Главный выбор: фон готовит смысл; инструменты выбирают, квалифицируют и собирают его;
 опыт исправляет содержание и способ подготовки. Ни новые таблицы, ни ещё один агентный
 runtime, ни сертификат «достаточного понимания» для этого не нужны.
+
+### 5.3 Restore useful behavior from the old design
+
+Сверка 2026-11-06: [старые нормы на `1c19f33`](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/1c19f33dbd8ca5278cea283ccecfaa073b9f8ac9/docs/architecture),
+V3, source-дефекты и KB. Delta/cache, key/version и optional telemetry — решения Eliot,
+не доказанные paper results. Ничего из этого не объявляется реализованным.
+
+| Прочитанная опора | Решение / предел вывода |
+|---|---|
+| A04-02, I06-12 | Обычный текст вместо ontology/ActionFrame-анкеты → [Cognition §5](COGNITION.md#5-direct-updates). |
+| A07-03, I07-19, I12-06/14 | Push/Pull/Dreamer, общая cue-нормализация, bounded lookup, инъекция изменений → [§6.2.1](COGNITION.md#621-proactive-attention-without-repeated-context). Без mirror/outbox/manifest framework и inference на hook. |
+| [InjectionPlanner `5aac094`, `attach`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs); [старый аудит §22](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/41c2291f3b968ddbb2690b2f4be79e1677730de7/docs/v3/AUDIT.md) | Receipt failure пропускал item; delivered записывался до ответа. Source checks перед выдачей, telemetry best effort после → [§6.5](COGNITION.md#65-handoff). Source-order finding, не fault injection. |
+| [LoCoMo-Plus v1](https://arxiv.org/html/2602.10715v1), §§3–4 | Лексически далёкие cue/trigger требуют поиска известной предпосылки, а не только сходства. [§6.2](COGNITION.md#62-candidate-arms) следует prepared dependencies; benchmark не проверял эту hook/cache policy. |
+| CASK `2610.09008v1`, ExperienceIndex `2610.10091v1`: [KB-разбор §§3/6](https://github.com/UnknownAlienHuman/agent-operation-system-knowledge/blob/fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689/extracts/audit-scope-invalidation-repair-experience.md) | CASK → сохранять speaker/hypothetical scope ([§1](COGNITION.md#1-observations-claims-and-revisions)); ExperienceIndex → artifact-bound опыт ([Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host)). Primary HTML/PDF здесь недоступны; использован KB full-paper audit. Ограниченные модели/корпус CASK и static corpus ExperienceIndex не доказывают универсальность/инвалидацию версий. |
+| [Claude hooks](https://code.claude.com/docs/en/hooks#posttoolbatch), 2026-11-06 | Одна batch-инъекция либо сериализованный per-tool fallback → [§6.5.1](COGNITION.md#651-first-claude-output-boundary). Разные decoder shapes; документация не подтверждает установленную версию. |
 
 ## 6. Inference boundary update — 2026-10-24
 

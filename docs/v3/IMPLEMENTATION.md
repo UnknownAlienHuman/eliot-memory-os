@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.55 · 2026-11-06 · design for the greenfield rewrite.**
+**Revision 1.0-draft.56 · 2026-11-06 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -520,6 +520,9 @@ Continuation uses these columns, not scan/parse of binding_json. Separate FULLTE
 indexes serve observation.search_excerpt and memory.search_text under the selected
 `blank,class` / `lowercase` analyzer. Index syntax/source evidence does not prove every
 reader's bounded execution; inspect actual plans/cardinality as each reader is connected.
+Slice 2 connects an indexed `memory.exact_cues` lookup under §7's shared normalization.
+Scope before its limit; hydrate only selected IDs. Do not scan bodies or load a whole
+project to satisfy a small cue match. Admit its actual fixed query/index plan together.
 
 ## 5. Fixed query corpus
 
@@ -628,40 +631,52 @@ reconciliation. These are selected durability requirements, not qualified Window
 
 ## 7. Core operations and host
 
-Capture, exact open and direct revision have distinct transactions below. The relay
-cannot submit arbitrary table mutations or manufacture operation results. Apply §7.1
-before any payload-bearing file or IPC. Model calls are absent from all Base operations.
-Job claim/settle uses §4.7.3 only when its real worker exists.
+Base uses no model. Capture/open/revision retain their transactions below; relays cannot
+forge operation results or mutate tables. Apply §7.1 before payload-bearing files/IPC.
+The agent-facing adapters accept intentions and fill internal IDs, binding, time and
+honest defaults; they do not expose storage forms:
 
-The initial Claude relay enables only host events verified against the installed host
-contract. [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary) owns capture/emission
-mapping; [§2.1](COGNITION.md#21-working-model-not-a-transcript-summary) owns the working model;
-[§6](COGNITION.md#6-retrieval-and-context) owns staged retrieval and compact rendering.
-An explicit context request uses the same operation; exact selectors use §7.3.
+| Agent input | Existing owner |
+|---|---|
+| Context for work/question/artifact | [Cognition §6](COGNITION.md#6-retrieval-and-context): bounded selection and readable answer. |
+| Open source/revision | §7.3: exact detail on demand. |
+| Remember text, optional sources | Capture/direct note; ambiguity remains attributed input, never a capture failure or silent goal amendment. |
+| Correct item / update goal, plan or progress | §7.4: resolve target/expected revision, hydrate and construct a complete replacement. Preserve qualifiers; changed assertions do not inherit old support. |
+| Ask/follow up/read/cancel Dreamer | §7.6: existing finite jobs and answer/status. |
 
-The automatic path is relay event → accepted capture/spool → addressed reads → qualified
-brief → final packet custody/recheck → host output. It performs **zero model, embedding,
-Research or remote-search calls**. Reuse one Store client; batch independent fixed reads
-where their semantics permit. Hydrate chosen exact revisions once per invocation, then
-revalidate live pointers/notices under the delivery fence. No corpus scan, rebuilt global
-graph, background-job join or durable packet cache belongs on this path.
+### Shared cues and automatic output
 
-The relay supplies an absolute deadline covering retrieval, final checks, packet custody
-and output; use the smaller of the configured wait and the host's remaining time. Start
-with a configurable **250 ms automatic wait** and a **warm p95 ≤100 ms target**, measured
-from relay event receipt to completed local response. These are unmeasured engineering
-objectives, not host guarantees or task-acceptance gates. Report relay/process startup
-and cold Store startup separately. Explicit requests may use their own larger budget.
+One pure versioned normalizer supplies both prepared `memory.exact_cues` and event lookup:
+§4.4's `H("cue-v1", kind, source-qualified canonical identity)`.
 
-Start output only after exact response custody/readback and final recheck, while the
-deadline is live; bound this single write by the remaining budget. If time expires before
-writing, return the host's successful non-blocking no-context response and record
-unavailable status. A partial write is Cognition §6.5's unknown handoff, never a second response.
-Capture already committed/staged remains so. Do not wait for semantic refresh, resend a
-possibly emitted response or deliver it later from spool. Missing optional retrieval
-withholds only its contribution; unsupported operations remain explicit in status.
-Host emission is not part of Store commit. Its exact retention/failure rules remain in
-[Cognition §6.5](COGNITION.md#65-handoff).
+| Cue | Canonical identity from the admitted source decoder |
+|---|---|
+| Artifact | Repository/workspace + source-relative path, `/` separators and authoritative spelling; alternatively the source's stable resource ID. Resolve aliases against the source, not raw absolute-path strings. |
+| Symbol | Canonical artifact + resolved container/name or stable symbol ID. |
+| Error | Tool/rule namespace + documented stable code; unknown prose remains lexical evidence. |
+
+No lossy lowercasing, substring equivalence or model-invented identity. Unresolved identity
+remains searchable/openable; no exact-match claim. Keep artifact version/hash separate
+from the stable key: first find past experience, then qualify it against the current version.
+Use existing fields/indexes, not another cue service/table.
+
+[Claude mapping](COGNITION.md#651-first-claude-output-boundary) is verified per installed
+host. Event → accepted capture/spool → addressed/cue reads → qualified baseline/update →
+source recheck → output. Reuse one Store client, batch independent fixed reads, hydrate
+selected revisions once, then revalidate live pointers/notices under the delivery fence.
+No model/embedding/Research/search call, corpus scan, graph rebuild or background join.
+
+The relay's absolute deadline covers capture, reads, checks and output. Initial targets:
+configurable **250 ms automatic wait**, **warm p95 ≤100 ms** from event receipt through local
+response; unmeasured engineering goals. Report relay/cold Store startup separately;
+explicit requests may have a larger budget. No useful update or deadline before writing
+returns successful empty output; partial write is unknown, never a second response.
+
+[Presentation/cache](COGNITION.md#621-proactive-attention-without-repeated-context) and
+[handoff](COGNITION.md#65-handoff) own concurrency and failure semantics. Capture already
+staged/committed remains so; unavailable optional retrieval omits only its contribution.
+Packet/handoff retention uses best-effort daemon capture with current policy checks,
+without a required storage round trip, receipt queue or later dispatch of old output.
 
 ### 7.1 Capture policy before durable custody
 
@@ -907,7 +922,7 @@ The additional collection limits here are initial engineering choices, not measu
 |---|---|
 | `kind` | `note`, `claim`, `explanation`, `prediction`, `commitment`, `project_view` or `method`. An unimplemented kind-specific consumer remains unavailable; storing its data does not execute it. |
 | `content` | Exact nonempty text; never a caller path or deferred body-fetch request. It includes the instruction body when the item is a method. |
-| `search_text`, `exact_cues` | Bounded derived search text, at most 4 KiB, and a sorted unique array of at most 64 nonempty cues, each at most 256 bytes. Search text derives only from permitted replacement data; it is not extra hidden content or an authority. |
+| `search_text`, `exact_cues` | Bounded derived search text, at most 4 KiB, and a sorted unique array of at most 64 nonempty cues, each at most 256 bytes. Typed cues use §7's shared normalizer; text derives only from permitted replacement data. Neither is extra hidden content or an authority. |
 | `reuse_scope`, `reuse_projects` | §4.7.2 values; at most 64 project identifiers, each within §4.5.1. Required even when the list is empty. |
 | `disclosure` | `local_only` or `external_allowed`, within current owner policy. An explicit value does not itself confer permission. |
 | `conditions_json`, `exceptions_json` | Each is a canonical JSON string encoding an array of at most 32 nonempty qualification strings, each at most 2 KiB; `[]` is explicitly none. Base preserves these as data, not an executable expression language. A material unevaluated condition/exception keeps applicability conditional_or_unknown; matching text is not evaluation. |
@@ -1546,7 +1561,7 @@ Runtime work remains separately authorized; documentation changes do not impleme
 | Asset repair (#5326/#5327) | Fix existing schema/query owner, selected codecs and bounds; replace capture primitives with a complete transaction and exact-open projection | Package fmt/Clippy and embedded inspection pass; still **not** a working Store. Do not add network/provider/backup machinery to `inspect`. |
 | Slice 0 — inline capture/open | Verified Store startup/admission → one bounded client → §7.2 transaction → §7.3 exact open | Disposable caller retains the command for direct readback/retry. Same command changes nothing; changed input conflicts. Inline-only; no production-host crash-custody claim until Slice 1. No model/backup prerequisite. |
 | Slice 1 — durable ingress/restart | §7.5 publish before send → single replay owner → Store/open → retire pending | Input survives restart and lost notification/reply under the same ID. Full quota does not evict old input; interrupted cleanup does not destroy pending custody. Native-event identity alone permits redelivery deduplication; equal bytes from distinct occurrences remain distinct. |
-| Slice 2 — useful context and corrections | Verified host boundary → current-work model + gap-directed retrieval → compact brief → actual emission; §7.4 update → later exact history/context | Agent recovers goal, mechanism/state, attempts, unknowns and next step where supported; absent fields stay unknown. Resume/compact gets fresh context, sources open exactly, corrections survive lost replies. No model required. |
+| Slice 2 — useful context and corrections | Host event → addressed/artifact/error cues → compact baseline or useful update → emission; thin note/correction → §7.4 → later history/context | Agent recovers goal, model/state, attempts, unknowns and next step where supported. Resume/compact rebuilds; tool results activate prepared knowledge; unchanged reads add nothing. Source/qualification changes pass dedup; optional receipt failure does not suppress context. No model required. |
 | Slice 3 — Base maintenance | Quiesced cut → backup/fence/manifest → isolated restore/cutover; notices → erasure; rotation/shutdown | Disposable data exercises actual paths with inference disabled. No user-data migration/destructive command is enabled before its own boundary works. |
 | Inference P1a — Dreamer | Accepted scoped controller extension → background preparation or explicit research question → one persisted call → useful revision → tool/context read; dependency-aware backup/release | Both callers use one job handler. A follow-up retains its own request identity; unknown send is not repeated under a new ID. Only model-assisted work waits for this boundary. |
 | Inference P1b and later | Outcome/test/correction → revise knowledge or processing method → later use; credential rotation and separately selected acquisition/vectors/documents/hosts | Inspect a changed consumer and retained counterexample. External research acquisition is separate from the already available local Dreamer dialogue. |
@@ -1558,8 +1573,9 @@ before connecting capture → work reconstruction → context → exact open.
 
 At that connection, record warm/cold latency, emitted UTF-8 bytes (tokens only with a real
 counter), Store/model call counts and omitted decision-critical facts. Inspect one fresh
-resume, one previous failed attempt, one changed premise and one compaction: can the agent
-identify the right next action/query and open its evidence? Later compare brief versus
+resume, a tool loop with a previous failed attempt, a changed premise and compaction:
+can the agent identify the right next action/query and open its evidence without repeated
+unchanged context? Later compare brief versus
 flat/raw retrieval at equal context budget, including write/refresh cost. A smaller packet
 that increases wrong actions or repeated failures is a regression. Use existing observations;
 no new scoring service or test campaign is required before writing this path.
@@ -1581,7 +1597,7 @@ V1/V2 bins are donors, not an instruction to wire their whole runtime into V3.
 | Planned runtime `src/store.rs` | One admitted client, bindings/decoders and operation calls using schema-package assets. No general SQL API. |
 | Planned runtime `src/capture.rs`, `src/open.rs` | §7.2 identities/outcomes and §7.3 exact reads, used immediately by the first caller. |
 | Later `src/spool.rs` | Slice 1: §7.5 publication/quota/replay/retirement, reused by §7.4; no second queue database. |
-| Later `src/context.rs`, `src/host.rs` | Slice 2: reconstruct/select/render over existing records; map callbacks and actual output. A pure renderer and ordinary adapter functions, not a checkpoint service or new host registry. |
+| Later `src/context.rs`, `src/host.rs` | Slice 2: shared cue normalization, bounded selection, volatile presentation cache and pure renderer; thin note/update adapters, callbacks and actual output. No checkpoint service, receipt registry or new host framework. |
 | Later maintenance modules in the same package | Slice 3 with real backup/restore/erasure callers; no crate/process per operation. |
 | Later `src/learning.rs`, `src/research.rs` in the same package | One Dreamer preparation handler and thin question/status adapters over existing jobs, retrieval and revisions; no second scheduler or conversation store. |
 
