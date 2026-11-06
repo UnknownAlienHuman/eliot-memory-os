@@ -94,7 +94,7 @@ prerequisites = []
 [[row]]
 issue = 5348
 unit = "V3-CONTEXT-DENSITY"
-body_sha256 = "8e0e7ae05b4b5e466f8db291438ee31a095368070cc280cf2495c11290877949"
+body_sha256 = "2f1dbbafdea608237732d4651d93a178f66c77cc4d9e62a5a65d2a0cdd9a79fa"
 disposition = "blocked"
 prerequisites = []
 
@@ -108,10 +108,10 @@ planned = 0
 nonexecutable = 2
 superseded = 2
 accepted_historical = 2
-sha256 = "e52a9cedee8ad2d3a6507aeeb6b4973a5c0d11f63f6fc261252107a8c3283406"
+sha256 = "2c7a2076f8e5a95e325b43a8c566d07607d9b7bcdfcb34ac90285a32fd54eb14"
 
 [provenance]
-base_commit = "6b7926335393cf3a292d5c40e9220caf0445c230"
-acquired_at = "2026-11-06T00:06:15Z"
-acquisition = "GitHub API issue #5348 exact body readback (2026-11-06T00:05:49Z); inherited catalogue blob 643d2b0f96a5f3a806713ac12ee483c4f93dbb67; local tracked descriptor inventory"
-note = "Add only #5348, blocked pending independent integration review. Retain the other 12 rows field-for-field from blob 643d2b0f96a5f3a806713ac12ee483c4f93dbb67, which preserves their full prior provenance: #5324 acquired 2026-10-30 at 4af7df71959d50ae431761e3989040e2d1870aef; the other 11 observed 2026-09-25/26 at 46d645f2c6ece125842e8deefdb661797c0fa0e9. No inherited row was freshly qualified. Coverage is this complete selected catalogue and the actual descriptor directory, not a whole-GitHub inventory or runtime acceptance."
+base_commit = "4b63f0b7791677192085342e84b48715cf8c36e0"
+acquired_at = "2026-11-06T23:12:02Z"
+acquisition = "GitHub API issue #5348 exact body readback after extending documentation scope to docs/v3/README.md; inherited catalogue and descriptor inventory at 4b63f0b7791677192085342e84b48715cf8c36e0"
+note = "Update only #5348 scope binding; retain its blocked disposition and the other 12 rows field-for-field. Prior acquisition provenance is retained in .github/work-unit-cohort.toml at 4b63f0b7791677192085342e84b48715cf8c36e0. No inherited row is freshly qualified; coverage is the selected catalogue and unchanged descriptor inventory, not all GitHub issues or runtime acceptance."

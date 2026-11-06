@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.24 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
+**Revision 1.0-draft.25 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
 
 V1/V2 Memory implementations are donors. This document owns purpose, responsibility
 and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store, maintenance
@@ -10,9 +10,8 @@ and build order; [Cognition](COGNITION.md) owns algorithms; the
 
 ## 0. External dependency
 
-Base works locally without a controller. Dreamer adds semantic preparation through the
-scoped controller extension; its actual missing interfaces and adaptation boundary are
-owned by [Inference §0](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
+Base works locally without a controller. Only model-assisted jobs depend on the scoped
+[Memory inference extension](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
 
 ## 1. Purpose and completion
 
@@ -30,21 +29,22 @@ check it. Retain concrete objects, critical values and conditions; links expose 
 | Old knowledge survives a code/API/goal change | Requalify the affected model and advice; expose the current fact and unresolved conflict. |
 | Experience accumulates without improving work | Revise the knowledge or processing method actually consumed by later decisions. |
 
-The loop is observation → working model → decision context → action/result → revision
-→ later use. Memory supplies grounded premises; the agent reasons and the host executes.
-Causal explanations and predicted consequences remain attributed hypotheses until
-supported. Missing understanding is a named question, never an invented answer.
+Committed capture preserves events as [observations](IMPLEMENTATION.md#72-capture-command-commit-and-replay).
+Direct edits and Dreamer publish [memory revisions](IMPLEMENTATION.md#74-direct-revision-and-lost-replies).
+Base assembles prepared knowledge, current observations and exact links into
+[decision context](COGNITION.md#6-retrieval-and-context), without inference. The agent
+reasons, the host acts, and captured outcomes inform later revisions.
+[Exact open](IMPLEMENTATION.md#73-exact-open-and-byte-ranges) supplies supporting detail.
 
-Base assembles understanding instrumentally from prepared knowledge, current observations
-and exact links. Dreamer does the semantic preparation in the background or for an explicit
-research question; the foreground path does not repeat it. Agent-authored revisions remain
-usable without inference. Measure correct continuation and avoided repeated mistakes
-against total preparation/read/use cost, not recall or compressed word count alone.
+Agent-authored revisions remain useful without Dreamer. Explanations and predicted
+consequences remain attributed hypotheses until supported; missing understanding stays
+a named question. Measure correct continuation and avoided repeated mistakes against total
+preparation/read/use cost, not recall or compressed word count alone.
 
-Each mechanism needs a caller, existing owner, result/unknown and actual consumer.
-Completion includes restart/readback where persistence matters; standalone scaffolding
-is intermediate. The operational model and evidence are in [Cognition §2](COGNITION.md#2-current-work-reconstruction)
-and [the research map](AUDIT-MAP.md#5-из-исследований-в-реализацию).
+Completion connects a caller, existing owner, result/unknown and actual consumer,
+including restart/readback for persistent effects. [Cognition §2](COGNITION.md#2-current-work-reconstruction)
+defines the working model; [the research map](AUDIT-MAP.md#5-из-исследований-в-реализацию)
+records its evidence and limits.
 
 ## 2. Ownership
 
@@ -97,13 +97,13 @@ prerequisites for starting the first capture/open increment.
 
 ### 3.2 Additive learning
 
-Prepare only changed work and reusable mechanisms/procedures with a real consumer.
-The same Dreamer path handles an explicit question or follow-up, even without a failed
-lookup. Outcome/test/correction feedback then revises the affected knowledge, retrieval
-cues or processing recipe, and later context/jobs consume that revision. This is external
-self-learning; a stored lesson with no changed consumer is only another note.
-Cleanup and backup continuity accompany the enabled call. Local research does not depend
-on web acquisition; optional acquisition/vectors/documents reuse existing owners and records.
+Dreamer prepares changed work and reusable mechanisms/procedures for a real consumer;
+an agent can also ask a question or follow-up without a failed lookup. Outcomes/tests/
+corrections revise knowledge, retrieval cues or the processing recipe. External
+self-learning requires later context/jobs to consume that revision
+([Cognition §12](COGNITION.md#12-consolidation-disagreement-and-improvement)).
+Calls include cleanup and backup continuity. Local Research needs no web acquisition;
+optional acquisition/vectors/documents reuse existing owners and records.
 
 ### 3.3 First host is narrow
 
@@ -139,23 +139,23 @@ decision dependencies and failed attempts, even when their wording differs from 
 Expand lexical/relations/methods and optional vectors for a remaining question. Scope before
 limits and select from the union; rank is neither truth nor applicability.
 
-The baseline is a small, self-contained work model with exact sources for detail.
-Preserve mechanism/attempts, corrections, commitments, exceptions and unresolved evidence.
-Keep only what changes the action, expected consequence or verification. Internal defaults,
-backend inventories and diagnostic bookkeeping stay out of the model's prompt; meaningful
-qualifications remain visible. [Cognition §6](COGNITION.md#6-retrieval-and-context) owns the codec.
+A new or uncertain context gets a self-contained work model; an ongoing context gets
+useful changes and necessary premises. Preserve mechanisms/attempts, corrections,
+commitments, exceptions and unresolved evidence that change the action, expected
+consequence or verification. Show meaningful qualifications and exact source handles;
+keep internal defaults, backend inventories and diagnostic bookkeeping out of the prompt.
 
-A new or uncertain context gets a self-contained baseline; an ongoing context gets only
-useful changes and their necessary premises. A small volatile presentation cache reduces
-repetition. It never establishes truth, delivery, use or permission. Source validation
-precedes output; failure to record optional packet telemetry does not withhold valid context.
+[Cognition §6](COGNITION.md#6-retrieval-and-context) owns selection and packing,
+[§6.2.1](COGNITION.md#621-proactive-attention-without-repeated-context) repeat suppression,
+and [§6.5](COGNITION.md#65-handoff) handoff. Validate sources before output; optional
+telemetry failure cannot withhold valid context. Prepared, emitted, used and successful
+remain distinct observations.
 
-Do not turn missing evidence, low similarity or an optional backend failure into a global
-task gate. Qualify/omit the affected claim; keep useful independent context and exact open.
-Prepared, emitted, used and successful are distinct observations. A pending/failed refresh
-leaves applicable old knowledge plus newer evidence available, with preparation limits;
-changed premises requalify affected advice. No-change requires completed
-cognitive work, not a rejected, malformed, truncated or unknown result.
+Missing evidence, low similarity or an optional backend failure affects only the dependent
+claims; independent useful context and exact open remain available. A pending/failed refresh
+leaves applicable prior knowledge plus newer evidence visible with preparation limits.
+Changed premises requalify affected advice; only completed cognitive work can yield
+`no_change` ([§9.2](COGNITION.md#92-result-and-cognitive-states)).
 
 ## 6. Store and schema authority
 
@@ -219,11 +219,9 @@ model call. Reuse an existing owner before creating a new one.
 
 ## 10. Product evidence and order
 
-Build the connected increments in
-[Implementation §11](IMPLEMENTATION.md#11-implementation-sequence); it alone owns their
-order. Start with capture → durable Store/spool → replay/restart → exact open, then host
-context and Base maintenance. Complete the inference boundary before enabling learning.
-A complete backup/crash/load campaign is not a condition for writing the first path.
+[Implementation §11](IMPLEMENTATION.md#11-implementation-sequence) owns the connected
+increments and their observable exits. The first capture/open path does not wait for
+backup/crash/load qualification; model-assisted learning waits for its inference boundary.
 
 Preserve safety checks at the boundary that needs them: no unverified credentials sent,
 no false durable capture, no unleased restore/cutover, no uncertain external effect retried.
