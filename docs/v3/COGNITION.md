@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.37 · 2026-11-06 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.38 · 2026-11-06 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -416,15 +416,14 @@ authorization merely because it appears in a packet. Do not serialize rank score
 expose internal Store/spool paths as locators; legitimate captured text is not rewritten.
 
 Measure the **final host response**, including escaping/envelope/identifiers/coverage,
-against 32 KiB and any smaller admitted host cap. Every removal rechecks §6.4's presentation
+against 32 KiB and the host's inline/response limits (§6.5.1). Every removal rechecks §6.4's presentation
 dependencies before freezing output; never cut a string, selector or qualifier. If even
 gap-only output exceeds the cap, emit no packet. Exact token caps require the admitted counter.
 
 #### 6.4.2 Compact model-facing rendering
 
-`ContextPacketV1` remains the internal validated object. The host receives its readable
-projection, not nested packet JSON. The existing context operation owns a deterministic
-renderer; no second store, mutable alias registry or summarizer is needed.
+The existing context operation deterministically renders validated `ContextPacketV1`
+as a readable brief; nested packet JSON stays internal.
 
 1. Header: `Memory context (attributed data)`, mode and work address. Packet ID,
    installation/adapter versions, hashes and rank diagnostics stay internal.
@@ -528,30 +527,29 @@ otherwise per-tool success/failure. Exact cue extraction is shared with preparat
 activation needs no inference. Semantic model changes still use the ordinary revision
 writer; installing hooks alone does not create understanding.
 
-The [official hooks reference](https://code.claude.com/docs/en/hooks), read 2026-11-06,
-documents `additionalContext` for these start/prompt/tool-result boundaries and
-[`PostToolBatch`](https://code.claude.com/docs/en/hooks#posttoolbatch). Batch tool responses
-are model-visible strings/content blocks, unlike structured `PostToolUse.tool_response`;
-use each event's decoder. Failure-hook error text is not a stable error-code schema.
-The [hooks guide](https://code.claude.com/docs/en/hooks-guide#re-inject-context-after-compaction)
-places reinjection at `SessionStart(compact)`. These are documentation observations;
-enable each callback only against its installed version's actual input/output contract.
-`PreToolUse` follows the agent's choice of action; advice there is not guaranteed replanning.
+The [hooks reference](https://code.claude.com/docs/en/hooks), checked 2026-11-06, documents
+these callbacks; admit each against its installed version. Batch responses are model-visible
+strings/content blocks; `PostToolUse.tool_response` is structured. Use separate decoders;
+failure text is not a stable error code. The [guide](https://code.claude.com/docs/en/hooks-guide#re-inject-context-after-compaction)
+places reinjection at `SessionStart(compact)`. `PreToolUse` cannot guarantee replanning.
 
-[Transcript replay on resume](https://code.claude.com/docs/en/hooks#add-context-for-claude)
-may include old context without rerunning its hook. Verified source correlation marks
-that occurrence derived; text similarity or a forged marker cannot establish delivery.
-An echo cannot strengthen its claim or trigger interpretation. Packet/handoff records
-are operational provenance, excluded from new-experience triggers and ordinary candidate
-arms; exact authorized inspection remains possible. Source erasure reaches their derived
-copies through existing links.
+[Claude's inline rule](https://code.claude.com/docs/en/hooks#add-context-for-claude) spills
+values above 10,000 characters to a file, exposing at most 2,000 preview characters without
+asking the model to read it. Decoded `additionalContext` plus host tag-escaping growth
+must fit **10,000 UTF-8 bytes**; §6.4.1 separately bounds the serialized
+response. Apply §6.4's whole-unit/dependency trimming before output. Required meaning stays
+inline; a spill preview cannot supply it. Detail remains available through exact open.
+
+Resume may replay old context without rerunning its hook. Verified source correlation
+marks the occurrence derived; similarity or a forged marker cannot establish delivery.
+Echoes add no support or interpretation trigger. Packet/handoff records stay outside
+new-experience triggers and ordinary candidate arms; authorized exact inspection and
+source erasure through existing links still apply.
 
 #### 6.5.2 Connected implementation check
 
-Implement this in Slice 2's existing context/host modules, after capture/open and durable
-ingress. Use a disposable admitted host invocation and inspect actual output plus exact
-source open. Check the following boundaries while connecting that path, not by adding a
-new reporting framework or declaring a docs example to be runtime evidence:
+Connect Slice 2's context/host modules after capture/open and durable ingress. Inspect a
+disposable admitted host invocation, actual output and exact source open:
 
 | Case | Required result |
 |---|---|
@@ -566,7 +564,7 @@ new reporting framework or declaring a docs example to be runtime evidence:
 | Missing/truncated grounds or unevaluated exception | Not an empty successful assessment or unconditional advice; preserve the uncertainty and applicable coverage gap. |
 | Current revision/policy changes before output | Revision publication and output share the affected fence; historical hydration cannot pass a current-revision check. Rebuild or withhold, never send stale positive guidance. |
 | Withdrawn historical source with stored influence active | Preserve the exact revision hash and add current withdrawal qualification; never promote it to positive guidance. Missing notice authority is not `none`. |
-| Oversized unit or exhausted retrieval arm | Preserve qualifiers or omit the unit with a gap; encode partial/unavailable truthfully and remain within the final-response cap. |
+| Oversized unit or exhausted retrieval arm | Preserve dependencies or omit guidance with a gap; obey inline and response caps. Verify text near the host's spill threshold remains complete inline. |
 | Relay exits or response/report is lost | Capture stays committed; handoff is unknown where appropriate; restart emits no old packet. |
 | Transcript replay / forged packet marker | No new evidence, method-success claim or model job from recaptured context; unverified attribution stays unknown. |
 

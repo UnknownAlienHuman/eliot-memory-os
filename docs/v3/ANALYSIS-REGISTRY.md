@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348 / PR #5349](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5349): старые требования/дефекты + V3 + KB → исправить owners → проверить связность/diff. Рабочая модель, Dreamer/research, injection и outcome learning; уточнены целостность выбранной цепи при packing и временные оси. [Источники §5.1–5.3](AUDIT-MAP.md#53-restore-useful-behavior-from-the-old-design); [Cognition](COGNITION.md), [Implementation §7/11](IMPLEMENTATION.md#7-core-operations-and-host). Runtime/измерения открыты. |
+| D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348 / PR #5349](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5349): старые требования/дефекты + V3 + KB. Пересверены девять V3 документов: working model, Dreamer/research, injection, learning, packing и время; исправлен Claude inline limit. [Источники §5.1–5.3](AUDIT-MAP.md#53-restore-useful-behavior-from-the-old-design); [Cognition](COGNITION.md), [Implementation §7/11](IMPLEMENTATION.md#7-core-operations-and-host). Runtime/измерения открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -62,7 +62,7 @@ R-126 переиспользует SQLite commands/writes. R-178/R-179/R-180 о�
 | R-175/R-176/R-204 | Исторические programmes/отчёты сохранены в Git; они не V3 roadmap и не основание считать всё согласованным. |
 | R-177/R-202 | Asset repair — часть Slice 0. Connected порядок задан в §11; предварительные каркасы будущих capabilities не нужны. |
 | R-198/R-200/R-201 | Предыдущие docs слиты; assignment зарегистрирован, synthetic descriptor удалён из active directory. Открыты integration checks, не повторная регистрация. |
-| R-203 | PR #5349, `7df04bf`, [run 42195044680](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/42195044680): `Verify shared documentation evidence` → повторный `ROUTE_RECEIPT_MISMATCH`. Local candidate check проходил; причина не установлена. Integration owner сверяет реальные route inputs того же дерева; prose scope не меняет checker/CI. Local PASS не remote PASS. |
+| R-203 | PR #5349, `6f2a58c`, [run 42208883178](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/42208883178): `Verify shared documentation evidence` → `ROUTE_RECEIPT_MISMATCH`. Local PASS повторён; CI merge и head имеют одно дерево. Причина не установлена; integration owner сравнивает реальные route inputs. Checker/CI не менялись; remote PASS нет. |
 | R-205/R-206 | Убраны ненужные V2 reading inputs и 56 дублирующих индексов. Не повторять эти патчи. |
 | R-207 | Обслуживание V2 tooling отложено; исправлять только доказанный blocker текущего V3 increment. |
 
@@ -93,7 +93,7 @@ Required checks не отключать; skipped historical audit не выда�
 | R-191 | `DECIDED / SOURCE_OPEN`: [NoticeV1 и erasure](IMPLEMENTATION.md#101-notice-command-and-durable-encoding) выбраны; source, Windows durability и полный cleanup inventory открыты. |
 | R-192/R-196 | Поздние capabilities сохраняют owner routes; legacy Operation/SDK путь не возвращается. |
 | R-193 | [Supervisor](IMPLEMENTATION.md#21-liveness-and-bounded-recovery): независимое наблюдение, конечный recovery budget, без retry неизвестного эффекта. |
-| R-194 | [Cognition §6/8.2](COGNITION.md#6-retrieval-and-context): baseline/update, presentation dependencies после сокращения, time cues, qualified knowledge/dedup/optional telemetry. Source/host путь открыт; 2 KiB/latency — неизмеренные цели. |
+| R-194 | [Cognition §6/8.2](COGNITION.md#6-retrieval-and-context): baseline/update, целостность dependencies после сокращения, time cues, dedup/optional telemetry. Claude inline limit отделён от 32 KiB envelope; source/host путь открыт. 2 KiB/latency — неизмеренные цели. |
 
 ## Store reconciliation
 

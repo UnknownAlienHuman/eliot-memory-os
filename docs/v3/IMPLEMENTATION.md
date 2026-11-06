@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.58 · 2026-11-06 · design for the greenfield rewrite.**
+**Revision 1.0-draft.59 · 2026-11-06 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -314,7 +314,7 @@ in the owning Rust code and use them in the relay, Store writer/decoder and exac
 | One Store or local IPC request/response | 1 MiB serialized, including envelope | Check before send and while receiving; possible mutation send still means unknown on failure. |
 | Exact body range | 64 KiB decoded bytes | One identity-bound range; never buffer the entire blob to serve a range. |
 | One spool `command.json` / total spool | 256 KiB / 256 MiB and 1,024 entries | Count pending, failed and temporary entries together under §7.5's publication lock; no eviction of accepted input. |
-| Candidate page / emitted Base packet | 32 candidates / 32 KiB UTF-8 | Page also has an encoded-byte cap; packet omissions carry explicit gaps. |
+| Candidate page / emitted Base packet | 32 candidates / 32 KiB UTF-8 | Page byte cap and host inline limit ([Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary)) also apply; omissions carry gaps. |
 
 A capture above inline capacity uses the existing durable spool and bounded blob reads,
 not a 16 MiB IPC frame or a new upload service. Spool quota counts actual file bytes,
