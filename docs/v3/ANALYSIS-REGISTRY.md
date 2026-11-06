@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**2026-11-05. Действующий план документации и открытых разрывов. Реализация не принята.**
+**2026-11-06. Действующий план документации и открытых разрывов. Реализация не принята.**
 
 Это единственный реестр V3. Правила — в [четырёх контрактах](../ARCHITECTURE_CONTRACT.md),
 исходники/команды — в [DEVELOPMENT](DEVELOPMENT.md), требования — в [AUDIT-MAP](AUDIT-MAP.md).
@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5348): KB/первоисточники → рабочая модель → поэтапный retrieval/плотная выдача → semantic/link review. Владельцы: [Cognition §2.1/6](COGNITION.md#21-working-model-not-a-transcript-summary), [Implementation §7/11](IMPLEMENTATION.md#7-core-operations-and-host); опора — [AUDIT-MAP §5.1](AUDIT-MAP.md#51-evidence-for-compact-understanding). Frozen coverage/attribution сохранены. Реальный renderer/hook, purpose codecs/limits и измерения остаются открыты. |
+| D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348 / PR #5349](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5349): KB → Dreamer preparation → инструментальная выдача → research dialogue → outcome-driven repair. Владельцы: [Cognition §2.2/8/12](COGNITION.md#22-prepare-knowledge-for-use), [Implementation §7.6/11](IMPLEMENTATION.md#76-dreamer-and-agent-research); источники — [AUDIT-MAP §5.2](AUDIT-MAP.md#52-dreamer-prepared-knowledge-and-learning-from-outcomes). Проверить frozen diff/ссылки; runtime, purpose codecs и измерения открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -58,8 +58,8 @@ codecs/aggregate limits) требуется до включения той capab
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `1c19f33dbd8ca5278cea283ccecfaa073b9f8ac9`, перечитан 2026-11-05 | База #5348; V3 owners и прямые consumers, не полный аудит V1/V2 или работающий runtime. |
-| Knowledge base | `fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689`, 2026-11-05 | Прочитаны synthesis, relevant records/extracts; выбранные primary sections, donor functions/licenses и hooks пересверены в [AUDIT-MAP §5.1](AUDIT-MAP.md#51-evidence-for-compact-understanding). Результаты не воспроизводились. |
+| Memory main | `1c19f33dbd8ca5278cea283ccecfaa073b9f8ac9`, remote перечитан 2026-11-06 | База #5348; V3 owners и прямые consumers, не полный аудит V1/V2 или работающий runtime. |
+| Knowledge base | `fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689`, 2026-11-06 | Прочитаны synthesis, relevant records/extracts; выбранные primary sections, donor functions/licenses и hooks пересверены в [AUDIT-MAP §5.1–5.2](AUDIT-MAP.md#52-dreamer-prepared-knowledge-and-learning-from-outcomes); даты/недоступные первоисточники отмечены там. Результаты не воспроизводились. |
 | Store PR #5327, чтение 2026-11-04 | Head `a040bd408be39afa9789561595d2cac8bef177b3`; дополнительно прочитаны memory/history DDL и `queries.rs` 210–315 | В перечне 31 queries нет полной create/revise transaction; старые поля, projections и временные ASSERT ещё согласовать. Это чтение source, не компиляция, execution или полный аудит PR. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
@@ -83,7 +83,7 @@ restore использует read-only lookup, не mutation-probe. **Блоки
 | R-175/R-176/R-204 | Старые active programmes и сохранённые отчёты не являются V3 roadmap. Blanket «всё согласовано» запрещён; исторические источники доступны в Git. |
 | R-177/R-202 | Asset repair не равен всему Slice 0. Порядок и source handoff теперь конкретны; будущие capabilities не требуют предварительных каркасов. |
 | R-198/R-200/R-201 | Предыдущие docs слиты, задача зарегистрирована, synthetic descriptor удалён только из active directory. Остались реальные integration checks, не повторная регистрация/создание реестра. |
-| R-203 | Прежний main CI вернул UNKNOWN/OMITTED, Surreal provisioning также сообщал ошибку. Не считать успешный bootstrap компиляцией/Clippy продукта; конкретный блокирующий run разбирать отдельно. |
+| R-203 | PR #5349 head `c2bfa62`, [run 42134881621](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/42134881621): `Verify shared documentation evidence` → `ROUTE_RECEIPT_MISMATCH`; provisioning также неуспешен. Integration owner сверяет receipt с фактическим candidate/CI reader и повторяет обязательный gate; текущий prose scope не меняет checker/CI. Bootstrap не равен компиляции/Clippy продукта. |
 | R-205/R-206 | Pure V3 reading отвязан от ненужных V2 inputs; удалены 56 дублирующих индексов. Повторно эти патчи не применять. |
 | R-207 | Дальнейшее обслуживание V2 tooling **отложено**. Исправлять только доказанную зависимость текущей V3 задачи; остаток ниже. |
 
@@ -110,11 +110,11 @@ Required checks не отключать; skipped historical audit не выда�
 | ID | Что должно остаться при реализации |
 |---|---|
 | R-189 | Exclusions до spool/blob/IPC; строгий current policy повторно проверяется перед replay. Failed custody не равна erasure; публикация spool не обходит закрытую admission boundary. |
-| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §2/6](COGNITION.md#2-current-work-reconstruction) связывает work slots с goal/model/state/tried/unknown/next и поэтапным раскрытием. Это source-qualified content, не новые поля/таблицы и не автоматический причинный вывод Base. Plan, commitment/method qualifiers, current revision/slot/notices сохраняются. Source writer/lookup/renderer и фактическая выдача открыты. |
+| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §2/8](COGNITION.md#22-prepare-knowledge-for-use) связывает рабочую модель с готовыми explanations/methods и свежими фактами. Dreamer готовит дельту; Base собирает её без inference. Explicit research/follow-up имеет собственную request identity и не ждёт failed lookup. Source submit/claim/revision/read и реальные consumers открыты. |
 | R-191 | `DECIDED / SOURCE_OPEN`: [§10.1–10.4](IMPLEMENTATION.md#101-notice-command-and-durable-encoding) задают NoticeV1, точный target/scope, отмену только названного отзыва, erasure replay keys и непрерывность через существующий installation checkpoint. Нет зеркальной Store-ревизии ради флага. Удаление current не переизбирает history и не обнуляет счётчик. Реализация, Windows durability и полная cleanup-инвентаризация открыты. |
 | R-192/R-196 | Поздние capabilities и все требования сохраняют owner routes; старый Operation/SDK путь не возвращается через rationale. |
 | R-193 | Supervisor различает alive/responsive/progress/outcome; конечный recovery budget, без retry неизвестного внешнего эффекта. |
-| R-194 | Internal packet сохраняет qualifiers/arm states; host получает компактную проекцию с exact selectors. 2 KiB — мягкая цель, 32 KiB — прежний cap после wrapping; token budget требует counter. [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host) задаёт deadline и unmeasured latency targets; timeout не блокирует задачу. Runtime/usage/польза не объявлены измеренными. |
+| R-194 | Internal packet сохраняет qualifiers/arm states; в prompt идут смысл, точные sources и влияющие на решение оговорки. Default/status bookkeeping исключён; computed preparation_state различает covered selection, pending input, changed basis и unknown. 2 KiB/latency — unmeasured targets; timeout не блокирует задачу. [Cognition §6/8.2](COGNITION.md#82-prepared-knowledge-and-newer-evidence). |
 
 ## Store reconciliation
 

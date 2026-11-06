@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.54 · 2026-11-05 · design for the greenfield rewrite.**
+**Revision 1.0-draft.55 · 2026-11-06 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -352,7 +352,7 @@ not a generic CRUD method for every table.
 | Table | Identity and immutable facts | Mutable/projection state and consumer |
 |---|---|---|
 | `stream` | stream_id, project, source_kind/native_id, workspace_id, stream_unique_key, created_at_ms | last_ingest_seq, updated_at_ms; capture allocation and ordered replay |
-| `observation` | observation_id, stream/event/command/native-event identity, command_sha256, event_sha256, capture_format, ingest_seq, source bytes, occurrence/receipt/creation facts and captured work binding | Immutable accepted observation; exact open/replay. An operation-owned observation may also contain immutable operation_result_json (§7.4). |
+| `observation` | observation_id, stream/event/command/native-event identity, command_sha256, event_sha256, capture_format, ingest_seq, source bytes, occurrence/receipt/creation facts and captured work binding | Immutable accepted observation; exact open/replay. An operation-owned observation may also contain immutable operation_result_json (§7.4/7.6). |
 | `memory` | memory_id, origin_project, created_at_ms | revision, kind, reuse_scope/reuse_projects, address tuple/key, content/search_text/exact_cues, disclosure, subject/aspect/perspective, conditions/exceptions, validity, support/exposure/influence, commitment/method state and updated_at_ms |
 | `memory_history` | history_id, memory_id, revision, exact semantic snapshot, replaced_at_ms | Immutable prior revision; historical open and provenance |
 | `link` | link_id, source/target kind+ID+optional revision, relation_kind, grounds_group, locator/qualification, created_at_ms | Immutable relation; bounded forward/reverse traversal |
@@ -537,6 +537,7 @@ For each selected operation, keep its writer/reader and bounds with the source:
 | Current/history/source open | Exact identity/revision, admitted scope and all relevant qualifications; host or cognition, with no fall-forward |
 | Continuation/retrieval | Bounded candidates plus exact handles/revisions and coverage; qualified context builder, not raw SQL output |
 | Revision | History/current/grounds and original operation result published together; replay returns that result even after later revisions |
+| Research submit/read | Persisted question and original job identity; bounded status/answer references for the requesting agent, through §7.6 |
 | Job claim/settle | Exact claim/frozen tuple and durable outcome; one worker and later semantic consumer |
 | Backup/catalog | Complete bounded typed pages under §8 cut, or exact owned schema facts; never a public broad-read API |
 
@@ -734,7 +735,7 @@ from `{project,workspace_id,...binding}` and require exact agreement on decode. 
 relation/locator strings. Observation `created_at_ms` uses its frozen first receipt time.
 `stream_id`, `ingest_seq`, link IDs and operation results are owning-transaction outputs,
 not accepted caller fields. A reserved record still validates its owning body/result
-contract (§7.4 / Cognition §6.5); this envelope grants no generic mutation authority.
+contract (§7.4, §7.6 or Cognition §6.5); this envelope grants no generic mutation authority.
 All command metadata is integer-only. Absence, empty string, zero and unknown are not
 interchangeable; §4.4 owns the fixed optional-field mapping to Store NONE.
 
@@ -774,7 +775,9 @@ not `StreamInsert`, `StreamAdvance` and `ObservationInsert` as separate calls:
 3. Only a new occurrence creates the stream if absent, rechecks its exact record (§6),
    checked-increments `last_ingest_seq` (first is 1), and inserts the observation and
    supported source relations. All writes commit together. Signed-64 exhaustion rejects;
-   replay allocates nothing. Do not queue unimplemented jobs.
+   replay allocates nothing. For implemented Dreamer preparation, coalesce eligible primary
+   input into its target job in this transaction (§7.6); replay adds nothing. Do not queue
+   unimplemented jobs.
 4. Check every statement and commit result, then decode the accepted observation ID,
    stream ID, sequence, original receipt time and hashes. Native redelivery returns the
    stored observation ID, not the caller's new proposed ID. Matching operation readback
@@ -1015,12 +1018,12 @@ must agree; installation ID must match the selected installation, not a restored
 Unknown format, duplicate JSON keys, extra members, malformed size/hash tuples, reparse
 paths and missing/extra files reject. Inline bytes remain in the command; blob bytes
 are only in `body.bin`, whose exact length/hash must match. No path from input is opened.
-The same envelope serves authorized operation-owned `memory_change`, `context_packet`
-and `context_handoff` records. Ordinary event capture rejects all three reserved kinds;
-the owning revision/context operation admits them. A kind or installation ID in a file
+The same envelope serves authorized operation-owned `memory_change`, `context_packet`,
+`context_handoff` and `research_request` records. Ordinary event capture rejects these reserved kinds;
+only the owning operation admits them. A kind or installation ID in a file
 is not authority. Apply the same closed dispatch before first send and during replay:
-revision uses §7.4's complete transaction; context provenance only stores its validated
-facts under Cognition §6.5; ordinary capture uses §7.2. No generic insert path may bypass
+revision uses §7.4's complete transaction; research submission uses §7.6; context provenance
+only stores its validated facts under Cognition §6.5; ordinary capture uses §7.2. No generic insert path may bypass
 an operation owner. Replaying packet/handoff storage never emits context or starts a job.
 
 **Publish before send.** All relay publishers and daemon cleanup use the same protected
@@ -1079,6 +1082,58 @@ replay or cleanup of already accepted entries. Before enabling this path, observ
 same disposable command across a lost notification, restart, lost commit reply, quota
 rejection and interrupted retirement; each reports custody and canonical outcome
 separately. This is a connected Slice 1 exit, not a new test programme or a runtime PASS.
+
+### 7.6 Dreamer and agent research
+
+This operation connects Cognition §8 to the existing capture/job/revision owners. It is
+part of the inference increment, not a model call hidden inside Base retrieval.
+
+| Caller | Operation and result |
+|---|---|
+| New primary outcome/correction/task handoff | Coalesce exact source references for `purpose=prepare`, target=current work/view, in the owning capture/revision transaction. Context packet/handoff receipts are not primary input. One active job plus one pending successor. |
+| Agent asks Dreamer | Submit a captured question with `purpose=research`, target=that request observation ID; return the original request/job identity and scheduling state. Distinct questions have distinct targets, even on the same work. |
+| Agent reads / follows up | Read bounded job status and accepted answer revision references; ordinary exact open supplies content. A follow-up submits another question with an exact `reply_to`; no transcript/session store. |
+| Agent cancels | Existing job cancellation/readback; timeout or a new question is not proof of cancellation. |
+
+For the submitted turn, the daemon's owning adapter builds a reserved `research_request`
+CaptureCommandV1 with `native_event_key` absent. Its canonical body is `ResearchRequestV1` with exactly `format=1`,
+`job_id`, nonempty `question`, `sources` (exact persisted selectors from §7.4.1), and
+optional `reply_to` (one such selector). The owner allocates and retains the job ID before
+staging; it is not a caller-supplied mutation authority. Existing body/selector limits and
+blob custody apply. Resolve/authorize all selectors; `reply_to` must identify a prior research
+request or answer. Question text and earlier answers are context, not verified premises.
+Work binding comes from the admitted envelope, not inferred question text.
+The caller's finite wait is invocation behavior, not part of the persisted question.
+
+Use one fixed transaction: resolve the immutable command first; on a new request, capture
+it and its source relations, insert the pending job, and retain
+`operation_result_json={format:1,job_id}` together. Replay returns that original job even
+after completion. No model call occurs in the transaction. Unsupported capability returns
+unavailable, never a successful placeholder job. Generic event replay cannot submit research.
+
+Claim freezes the selected question, relevant prior answer, current view/method revisions,
+new evidence, limits and profile under §4.7.3. Both prepare and research use the same finite
+processor and §7.4 revision writer. A research answer is a scoped view/explanation with
+exact grounds; the job's result/coverage names accepted output revisions and remaining
+input. Dependent writes use confirmed exact revisions; independent partial output stays usable.
+External acquisition uses its configured owner; capture new evidence before a new claim.
+
+In each job-owned revision transaction, the publisher also creates one internal
+`prepared_by` link from the exact output memory revision to its job ID, under the same
+claim and replay identity. A `no_change` settlement links only the exact revision it
+evaluated, never a newer current revision. This is a P1a-only `target_kind=job` relation,
+outside public source selectors, grounds and ordinary candidate traversal; only the
+publisher creates it. The existing source/revision link index supplies bounded exact job
+lookup. The link proves association; the accepted result and coverage determine §8.2's
+preparation state. Partial/missing coverage cannot become `covered` from a link alone.
+
+Serve explicit requests ahead of speculative preparation within existing worker capacity;
+never hold capture/context on a research join. Read status or accepted partial output within
+the requested deadline and return the job handle if still running. Status polling does no
+inference. Read pending work by its existing indexed target/slot; a missing/truncated
+preparation relation yields unknown, not a scan of past jobs. Source implementation supplies
+the internal relation, closed job-purpose/result codecs and aggregate limits before
+exposing this handler; the architecture adds no table, worker fleet or research engine.
 
 ## 8. Backup-set owner and lifecycle
 
@@ -1493,8 +1548,8 @@ Runtime work remains separately authorized; documentation changes do not impleme
 | Slice 1 — durable ingress/restart | §7.5 publish before send → single replay owner → Store/open → retire pending | Input survives restart and lost notification/reply under the same ID. Full quota does not evict old input; interrupted cleanup does not destroy pending custody. Native-event identity alone permits redelivery deduplication; equal bytes from distinct occurrences remain distinct. |
 | Slice 2 — useful context and corrections | Verified host boundary → current-work model + gap-directed retrieval → compact brief → actual emission; §7.4 update → later exact history/context | Agent recovers goal, mechanism/state, attempts, unknowns and next step where supported; absent fields stay unknown. Resume/compact gets fresh context, sources open exactly, corrections survive lost replies. No model required. |
 | Slice 3 — Base maintenance | Quiesced cut → backup/fence/manifest → isolated restore/cutover; notices → erasure; rotation/shutdown | Disposable data exercises actual paths with inference disabled. No user-data migration/destructive command is enabled before its own boundary works. |
-| Inference P1a | Accepted scoped controller extension → one persisted call → decoded revision → later context; dependency-aware backup/release | Unknown send is not repeated under a new ID. Only this row waits for controller decisions; do not scaffold it in Base. |
-| Inference P1b and later | Credential rotation, then independently selected vectors/views/documents/Research/hosts | Add each capability only with its real input, failure result and consumer. |
+| Inference P1a — Dreamer | Accepted scoped controller extension → background preparation or explicit research question → one persisted call → useful revision → tool/context read; dependency-aware backup/release | Both callers use one job handler. A follow-up retains its own request identity; unknown send is not repeated under a new ID. Only model-assisted work waits for this boundary. |
+| Inference P1b and later | Outcome/test/correction → revise knowledge or processing method → later use; credential rotation and separately selected acquisition/vectors/documents/hosts | Inspect a changed consumer and retained counterexample. External research acquisition is separate from the already available local Dreamer dialogue. |
 
 Slice 2 is the first useful local memory milestone. Full backup/restore and optional
 inference are separate increments; each shipped operation still includes its own custody,
@@ -1528,6 +1583,7 @@ V1/V2 bins are donors, not an instruction to wire their whole runtime into V3.
 | Later `src/spool.rs` | Slice 1: §7.5 publication/quota/replay/retirement, reused by §7.4; no second queue database. |
 | Later `src/context.rs`, `src/host.rs` | Slice 2: reconstruct/select/render over existing records; map callbacks and actual output. A pure renderer and ordinary adapter functions, not a checkpoint service or new host registry. |
 | Later maintenance modules in the same package | Slice 3 with real backup/restore/erasure callers; no crate/process per operation. |
+| Later `src/learning.rs`, `src/research.rs` in the same package | One Dreamer preparation handler and thin question/status adapters over existing jobs, retrieval and revisions; no second scheduler or conversation store. |
 
 These are default source locations, not installed interfaces or a new module registry.
 A different location requires a concrete existing owner/caller advantage, not a new

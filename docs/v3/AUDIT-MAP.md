@@ -77,7 +77,7 @@
 | DRM-01 | Dreamer — не владелец | Модель предлагает; приложение применяет обычные revisions. Provisional advice не ждёт promotion bureaucracy. | [Cognition §9.2](COGNITION.md#92-result-and-cognitive-states) |
 | DRM-02 | Dreamer расширяет гипотезы | Объяснения, alternatives, gaps и следующий полезный вопрос остаются предметом интерпретации. | [Cognition §12](COGNITION.md#12-consolidation-disagreement-and-improvement) |
 | DRM-03 | вычисления Dreamer под человеком | Configured finite work/cost/routes; explicit request и off/idle/background не отдельные scheduler engines. | [Cognition §8](COGNITION.md#8-processing-methods-and-jobs) |
-| DRM-04 | добыча ≠ толкование | Acquisition отдельно от interpretation; Research входит в полный scope, не удаляется решением аудитора. | [Cognition §15](COGNITION.md#15-additive-capabilities-and-their-consumers) |
+| DRM-04 | добыча ≠ толкование | Агент запускает Dreamer и продолжает диалог через Research; внешняя acquisition — отдельный источник, не условие локального анализа. | [Cognition §8.3](COGNITION.md#83-research-an-agent-can-ask-dreamer) |
 | ACT-01 | эффект определяет полномочия | Host/controller исполняет и проверяет actual permissions. Память советует; regex команд не второй execution governor. | [Architecture §2](ARCHITECTURE.md#2-ownership) |
 | SWM-01 | рой — ограниченный конвейер | Рой остаётся controller/host; память не владеет повторно task acceptance. | [Architecture §2](ARCHITECTURE.md#2-ownership) |
 | SWM-02 | координация переживает агентов | Долговечная работа Eliot сохраняется в job; вся peer-координация не импортируется. | [Cognition §8](COGNITION.md#8-processing-methods-and-jobs) |
@@ -239,7 +239,7 @@
 | Не-кодовые источники | Native text + внешний Docling и реальные source locators | Конкретные converters/open сегментов, preserve raw |
 | Первое включение | Local config, один instance, малый standalone supervisor + daemon + DB | Windows launch, IPC, lifecycle и файловые primitives |
 | Модели и embeddings | Новый узкий `inference.text`/`inference.embed` у controller; Memory не копирует Task/Attempt или provider stack | Durable request/result/readback, unknown outcome и per-input vector mapping |
-| Research | Один domain adapter через реальную configured task/tool surface | Request/result/source mapping, не второй research engine |
+| Research | Agent-facing Dreamer question/follow-up; внешняя добыча через configured owner | Один submit/read поверх jobs/revisions; локальный анализ не требует web acquisition |
 | Итоговая документация | Один смысловой baseline аудита; drafts переписать согласованно | Architecture — цель; Implementation — connected paths; Cognition — алгоритмы |
 
 Оставшиеся пункты — реализация выбранной конструкции, а не разрешение снова плодить каталоги. Не заявляются работающий V3, успешный model/DB/Windows run, независимые субагенты или повтор всех прошлых тестов. Форматирование/ссылки документов проверяются отдельно от продуктового поведения. Существующие CI и main не меняются этим аудитом.
@@ -265,6 +265,29 @@
 2 KiB brief, 250 ms ожидания и warm p95 ≤100 ms — начальные **цели дизайна Eliot**,
 не результаты этих источников. Проверять сохранение решения/исключений и полный расход;
 один compression ratio не определяет полезность. Код доноров в этой правке не копируется.
+
+### 5.2 Dreamer, prepared knowledge and learning from outcomes
+
+Продолжение #5348, 2026-11-06. Прочитаны профильные KB-аудиты background/sleep-time,
+LightMem, procedural skills и dependency repair на том же `fe7c0c8`; ниже различены
+повторно открытые primary sections и непосредственно прочитанный pinned code.
+Это основания проектного выбора, не полный новый аудит или воспроизведение результатов.
+
+| Опора | Что используем | Что не переносим |
+|---|---|---|
+| [Sleep-time Compute v1](https://arxiv.org/html/2504.13171v1), §3, §5.3–5.4, §7; [pinned script](https://github.com/letta-ai/sleep-time-compute/blob/ffdf6626178f55318e1109610fecd95f58b9ee28/run_stateful_aime_stream.py), `rethink_memory`, `run_memory_edits` | Подготовить переиспользуемые выводы до запроса → [Cognition §2.2/8.1](COGNITION.md#22-prepare-knowledge-for-use). | Выгода зависит от повторного использования и предсказуемости вопросов. Shared-block overwrite исследовательского скрипта не даёт revision/invalidation/scheduler contract. |
+| [LightMem v4](https://arxiv.org/html/2510.18866v4), §3.2–3.3; [pinned `lightmem.py`](https://github.com/zjunlp/LightMem/blob/8449d574df6bae1bdf3314a1564da65e2f37e046/src/lightmem/memory/lightmem.py), `offline_update_all_entries` | Группировать относящиеся к одному вопросу изменения и выполнять консолидацию вне выдачи. | Не копировать corpus-wide scan, прямой update/delete vector store или замену raw сжатием. Eliot обновляет затронутые units обычным writer; дешевизну считать вместе с подготовкой. |
+| [Memp v4](https://arxiv.org/html/2508.06433v4), §3.1, §4.2–4.3, Table 1 | Из опыта извлекать применимую процедуру, ожидаемый исход и recovery; связывать абстракцию с конкретным примером → [§12.1](COGNITION.md#121-learning-must-change-a-later-decision). | Выигрыш на похожих задачах не универсален по критериям; не импортировать отдельный procedural store, бесконтрольный рост lessons или обязательный rerun каждой записи. |
+| SkillRevise [loop.py](https://github.com/HKUST-KnowComp/skillrevise/blob/fb8042ac2415cb6d7f3a49db0c9a95ecb79edc6d/skillrevise/core/loop.py), `HarnessLoop.run_task`/`_is_better`; [revision.py](https://github.com/HKUST-KnowComp/skillrevise/blob/fb8042ac2415cb6d7f3a49db0c9a95ecb79edc6d/skillrevise/method/revision.py), `LLMRevisionEngine.revise` | Структурировать правку через execution anchors/контрпримеры; отличать последнего кандидата от лучшего измеренного → [§12](COGNITION.md#12-consolidation-disagreement-and-improvement). | Код проверяет форму anchors, не их соответствие source spans. Paper v4 известен по KB-аудиту; HTML/PDF здесь недоступны. Не переносить diagnosis gate на сохранение факта/гипотезы или самовольное исполнение тестов. |
+| [PACMI v1](https://arxiv.org/pdf/2610.05732v1), scope assumptions, §3, §6 | Изменение основания должно доходить до зависимого совета; актуальность отдельно от релевантности → [§8.2](COGNITION.md#82-prepared-knowledge-and-newer-evidence). | Dependency edges даны аннотацией; автоматическое извлечение полного графа не доказано. Не копировать новый validity lattice или LLM premise checker на каждый запрос. |
+| [MemoryArena v2](https://arxiv.org/html/2602.16313v2), §3.2, §4.2–4.4 | Проверять цепь память → действие → наблюдаемый исход → следующая задача; recall не заменяет пользу → [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). | Aggregate task score не изолирует память от агента/инструментов. Здесь не вводится новый benchmark framework или заявленный выигрыш Eliot. |
+
+[Контролируемый LightMem-разбор в KB](https://github.com/UnknownAlienHuman/agent-operation-system-knowledge/blob/fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689/extracts/audit-lightmem-cluster.md)
+дополнительно требует сравнения с raw retrieval при сопоставимом бюджете. Его paper
+`2607.29104` заново не получен (HTML/PDF недоступны); новые численные выводы из него не заявляются.
+Главный выбор: фон готовит смысл; инструменты выбирают, квалифицируют и собирают его;
+опыт исправляет содержание и способ подготовки. Ни новые таблицы, ни ещё один агентный
+runtime, ни сертификат «достаточного понимания» для этого не нужны.
 
 ## 6. Inference boundary update — 2026-10-24
 

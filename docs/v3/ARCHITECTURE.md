@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.21 · 2026-11-05 · design for the greenfield rewrite, not implemented behavior.**
+**Revision 1.0-draft.22 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
 
 V1/V2 Memory implementations are donors. This document owns purpose, responsibility
 and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store, maintenance
@@ -31,10 +31,11 @@ The loop is observation → working model → decision context → action/result
 Causal explanations and predicted consequences remain attributed hypotheses until
 supported. Missing understanding is a named question, never an invented answer.
 
-Base uses existing observations, views, links and exact open without inference.
-Semantic synthesis is optional background work or an explicit agent-authored revision;
-it does not delay capture or every hook. Measure correct continuation and avoided repeated
-mistakes alongside total latency/cost/context size, not recall or compression alone.
+Base assembles understanding instrumentally from prepared knowledge, current observations
+and exact links. Dreamer does the semantic preparation in the background or for an explicit
+research question; the foreground path does not repeat it. Agent-authored revisions remain
+usable without inference. Measure correct continuation and avoided repeated mistakes
+against total preparation/read/use cost, not recall or compressed word count alone.
 
 Each mechanism needs a caller, existing owner, result/unknown and actual consumer.
 Completion includes restart/readback where persistence matters; standalone scaffolding
@@ -62,9 +63,10 @@ one inherited typed channel. Supervisor independently resolves approved resource
 it does not accept arbitrary SQL, argv, endpoint, path or secret from the daemon.
 Daemon never receives root or Owner credentials.
 
-Dreamer is a role performed for one finite semantic job, not a permanent process,
-provider stack, scheduler, special database or canonical writer. A controller call is
-not an Agent/session/Goal lifecycle. Memory links external work but does not own it.
+Dreamer is the semantic role of finite jobs in the existing daemon: prepare/revise useful
+knowledge and answer agent research turns. Dialogue is linked requests/results, not a
+permanent process, separate chat store or canonical writer. A controller call is not an
+Agent/session/Goal lifecycle. Memory links external work but does not own it.
 
 The [inference contract](INFERENCE-CONTRACT.md) owns client/credential/call identity,
 destination and uncertain-effect readback; rotation/rollback never authorizes a duplicate call.
@@ -95,10 +97,13 @@ prerequisites for starting the first capture/open increment.
 
 ### 3.2 Additive learning
 
-The first learning loop turns a retained episode and exact processing method into one
-controller call, then a Memory revision consumed by later context. Cleanup and backup
-continuity are part of enabling that call, not claims inferred from a returned model body.
-Vectors, views, documents, Research and other hosts reuse the same records/jobs/revisions.
+Prepare only changed work and reusable mechanisms/procedures with a real consumer.
+The same Dreamer path handles an explicit question or follow-up, even without a failed
+lookup. Outcome/test/correction feedback then revises the affected knowledge, retrieval
+cues or processing recipe, and later context/jobs consume that revision. This is external
+self-learning; a stored lesson with no changed consumer is only another note.
+Cleanup and backup continuity accompany the enabled call. Local research does not depend
+on web acquisition; optional acquisition/vectors/documents reuse existing owners and records.
 
 ### 3.3 First host is narrow
 
@@ -134,16 +139,17 @@ cues, lexical/relations/methods and optional vectors only for a named question o
 premise. Scope each requested arm before its limit; union before selection. Unrequested
 arms remain explicit. BM25 ranks one query snapshot, not truth or a cross-call cursor.
 
-The default output is a small, self-contained work brief, with exact source selectors for
-on-demand detail. Preserve the causal/attempt chain, corrections, open commitments,
-exceptions and uncertainty before generic matches. Every included statement should help
-choose, explain or verify the next step. Metadata stays in the internal packet unless it
-changes interpretation. [Cognition §6](COGNITION.md#6-retrieval-and-context) owns the codec.
+The default output is a small, self-contained work model with exact sources for detail.
+Preserve mechanism/attempts, corrections, commitments, exceptions and unresolved evidence.
+Keep only what changes the action, expected consequence or verification. Internal defaults,
+backend inventories and diagnostic bookkeeping stay out of the model's prompt; meaningful
+qualifications remain visible. [Cognition §6](COGNITION.md#6-retrieval-and-context) owns the codec.
 
 Do not turn missing evidence, low similarity or an optional backend failure into a global
 task gate. Qualify/omit the affected claim; keep useful independent context and exact open.
-Prepared, emitted, used and successful are distinct observations. A failed refresh leaves
-the previous still-qualified view accessible with its limits; no-change requires completed
+Prepared, emitted, used and successful are distinct observations. A pending/failed refresh
+leaves applicable old knowledge plus newer evidence available, with preparation limits;
+changed premises requalify affected advice. No-change requires completed
 cognitive work, not a rejected, malformed, truncated or unknown result.
 
 ## 6. Store and schema authority
