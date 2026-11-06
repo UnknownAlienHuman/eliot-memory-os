@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.56 · 2026-11-06 · design for the greenfield rewrite.**
+**Revision 1.0-draft.57 · 2026-11-06 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -922,7 +922,7 @@ The additional collection limits here are initial engineering choices, not measu
 |---|---|
 | `kind` | `note`, `claim`, `explanation`, `prediction`, `commitment`, `project_view` or `method`. An unimplemented kind-specific consumer remains unavailable; storing its data does not execute it. |
 | `content` | Exact nonempty text; never a caller path or deferred body-fetch request. It includes the instruction body when the item is a method. |
-| `search_text`, `exact_cues` | Bounded derived search text, at most 4 KiB, and a sorted unique array of at most 64 nonempty cues, each at most 256 bytes. Typed cues use §7's shared normalizer; text derives only from permitted replacement data. Neither is extra hidden content or an authority. |
+| `search_text`, `exact_cues` | Search text at most 4 KiB; sorted unique array of at most 64 nonempty cues, each at most 256 bytes. Derive both from permitted replacement data, not blind inheritance; typed cues use §7's shared normalizer. Publish with the same revision (§7.4.2). Neither is hidden content or an authority. |
 | `reuse_scope`, `reuse_projects` | §4.7.2 values; at most 64 project identifiers, each within §4.5.1. Required even when the list is empty. |
 | `disclosure` | `local_only` or `external_allowed`, within current owner policy. An explicit value does not itself confer permission. |
 | `conditions_json`, `exceptions_json` | Each is a canonical JSON string encoding an array of at most 32 nonempty qualification strings, each at most 2 KiB; `[]` is explicitly none. Base preserves these as data, not an executable expression language. A material unevaluated condition/exception keeps applicability conditional_or_unknown; matching text is not evaluation. |

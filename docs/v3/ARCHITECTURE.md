@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.23 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
+**Revision 1.0-draft.24 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
 
 V1/V2 Memory implementations are donors. This document owns purpose, responsibility
 and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store, maintenance
@@ -19,7 +19,7 @@ owned by [Inference §0](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
 Eliot reconstructs the smallest useful model of the work: **goal/criterion, how the
 relevant part works, current state, attempts/results, uncertainty and next step**.
 The agent should recover why a decision follows, what would change it and where to
-check the evidence. A transcript summary or list of similar facts alone is insufficient.
+check it. Retain concrete objects, critical values and conditions; links expose supporting detail.
 
 | Agent problem | Required behavior |
 |---|---|

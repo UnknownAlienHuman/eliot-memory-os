@@ -246,32 +246,28 @@
 
 ### 5.1 Evidence for compact understanding
 
-База: [agent-operation-system-knowledge@fe7c0c8](https://github.com/UnknownAlienHuman/agent-operation-system-knowledge/tree/fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689),
-`research/INDEX.md`, `DECISIONS.md`, тематические карточки и их `registry`/`extracts`.
-Ниже — целевой пересмотр первичных sections/code paths 2026-11-05, не повтор полного
-аудита базы и не independent reproduction. Выбор механизма — инженерный вывод;
-заявленные авторами выигрыши не переносятся на Eliot.
+База: [KB@fe7c0c8](https://github.com/UnknownAlienHuman/agent-operation-system-knowledge/tree/fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689),
+`research/INDEX.md`, `DECISIONS.md`, карточки/registry/extracts. Целевой primary/code
+пересмотр 2026-11-05; инженерный выбор, без independent reproduction или переноса выигрышей на Eliot.
 
 | Проверенная опора | Вывод → владелец V3 | Граница |
 |---|---|---|
 | [Agent Memory, v2](https://arxiv.org/pdf/2606.06448v2), §4.2, Table 3, pp. 6–7 | Считать construction + retrieval + generation; простой raw/lexical baseline → [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). | Основная таблица: пять LongMemEval histories, 300 queries, Qwen3-32B. Это не универсальная победа BM25 и не action benchmark. |
-| [Acon, v3](https://arxiv.org/html/2510.00615v3), §3, §4.5 Table 4, Appendix A | Сокращение контекста может добавить compressor latency; семантическое сжатие вне hook, при сохранении точных источников → [Cognition §6.4](COGNITION.md#64-packing). | Выбранные benchmarks/models; lossless compression, производственная надёжность и ускорение Eliot не доказаны. |
+| [Acon, v3](https://arxiv.org/html/2510.00615v3), §3, §4.5 Table 4, Appendix A | Compressor latency → сжатие вне hook, точные источники сохранены → [Cognition §6.4](COGNITION.md#64-packing). | Выбранные benchmarks/models; lossless compression, production reliability и ускорение Eliot не доказаны. |
 | [ActMem, v2](https://arxiv.org/html/2603.00026v2), §3.3–3.4, §4–5 | Передавать условия, механизм и последствия для решения, а не только похожие факты → [Cognition §2.1](COGNITION.md#21-working-model-not-a-transcript-summary). | Causal edges выводит модель; synthetic reasoning evaluation не превращает их в установленную причинность. Полный KG pipeline не заимствуется. |
-| [Memory-R1, v5](https://arxiv.org/html/2508.19828v5), §3.1–3.2, §4.4 | Разделить изменение памяти и выбор полезного контекста → существующие revision writer и [§8 jobs](COGNITION.md#8-processing-methods-and-jobs). | Обученные manager/answer policies и dialogue QA не обосновывают RL-зависимость Base или замену исходных наблюдений. |
+| [Memory-R1, v5](https://arxiv.org/html/2508.19828v5), §3.1–3.2, §4.4 | Изменение памяти отдельно от отбора контекста → revision writer и [§8 jobs](COGNITION.md#8-processing-methods-and-jobs). | Trained policies/dialogue QA не обосновывают RL в Base или замену raw observations. |
 | [Claude-Mem `d9b36b6`, SearchManager.ts](https://github.com/thedotmack/claude-mem/blob/d9b36b66dc68da92af9df238e4c4debab587ba62/src/services/worker/SearchManager.ts): `timeline`, `searchChromaForTimeline`, selected hydration; [Apache-2.0](https://github.com/thedotmack/claude-mem/blob/d9b36b66dc68da92af9df238e4c4debab587ba62/LICENSE) | Малое раскрытие по якорю с последующим exact open → [Cognition §6.2](COGNITION.md#62-candidate-arms). | Прочитаны выбранные функции; derived observations не заменяют raw evidence. Bun/SQLite/Chroma/runtime не импортируются. |
 | [Letta Code `1fb6ea4`, memory-filesystem.ts](https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/memory-filesystem.ts): `getScopedMemoryFilesystemRoot`, `ensureLocalMemfsCheckout`; [Apache-2.0](https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/LICENSE) | Малое редактируемое представление, привязанное к владельцу → существующие work slots в [Cognition §2](COGNITION.md#2-current-work-reconstruction). | Backend-dependent local/Git initialization не является общей транзакцией с messages/effects; MemFS и второй host не импортируются. |
 | [Claude hooks](https://code.claude.com/docs/en/hooks#sessionstart), [compaction guide](https://code.claude.com/docs/en/hooks-guide#re-inject-context-after-compaction); [Codex hooks](https://developers.openai.com/codex/hooks#sessionstart) | Автовыдача на реальном synchronous boundary, включая SessionStart после compact → [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary). | Документы прочитаны 2026-11-05; версии установленного хоста не проверены. Codex — следующий adapter candidate, не уже поддержанный host. |
 
-2 KiB brief, 250 ms ожидания и warm p95 ≤100 ms — начальные **цели дизайна Eliot**,
-не результаты этих источников. Проверять сохранение решения/исключений и полный расход;
-один compression ratio не определяет полезность. Код доноров в этой правке не копируется.
+2 KiB brief, ожидание 250 ms, warm p95 ≤100 ms — **цели Eliot**, не измерения.
+Критерий: сохранённое решение/исключения и полный расход, не compression ratio.
+Код доноров не копируется.
 
 ### 5.2 Dreamer, prepared knowledge and learning from outcomes
 
-Продолжение #5348, 2026-11-06. Прочитаны профильные KB-аудиты background/sleep-time,
-LightMem, procedural skills и dependency repair на том же `fe7c0c8`; ниже различены
-повторно открытые primary sections и непосредственно прочитанный pinned code.
-Это основания проектного выбора, не полный новый аудит или воспроизведение результатов.
+Пересмотр 2026-11-06 на KB `fe7c0c8`: background/LightMem, procedural skills,
+dependency repair, `extracts/audit-long-horizon-benchmark-validity.md`; ниже — primary sections/code.
 
 | Опора | Что используем | Что не переносим |
 |---|---|---|
@@ -281,23 +277,24 @@ LightMem, procedural skills и dependency repair на том же `fe7c0c8`; н�
 | SkillRevise [loop.py](https://github.com/HKUST-KnowComp/skillrevise/blob/fb8042ac2415cb6d7f3a49db0c9a95ecb79edc6d/skillrevise/core/loop.py), `HarnessLoop.run_task`/`_is_better`; [revision.py](https://github.com/HKUST-KnowComp/skillrevise/blob/fb8042ac2415cb6d7f3a49db0c9a95ecb79edc6d/skillrevise/method/revision.py), `LLMRevisionEngine.revise` | Структурировать правку через execution anchors/контрпримеры; отличать последнего кандидата от лучшего измеренного → [§12](COGNITION.md#12-consolidation-disagreement-and-improvement). | Код проверяет форму anchors, не их соответствие source spans. Paper v4 известен по KB-аудиту; HTML/PDF здесь недоступны. Не переносить diagnosis gate на сохранение факта/гипотезы или самовольное исполнение тестов. |
 | [PACMI v1](https://arxiv.org/pdf/2610.05732v1), scope assumptions, §3, §6 | Изменение основания должно доходить до зависимого совета; актуальность отдельно от релевантности → [§8.2](COGNITION.md#82-prepared-knowledge-and-newer-evidence). | Dependency edges даны аннотацией; автоматическое извлечение полного графа не доказано. Не копировать новый validity lattice или LLM premise checker на каждый запрос. |
 | [MemoryArena v2](https://arxiv.org/html/2602.16313v2), §3.2, §4.2–4.4 | Проверять цепь память → действие → наблюдаемый исход → следующая задача; recall не заменяет пользу → [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). | Aggregate task score не изолирует память от агента/инструментов. Здесь не вводится новый benchmark framework или заявленный выигрыш Eliot. |
+| [LongMemEval-V2 v1](https://arxiv.org/html/2605.12493v1), §4–5/E.1; [`agentrunbook_r.py@2cc8c54`](https://github.com/xiaowu0162/LongMemEval-V2/blob/2cc8c540bdb87fe6761629b585e727e1c4704520/memory_modules/agentrunbook_r.py), `_build_raw_state_entries` / `_build_event_transition_specs` | Raw state / transition / procedure → existing observation/explanation/method, [§2.2/8.1](COGNITION.md#22-prepare-knowledge-for-use). | Fixed-reader QA на web trajectories, не live task success; pools/query-time agent не копируются в hook. |
+| [DynamicMem v1](https://arxiv.org/html/2606.22877v1), §5.2 | Сохранять референт, значение, условие; topical relevance недостаточно → [§2.2](COGNITION.md#22-prepare-knowledge-for-use). | 10 synthetic personas; LLM taxonomy исключает failures без cited evidence. Не causal/population estimate. |
+| [A-Mem v11](https://arxiv.org/html/2502.12110v11), §3.4; [`memory_layer_robust.py@b31a1dd`](https://github.com/WujiangXu/A-mem/blob/b31a1dddf56f87ec762cce3539418602d7e2ffb1/memory_layer_robust.py), `process_memory` | Neighbor metadata меняется in-place, её индекс — при `refresh_index`: representation привязана к revision → [Implementation §7.4](IMPLEMENTATION.md#74-direct-revision-and-lost-replies), [Cognition §15](COGNITION.md#15-additive-capabilities-and-their-consumers). | Нет атомарной history/rollback; поздний code fix не результат paper 2025 года. |
+| [Rethinking Harness Evolution v4](https://arxiv.org/html/2607.12227v4), §4.1–4.4 | Больше попыток/подгонка на исходных задачах не доказывают перенос → [§12.1](COGNITION.md#121-learning-must-change-a-later-decision). | Task/compute dependence; без rerun-gate для каждой записи. |
 
 [Контролируемый LightMem-разбор в KB](https://github.com/UnknownAlienHuman/agent-operation-system-knowledge/blob/fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689/extracts/audit-lightmem-cluster.md)
-дополнительно требует сравнения с raw retrieval при сопоставимом бюджете. Его paper
-`2607.29104` заново не получен (HTML/PDF недоступны); новые численные выводы из него не заявляются.
-Главный выбор: фон готовит смысл; инструменты выбирают, квалифицируют и собирают его;
-опыт исправляет содержание и способ подготовки. Ни новые таблицы, ни ещё один агентный
-runtime, ни сертификат «достаточного понимания» для этого не нужны.
+добавляет raw retrieval при равном бюджете; paper `2607.29104` повторно недоступен,
+новых численных выводов нет.
 
 ### 5.3 Restore useful behavior from the old design
 
-Сверка 2026-11-06: [старые нормы на `1c19f33`](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/1c19f33dbd8ca5278cea283ccecfaa073b9f8ac9/docs/architecture),
-V3, source-дефекты и KB. Delta/cache, key/version и optional telemetry — решения Eliot,
-не доказанные paper results. Ничего из этого не объявляется реализованным.
+Сверены [старые нормы `1c19f33`](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/1c19f33dbd8ca5278cea283ccecfaa073b9f8ac9/docs/architecture),
+V3, source-дефекты и KB. Delta/cache, key/version и telemetry — решения, не runtime evidence.
 
 | Прочитанная опора | Решение / предел вывода |
 |---|---|
 | A04-02, I06-12 | Обычный текст вместо ontology/ActionFrame-анкеты → [Cognition §5](COGNITION.md#5-direct-updates). |
+| A06-01–06, A07-08 | Восстанавливать модель с условиями, альтернативами и различающим наблюдением; смена основания требует переоценки зависимого совета → [§2/8.2](COGNITION.md#2-current-work-reconstruction). Старый нормативный замысел; profile/governor/watchdog framework не переносится. |
 | A07-03, I07-19, I12-06/14 | Push/Pull/Dreamer, общая cue-нормализация, bounded lookup, инъекция изменений → [§6.2.1](COGNITION.md#621-proactive-attention-without-repeated-context). Без mirror/outbox/manifest framework и inference на hook. |
 | [InjectionPlanner `5aac094`, `attach`](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/5aac094834fb5635921b550c821cb933a1196105/crates/eliot-engine/src/ul/injection.rs); [старый аудит §22](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/41c2291f3b968ddbb2690b2f4be79e1677730de7/docs/v3/AUDIT.md) | Receipt failure пропускал item; delivered записывался до ответа. Source checks перед выдачей, telemetry best effort после → [§6.5](COGNITION.md#65-handoff). Source-order finding, не fault injection. |
 | [LoCoMo-Plus v1](https://arxiv.org/html/2602.10715v1), §§3–4 | Лексически далёкие cue/trigger требуют поиска известной предпосылки, а не только сходства. [§6.2](COGNITION.md#62-candidate-arms) следует prepared dependencies; benchmark не проверял эту hook/cache policy. |

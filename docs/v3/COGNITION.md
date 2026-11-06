@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.35 · 2026-11-06 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.36 · 2026-11-06 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -130,10 +130,11 @@ records why this design is selected and what the studies do not establish.
 ### 2.2 Prepare knowledge for use
 
 Dreamer prepares reusable meaning before the next request; Base assembles it with the
-current task facts. Keep each unit coherent, scoped and independently reusable:
+current task facts. Retain exact evidence alongside coherent, scoped reusable units:
 
-| Existing item | Content to prepare |
+| Existing item | Retained evidence / prepared meaning |
 |---|---|
+| Observation / linked action-result | Exact state and action/result observations; occurrence/resource identities and both available sides of a transition, without inventing a missing state or cause. |
 | Claim / explanation | Relevant fact or mechanism; dependencies, conditions, competing explanation and observation that distinguishes them. |
 | Project view | The task's current working model (§2.1), with exact sources and unresolved changes; reference reusable explanations instead of copying a whole project history. |
 | Advice method | When it applies → action/procedure → expected result → check → known failure/recovery. A result seen once remains scoped experience. |
@@ -145,13 +146,13 @@ the relevant condition/experience even when their wording differs; Base follows 
 relation without rediscovering its meaning. No universal ontology or new object hierarchy.
 An item can generalize across tasks only within its stated conditions and reuse scope.
 
-The preparation criterion is **decision sufficiency**: retain what changes the action,
-its expected consequence, applicability or verification. Remove repeated narration and
-irrelevant detail, not negation, exceptions, uncertainty or the distinguishing example.
-Dreamer checks its proposed reduction against those questions and the actual source;
-this is a semantic heuristic, not proof that every future query is covered. Base checks
-selectors, qualifications and packing mechanically; it never asks a model to certify
-that the context is sufficient. Missing knowledge stays a focused question for §8.3.
+**Decision sufficiency** preserves what changes the action, consequence, applicability
+or check: concrete referents, critical values/units/versions, negation, exceptions,
+uncertainty and the distinguishing example. Source IDs locate evidence; they do not replace
+its meaning in the text. Remove narration, not these distinctions. Dreamer compares
+reductions with original evidence; this heuristic cannot prove future-query coverage.
+Base checks selectors, qualifications and packing mechanically; missing knowledge
+remains a focused question (§8.3).
 
 ## 3. Grounds and applicability
 
@@ -584,24 +585,23 @@ exact method and source coverage. A stored method without a consumer is not impr
 
 ### 8.1 Dreamer preparation
 
-Dreamer is the semantic handler of an existing finite job. Prepare only a view, explanation
-or method with a named context/research consumer; do not speculate over the whole archive.
+One finite job prepares a view, explanation or method for a named context/research
+consumer, without speculative archive-wide synthesis:
 
-1. **Collect cheaply.** Capture source events; join supplied action/result/test identities,
-   scope and resource versions instrumentally. Remove repeated representations from the
-   working set, never distinct occurrences from the source history.
-2. **Select the change.** Freeze new primary facts plus the exact prior view/method and
-   necessary supporting or contradicting neighbors. Reopen original spans where a reduction
-   omits the needed detail. A prior summary is a useful input, not replacement evidence.
-3. **Synthesize.** Identify changed state, mechanism, reusable procedure and unresolved
-   alternative. Preserve speaker/hypothetical scope and distinguish outcome from inferred
-   cause. Derive lexical terms from content; bind observed exact cues through §7 of
-   Implementation's shared normalizer. Never invent identities or supporting facts.
-4. **Clean.** Revise the relevant existing unit; remove redundant narration, split incompatible
-   conditions, preserve a decisive counterexample and the test that resolves uncertainty.
-   Do not append another generic lesson when the old item can be corrected.
-5. **Publish for use.** Resolve sources and expected revisions through §9.2 and the normal
-   revision writer. The next context lookup consumes the prepared text without inference.
+1. **Collect.** Join captured events with supplied action/result/test identities, scope and
+   resource versions. Deduplicate representations, never occurrences.
+2. **Select.** Freeze changed primary facts, the exact prior view/method and needed original
+   supporting/contradicting anchors. Reopen only spans needed to resolve material omissions;
+   summaries add no independent support. Unavailable anchors leave qualified gaps, never
+   invented facts or silently dropped conditions.
+3. **Synthesize.** Distinguish state, observed transition, mechanism, procedure and unresolved
+   alternatives. Preserve speaker/hypothetical scope; outcome alone does not establish cause.
+   Never invent identities or support.
+4. **Clean.** Revise the owning unit; remove narration, split incompatible conditions, retain
+   counterexamples and discriminating checks. Derive search text from replacement content
+   and observed exact cues through Implementation §7's shared normalizer.
+5. **Publish.** Use §9.2 and the ordinary revision writer; the next context lookup consumes
+   prepared text without inference.
 
 Automatic mode is `off | idle | background`. New primary outcomes, test results, corrections
 or agent-authored task handoffs coalesce into the work/view-targeted refresh. Repeated polling, packets,
@@ -634,17 +634,16 @@ selected primary observations:
 |---|---|
 | `covered` | A completed accepted preparation/research result accounts for the requested finite input and this exact output revision. This is selection-relative coverage, not universal freshness. |
 | `pending_input` | Known relevant input is not incorporated. Show the still-applicable view with the new evidence and a short pending qualification; do not wait for Dreamer. |
-| `basis_changed` | A material premise/resource revision was corrected, refuted or withdrawn. Requalify affected advice under §3; expose current evidence and retain old text only as qualified history. |
+| `basis_changed` | A material premise changed, was refuted/withdrawn, or its bound resource has a new version. A version change alone is not refutation: requalify dependent advice under §3; unresolved impact stays conditional, established incompatibility becomes qualified history. |
 | `unknown` | The preparation relation, input coverage or bounded lookup is insufficient. Keep that uncertainty; do not infer freshness from age, `current`, or an empty page. |
 
-Job coverage binds its accepted output revisions and accounted primary input. Agent-authored
-views remain usable immediately; prose or grounds alone do not certify processing coverage.
-`no_change` may advance coverage for the same view; failed/partial/unknown work cannot. Preserve
-unprocessed references in the existing successor intent without automatically retrying an
-unknown call. A reader never scans historic jobs to manufacture completeness; exhausted
-lookup returns `unknown`. Receipt-time order cannot exclude delayed capture (§2).
-Independent useful units remain available in every case. These are computed qualifiers,
-not another persisted status, freshness service or prerequisite for the agent to act.
+Accepted job coverage binds exact output revisions to accounted primary input. Direct views
+are usable immediately; prose/grounds do not prove processing coverage. `no_change` may advance
+same-view coverage; failed/partial/unknown work cannot. Retain unprocessed references in the
+coalesced successor without automatically retrying an unknown call. Bounded indexed lookup
+never scans historic jobs; exhaustion is `unknown`, and receipt order cannot exclude delayed
+capture (§2). These computed qualifiers add no persisted state and do not gate unrelated
+units or the agent's actions.
 
 ### 8.3 Research: an agent can ask Dreamer
 
@@ -766,8 +765,10 @@ One success can yield useful scoped experience immediately; it does not establis
 universal rule. A factual repair or qualified hypothesis does not wait for promotion,
 mandatory repeated execution or another evaluator service. A failure can immediately
 narrow advice or motivate a provisional alternative. Claiming that a replacement is better
-needs an attributable comparison with comparable scope and cost. Preserve beneficial behavior and known counterexamples when
-revising; the latest generated candidate is not automatically the best-supported one.
+needs an attributable comparison with comparable criteria, scope and total cost. More
+attempts or fitting the revision's own examples do not establish transferable benefit.
+Preserve beneficial behavior and counterexamples; the latest candidate is not automatically
+the best-supported one.
 
 Optimize useful continuation, avoided repeated mistakes and total preparation/read/use
 cost. Token reduction alone can hide lost evidence. Reuse observations may inform a
@@ -869,7 +870,7 @@ before Base. Each uses existing observations, revisions, finite jobs and exact o
 | Project views | Explicit question/scope/cut → versioned answer with source coverage → context or exact view open | Failed/partial refresh retains the prior qualified view and exposes its age/gaps, not an empty successful refresh. |
 | Cross-project methods | Attributable episode/outcome → provisional generalization with conditions and origin → authorized project retrieval | Shared label is not broad efficacy or permission. Selected membership must be persisted/enforced before that mode is enabled. |
 | Documents/media | Permitted original → versioned external conversion with hierarchy and page/span/time locators → retrieval and exact representation open | Conversion failure preserves allowed raw access and states unsupported/partial; no invented text or flattened loss of provenance. |
-| Embeddings | Exact source revision plus query/document role and compatible model/space → individually mapped vectors → optional retrieval arm | Missing, mismatched or failed input has no fabricated zero/aggregate vector; exact/lexical Base remains available. |
+| Embeddings | Exact source revision plus query/document role and compatible model/space → individually mapped vectors → optional retrieval arm | Each vector stays bound to its indexed revision; never relabel stale content as current. Missing/mismatched/failed input has no fabricated vector; exact/lexical lookup continues during refresh. |
 | Research | Agent question/follow-up → §8.3 Dreamer job → concise answer/view and exact sources → agent/context; external acquisition only through its configured owner | Distinct questions survive; local analysis remains usable without external acquisition. Partial/unknown is not no-findings; no second research executor. |
 
 Self-inspection uses the same source/open/status paths for Eliot's own documents and

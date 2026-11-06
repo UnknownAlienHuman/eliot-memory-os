@@ -22,21 +22,18 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348 / PR #5349](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5349): старые требования/дефекты + V3 + KB → исправить owning sections → проверить связность и diff. Выбраны рабочая модель, Dreamer/research, event-driven context, baseline/update, простой capture и обучение по исходам. [Источники §5.1–5.3](AUDIT-MAP.md#53-restore-useful-behavior-from-the-old-design); [Cognition](COGNITION.md), [Implementation §7/11](IMPLEMENTATION.md#7-core-operations-and-host). Runtime и измерения открыты. |
+| D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348 / PR #5349](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5349): старые требования/дефекты + V3 + KB → исправить owners → проверить связность/diff. Рабочая модель, Dreamer/research, injection и outcome learning уточнены: сжатие сохраняет референты, смена версии переоценивает совет. [Источники §5.1–5.3](AUDIT-MAP.md#53-restore-useful-behavior-from-the-old-design); [Cognition](COGNITION.md), [Implementation §7/11](IMPLEMENTATION.md#7-core-operations-and-host). Runtime/измерения открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
 
 Первым остаётся [#5326 / Store PR #5327](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5327):
 assets + minimum fmt/Clippy, затем [inline capture → open](IMPLEMENTATION.md#72-capture-command-commit-and-replay).
-Production ingress требует [durable-before-send](IMPLEMENTATION.md#75-durable-ingress-and-replay);
-первый disposable путь не ждёт inference, backup campaign или R-207.
-
-[Implementation §11](IMPLEMENTATION.md#11-implementation-sequence) владеет дальнейшим порядком:
-Slice 2 связывает revision, work lookup и renderer; Slice 3 — notices/backup. Не расширять
-asset-поручение до этих срезов и не создавать конкурирующего writer. R-185 purpose codecs/
-aggregate limits нужны перед своей capability, не перед первым capture. D1 routes для prose/
-Store уже пройдены; менять их только при конкретном сбое, не продолжать обслуживание ради него самого.
+Production ingress — [durable-before-send](IMPLEMENTATION.md#75-durable-ingress-and-replay);
+disposable путь не ждёт inference/backup/R-207. Далее [§11](IMPLEMENTATION.md#11-implementation-sequence):
+Slice 2 revision/work/context, Slice 3 notices/backup. Не расширять asset scope и не создавать
+конкурирующего writer. R-185 codecs/limits нужны до своей capability. D1 routes — review-in-PR;
+возвращаться к ним лишь при конкретном сбое.
 
 ## Snapshot and evidence limits
 
@@ -65,7 +62,7 @@ R-126 переиспользует SQLite commands/writes. R-178/R-179/R-180 о�
 | R-175/R-176/R-204 | Исторические programmes/отчёты сохранены в Git; они не V3 roadmap и не основание считать всё согласованным. |
 | R-177/R-202 | Asset repair — часть Slice 0. Connected порядок задан в §11; предварительные каркасы будущих capabilities не нужны. |
 | R-198/R-200/R-201 | Предыдущие docs слиты; assignment зарегистрирован, synthetic descriptor удалён из active directory. Открыты integration checks, не повторная регистрация. |
-| R-203 | PR #5349 head `7da40c0`, [run 42175626167](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/42175626167): `Verify shared documentation evidence` → `ROUTE_RECEIPT_MISMATCH`, повтор после `c2bfa62`. Локальная final-candidate проверка проходила; причина расхождения не установлена. Integration owner сравнивает реальные recomputed route inputs CI с тем же деревом; prose scope не меняет checker/CI и не выдаёт local PASS за remote PASS. |
+| R-203 | PR #5349, `837a484`, [run 42183111564](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/42183111564): `Verify shared documentation evidence` → `ROUTE_RECEIPT_MISMATCH`, повтор после `7da40c0`/`c2bfa62`. Local candidate check проходил; причина расхождения не установлена. Integration owner сверяет recomputed route inputs того же дерева; prose scope не меняет checker/CI и не выдаёт local PASS за remote PASS. |
 | R-205/R-206 | Убраны ненужные V2 reading inputs и 56 дублирующих индексов. Не повторять эти патчи. |
 | R-207 | Обслуживание V2 tooling отложено; исправлять только доказанный blocker текущего V3 increment. |
 
@@ -92,7 +89,7 @@ Required checks не отключать; skipped historical audit не выда�
 | ID | Что должно остаться при реализации |
 |---|---|
 | R-189 | [Capture policy](IMPLEMENTATION.md#71-capture-policy-before-durable-custody) действует до payload custody и при replay; staged/failed custody не обходит admission и не доказывает erasure. |
-| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §2/8/12](COGNITION.md#22-prepare-knowledge-for-use) — рабочая модель, Dreamer/research, cue activation и outcome repair. Source consumers открыты. |
+| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §2/8/12](COGNITION.md#22-prepare-knowledge-for-use) — рабочая модель, Dreamer/research, cue activation, исходные anchors при повторном сжатии и outcome repair. Source consumers открыты. |
 | R-191 | `DECIDED / SOURCE_OPEN`: [NoticeV1 и erasure](IMPLEMENTATION.md#101-notice-command-and-durable-encoding) выбраны; source, Windows durability и полный cleanup inventory открыты. |
 | R-192/R-196 | Поздние capabilities сохраняют owner routes; legacy Operation/SDK путь не возвращается. |
 | R-193 | [Supervisor](IMPLEMENTATION.md#21-liveness-and-bounded-recovery): независимое наблюдение, конечный recovery budget, без retry неизвестного эффекта. |
@@ -155,8 +152,8 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 ## Source coverage
 
 S-001–S-107 и прежние counts — историческое evidence, не повторные проверки. В #5348
-прочитаны текущие owners/consumers, профильные A4/A7/I7/I12 и source audit, включая
-InjectionPlanner. [AUDIT-MAP §5.1–5.3](AUDIT-MAP.md#53-restore-useful-behavior-from-the-old-design)
+прочитаны owners/consumers, профильные A4/A6/A7/I7/I12 и source audit, включая InjectionPlanner;
+выбранные пути A-Mem и AgentRunbook. [AUDIT-MAP §5.1–5.3](AUDIT-MAP.md#53-restore-useful-behavior-from-the-old-design)
 различает primary/KB-only/недоступные источники. Проверки точного diff/ссылок и review —
 в PR; весь архив, Rust/Clippy и runtime этим prose-проходом не квалифицируются.
 
