@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.20 · 2026-10-28 · design for the greenfield rewrite, not implemented behavior.**
+**Revision 1.0-draft.21 · 2026-11-05 · design for the greenfield rewrite, not implemented behavior.**
 
 V1/V2 Memory implementations are donors. This document owns purpose, responsibility
 and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store, maintenance
@@ -21,24 +21,25 @@ Never route around missing inference through owner credentials, Agent tasks or l
 
 ## 1. Purpose and completion
 
-Eliot makes accumulated experience useful at the next decision:
+Eliot reconstructs the smallest useful model of the work: **goal/criterion, how the
+relevant part works, current state, attempts/results, uncertainty and next step**.
+The agent should recover why a decision follows, what would change it and where to
+check the evidence. A transcript summary or list of similar facts alone is insufficient.
 
-```text
-preserve exact observation
-→ reconstruct current work
-→ supply applicable context
-→ observe action/result
-→ revise memory or method
-→ use the revision later
-```
+The loop is observation → working model → decision context → action/result → revision
+→ later use. Memory supplies grounded premises; the agent reasons and the host executes.
+Causal explanations and predicted consequences remain attributed hypotheses until
+supported. Missing understanding is a named question, never an invented answer.
 
-Value means restored work without invented state, remembered failures and exceptions,
-explicit unknowns, learning from outcomes and preserved source/history. Optional
-inference must not be necessary for ordinary capture, retrieval or context.
+Base uses existing observations, views, links and exact open without inference.
+Semantic synthesis is optional background work or an explicit agent-authored revision;
+it does not delay capture or every hook. Measure correct continuation and avoided repeated
+mistakes alongside total latency/cost/context size, not recall or compression alone.
 
-Add a mechanism only for a named caller, owner, durable result or typed unknown and
-actual consumer. Completion includes restart/readback where persistence matters.
-A type, port, fixture, receipt, report, branch or passing compile alone is intermediate.
+Each mechanism needs a caller, existing owner, result/unknown and actual consumer.
+Completion includes restart/readback where persistence matters; standalone scaffolding
+is intermediate. The operational model and evidence are in [Cognition §2](COGNITION.md#2-current-work-reconstruction)
+and [the research map](AUDIT-MAP.md#5-из-исследований-в-реализацию).
 
 ## 2. Ownership
 
@@ -65,10 +66,8 @@ Dreamer is a role performed for one finite semantic job, not a permanent process
 provider stack, scheduler, special database or canonical writer. A controller call is
 not an Agent/session/Goal lifecycle. Memory links external work but does not own it.
 
-Stable client identity, credential version and call identity remain separate. Rotation
-or rollback cannot authorize a second uncertain effect. The send owner controls actual
-profile/destination/credentials; a profile name is not permission for silent fallback.
-Detailed identities and readback belong to the inference contract, not a second model here.
+The [inference contract](INFERENCE-CONTRACT.md) owns client/credential/call identity,
+destination and uncertain-effect readback; rotation/rollback never authorizes a duplicate call.
 
 ## 3. Product shape
 
@@ -103,11 +102,12 @@ Vectors, views, documents, Research and other hosts reuse the same records/jobs/
 
 ### 3.3 First host is narrow
 
-The first Claude profile selects SessionStart, UserPromptSubmit, PostToolUse,
-PostToolUseFailure, Stop, SubagentStop, PostCompact and SessionEnd. Verify the installed
-host contract before enabling each event. Host JSON is adapter input, not domain state.
-Session/prompt boundaries emit actual context; final messages are retained directly;
-compact summaries are derived representations. Enforcement hooks are outside Base.
+The first Claude relay captures selected lifecycle/tool outcomes and emits context at
+synchronous SessionStart (including resume/compact) and UserPromptSubmit boundaries.
+Final messages are retained directly; compaction summaries are derived. Event mapping
+and installed-host verification belong to [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary).
+Additional hosts translate the same operations; their event names do not alter domain state.
+Memory failure withholds unavailable context and leaves host execution available.
 
 ## 4. Identity and memory invariants
 
@@ -129,22 +129,22 @@ reintroduction/inventory/restore claims; none is physical deletion proof.
 
 ## 5. Retrieval, context and learning
 
-Address current work before similarity search. Union independently bounded direct,
-address, exact-cue, lexical, optional vector, grounds/relation and method candidates
-before final selection. Apply scope before arm limits.
+Start with addressed work, its current qualifications and linked attempts. Expand exact
+cues, lexical/relations/methods and optional vectors only for a named question or missing
+premise. Scope each requested arm before its limit; union before selection. Unrequested
+arms remain explicit. BM25 ranks one query snapshot, not truth or a cross-call cursor.
 
-Lexical ranking uses one bounded statement snapshot, not a durable BM25 cursor across
-corpus changes. Score orders candidates but proves neither truth nor applicability.
+The default output is a small, self-contained work brief, with exact source selectors for
+on-demand detail. Preserve the causal/attempt chain, corrections, open commitments,
+exceptions and uncertainty before generic matches. Every included statement should help
+choose, explain or verify the next step. Metadata stays in the internal packet unless it
+changes interpretation. [Cognition §6](COGNITION.md#6-retrieval-and-context) owns the codec.
 
-A packet preserves current goal/progress, exact corrections, open commitments,
-applicable methods with exceptions, relevant episodes, dissent/unknowns and exact
-source handles. Negation, version and contraindications travel with the value.
-Prepared, emitted, action-associated, used and successful are different facts.
-
-A project view is a versioned answer over examined scope. Failed refresh leaves the
-previous qualified view and exact source access available. No-change requires completed
-cognitive work on supplied input; rejection, missing/malformed/truncated output or
-unknown execution is not no-change. Cleanup is separate from cognitive outcome.
+Do not turn missing evidence, low similarity or an optional backend failure into a global
+task gate. Qualify/omit the affected claim; keep useful independent context and exact open.
+Prepared, emitted, used and successful are distinct observations. A failed refresh leaves
+the previous still-qualified view accessible with its limits; no-change requires completed
+cognitive work, not a rejected, malformed, truncated or unknown result.
 
 ## 6. Store and schema authority
 

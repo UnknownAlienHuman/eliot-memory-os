@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.53 · 2026-11-04 · design for the greenfield rewrite.**
+**Revision 1.0-draft.54 · 2026-11-05 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -633,9 +633,34 @@ before any payload-bearing file or IPC. Model calls are absent from all Base ope
 Job claim/settle uses §4.7.3 only when its real worker exists.
 
 The initial Claude relay enables only host events verified against the installed host
-contract. Address work before search; deliver actual context at supported boundaries.
-Unsupported events/operations are unavailable, not successful empty handlers. Cognition
-owns context selection and packing; host emission is not part of Store commit.
+contract. [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary) owns capture/emission
+mapping; [§2.1](COGNITION.md#21-working-model-not-a-transcript-summary) owns the working model;
+[§6](COGNITION.md#6-retrieval-and-context) owns staged retrieval and compact rendering.
+An explicit context request uses the same operation; exact selectors use §7.3.
+
+The automatic path is relay event → accepted capture/spool → addressed reads → qualified
+brief → final packet custody/recheck → host output. It performs **zero model, embedding,
+Research or remote-search calls**. Reuse one Store client; batch independent fixed reads
+where their semantics permit. Hydrate chosen exact revisions once per invocation, then
+revalidate live pointers/notices under the delivery fence. No corpus scan, rebuilt global
+graph, background-job join or durable packet cache belongs on this path.
+
+The relay supplies an absolute deadline covering retrieval, final checks, packet custody
+and output; use the smaller of the configured wait and the host's remaining time. Start
+with a configurable **250 ms automatic wait** and a **warm p95 ≤100 ms target**, measured
+from relay event receipt to completed local response. These are unmeasured engineering
+objectives, not host guarantees or task-acceptance gates. Report relay/process startup
+and cold Store startup separately. Explicit requests may use their own larger budget.
+
+Start output only after exact response custody/readback and final recheck, while the
+deadline is live; bound this single write by the remaining budget. If time expires before
+writing, return the host's successful non-blocking no-context response and record
+unavailable status. A partial write is Cognition §6.5's unknown handoff, never a second response.
+Capture already committed/staged remains so. Do not wait for semantic refresh, resend a
+possibly emitted response or deliver it later from spool. Missing optional retrieval
+withholds only its contribution; unsupported operations remain explicit in status.
+Host emission is not part of Store commit. Its exact retention/failure rules remain in
+[Cognition §6.5](COGNITION.md#65-handoff).
 
 ### 7.1 Capture policy before durable custody
 
@@ -1466,10 +1491,23 @@ Runtime work remains separately authorized; documentation changes do not impleme
 | Asset repair (#5326/#5327) | Fix existing schema/query owner, selected codecs and bounds; replace capture primitives with a complete transaction and exact-open projection | Package fmt/Clippy and embedded inspection pass; still **not** a working Store. Do not add network/provider/backup machinery to `inspect`. |
 | Slice 0 — inline capture/open | Verified Store startup/admission → one bounded client → §7.2 transaction → §7.3 exact open | Disposable caller retains the command for direct readback/retry. Same command changes nothing; changed input conflicts. Inline-only; no production-host crash-custody claim until Slice 1. No model/backup prerequisite. |
 | Slice 1 — durable ingress/restart | §7.5 publish before send → single replay owner → Store/open → retire pending | Input survives restart and lost notification/reply under the same ID. Full quota does not evict old input; interrupted cleanup does not destroy pending custody. Native-event identity alone permits redelivery deduplication; equal bytes from distinct occurrences remain distinct. |
-| Slice 2 — useful context and corrections | Verified host boundary → addressed exact/lexical retrieval → deterministic packet → actual host emission; §7.4 direct update → later exact history/context | Host receives goal/constraints/qualified evidence and source handles. Correction survives another revision and a lost reply. Empty, unavailable and truncated retrieval differ. No generated summary or model required. |
+| Slice 2 — useful context and corrections | Verified host boundary → current-work model + gap-directed retrieval → compact brief → actual emission; §7.4 update → later exact history/context | Agent recovers goal, mechanism/state, attempts, unknowns and next step where supported; absent fields stay unknown. Resume/compact gets fresh context, sources open exactly, corrections survive lost replies. No model required. |
 | Slice 3 — Base maintenance | Quiesced cut → backup/fence/manifest → isolated restore/cutover; notices → erasure; rotation/shutdown | Disposable data exercises actual paths with inference disabled. No user-data migration/destructive command is enabled before its own boundary works. |
 | Inference P1a | Accepted scoped controller extension → one persisted call → decoded revision → later context; dependency-aware backup/release | Unknown send is not repeated under a new ID. Only this row waits for controller decisions; do not scaffold it in Base. |
 | Inference P1b and later | Credential rotation, then independently selected vectors/views/documents/Research/hosts | Add each capability only with its real input, failure result and consumer. |
+
+Slice 2 is the first useful local memory milestone. Full backup/restore and optional
+inference are separate increments; each shipped operation still includes its own custody,
+scope and current-notice checks. Do not turn the whole Base completion list into a gate
+before connecting capture → work reconstruction → context → exact open.
+
+At that connection, record warm/cold latency, emitted UTF-8 bytes (tokens only with a real
+counter), Store/model call counts and omitted decision-critical facts. Inspect one fresh
+resume, one previous failed attempt, one changed premise and one compaction: can the agent
+identify the right next action/query and open its evidence? Later compare brief versus
+flat/raw retrieval at equal context budget, including write/refresh cost. A smaller packet
+that increases wrong actions or repeated failures is a regression. Use existing observations;
+no new scoring service or test campaign is required before writing this path.
 
 ### 11.1 Source placement and handoff
 
@@ -1487,7 +1525,9 @@ V1/V2 bins are donors, not an instruction to wire their whole runtime into V3.
 | Planned runtime `src/main.rs`, `src/lib.rs` | Select supervisor/daemon/relay mode and compose only implemented operations. No successful stubs for later modes. |
 | Planned runtime `src/store.rs` | One admitted client, bindings/decoders and operation calls using schema-package assets. No general SQL API. |
 | Planned runtime `src/capture.rs`, `src/open.rs` | §7.2 identities/outcomes and §7.3 exact reads, used immediately by the first caller. |
-| Later `src/spool.rs`, host/context and maintenance modules in that package | §7.5 owns publication/quota/replay/retirement; add with Slice 1 and reuse it for §7.4. Host and maintenance arrive with their callers. No second queue database or crate/process per noun. |
+| Later `src/spool.rs` | Slice 1: §7.5 publication/quota/replay/retirement, reused by §7.4; no second queue database. |
+| Later `src/context.rs`, `src/host.rs` | Slice 2: reconstruct/select/render over existing records; map callbacks and actual output. A pure renderer and ordinary adapter functions, not a checkpoint service or new host registry. |
+| Later maintenance modules in the same package | Slice 3 with real backup/restore/erasure callers; no crate/process per operation. |
 
 These are default source locations, not installed interfaces or a new module registry.
 A different location requires a concrete existing owner/caller advantage, not a new

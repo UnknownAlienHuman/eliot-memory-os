@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.32 · 2026-11-05 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.33 · 2026-11-05 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -87,6 +87,42 @@ prompt may remain explicit caller input, without claiming it was persisted. Repo
 capture when the committed view lacks it. Stream ingest sequence orders commits, not host
 occurrences; use observed source sequence/parent relations for causality and label gaps.
 Replay after an outage must not silently invent a newer user goal from arrival order.
+
+### 2.1 Working model, not a transcript summary
+
+Reconstruction should answer six decision questions. They are a content convention over
+existing views/observations, not new columns, packet roles or a second task store.
+
+| Question | Smallest useful content / existing owner |
+|---|---|
+| Goal | Desired outcome and acceptance criterion; current goal view plus attributable amendments. |
+| Model | Relevant entities, dependencies and mechanism: what changes what, under which conditions; a scoped explanation/view with exact grounds. |
+| State | What is true now, completed work and unresolved commitments; progress view and bound observations. |
+| Tried | Action → expected/observed result → criterion → supported cause or unknown; original call/result links, including failures and exceptions. |
+| Unknown | Decision-critical missing fact, conflicting evidence or unverified premise, plus the observation/source that could resolve it. |
+| Next | One justified action or focused query and its expected useful result; plan view or explicitly attributed proposal, never a completed attempt. |
+
+The host agent may write a concise prose `project_view` through the existing revision operation:
+goal stays in its goal slot, next step in plan, and state/model/tried/unknown in progress
+or linked explanation items. Update after a meaningful result, correction, changed
+premise or handoff; unchanged polls do not need a revision. Attach exact grounds and
+resource versions. Base selects labelled source text and linked observations; it does
+not infer a causal model, parse prose into authoritative fields or wait for a summarizer.
+Call/result links establish the attempt pairing; a cause requires a separately attributed
+explanation and its grounds.
+Absent model/next-step content stays unknown. Optional §8 jobs use the same writer later.
+
+A useful model permits a small conditional simulation: **given state S, action A should
+produce O because M; observe E to distinguish alternatives**. Preserve whether M/O is an
+observation, source assertion or hypothesis. Sequence, co-occurrence and model confidence
+do not establish cause. Model only the decision-relevant part; unresolved alternatives
+remain available through exact open. Any changed material resource revision or premise
+requalifies affected advice under §3; unrelated work continues.
+
+A linked or retrieved matching failure outranks generic similar history. Keep its conditions
+and the changed premise that would justify trying again: an old failure is evidence, not a global
+ban. Corrections revise the affected view before later reuse. The [research map](AUDIT-MAP.md#51-evidence-for-compact-understanding)
+records why this design is selected and what the studies do not establish.
 
 ## 3. Grounds and applicability
 
@@ -176,21 +212,31 @@ corrections require the explicit adoption rule in Implementation §8.2, not auto
 
 ### 6.1 Decision frame
 
-Use work address, observed resource versions, focused question, exact cues, constraints
-and budget. Missing address or source coverage remains explicit, not guessed from a
-similar result.
+Bind work (§2), focused question, resource/version, exact cues, constraints and budget.
+For resumption, use §2.1's six questions; for a narrow lookup, answer only that question
+with its necessary state/qualifiers. A required premise is a supplied selector or an
+attributed source claim, not an automatically invented checklist. Missing address,
+model or source coverage stays explicit.
 
 ### 6.2 Candidate arms
 
-Generate independently bounded candidates from direct handles/addresses, exact cues/
-aliases, lexical search, compatible vectors when enabled, grounds/contradictions/
-replacements, typed relations and eligible methods. Apply project/work scope before arm
-limits; union before final selection.
+Use staged disclosure within one request budget, not every retrieval arm on every hook:
 
-Return examined scope/cut, arm availability and truncation/gaps with the result. An empty
-top-K means no match in that examined retrieval, not that no relevant source exists.
-Timeout, unavailable arm and truncated traversal are not successful empty searches.
-Independent useful arms may still contribute a qualified partial answer.
+| Stage | Retrieve / stopping rule |
+|---|---|
+| Address | Current work slots/commitments, direct handles, their qualifications and linked recent attempts. Return when these cover the explicit request with known limits. |
+| Expand | For a named gap/cue, request bounded exact, lexical, relation or method candidates; vectors only when enabled and useful. Follow an artifact/failed premise to its relevant neighbors, not an unrestricted graph walk. |
+| Open | The agent requests a selected exact source/revision or a focused follow-up question; reuse §7, without replaying the whole history. |
+
+Apply scope before each arm limit; union requested arms before selection. Preserve
+contradictions, replacements and required grounds for selected advice even on the cheap
+path. Base routing follows explicit addresses/cues/gaps; it does not call a model to judge
+its own understanding. An unresolved question may be returned instead of automatic expansion.
+
+Report examined scope, arm states and gaps. Unused arms are `not_requested`; failed,
+disabled and truncated arms retain their own states. Empty top-K means no match in that
+finite query, not global absence. Reaching the deadline returns useful qualified partial
+context; it never starts an unbounded search or blocks unrelated host work.
 
 ### 6.3 Lexical snapshot
 
@@ -202,9 +248,10 @@ Exact SQL belongs to [Implementation §5.1](IMPLEMENTATION.md#51-exact-full-text
 
 ### 6.4 Packing
 
-Prioritize current goal/criteria/plan/progress; exact corrections/constraints; open
-commitments; applicable or conditional advice with exceptions; relevant episodes;
-dissent/unknowns/missing checks; exact source handles.
+Prioritize decision-changing corrections/constraints, current goal/model/state/next step,
+open commitments and matching failed attempts; then applicable advice, discriminating
+evidence and related history. Unknowns, counterevidence, qualifiers and source handles
+travel with the claim they qualify, not as disposable low-priority context.
 
 Apply Implementation §4.7.2's eligibility before assigning a positive role. Hidden items
 are excluded from automatic packets, not made public by relabeling them evidence.
@@ -215,10 +262,11 @@ job and cannot become ordinary recommendations. Persisted goal/plan/progress gui
 uses §2's current views, not a text classifier; live input stays explicitly uncommitted.
 Missing required state withholds the unit with a gap, not a default.
 
-Base renders selected structured fields and exact labelled excerpts; it does not need
-an LLM to summarize them. Within the priority classes above, prefer addressed current
-work, then newer observed receipt time, then canonical ID/revision as a deterministic
-tie-break. Union duplicate exact revision handles, not similar text or distinct events.
+Base renders existing concise views or exact labelled excerpts. Dense semantic reductions
+come from §2.1's explicit revision or a later background job, never a hidden model call
+while packing. Prefer addressed work and decision-relevant attempts, then newer receipt
+time and canonical ID/revision. Deduplicate exact revision handles, not similar claims
+or distinct events. Do not repeat the live prompt, generic instructions or unrelated logs.
 
 Treat value plus negation, conditions, exceptions, validity and source handle as one
 packing unit. Include it whole; otherwise use an existing qualified short representation
@@ -227,6 +275,11 @@ Enforce [the Base byte cap](IMPLEMENTATION.md#451-first-base-limits) on actual e
 UTF-8 bytes, including labels/handles/gaps. Reserve room for the gap summary first.
 A byte count is not a token measurement: when the host requires an exact token budget,
 use its admitted counter or report that capability unavailable, never a guessed PASS.
+
+Aim for **2 KiB of model-visible brief text** on automatic hooks; this is a soft initial
+design target, not measured performance or a new rejection limit. Expand when necessary
+to preserve a decision-critical chain/qualification, within the existing 32 KiB final
+response cap. Prefer fewer complete useful units to compressed words that lose meaning.
 
 Retrieved text, documents, tool output and recalled model answers are evidence, not
 new host/system instructions. Render them as attributed data with source/revision and
@@ -285,6 +338,34 @@ a whole lowest-priority unit and updating gaps is allowed before freezing output
 a JSON string, source selector or qualifier is not. If even the gap-only response exceeds
 the cap, emit no packet. An exact host token cap still requires its admitted counter.
 
+#### 6.4.2 Compact model-facing rendering
+
+`ContextPacketV1` remains the internal validated object. The host receives its readable
+projection, not nested packet JSON. The existing context operation owns a deterministic
+renderer; no second store, mutable alias registry or summarizer is needed.
+
+1. Header: `Memory context (attributed data)` plus packet ID and current project/work
+   address. Keep installation IDs, adapter versions, hashes and ranking diagnostics internal.
+2. In packet order, render `role [n] representation: text`; `text` is the unit's exact
+   JSON-quoted string. Use `[live]` for uncommitted `live_input`; assign source numbers by
+   first appearance. Group complete action/result units when their captured relation proves
+   the pairing; grouping neither creates a causal assertion nor merges their identities.
+3. Render every present packet qualifier value unchanged as compact JSON adjacent to its
+   unit. A short label never substitutes for the actual exception/condition. Keep uncertainty,
+   withdrawal, validity and partial-source qualifications visible; work scope is in the header.
+4. End with one source dictionary: `[n]=observation:<id>` or `memory:<id>@<revision>`;
+   include each unit's excerpt offset/length next to that unit. Reuse the number only
+   for the same exact source; live input has no source alias. Resolve `[n]` locally to
+   the displayed immutable selector, then call ordinary exact open. Never send `[n]`
+   as an API selector, resolve it through a packet service or replace the revision with `current`.
+5. Include every arm state and gap code compactly, including `not_requested`. Recount
+   bytes after host wrapping; omit whole units, never cut text/qualifiers to fit.
+
+Each emitted brief is self-contained; it does not assume an earlier injection survived
+host compaction. The retained `context_packet` body is the exact final host response
+(§6.5), with binding and exact source links; the full source hashes remain verifiable
+through those records. The renderer changes presentation, not provenance or permissions.
+
 ### 6.5 Handoff
 
 The daemon prepares/records context; the narrow relay emits it for one live host
@@ -292,41 +373,31 @@ invocation. Capture completion, context preparation, local emission, host accept
 action association, use/influence and criterion outcome are separate facts. Context
 failure never rolls back a committed capture or authorizes blocking the user's task.
 
-Before returning output to the relay, retain the exact final host-response bytes as one
-operation-owned `context_packet` observation, with `observation_id=packet_id`, ordinary
-body length/hash, the binding above and derived links to the exact unit sources. Apply
-capture exclusions to every retained copy, including live input and metadata. Reuse
-existing capture/blob custody and its limits; do not add a packet table, delivery queue
-or job. If the exact packet cannot be committed/read back before the host deadline,
-return context unavailable; staged packet custody is not permission to emit it later.
-Generic capture cannot forge this reserved kind or a delivery result. Its replay identity
-is the packet ID; a native host key is correlation, not observation deduplication for
-packet construction. A saved packet is preparation and possible-send intent, never
-proof of emission.
+Before relay output, commit/read back the exact final response as an operation-owned
+`context_packet` observation: `observation_id=packet_id`, body length/hash, binding and
+links to exact unit sources. Reuse capture/blob custody, limits and exclusions for every
+copy, including live input/metadata. Generic capture cannot forge this reserved kind or
+handoff results. Packet ID owns replay; a native host key only correlates construction.
+If custody misses the deadline, return unavailable; staged packets are never sent later.
 
-Immediately before output, recheck the live invocation/session/work binding, installation
-selection, current authorization/disclosure and suppression. A local host may forward
-context to a remote provider: local IPC permission alone does not authorize that
-forwarding. The admitted host profile must bound the allowed destination/disclosure;
-unknown destination keeps restricted content withheld. For a memory unit selected as current
-goal/plan/constraint/progress/commitment/method, verify that the current revision still
-equals the selected revision and still passes the role's eligibility. For an addressed
-view, recheck that the requested work slot resolves to that same item/revision; for a
-commitment, recheck its creation binding and current permission to use that membership.
-Historical open is not either check.
-Revalidate exact source hashes, qualifications and current notices. A changed eligible
-result requires rebuilding and a new packet ID, never changing bytes under the old one.
-No retry follows an ambiguous prior emission.
+Inside the existing affected-delivery fence, immediately before output, recheck:
 
-The bounded emission participates in the existing affected-delivery fence used by
-revision publication, withdrawal, erasure and cutover. Closing that fence rejects new emissions and drains
-in-flight ones; a timeout leaves unresolved delivery, not completed erasure. Recheck
-inside the fence, not only while constructing the packet. Do not hold the spool
-publication mutex across host/Store I/O. Once local output I/O has stopped or settled,
-release the delivery fence before queueing/persisting the handoff fact; its storage must
-not be what a waiting revision needs to drain. A still-running possible writer is not
-settled merely because its caller timed out. Bytes already handed to the host cannot be
-recalled by a later notice; host-owned transcripts/copies remain explicit cleanup limits.
+- live invocation/work/session and installation selection; current authorization,
+  disclosure, suppression and the host's actual allowed destination (local IPC alone
+  does not authorize remote forwarding; unknown destination withholds restricted text);
+- exact source hashes and qualifiers/notices; current-guidance roles also require the
+  selected revision still current/eligible, addressed slot → same item/revision, and
+  commitment creation binding/current membership. Historical evidence keeps its exact
+  revision and current withdrawal qualification; it need not be the current revision.
+
+Historical hydration cannot replace these current checks. A changed eligible selection
+requires new bytes and packet ID; ambiguous prior emission is never retried.
+Revision/withdrawal/erasure/cutover closes the fence to new emissions and drains existing
+ones; timeout means unresolved delivery. Keep the spool publication mutex out of host/
+Store I/O. Release the delivery fence **after output I/O stops/settles and before handoff
+storage** so revision publication never waits on storage behind its own fence. Caller
+timeout alone does not settle a possible writer. Later notices cannot recall emitted
+bytes; host transcripts/copies remain explicit cleanup limits.
 
 | Reported state | Required observation / recovery |
 |---|---|
@@ -347,30 +418,36 @@ Failure to retain this fact after output leaves durable status unknown even when
 live relay observed success. It cannot change the host response, block the turn or cause
 another send. Retrying storage of the same fact never repeats host output.
 
-For one live invocation there is one emitter and one bounded emission attempt; ordinary
-short-write completion belongs to that attempt, not a new response. After interruption,
-partial-output failure or an ambiguous result, do not restart the response. A documented
-native request key may correlate a redelivery to the existing packet; session ID, prompt
-text and time proximity are not such a key. Without a stable key there is no cross-process
-exactly-once claim. In this first profile, restart, spool replay and backup restore may
-reconcile/store packet facts, but **never dispatch old packets**. A new actual host
-boundary may request freshly authorized context; it is not replay of an uncertain old
-handoff. Read-only host acknowledgement can resolve an old unknown only when the installed
-adapter actually supplies it; do not build a speculative acknowledgement endpoint.
+One invocation has one emitter/attempt; short-write completion stays within it.
+Interruption, partial output or ambiguity never restarts the response. Only a documented
+native request key correlates redelivery; session ID, text and time proximity do not,
+so no cross-process exactly-once claim follows. Restart/spool/restore may reconcile facts,
+but **never dispatch old packets**. A fresh host boundary reconstructs current context.
+An installed read-only acknowledgement may resolve unknown; no speculative endpoint.
 
 #### 6.5.1 First Claude output boundary
 
-Initial context emission uses only admitted synchronous `SessionStart` and
-`UserPromptSubmit` callbacks; other selected events remain capture-only until separately
-implemented. Emit one JSON response with `hookSpecificOutput.hookEventName` equal to the
-received event and `hookSpecificOutput.additionalContext` containing the serialized
-packet as a string. Use the documented successful exit, no extra plain-text duplicate,
-permission decision, prompt replacement or blocking fallback. Diagnostics never share
-stdout or echo private content. Event-specific mapping is ordinary adapter code, not a
-new host capability registry.
+Initial emission uses admitted synchronous `SessionStart` and `UserPromptSubmit` callbacks.
+Return one JSON response: `hookSpecificOutput.hookEventName` is the received event;
+`hookSpecificOutput.additionalContext` is §6.4.2's brief string. Use successful exit,
+without a duplicate stdout body, permission decision, prompt replacement or blocking
+fallback. Diagnostics do not share stdout or echo private content.
+
+| Boundary | Automatic work |
+|---|---|
+| `SessionStart`, including startup/resume/compact | Reconstruct fresh addressed context; compaction/resume does not replay an old packet. A fork uses its actual new binding. |
+| `UserPromptSubmit` | Capture accepted input, then build a brief for this prompt and current state. Staged input stays explicitly uncommitted. |
+| `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop` | Capture supplied action/results/final text with original binding and available call identity. A Stop callback alone does not mean task acceptance. |
+| `PostCompact`, `SessionEnd` | Capture supplied summary/lifecycle data only. Compaction summary is derived; do not depend on a clean exit to preserve earlier work. |
+
+Event mapping is adapter code, not a capability registry. Capture is automatic; semantic
+brief updates use §2.1's writer, so hook installation alone does not claim automatic
+understanding. Stop/compaction never waits for a learning job. Unsupported callbacks
+and failed context remain visible in local status while the user's task continues.
 
 The [official hooks reference](https://code.claude.com/docs/en/hooks#userpromptsubmit-decision-control),
-read 2026-11-04, documents this context field. It also documents
+read 2026-11-05, documents this context field. The [hooks guide](https://code.claude.com/docs/en/hooks-guide#re-inject-context-after-compaction)
+places re-injection at `SessionStart(compact)`, not `PostCompact`. It also documents
 [transcript replay on resume](https://code.claude.com/docs/en/hooks#add-context-for-claude):
 old mid-session context can be replayed by the host without invoking the old hook again.
 This is not fresh Memory validation or a new method outcome. These are documentation
@@ -421,6 +498,14 @@ A processing method is an ordinary versioned Memory item: purpose, instruction b
 input/result contract, conditions/limitations and disclosure consequences. First enable
 stores a real default; upgrade never overwrites an edited revision. Job claim freezes
 exact method and source coverage. A stored method without a consumer is not improvement.
+
+When inference is enabled, a work-brief refresh consumes new primary outcomes,
+corrections or agent-authored task handoffs and proposes §2.1's concise view through the
+same revision writer. Packet/handoff receipts and injected echoes are not new input.
+Coalesce input in the existing work-targeted job and run at the selected idle/background
+boundary, not once per hook. Bind exact prior view/input revisions and grounds; preserve
+partial/unknown results. Capture and context continue while it runs. With inference off,
+agent-authored revisions and exact episode retrieval remain the complete Base route.
 
 Automatic mode is `off | idle | background`; a profile may forbid automatic calls.
 New primary committed input, correction or explicit question can trigger interpretation.

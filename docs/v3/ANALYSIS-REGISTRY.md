@@ -22,7 +22,7 @@
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
 | D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
-| D5. Сценарии | `PARTIAL` | Current-work и packet правила сохранены. [Cognition §4/9.2/12](COGNITION.md#4-episode-membership-and-coverage) согласуют frozen coverage, partial/no_change и учёт одного действия по нескольким отчётам. Полнота выборки не полнота задачи; критерий/метод привязаны к точной версии. Purpose-specific codecs/limits, остальные сценарии и runtime открыты. |
+| D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5348): KB/первоисточники → рабочая модель → поэтапный retrieval/плотная выдача → semantic/link review. Владельцы: [Cognition §2.1/6](COGNITION.md#21-working-model-not-a-transcript-summary), [Implementation §7/11](IMPLEMENTATION.md#7-core-operations-and-host); опора — [AUDIT-MAP §5.1](AUDIT-MAP.md#51-evidence-for-compact-understanding). Frozen coverage/attribution сохранены. Реальный renderer/hook, purpose codecs/limits и измерения остаются открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
@@ -49,20 +49,21 @@ Episode/coverage и attribution теперь уточнены в существ�
 job/revision/context операции; новых таблиц и счётчиков успеха не требуется.
 D1 пройден для prose и первого Store пути: точные секции вместо общей обязательной
 цепочки книг, inherited instructions без перезапуска индексов, проверка по changed surface.
-Не продолжать улучшать маршруты без конкретного сбоя исполнителя. Следующая работа —
-D4/source handoff выше; документационный остаток D5 проверять по затронутому контракту
-при его реализации. R-185 (purpose codecs/aggregate limits) требуется до включения той
-capability, а не до первого Store/capture. Общей новой серии документационных задач нет.
+Не продолжать улучшать маршруты без конкретного сбоя исполнителя. Поручение #5348 уточняет
+D5 по базе знаний; оно не создаёт конкурирующий Store writer. После review контракта —
+D4/source handoff, затем Slice 2 с рабочей моделью и реальной выдачей. R-185 (purpose
+codecs/aggregate limits) требуется до включения той capability, не до первого Store/capture.
 
 ## Snapshot and evidence limits
 
 | Источник | Зафиксировано | Предел вывода |
 |---|---|---|
-| Memory main | `1199a52e7221f395f0f1884e636e52b515492652`, перечитан 2026-11-05 | Документационная база и предыдущие слияния, не работоспособность V3. |
+| Memory main | `1c19f33dbd8ca5278cea283ccecfaa073b9f8ac9`, перечитан 2026-11-05 | База #5348; V3 owners и прямые consumers, не полный аудит V1/V2 или работающий runtime. |
+| Knowledge base | `fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689`, 2026-11-05 | Прочитаны synthesis, relevant records/extracts; выбранные primary sections, donor functions/licenses и hooks пересверены в [AUDIT-MAP §5.1](AUDIT-MAP.md#51-evidence-for-compact-understanding). Результаты не воспроизводились. |
 | Store PR #5327, чтение 2026-11-04 | Head `a040bd408be39afa9789561595d2cac8bef177b3`; дополнительно прочитаны memory/history DDL и `queries.rs` 210–315 | В перечне 31 queries нет полной create/revise transaction; старые поля, projections и временные ASSERT ещё согласовать. Это чтение source, не компиляция, execution или полный аудит PR. |
 | SurrealDB | `v3.3.4` / `1ac2b1dba7cd177621a4cf5d507caebeb2414395` | Наследованные exact-tag findings; upstream и Windows/RocksDB здесь повторно не квалифицировались. |
 | Controller | `5891cb706d1708bda28b2bd64be6d7996a6e2bdb`, наблюдение 2026-10-28 | Не текущий moving main. Его поддержку повторно проверяет владелец inference-задачи. |
-| Claude hooks | [Официальный контракт](https://code.claude.com/docs/en/hooks#add-context-for-claude), прочитан 2026-11-04 | Документированные output fields и replay контекста; версия установленного хоста и фактическая доставка здесь не проверялись. |
+| Host hooks | [Claude](https://code.claude.com/docs/en/hooks#sessionstart), [Codex](https://developers.openai.com/codex/hooks#sessionstart), прочитаны 2026-11-05 | Документированные context fields и SessionStart(compact); у страниц нет указанной версии установленного продукта. Реальная доставка не проверена; первым adapter остаётся Claude. |
 
 ## Controller dependency
 
@@ -109,11 +110,11 @@ Required checks не отключать; skipped historical audit не выда�
 | ID | Что должно остаться при реализации |
 |---|---|
 | R-189 | Exclusions до spool/blob/IPC; строгий current policy повторно проверяется перед replay. Failed custody не равна erasure; публикация spool не обходит закрытую admission boundary. |
-| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §2/6](COGNITION.md#2-current-work-reconstruction) связывает current-work slots и commitment membership с packet. Plan имеет отдельную роль; commitment/method qualifiers не теряются. Перед выдачей проверяются current revision, work slot, роль и notices. Source writer/lookup/renderer и реальная выдача остаются открыты. |
+| R-190 | `DECIDED / SOURCE_OPEN`: [Cognition §2/6](COGNITION.md#2-current-work-reconstruction) связывает work slots с goal/model/state/tried/unknown/next и поэтапным раскрытием. Это source-qualified content, не новые поля/таблицы и не автоматический причинный вывод Base. Plan, commitment/method qualifiers, current revision/slot/notices сохраняются. Source writer/lookup/renderer и фактическая выдача открыты. |
 | R-191 | `DECIDED / SOURCE_OPEN`: [§10.1–10.4](IMPLEMENTATION.md#101-notice-command-and-durable-encoding) задают NoticeV1, точный target/scope, отмену только названного отзыва, erasure replay keys и непрерывность через существующий installation checkpoint. Нет зеркальной Store-ревизии ради флага. Удаление current не переизбирает history и не обнуляет счётчик. Реализация, Windows durability и полная cleanup-инвентаризация открыты. |
 | R-192/R-196 | Поздние capabilities и все требования сохраняют owner routes; старый Operation/SDK путь не возвращается через rationale. |
 | R-193 | Supervisor различает alive/responsive/progress/outcome; конечный recovery budget, без retry неизвестного внешнего эффекта. |
-| R-194 | Coverage packet различает complete/partial/unavailable/disabled/not_requested по arm; пустые units не скрывают сбой. 32 KiB считается после host wrapping/escaping; token budget требует настоящего counter. Usage unknown не равен нулю. |
+| R-194 | Internal packet сохраняет qualifiers/arm states; host получает компактную проекцию с exact selectors. 2 KiB — мягкая цель, 32 KiB — прежний cap после wrapping; token budget требует counter. [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host) задаёт deadline и unmeasured latency targets; timeout не блокирует задачу. Runtime/usage/польза не объявлены измеренными. |
 
 ## Store reconciliation
 
@@ -179,13 +180,12 @@ R-049/R-058–R-067: production code first, minimum changed-package fmt/Clippy �
 
 S-001–S-107 и предыдущие check counts — исторические evidence в закреплённом срезе,
 [AUDIT](AUDIT.md), [AUDIT-MAP](AUDIT-MAP.md) и PR, не повторно исполненные результаты.
-Текущий D1 проход: START, root AGENTS/README/WORKFLOW, authority, task map,
-development и inherited crates/storage. Сопоставлены маршруты локального import repair,
-capture, direct revision и packet prose с владельцами и check recipes. Контракты продукта,
-AUDIT-MAP и generated V2 blocks не менялись; остальные source families не аудитированы.
-Шесть изменяемых baseline файлов сверены с Git blob SHA текущего main; это частичный
-checkout. Точные diff/anchors/links и независимое review фиксируются в PR. Machine evidence,
-весь Store source, внешний API и runtime не становятся PASS от сокращения human reading.
+Проход #5348: Architecture, Cognition, затронутые Implementation §4/7/11, AUDIT-MAP и
+этот реестр; root instructions/WORKFLOW/task map задали scope. Пересмотрены working model,
+retrieval, renderer, hooks и границы малой реализации. Выборка KB/primary evidence — §5.1
+source map; полный корпус не объявлен заново аудитированным. Точные diff/link checks и
+независимое review фиксируются в PR. Rust/Clippy и runtime не запускались: исходники не
+меняются. Machine integration evidence и результаты прежних CI остаются отдельными.
 
 ## Integration blockers
 

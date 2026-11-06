@@ -1,6 +1,6 @@
 # Eliot V3 — решения по исходным требованиям и границы охвата
 
-**Маршруты требований сверены 2026-10-28; происхождение аудита — 2026-10-22/24. Не runtime registry.**
+**Маршруты требований: 2026-10-28; целевой research update: 2026-11-05 (§5.1). Не runtime registry.**
 
 Ищите конкретный ID и переходите в колонку «Текущий owner». Владелец задаёт действующее
 правило; эта карта сохраняет требование, осознанное отклонение и источник, но не создаёт
@@ -243,6 +243,28 @@
 | Итоговая документация | Один смысловой baseline аудита; drafts переписать согласованно | Architecture — цель; Implementation — connected paths; Cognition — алгоритмы |
 
 Оставшиеся пункты — реализация выбранной конструкции, а не разрешение снова плодить каталоги. Не заявляются работающий V3, успешный model/DB/Windows run, независимые субагенты или повтор всех прошлых тестов. Форматирование/ссылки документов проверяются отдельно от продуктового поведения. Существующие CI и main не меняются этим аудитом.
+
+### 5.1 Evidence for compact understanding
+
+База: [agent-operation-system-knowledge@fe7c0c8](https://github.com/UnknownAlienHuman/agent-operation-system-knowledge/tree/fe7c0c80e2536515ce234fc9d8f3adb4eb0ca689),
+`research/INDEX.md`, `DECISIONS.md`, тематические карточки и их `registry`/`extracts`.
+Ниже — целевой пересмотр первичных sections/code paths 2026-11-05, не повтор полного
+аудита базы и не independent reproduction. Выбор механизма — инженерный вывод;
+заявленные авторами выигрыши не переносятся на Eliot.
+
+| Проверенная опора | Вывод → владелец V3 | Граница |
+|---|---|---|
+| [Agent Memory, v2](https://arxiv.org/pdf/2606.06448v2), §4.2, Table 3, pp. 6–7 | Считать construction + retrieval + generation; простой raw/lexical baseline → [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). | Основная таблица: пять LongMemEval histories, 300 queries, Qwen3-32B. Это не универсальная победа BM25 и не action benchmark. |
+| [Acon, v3](https://arxiv.org/html/2510.00615v3), §3, §4.5 Table 4, Appendix A | Сокращение контекста может добавить compressor latency; семантическое сжатие вне hook, при сохранении точных источников → [Cognition §6.4](COGNITION.md#64-packing). | Выбранные benchmarks/models; lossless compression, производственная надёжность и ускорение Eliot не доказаны. |
+| [ActMem, v2](https://arxiv.org/html/2603.00026v2), §3.3–3.4, §4–5 | Передавать условия, механизм и последствия для решения, а не только похожие факты → [Cognition §2.1](COGNITION.md#21-working-model-not-a-transcript-summary). | Causal edges выводит модель; synthetic reasoning evaluation не превращает их в установленную причинность. Полный KG pipeline не заимствуется. |
+| [Memory-R1, v5](https://arxiv.org/html/2508.19828v5), §3.1–3.2, §4.4 | Разделить изменение памяти и выбор полезного контекста → существующие revision writer и [§8 jobs](COGNITION.md#8-processing-methods-and-jobs). | Обученные manager/answer policies и dialogue QA не обосновывают RL-зависимость Base или замену исходных наблюдений. |
+| [Claude-Mem `d9b36b6`, SearchManager.ts](https://github.com/thedotmack/claude-mem/blob/d9b36b66dc68da92af9df238e4c4debab587ba62/src/services/worker/SearchManager.ts): `timeline`, `searchChromaForTimeline`, selected hydration; [Apache-2.0](https://github.com/thedotmack/claude-mem/blob/d9b36b66dc68da92af9df238e4c4debab587ba62/LICENSE) | Малое раскрытие по якорю с последующим exact open → [Cognition §6.2](COGNITION.md#62-candidate-arms). | Прочитаны выбранные функции; derived observations не заменяют raw evidence. Bun/SQLite/Chroma/runtime не импортируются. |
+| [Letta Code `1fb6ea4`, memory-filesystem.ts](https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/memory-filesystem.ts): `getScopedMemoryFilesystemRoot`, `ensureLocalMemfsCheckout`; [Apache-2.0](https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/LICENSE) | Малое редактируемое представление, привязанное к владельцу → существующие work slots в [Cognition §2](COGNITION.md#2-current-work-reconstruction). | Backend-dependent local/Git initialization не является общей транзакцией с messages/effects; MemFS и второй host не импортируются. |
+| [Claude hooks](https://code.claude.com/docs/en/hooks#sessionstart), [compaction guide](https://code.claude.com/docs/en/hooks-guide#re-inject-context-after-compaction); [Codex hooks](https://developers.openai.com/codex/hooks#sessionstart) | Автовыдача на реальном synchronous boundary, включая SessionStart после compact → [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary). | Документы прочитаны 2026-11-05; версии установленного хоста не проверены. Codex — следующий adapter candidate, не уже поддержанный host. |
+
+2 KiB brief, 250 ms ожидания и warm p95 ≤100 ms — начальные **цели дизайна Eliot**,
+не результаты этих источников. Проверять сохранение решения/исключений и полный расход;
+один compression ratio не определяет полезность. Код доноров в этой правке не копируется.
 
 ## 6. Inference boundary update — 2026-10-24
 
