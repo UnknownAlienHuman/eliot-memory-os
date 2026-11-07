@@ -91,20 +91,27 @@ body_sha256 = "020be359b5d07de99dc55ef1472f3a6a96c49b9cd8b10af48b1b58c223d56e1e"
 disposition = "blocked"
 prerequisites = []
 
+[[row]]
+issue = 5348
+unit = "V3-CONTEXT-DENSITY"
+body_sha256 = "5ce991c5eaf38dcfb19653c17612bb0c8ccd0cbf635d608c2730b798cee38d47"
+disposition = "blocked"
+prerequisites = []
+
 [aggregate]
-issues = [728, 748, 750, 818, 838, 839, 843, 846, 859, 974, 994, 5324]
+issues = [728, 748, 750, 818, 838, 839, 843, 846, 859, 974, 994, 5324, 5348]
 numeric_descriptors = []
 matrix_cases = 0
 assigned = 0
-blocked = 6
+blocked = 7
 planned = 0
 nonexecutable = 2
 superseded = 2
 accepted_historical = 2
-sha256 = "842457314bbf6696861ae56f070170c3d463797a6ba146914e6f2c79e07c1806"
+sha256 = "46771a74048bf57dca3c73d2619762b00cdddeb25d76446d0c0f5b8d8c0178a0"
 
 [provenance]
-base_commit = "4af7df71959d50ae431761e3989040e2d1870aef"
-acquired_at = "2026-10-30T20:42:28Z"
-acquisition = "GitHub connector: exact catalogue blob c7c657c3944fb530f50f6bc59185c4424d702467, work-units tree 699c8a87ebd195bdfb7d2174f77d56fa683ea74a, and issue #5324 owner update/readback; scope comments 6532944200 and 6533001109"
-note = "D6 catalogue extension at 4af7df7. Only #5324 was acquired live (issue updated_at 2026-10-30T20:42:22Z); its blocked disposition is declared by the root-owned assignment. The other 11 rows are byte-for-field retained from blob c7c657c3944fb530f50f6bc59185c4424d702467, whose observations date to 2026-09-25/26 at base 46d645f2c6ece125842e8deefdb661797c0fa0e9; they are not freshly qualified. Active numeric descriptors are empty after removing the exact duplicate of the retained #837 testdata fixture. Catalogue integrity does not imply task completion, current full-project authority or runtime acceptance."
+base_commit = "f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa"
+acquired_at = "2026-11-07T02:28:57Z"
+acquisition = "GitHub API issue #5348 exact body readback after adding .gitattributes LF normalization for the reproduced documentation-evidence mismatch; inherited catalogue and descriptor inventory at f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa"
+note = "Update only #5348 scope binding; retain its blocked disposition and the other 12 rows field-for-field. Prior acquisition provenance is retained in .github/work-unit-cohort.toml at f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa. No inherited row is freshly qualified; coverage is the selected catalogue and unchanged descriptor inventory, not all GitHub issues or runtime acceptance."

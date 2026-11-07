@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Cognition
 
-**Revision 1.0-draft.32 · 2026-11-05 · design algorithms, not runtime evidence.**
+**Revision 1.0-draft.39 · 2026-11-06 · design algorithms, not runtime evidence.**
 
 [Architecture](ARCHITECTURE.md) owns product invariants;
 [Implementation](IMPLEMENTATION.md) owns runtime, Store and physical maintenance;
@@ -35,7 +35,10 @@ A semantic item is a revisable claim, method, explanation, commitment, predictio
 project view. Retain exact current/history revisions, origin/reuse/disclosure,
 conditions/exceptions, validity, grounds and independent support/exposure/influence.
 Original bytes, converted representation, excerpt, summary and claim have distinct
-identities and explicit links.
+identities and explicit links. Preserve whose assertion it is and whether it concerns the
+actual task, a hypothesis, quoted belief, test fixture or abandoned branch. Project/session
+binding alone does not express that distinction. Use existing perspective, qualifications,
+content and exact sources; uncertain ownership remains attributed evidence, not a shared fact.
 
 ## 2. Current-work reconstruction
 
@@ -87,6 +90,69 @@ prompt may remain explicit caller input, without claiming it was persisted. Repo
 capture when the committed view lacks it. Stream ingest sequence orders commits, not host
 occurrences; use observed source sequence/parent relations for causality and label gaps.
 Replay after an outage must not silently invent a newer user goal from arrival order.
+
+### 2.1 Working model, not a transcript summary
+
+Reconstruction should answer six decision questions. They are a content convention over
+existing views/observations, not new columns, packet roles or a second task store.
+
+| Question | Smallest useful content / existing owner |
+|---|---|
+| Goal | Desired outcome and acceptance criterion; current goal view plus attributable amendments. |
+| Model | Relevant entities, dependencies and mechanism: what changes what, under which conditions; a scoped explanation/view with exact grounds. |
+| State | What is true now, completed work and unresolved commitments; progress view and bound observations. |
+| Tried | Action → expected/observed result → criterion → supported cause or unknown; original call/result links, including failures and exceptions. |
+| Unknown | Decision-critical missing fact, conflicting evidence or unverified premise, plus the observation/source that could resolve it. |
+| Next | One justified action or focused query and its expected useful result; plan view or explicitly attributed proposal, never a completed attempt. |
+
+The host agent supplies a concise progress/goal/plan update; the existing adapter builds
+the revision command (§5), without asking it to fill storage fields. Goal stays in its goal
+slot, next step in plan, and state/model/tried/unknown in progress or linked explanations. Update after a meaningful result, correction, changed
+premise or handoff; unchanged polls do not need a revision. Attach available exact grounds
+and resource versions; retain attribution and label unsupported assertions/proposals. Base selects labelled source text and linked observations; it does
+not infer a causal model, parse prose into authoritative fields or wait for a summarizer.
+Call/result links establish the attempt pairing; a cause requires a separately attributed
+explanation and its grounds.
+Absent model/next-step content stays unknown. Optional §8 jobs use the same writer later.
+
+A useful model permits a small conditional simulation: **given state S, action A should
+produce O because M; observe E to distinguish alternatives**. Preserve whether M/O is an
+observation, source assertion or hypothesis. Sequence, co-occurrence and model confidence
+do not establish cause. Model only the decision-relevant part; unresolved alternatives
+remain available through exact open. Any changed material resource revision or premise
+requalifies affected advice under §3; unrelated work continues.
+
+A linked or retrieved matching failure outranks generic similar history. Keep its conditions
+and the changed premise that would justify trying again: an old failure is evidence, not a global
+ban. Corrections revise the affected view before later reuse. The [research map](AUDIT-MAP.md#51-evidence-for-compact-understanding)
+records why this design is selected and what the studies do not establish.
+
+### 2.2 Prepare knowledge for use
+
+Dreamer prepares reusable meaning before the next request; Base assembles it with the
+current task facts. Retain exact evidence alongside coherent, scoped reusable units:
+
+| Existing item | Retained evidence / prepared meaning |
+|---|---|
+| Observation / linked action-result | Exact state and action/result observations; occurrence/resource identities and both available sides of a transition, without inventing a missing state or cause. |
+| Claim / explanation | Relevant fact or mechanism; dependencies, conditions, competing explanation and observation that distinguishes them. |
+| Project view | The task's current working model (§2.1), with exact sources and unresolved changes; reference reusable explanations instead of copying a whole project history. |
+| Advice method | When it applies → action/procedure → expected result → check → known failure/recovery. A result seen once remains scoped experience. |
+
+Keep stable mechanisms separate from changing task state so one new result does not
+force a rewrite of everything. Use existing subject/aspect, work/resource binding,
+exact cues and links. Prepare the relation from an artifact, error or decision premise to
+the relevant condition/experience even when their wording differs; Base follows that stored
+relation without rediscovering its meaning. No universal ontology or new object hierarchy.
+An item can generalize across tasks only within its stated conditions and reuse scope.
+
+**Decision sufficiency** preserves what changes the action, consequence, applicability
+or check: concrete referents, critical values/units/versions, negation, exceptions,
+uncertainty and the distinguishing example. Source IDs locate evidence; they do not replace
+its meaning in the text. Remove narration, not these distinctions. Dreamer compares
+reductions with original evidence; this heuristic cannot prove future-query coverage.
+Base checks selectors, qualifications and packing mechanically; missing knowledge
+remains a focused question (§8.3).
 
 ## 3. Grounds and applicability
 
@@ -161,8 +227,17 @@ replacement call because remaining work is nonempty.
 
 ## 5. Direct updates
 
-Notes/commitments are ordinary scoped Memory items with source observations. Display,
-acknowledgement, due time and notification do not resolve a commitment.
+An agent can save what it saw, changed, decided, tried or still doubts in ordinary text,
+with optional exact sources. The adapter supplies work binding, occurrence identity and
+internal defaults; categorization is not a prerequisite for capture. Explicit notes are
+ordinary scoped items; ambiguous input remains an attributed observation, searchable
+without Dreamer. Later preparation may structure it, not turn it into an unqualified fact.
+
+The thin input surface belongs to [Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host).
+For an explicit correction/progress update, the adapter resolves the target and builds the
+complete revision; preserve material qualifications and do not carry old support onto a
+changed assertion without grounds. Display, acknowledgement, due time and notification
+do not resolve a commitment.
 
 Structured correction verifies expected current revision, preserves history, publishes
 the revision/source/grounds/replacement and coalesces affected work in one transaction.
@@ -176,21 +251,70 @@ corrections require the explicit adoption rule in Implementation §8.2, not auto
 
 ### 6.1 Decision frame
 
-Use work address, observed resource versions, focused question, exact cues, constraints
-and budget. Missing address or source coverage remains explicit, not guessed from a
-similar result.
+Bind work (§2), the current event or focused question, resource/version, exact cues,
+constraints and budget. Automatic focus comes from the current event and bounded recent
+accepted outcomes: touched artifact/symbol, actual error/result or changed work premise.
+Recall does not depend on a well-worded query; incomplete event coverage stays explicit.
+For resumption, use §2.1's six questions; a narrow lookup answers only that question with
+its necessary state/qualifiers. A required premise is a supplied selector or an
+attributed source claim, not an automatically invented checklist. Missing address,
+model or source coverage stays explicit.
+
+Keep receipt/occurrence, validity and mentioned-event time distinct (Implementation §4.7.1).
+Explicit time filters use the matching known axis; model-inferred ranges remain cues.
+Unknown mentioned-event dates cannot exclude otherwise relevant candidates. Timed wake-up
+belongs to the host; without that event, recall waits for the next supported boundary.
 
 ### 6.2 Candidate arms
 
-Generate independently bounded candidates from direct handles/addresses, exact cues/
-aliases, lexical search, compatible vectors when enabled, grounds/contradictions/
-replacements, typed relations and eligible methods. Apply project/work scope before arm
-limits; union before final selection.
+Use staged disclosure within one request budget, not every retrieval arm on every hook:
 
-Return examined scope/cut, arm availability and truncation/gaps with the result. An empty
-top-K means no match in that examined retrieval, not that no relevant source exists.
-Timeout, unavailable arm and truncated traversal are not successful empty searches.
-Independent useful arms may still contribute a qualified partial answer.
+| Stage | Retrieve / stopping rule |
+|---|---|
+| Address / cue | Current work slots/commitments, direct handles and event-derived exact cues; hydrate their qualifications and linked attempts/decision dependencies. An unresolved material constraint/counterexample means partial or conditional context, not a covered decision. |
+| Expand | For a remaining gap/cue, request bounded lexical, relation or method candidates; vectors only when enabled and useful. Follow the affected artifact/premise to prepared neighbors, not an unrestricted graph walk. |
+| Open | The agent requests a selected exact source/revision or a focused follow-up question; reuse §7, without replaying the whole history. |
+
+Apply scope before each arm limit; union requested arms before selection. Preserve
+contradictions, replacements and required grounds for selected advice even on the cheap
+path. Base routing follows explicit addresses/cues/gaps; it does not call a model to judge
+its own understanding. An unresolved question may be returned instead of automatic expansion.
+
+Report examined scope, arm states and gaps. Unused arms are `not_requested`; failed,
+disabled and truncated arms retain their own states. Empty top-K means no match in that
+finite query, not global absence. Reaching the deadline returns useful qualified partial
+context; it never starts an unbounded search or blocks unrelated host work.
+
+### 6.2.1 Proactive attention without repeated context
+
+`baseline` rebuilds §2.1 after start/resume/compact, fork, work change or uncertain context
+continuity; `update` carries a useful change and its necessary premises; `focused` answers
+an explicit request, bypassing automatic deduplication. All use the same qualified sources.
+
+In a live context, select new/changed relevant revisions, qualifications, corrections and
+cue-linked outcomes. Repeat unchanged reads add nothing; unrelated observations do not
+invalidate the whole view. Carry constraints, counterexamples and unresolved commitments
+with the decision they affect. Withdrawal/unavailability of prior guidance is a change:
+show its permitted qualification/gap, never forbidden content. No useful change means a
+successful empty response, not another summary. Similarity cannot suppress corrections.
+
+A bounded volatile cache holds source IDs/revisions and representation/qualification
+digests per work/session/host-context continuity; no bodies or persistent delivery registry.
+Mark only after a complete observed local write. It is a repetition hint, never truth,
+authorization, host acceptance or use. Do not key it by every event ID or merge distinct
+source occurrences. Explicit requests and source validation never depend on cache hits.
+
+Serialize cache comparison → output completion/marking with one in-process per-context
+permit, acquired within deadline without a Store transaction/delivery fence held.
+Contention returns empty; independent capture continues, and the next boundary rebuilds
+focus from accepted outcomes. Content mutations never wait for cache maintenance.
+
+Recheck invalidates an affected source/notice entry only. Restart, ambiguous output,
+compact/resume, fork, changed work/adapter/context or overflow resets the cache and requires
+a baseline. On a replaceable host slot, replace it; on append-only hooks, state the complete
+current value/qualification and supersede earlier guidance for that item. Different-item
+replacement needs exact existing links, not similar prose. Each update supplies its own
+sources/premises; if this is unreliable, send a baseline. Memory cannot remove old transcript text.
 
 ### 6.3 Lexical snapshot
 
@@ -202,31 +326,41 @@ Exact SQL belongs to [Implementation §5.1](IMPLEMENTATION.md#51-exact-full-text
 
 ### 6.4 Packing
 
-Prioritize current goal/criteria/plan/progress; exact corrections/constraints; open
-commitments; applicable or conditional advice with exceptions; relevant episodes;
-dissent/unknowns/missing checks; exact source handles.
+Rank corrections/constraints, current goal/model/state/next step, open commitments and
+matching failures; then applicable advice, discriminating evidence and history. Keep
+unknowns, counterevidence, qualifiers and handles with the claims they qualify.
 
-Apply Implementation §4.7.2's eligibility before assigning a positive role. Hidden items
-are excluded from automatic packets, not made public by relabeling them evidence.
-Only a current `commitment` with `commitment_state=open` gets role `commitment`; resolved
-or cancelled items may appear as qualified history, never an outstanding obligation.
-Role `method` requires `method_role=advice`; processing recipes belong to §8's owning
-job and cannot become ordinary recommendations. Persisted goal/plan/progress guidance
-uses §2's current views, not a text classifier; live input stays explicitly uncommitted.
-Missing required state withholds the unit with a gap, not a default.
+Apply Implementation §4.7.2 before roles. Hidden items never enter automatic packets.
+Only current open commitments get role `commitment`; resolved/cancelled items are history.
+Only `method_role=advice` gets role `method`; processing recipes stay in §8 jobs. §2's slots
+supply goal/plan/progress, not a text classifier; live input remains uncommitted.
+Missing required state withholds that unit with a gap, never a default.
 
-Base renders selected structured fields and exact labelled excerpts; it does not need
-an LLM to summarize them. Within the priority classes above, prefer addressed current
-work, then newer observed receipt time, then canonical ID/revision as a deterministic
-tie-break. Union duplicate exact revision handles, not similar text or distinct events.
+Base renders existing concise views or exact labelled excerpts. Dense semantic reductions
+come from §2.1's explicit revision or §8's Dreamer preparation, never a hidden model call
+while packing. Prefer addressed work and decision-relevant attempts, then newer receipt
+time and canonical ID/revision. Deduplicate exact revision handles, not similar claims
+or distinct events. Do not repeat the live prompt, generic instructions or unrelated logs.
 
 Treat value plus negation, conditions, exceptions, validity and source handle as one
 packing unit. Include it whole; otherwise use an existing qualified short representation
 or omit it with an explicit gap. Do not invent a shorter paraphrase or drop a qualifier.
+When a material premise/condition/counterexample occupies another selected unit, retain
+its dependency with the guidance it qualifies. After any cut, keep that dependency complete,
+use an existing short form carrying the decisive meaning, or omit the dependent guidance
+with `packet_limit`. A bare uncertainty label/handle cannot replace a missing caveat.
+Track only bounded presentation dependencies from selection's exact links; no inferred
+edges or persisted group. Resolve support under §3 without loading every ground's body
+into context. Independent useful units remain available.
 Enforce [the Base byte cap](IMPLEMENTATION.md#451-first-base-limits) on actual emitted
 UTF-8 bytes, including labels/handles/gaps. Reserve room for the gap summary first.
 A byte count is not a token measurement: when the host requires an exact token budget,
 use its admitted counter or report that capability unavailable, never a guessed PASS.
+
+Aim for **2 KiB of model-visible brief text** on automatic hooks; this is a soft initial
+design target, not measured performance or a new rejection limit. Expand when necessary
+to preserve a decision-critical chain/qualification, within the existing 32 KiB final
+response cap. Prefer fewer complete useful units to compressed words that lose meaning.
 
 Retrieved text, documents, tool output and recalled model answers are evidence, not
 new host/system instructions. Render them as attributed data with source/revision and
@@ -239,17 +373,18 @@ this boundary; the application accepts only the owning operation's closed DTO/ef
 
 `ContextPacketV1` is one closed data object owned by the existing context operation,
 not an instruction protocol or a new packet service. Its exact top-level fields are
-`format=1`, `packet_id`, `binding`, `units` and `coverage`. Use Implementation §4.5's
+`format=1`, `packet_id`, `mode`, `binding`, `units` and `coverage`. Use Implementation §4.5's
 canonical JSON, no floating-point fields, duplicate keys or unknown members. Unsupported
 formats fail explicitly. Packet identity is an ordinary `o_` observation ID, not a new
 ID namespace; allocate it once before preparing the output.
 
 | Field | Required meaning |
 |---|---|
+| `mode` | `baseline`, `update` or `focused`, selected by §6.2.1; it changes presentation, not eligibility or evidence. |
 | `binding` | `installation_id`, nonnegative integer `selection_generation`, `project`, `workspace_id`, `actor_id`, `session_id`, `host`, `host_version`, `adapter_version`, `event`; optional `task_id` and `native_request_key`. All other values are nonempty strings bounded by Implementation §4.5.1. The admitted adapter supplies versions/event mapping, not caller text. Missing task uses §2's session address. Missing session/work authority cannot fall back to a similar project's packet. |
 | `units` | At most 32 ordered units under §6.4. Each has `role`, `representation`, `text`, `source` and `qualifiers`, plus `span` only for an excerpt. Roles are `goal`, `plan`, `constraint`, `progress`, `commitment`, `method`, `evidence`, `counterevidence`. Representations are `verbatim`, `excerpt`, `stored_reduction`, `live_input`. A stored reduction retains its own exact source identity; it is not generated while packing. |
 | `source` | For persisted units: `{kind:"observation",id,sha256}` or `{kind:"memory",id,revision,sha256}`. Use exact-open `body_sha256` for an observation and `revision_sha256` for a memory ([Implementation §7.3](IMPLEMENTATION.md#73-exact-open-and-byte-ranges)); a memory content-only hash is insufficient. Resolve `current` before packing; revision is positive and exact. Only `live_input` has `source=null`, meaning explicitly uncommitted caller input, not an invented citation. |
-| `qualifiers` | Closed projection of applicable source fields: `conditions_json`, `exceptions_json`, `valid_from_ms`, `valid_until_ms`, `support_state`, `exposure_state`, `influence_state`, `applicability`, `capture_limit_json`, plus required `commitment_state` for commitment sources, required `method_role` for method sources (`processing_purpose` exactly for processing), and computed `current_withdrawal` for every persisted memory unit. Copy the source's complete conditions/exceptions/limitations; compute applicability by §3 and withdrawal by Implementation §10. Omit fields inapplicable to that source kind; do not replace missing required facts with permissive values. |
+| `qualifiers` | Closed projection of applicable source fields: `perspective`, `conditions_json`, `exceptions_json`, `valid_from_ms`, `valid_until_ms`, `support_state`, `exposure_state`, `influence_state`, `applicability`, `capture_limit_json`, plus required `commitment_state` for commitment sources, required `method_role` for method sources (`processing_purpose` exactly for processing), computed `current_withdrawal` for every persisted memory unit, and `preparation_state` for prepared synthesis regardless of its rendered representation (§8.2). Copy complete source qualifications; compute applicability by §3 and withdrawal by Implementation §10. Omit inapplicable fields; missing facts never receive permissive defaults. |
 | `coverage` | `{consistency:"per_query",arms:[{name,state}],gaps:[code...]}`. Names: `addressed`, `exact`, `lexical`, `relations`, `methods`, `vectors`; each appears once. States: `complete`, `partial`, `unavailable`, `disabled`, `not_requested`. This initial packet does not claim a coherent cut across independent queries. |
 
 `current_withdrawal` is `none | withdrawn`, evaluated from current notices inside the
@@ -262,7 +397,8 @@ Erased/forbidden content is never packed. Preserve this live qualification when 
 
 Gap codes are the bounded, sorted, duplicate-free set `binding_missing`, `capture_pending`,
 `source_missing`, `source_changed`, `source_damaged`, `scope_withheld`, `arm_unavailable`,
-`candidate_limit`, `packet_limit`, `token_counter_unavailable`, `qualification_missing`.
+`candidate_limit`, `packet_limit`, `token_counter_unavailable`, `qualification_missing`,
+`preparation_pending`, `preparation_unknown`.
 The complete required header/coverage must fit before adding units; otherwise return an
 explicit context error without source bytes. Never enumerate forbidden source IDs, titles
 or counts in gaps. Empty successful arms mean only no match in the requested finite scope;
@@ -279,121 +415,148 @@ support. Live input is attributed to the current caller, never made a persisted 
 authorization merely because it appears in a packet. Do not serialize rank scores or
 expose internal Store/spool paths as locators; legitimate captured text is not rewritten.
 
-Measure the **final host response**, including JSON escaping, envelope, identifiers and
-coverage, against the 32 KiB Base packet cap (and any smaller admitted host cap). Removing
-a whole lowest-priority unit and updating gaps is allowed before freezing output; cutting
-a JSON string, source selector or qualifier is not. If even the gap-only response exceeds
-the cap, emit no packet. An exact host token cap still requires its admitted counter.
+Measure the **final host response**, including escaping/envelope/identifiers/coverage,
+against 32 KiB and the host's inline/response limits (§6.5.1). Every removal rechecks §6.4's presentation
+dependencies before freezing output; never cut a string, selector or qualifier. If even
+gap-only output exceeds the cap, emit no packet. Exact token caps require the admitted counter.
+
+#### 6.4.2 Compact model-facing rendering
+
+The existing context operation deterministically renders validated `ContextPacketV1`
+as a readable brief; nested packet JSON stays internal.
+
+1. Header: `Memory context (attributed data)`, mode and work address. Packet ID,
+   installation/adapter versions, hashes and rank diagnostics stay internal.
+2. Render packet order as `role [n]: text`, with exact JSON-quoted text. Mark excerpt/reduction
+   once and uncommitted input `[live]`. Number exact sources by first appearance. Group complete
+   action/result units by captured pairing; retain identities and do not infer cause.
+   Updates name the current guidance's exact revision and supersede earlier guidance for
+   that item; history is never labelled current.
+3. Render decision-relevant qualifications next to the unit: supplied perspective and
+   actual/hypothetical scope, full nonempty conditions/exceptions, validity,
+   uncertain/disputed/refuted support, conditional applicability,
+   withdrawal/supersession, partial source and pending/unknown preparation. Repeated identical
+   qualifications may appear once for an explicitly delimited group. Empty arrays and normal/
+   active/non-withdrawn defaults stay internal; roles already express an open commitment or
+   advice method. This is a fixed projection, not semantic paraphrasing or hidden qualification loss.
+4. End with `[n]=observation:<id>` or `memory:<id>@<revision>`; put excerpt offset/length beside
+   its unit. Reuse aliases only for the same exact source; live input has none. Resolve locally
+   to that immutable selector for ordinary exact open, never send `[n]` to a packet service/API
+   or substitute `current`.
+5. Show answer/scope-relevant gaps; full arm/gap diagnostics stay internal unless requested.
+   Recount wrapped bytes and recheck §6.4 dependencies after trimming; no isolated cut may
+   leave advice without its decisive qualification.
+
+A baseline is self-contained after lost context; an update follows §6.2.1 and uses only
+its own source aliases. Explicit diagnostics may return the internal packet. If §6.5's
+optional recording succeeds, historical packet open returns the exact prepared body,
+binding and source links; a separate observed handoff establishes emission. Missing records
+remain unavailable. Never persist a second full packet copy for unused backend inventory.
 
 ### 6.5 Handoff
 
-The daemon prepares/records context; the narrow relay emits it for one live host
-invocation. Capture completion, context preparation, local emission, host acceptance,
-action association, use/influence and criterion outcome are separate facts. Context
-failure never rolls back a committed capture or authorizes blocking the user's task.
+The daemon prepares context; the narrow relay emits it for one live host invocation.
+Capture, preparation, local emission, host acceptance, use and outcome are different facts.
+Primary capture/revision keeps its durable contract. **Packet/handoff telemetry is optional:
+its failure must not withhold valid context or delay the host.** It cannot roll back capture.
 
-Before returning output to the relay, retain the exact final host-response bytes as one
-operation-owned `context_packet` observation, with `observation_id=packet_id`, ordinary
-body length/hash, the binding above and derived links to the exact unit sources. Apply
-capture exclusions to every retained copy, including live input and metadata. Reuse
-existing capture/blob custody and its limits; do not add a packet table, delivery queue
-or job. If the exact packet cannot be committed/read back before the host deadline,
-return context unavailable; staged packet custody is not permission to emit it later.
-Generic capture cannot forge this reserved kind or a delivery result. Its replay identity
-is the packet ID; a native host key is correlation, not observation deduplication for
-packet construction. A saved packet is preparation and possible-send intent, never
-proof of emission.
+Inside the existing affected-delivery fence, immediately before output, recheck:
 
-Immediately before output, recheck the live invocation/session/work binding, installation
-selection, current authorization/disclosure and suppression. A local host may forward
-context to a remote provider: local IPC permission alone does not authorize that
-forwarding. The admitted host profile must bound the allowed destination/disclosure;
-unknown destination keeps restricted content withheld. For a memory unit selected as current
-goal/plan/constraint/progress/commitment/method, verify that the current revision still
-equals the selected revision and still passes the role's eligibility. For an addressed
-view, recheck that the requested work slot resolves to that same item/revision; for a
-commitment, recheck its creation binding and current permission to use that membership.
-Historical open is not either check.
-Revalidate exact source hashes, qualifications and current notices. A changed eligible
-result requires rebuilding and a new packet ID, never changing bytes under the old one.
-No retry follows an ambiguous prior emission.
+- live invocation/work/session and installation selection; current authorization,
+  disclosure, suppression and the host's actual allowed destination (local IPC alone
+  does not authorize remote forwarding; unknown destination withholds restricted text);
+- exact source hashes and qualifiers/notices; current-guidance roles require the selected
+  revision still current/eligible, addressed slot → same item/revision, and commitment
+  membership. Historical evidence keeps its exact revision and current withdrawal state.
 
-The bounded emission participates in the existing affected-delivery fence used by
-revision publication, withdrawal, erasure and cutover. Closing that fence rejects new emissions and drains
-in-flight ones; a timeout leaves unresolved delivery, not completed erasure. Recheck
-inside the fence, not only while constructing the packet. Do not hold the spool
-publication mutex across host/Store I/O. Once local output I/O has stopped or settled,
-release the delivery fence before queueing/persisting the handoff fact; its storage must
-not be what a waiting revision needs to drain. A still-running possible writer is not
-settled merely because its caller timed out. Bytes already handed to the host cannot be
-recalled by a later notice; host-owned transcripts/copies remain explicit cleanup limits.
+Historical hydration and the presentation cache cannot replace these checks. A changed
+selection requires freshly rendered bytes; an ambiguous prior emission is never retried.
+Revision/withdrawal/erasure/cutover closes the affected fence to new emissions and drains
+existing ones; timeout means unresolved delivery. Keep the spool mutex out of host/Store
+I/O. Release the fence **after output settles and before optional record storage**; a caller
+timeout alone does not settle a possible writer. Later notices cannot recall emitted bytes.
 
-| Reported state | Required observation / recovery |
+| Local state | Meaning |
 |---|---|
-| `prepared` | Exact output built/retained; no claim about host receipt. After a discontinuity, a possibly returned packet without a terminal fact is `unknown`, not safe to resend. |
-| `not_emitted` | The live owner knows no response byte crossed the host boundary, for example a binding/policy rejection before write. Retain a bounded reason; do not report this after a partial write. |
-| `emitted` | The relay observed the complete local write/flush. This proves only emission to the local channel, not successful process exit, host parsing/acceptance, model use, task success or independent support. |
-| `unknown` | Partial write, lost completion/report, cancellation or crash after possible output. Preserve identity/bytes; never regenerate or append the packet automatically. |
+| `prepared` | Exact output built; no claim of retention, emission or host receipt. |
+| `not_emitted` | The live owner knows no response byte crossed the host boundary. Missing telemetry does not establish this state. |
+| `emitted` | The relay observed a complete local write/flush; not host parsing, model use, task success or independent support. |
+| `unknown` | Partial write, lost completion/report or crash after possible output. No automatic regeneration/resend of those bytes. |
 
-Record the actual local outcome as an immutable, operation-owned `context_handoff`
-observation: `{format:1,packet_id,packet_sha256,state,reason}`. Here `state` is one of
-`not_emitted`, `emitted`, `unknown`; absence is not a fourth successful result. `reason`
-is `binding_changed`, `policy_withheld`, `source_changed`, `deadline`, `output_complete`,
-`output_failed` or `interrupted`, consistent with the observed state. Its observation
-binding identifies the same invocation/adapter and links to the packet observation;
-`packet_sha256` is the recorded final output hash. A later host acknowledgement, association or outcome is a separate attributed
-observation with exact correlation, not a rewrite or an upgrade inferred from exit zero.
-Failure to retain this fact after output leaves durable status unknown even when the
-live relay observed success. It cannot change the host response, block the turn or cause
-another send. Retrying storage of the same fact never repeats host output.
+When recording is available, use existing operation-owned capture, bounded by its normal
+policy/quota: `context_packet` has `observation_id=packet_id`, the exact final body/hash,
+binding and links to unit sources; `context_handoff` has
+`{format:1,packet_id,packet_sha256,state,reason}` and the same invocation binding.
+Handoff state is `not_emitted | emitted | unknown`; reason is `binding_changed`,
+`policy_withheld`, `source_changed`, `deadline`, `output_complete`, `output_failed` or
+`interrupted`, consistent with what was observed. Record the packet before its referencing
+handoff, without another queue/service or a required write on the output path. Generic
+capture cannot forge either reserved kind. Every retained copy remains subject to capture
+policy and source erasure; live input is not exempt.
 
-For one live invocation there is one emitter and one bounded emission attempt; ordinary
-short-write completion belongs to that attempt, not a new response. After interruption,
-partial-output failure or an ambiguous result, do not restart the response. A documented
-native request key may correlate a redelivery to the existing packet; session ID, prompt
-text and time proximity are not such a key. Without a stable key there is no cross-process
-exactly-once claim. In this first profile, restart, spool replay and backup restore may
-reconcile/store packet facts, but **never dispatch old packets**. A new actual host
-boundary may request freshly authorized context; it is not replay of an uncertain old
-handoff. Read-only host acknowledgement can resolve an old unknown only when the installed
-adapter actually supplies it; do not build a speculative acknowledgement endpoint.
+A bounded best-effort submission to the existing daemon may lose telemetry. The relay
+never waits for its Store commit or stays alive past the output deadline to save a receipt.
+After loss, durable attribution stays unknown; exact historical packet open may be
+unavailable. Neither a presentation-cache entry nor a later transcript echo repairs that
+fact. An actual later host acknowledgement is a separate attributed observation.
+
+One invocation has one emitter/attempt; short-write completion stays within it. Storage
+retry reconciles only the same fact, never repeats output. Only a documented native request
+key correlates redelivery; session/text/time similarity does not. Restart/spool/restore
+**never dispatch old packets**: a fresh boundary reconstructs current context. No claim of
+cross-process exactly-once output or automatic recall of host transcript copies follows.
 
 #### 6.5.1 First Claude output boundary
 
-Initial context emission uses only admitted synchronous `SessionStart` and
-`UserPromptSubmit` callbacks; other selected events remain capture-only until separately
-implemented. Emit one JSON response with `hookSpecificOutput.hookEventName` equal to the
-received event and `hookSpecificOutput.additionalContext` containing the serialized
-packet as a string. Use the documented successful exit, no extra plain-text duplicate,
-permission decision, prompt replacement or blocking fallback. Diagnostics never share
-stdout or echo private content. Event-specific mapping is ordinary adapter code, not a
-new host capability registry.
+Use admitted synchronous callbacks and one JSON response: `hookSpecificOutput.hookEventName`
+is the received event; `hookSpecificOutput.additionalContext` is §6.4.2's brief string.
+Return successful exit, without duplicate stdout, permission decisions or blocking fallback.
+No selected update means the host's successful empty response. Diagnostics stay off stdout.
 
-The [official hooks reference](https://code.claude.com/docs/en/hooks#userpromptsubmit-decision-control),
-read 2026-11-04, documents this context field. It also documents
-[transcript replay on resume](https://code.claude.com/docs/en/hooks#add-context-for-claude):
-old mid-session context can be replayed by the host without invoking the old hook again.
-This is not fresh Memory validation or a new method outcome. These are documentation
-observations, not qualification of an installed Claude version; enable each callback
-only after observing its actual input/output contract on that version.
+| Boundary | Automatic work |
+|---|---|
+| `SessionStart`, including startup/resume/compact | Fresh baseline; no old-packet replay. A fork uses its actual new binding. |
+| `UserPromptSubmit` | Capture accepted input and rebuild affected focus/current work; emit a useful update or required baseline. Staged input stays explicitly uncommitted. |
+| `PostToolUse`, `PostToolUseFailure` | Capture supplied result/error with original binding and call identity; extract actual artifact/error cues. Emit here only when the adapter has no admitted batch boundary. |
+| `PostToolBatch`, when supported | After the parallel batch resolves and before the next model call, emit one combined update. Correlate its entries with captured tool calls, not new independent occurrences. |
+| `Stop`, `SubagentStop`, `PostCompact`, `SessionEnd` | Capture supplied final text/summary/lifecycle data. Stop is not task acceptance; compaction summary is derived. Never wait for Dreamer or a clean exit to preserve earlier work. |
 
-When context later appears in a transcript, preserve the occurrence but mark verified
-injected/derived lineage by exact packet/source correlation. An unverified packet marker
-in user/tool text does not establish delivery. Similar text is not deduplication, and an
-echo cannot strengthen its own claim or retrigger interpretation. Packet/handoff records
-are operational provenance, excluded from new-experience triggers and normal candidate
-arms; exact authorized inspection remains possible. Source erasure reaches these derived
-copies through their links, not a rule that operational records may keep private bodies.
+Select one tool-result emission path per installed adapter: batch when actually supported,
+otherwise per-tool success/failure. Exact cue extraction is shared with preparation
+([Implementation §7](IMPLEMENTATION.md#7-core-operations-and-host)); known dependency
+activation needs no inference. Semantic model changes still use the ordinary revision
+writer; installing hooks alone does not create understanding.
+
+The [hooks reference](https://code.claude.com/docs/en/hooks), checked 2026-11-06, documents
+these callbacks; admit each against its installed version. Batch responses are model-visible
+strings/content blocks; `PostToolUse.tool_response` is structured. Use separate decoders;
+failure text is not a stable error code. The [guide](https://code.claude.com/docs/en/hooks-guide#re-inject-context-after-compaction)
+places reinjection at `SessionStart(compact)`. `PreToolUse` cannot guarantee replanning.
+
+[Claude's inline rule](https://code.claude.com/docs/en/hooks#add-context-for-claude) spills
+values above 10,000 characters to a file, exposing at most 2,000 preview characters without
+asking the model to read it. Decoded `additionalContext` plus host tag-escaping growth
+must fit **10,000 UTF-8 bytes**; §6.4.1 separately bounds the serialized
+response. Apply §6.4's whole-unit/dependency trimming before output. Required meaning stays
+inline; a spill preview cannot supply it. Detail remains available through exact open.
+
+Resume may replay old context without rerunning its hook. Verified source correlation
+marks the occurrence derived; similarity or a forged marker cannot establish delivery.
+Echoes add no support or interpretation trigger. Packet/handoff records stay outside
+new-experience triggers and ordinary candidate arms; authorized exact inspection and
+source erasure through existing links still apply.
 
 #### 6.5.2 Connected implementation check
 
-Implement this in Slice 2's existing context/host modules, after capture/open and durable
-ingress. Use a disposable admitted host invocation and inspect actual output plus exact
-source open. Check the following boundaries while connecting that path, not by adding a
-new reporting framework or declaring a docs example to be runtime evidence:
+Connect Slice 2's context/host modules after capture/open and durable ingress. Inspect a
+disposable admitted host invocation, actual output and exact source open:
 
 | Case | Required result |
 |---|---|
+| New/compacted/uncertain context | Self-contained current baseline with exact sources; no dependence on old aliases or cache. |
+| Long tool loop; repeated unchanged read | Artifact/error/result activates relevant prepared knowledge before the next supported model boundary; unchanged repetition emits nothing. |
+| A selected source/qualification changes | Emit its complete correction and necessary premises; do not suppress it by item ID, similar words or prior presentation. |
+| Packet/receipt storage fails | Valid context still emits within deadline; durable attribution remains unknown and no old output is replayed. |
 | Same text, different work/session | No cross-binding packet reuse; distinct occurrences remain distinct. |
 | Same task key in different workspaces, or two tasks in one session | Distinct work addresses; an empty/failed task lookup never widens to the whole session. |
 | Resolved commitment or processing recipe selected as advice | Reclassify as qualified history or omit; preserve commitment/method state, never emit it as active work/advice. |
@@ -401,7 +564,7 @@ new reporting framework or declaring a docs example to be runtime evidence:
 | Missing/truncated grounds or unevaluated exception | Not an empty successful assessment or unconditional advice; preserve the uncertainty and applicable coverage gap. |
 | Current revision/policy changes before output | Revision publication and output share the affected fence; historical hydration cannot pass a current-revision check. Rebuild or withhold, never send stale positive guidance. |
 | Withdrawn historical source with stored influence active | Preserve the exact revision hash and add current withdrawal qualification; never promote it to positive guidance. Missing notice authority is not `none`. |
-| Oversized unit or exhausted retrieval arm | Preserve qualifiers or omit the unit with a gap; encode partial/unavailable truthfully and remain within the final-response cap. |
+| Oversized unit or exhausted retrieval arm | Preserve dependencies or omit guidance with a gap; obey inline and response caps. Verify text near the host's spill threshold remains complete inline. |
 | Relay exits or response/report is lost | Capture stays committed; handoff is unknown where appropriate; restart emits no old packet. |
 | Transcript replay / forged packet marker | No new evidence, method-success claim or model job from recaptured context; unverified attribution stays unknown. |
 
@@ -422,34 +585,110 @@ input/result contract, conditions/limitations and disclosure consequences. First
 stores a real default; upgrade never overwrites an edited revision. Job claim freezes
 exact method and source coverage. A stored method without a consumer is not improvement.
 
-Automatic mode is `off | idle | background`; a profile may forbid automatic calls.
-New primary committed input, correction or explicit question can trigger interpretation.
-Reads, packet/handoff provenance, injected echoes, cleanup and accounting cannot. For `(project,purpose,target)`, permit
-one active job and one coalesced successor. Waiting is not failure or retry authorization.
+### 8.1 Dreamer preparation
+
+One finite job prepares a view, explanation or method for a named context/research
+consumer, without speculative archive-wide synthesis:
+
+1. **Collect.** Join captured events with supplied action/result/test identities, scope and
+   resource versions. Deduplicate representations, never occurrences.
+2. **Select.** Freeze changed primary facts, the exact prior view/method and needed original
+   supporting/contradicting anchors. Reopen only spans needed to resolve material omissions;
+   summaries add no independent support. Unavailable anchors leave qualified gaps, never
+   invented facts or silently dropped conditions.
+3. **Synthesize.** Distinguish state, observed transition, mechanism, procedure and unresolved
+   alternatives. Preserve speaker/hypothetical scope; outcome alone does not establish cause.
+   Never invent identities or support.
+4. **Clean.** Revise the owning unit; remove narration, split incompatible conditions, retain
+   counterexamples and discriminating checks. Derive search text from replacement content
+   and observed exact cues through Implementation §7's shared normalizer.
+5. **Publish.** Use §9.2 and the ordinary revision writer; the next context lookup consumes
+   prepared text without inference.
+
+Automatic mode is `off | idle | background`. In enabled modes, new committed user/task
+input, outcomes/tests, corrections and agent-authored handoffs coalesce preparation for
+the admitted work address (Implementation §7.6). Input can seed a missing view before any
+outcome or failed lookup. The adapter uses event kind/identity, not semantic classification.
+Start/resume alone, replay, polling, packets/echoes, cleanup and accounting add no input.
+
+Queueing is not a model call. Existing scheduling batches a burst into one pending intent;
+capture/context retain foreground capacity. Prioritize current work and repeated needs
+within configured capacity/cost, accounting for reuse and refresh cost. Unused derived
+material may lose exposure without erasing its source.
+
+`off` disables automatic preparation, not an explicit research request admitted by the
+configured inference profile. For `(project,purpose,target)`, permit one active job and one
+coalesced successor. Distinct explicit questions use distinct targets (§8.3). The host agent
+and Dreamer share one revision writer/CAS: neither silently overwrites a newer direct edit;
+inference never amends the user's goal by itself. Base remains useful with inference off.
+
 [Implementation §4.7.3](IMPLEMENTATION.md#473-job-state-and-claim-ownership) owns scheduling
 states, claim generations and terminal-result mapping; provider, cognitive and cleanup
-states must not be collapsed into that scheduler status.
-Keep reserved limits, measured usage and unknown usage distinct. A configured token/cost
-ceiling is not observed consumption; absent provider accounting is not zero usage.
+states remain distinct. Keep reserved limits, measured usage and unknown usage distinct;
+an absent provider measurement is not zero cost.
+
+### 8.2 Prepared knowledge and newer evidence
+
+A current revision is not proof that its synthesis includes newer facts. Apply this check
+to prepared views, explanations and methods, including an exact-text rendering of them;
+ordinary direct facts/goals do not become synthesis merely by being stored. Use exact
+grounds, indexed preparation links/job coverage (§7.6 of Implementation) and newly
+selected primary observations:
+
+| Computed `preparation_state` | Reader behavior |
+|---|---|
+| `covered` | A completed accepted preparation/research result accounts for the requested finite input and this exact output revision. This is selection-relative coverage, not universal freshness. |
+| `pending_input` | Known relevant input is not incorporated. Show the still-applicable view with the new evidence and a short pending qualification; do not wait for Dreamer. |
+| `basis_changed` | A material premise changed, was refuted/withdrawn, or its bound resource has a new version. A version change alone is not refutation: requalify dependent advice under §3; unresolved impact stays conditional, established incompatibility becomes qualified history. |
+| `unknown` | The preparation relation, input coverage or bounded lookup is insufficient. Keep that uncertainty; do not infer freshness from age, `current`, or an empty page. |
+
+Accepted job coverage binds exact output revisions to accounted primary input. Direct views
+are usable immediately; prose/grounds do not prove processing coverage. `no_change` may advance
+same-view coverage; failed/partial/unknown work cannot. Retain unprocessed references in the
+coalesced successor without automatically retrying an unknown call. Bounded indexed lookup
+never scans historic jobs; exhaustion is `unknown`, and receipt order cannot exclude delayed
+capture (§2). These computed qualifiers add no persisted state and do not gate unrelated
+units or the agent's actions.
+
+### 8.3 Research: an agent can ask Dreamer
+
+Research is an explicit question-driven Dreamer job over retained knowledge, optionally
+using acquired sources. It is not restricted to web search, a failed retrieval or a claimed
+uncertainty threshold. The agent may ask for an explanation, synthesis, competing models,
+missing evidence, a procedure or review of its own understanding whenever useful.
+
+The caller submits a question, work scope and optional exact sources/previous answer.
+Persist each turn as its own source observation; return its existing job handle immediately,
+or wait only for the caller's finite requested interval. Job status/read exposes accepted
+partial or final answer references, remaining questions and failure status. Exact open
+uses the ordinary source/revision operation. A reply is a new request linked to the exact
+previous question/answer, with its relevant delta; no permanent Dreamer session or full
+transcript replay is needed. Different questions are never overwritten by coalescing.
+
+The answer is a concise usable model/proposal, supporting sources, material alternatives
+and the next discriminating query/check. Publish it as an ordinary scoped view/explanation;
+it does not silently replace work goals. Reusable findings may also revise their owning
+items. Unresolved evidence can produce a useful answer with a question back to the agent.
+Status reads never restart work; cancellation uses existing job control.
+
+When external evidence is needed, use the configured acquisition owner and capture its
+result before including it in a new frozen input. A later result/follow-up is a new finite
+job, not mutation of a running job's input. Missing acquisition does not disable local
+analysis. Neither automatic hooks nor an unanswered question start an unbounded research loop.
 
 ## 9. Controller-backed job lifecycle
 
 ### 9.1 Stable identity and live admission
 
-Use the inference contract's admitted scoped caller and exact pre-send mutation identity.
-Persist the canonical ID outside rollback state and in its owning job before send.
-Live recovery uses the same method/ID/bytes; payload conflict or provider uncertainty
-never authorizes a replacement call ID. Read-only mutation lookup handles uncertain
-auxiliary effects; restore must not probe existence by resubmitting an old mutation.
-
-Admission distinguishes `prepared | admitted | retired_not_admitted | admission_unknown`.
-A method string or accepted controller Agent command is not inference admission.
+Consume only the exact admitted call/input. Unknown admission is unresolved, never a
+new call ID. [Inference §§2/5–7](INFERENCE-CONTRACT.md#2-principal-credential-and-identities)
+owns admission, rollback-safe identity, replay and read-only uncertain-effect lookup.
 
 ### 9.2 Result and cognitive states
 
 Read bounded exact call status → range-read its result → verify digest/length → durably
-publish the Memory result blob → decode the purpose-specific schema → publish accepted
-revisions atomically → expose them to the later consumer. Retain malformed/partial
+publish the Memory result blob → decode the purpose-specific schema → publish each accepted
+revision through the existing atomic writer → expose it to its consumer. Retain malformed/partial
 transport facts without claiming cognitive completion.
 
 ```text
@@ -475,56 +714,77 @@ expected revisions, current scope/disclosure and suppression/deletion notices. U
 claims remain qualified proposals; fabricated sources or unauthorized effects reject.
 An old job result cannot reinstate a withdrawn method or erased source.
 
+Each item uses Implementation §7.4's single-item operation. A dependent edit names the
+confirmed predecessor result; it cannot use a merely proposed revision. If a later edit
+conflicts, retain independent accepted items and report partial coverage. Do not pretend
+that several successful single-item writes were one atomic multi-item publication.
+
 ### 9.3 Cleanup authority
 
-After verified copy or terminal-no-result, request caller-authorized release only after
-the backup-set owner confirms no retained generation needs that call. Queued cancellation
-and explicit abandon-for-erasure follow the inference contract; cleanup has its own state.
-A useful revision may be consumed while cleanup debt remains visible.
-
-Controller-owner break-glass is external authority. Missing caller leaves owner-action
-debt until non-content readback, not an owner-token fallback.
+Release/cancel/retention follow [Inference §9](INFERENCE-CONTRACT.md#9-release-retention-and-erasure)
+and [Implementation §8](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle). Accepted useful
+revisions remain usable while cleanup debt is visible. Missing caller authority requires
+owner action, never credential fallback.
 
 ## 10. Backup admission and authority
 
-Physical backup algorithms belong only to
-[Implementation §8](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle); the external cut
-belongs only to [Inference §8–10](INFERENCE-CONTRACT.md#8-memory-backup-interaction).
-Cognition consumes the following facts rather than maintaining another backup protocol:
-
-- source/revision/coverage/result facts come from one admitted backup cut;
-- a closed job is self-contained only if all needed bodies/facts are retained and no
-  later settlement, publication or controller readback/cleanup remains;
-- a dependent job still needs its exact external call/copy and remains release-pinned;
-- retired IDs never run; unknown external effects remain unknown;
-- terminal backup records do not prove physical erasure.
-
-Base backups have no external inference dependency. Do not fabricate a controller cut
-or require controller availability for an installation that has never admitted calls.
+[Implementation §8](IMPLEMENTATION.md#8-backup-set-owner-and-lifecycle) owns the physical cut;
+[Inference §8](INFERENCE-CONTRACT.md#8-memory-backup-interaction) owns external dependencies.
+A closed job needs all exact retained facts/bodies and no pending settlement, publication
+or external readback/cleanup; otherwise it remains dependent and release-pinned. Retired
+IDs never run; unknown effects remain unknown. Backup records do not prove erasure.
+Base backup does not require inference when no calls were admitted.
 
 ## 11. Exact rollback and external work
 
-Restore exact backup cognition, not a merge of later Store rows. Current suppression/
-deletion notices dominate backup content; see
-[Implementation §10](IMPLEMENTATION.md#10-erasure-rotation-and-observability).
-Post-cut spool is reconciled by exact identity and bytes through Implementation's owner; its existence is not permission to adopt unrelated
-future results.
-
-Closed jobs restore from exact backup facts. Dependent jobs need the exact call/copy.
-Retired IDs stay retired; unknown admission disables inference until reconciled.
-The inference contract owns the fixed post-cut inventory and auxiliary-effect readback.
-Never turn post-cut results into restored cognition merely because they are available.
-
-History gap, missing dependent copy, identity loss or unresolved external mutation keeps
-external work unavailable while otherwise valid Base remains useful. Local corruption/
-lease/cutover failures separately block their affected operation. Reconciled installation
-records outrank restored maintenance mirrors; mirrors cannot clear pins or replay effects.
+Restore exact backup cognition; [current notices](IMPLEMENTATION.md#10-erasure-rotation-and-observability)
+dominate. Reconcile post-cut spool by exact identity/bytes; do not adopt unrelated future
+results. Closed jobs use retained facts, dependent jobs their exact call/copy; retired
+IDs remain retired. [Inference §10](INFERENCE-CONTRACT.md#10-restore-and-stale-mirrors) owns
+inventory, uncertainty and mirror reconciliation. Missing history/identity/copies or
+unresolved external effects keep inference unavailable while valid Base remains useful;
+Store, lease and cutover failures separately block their affected operation.
 
 ## 12. Consolidation, disagreement and improvement
 
 Distinguish source replay, packet grouping, same-item revision, synthesis, generalization
 and correction/split. Broader patterns are separate provisional items linked to exact
 sources; never merge source IDs or rewrite history.
+
+### 12.1 Learning must change a later decision
+
+The loop is **expected result → observed outcome → local diagnosis → changed knowledge
+or processing method → later use → new outcome**. Tests, user corrections and failed tool
+calls are ordinary primary observations. A plausible retrospective explanation remains
+a hypothesis until its evidence discriminates it from alternatives.
+
+| Failure located in the existing path | Smallest useful adaptation |
+|---|---|
+| Wrong fact/premise or changed artifact | Correct the owning claim/view, requalify dependent advice, retain the counterexample. |
+| Useful knowledge was not retrieved | Repair exact cues, scope or links; do not rewrite a correct fact to compensate for a lookup defect. |
+| Retrieved knowledge was lost in a long/noisy brief | Revise the short representation or exposure priority; preserve the decisive condition/example. |
+| Procedure failed under a known condition | Narrow its applicability or revise its step/check/recovery; record what change would justify another attempt. |
+| Dreamer repeatedly omitted, overgeneralized or misclassified evidence | Revise the existing processing recipe/input selection against those examples; subsequent jobs must consume that exact method revision. |
+
+One success can yield useful scoped experience immediately; it does not establish a
+universal rule. A factual repair or qualified hypothesis does not wait for promotion,
+mandatory repeated execution or another evaluator service. A failure can immediately
+narrow advice or motivate a provisional alternative. Claiming that a replacement is better
+needs an attributable comparison with comparable criteria, scope and total cost. More
+attempts or fitting the revision's own examples do not establish transferable benefit.
+Preserve beneficial behavior and counterexamples; the latest candidate is not automatically
+the best-supported one.
+
+Optimize useful continuation, avoided repeated mistakes and total preparation/read/use
+cost. Token reduction alone can hide lost evidence. Reuse observations may inform a
+primary-outcome-driven job, but reads/emission cannot reward their own content or trigger
+another learning pass. No reusable change means no new lesson; keep the source result.
+Dreamer proposes knowledge/recipe edits, not tool execution or model-weight training.
+Ordinary feedback such as “stale”, “missing”, “irrelevant” or a corrected result is useful
+input through §5, not a required scorecard. Missing delivery telemetry limits attribution;
+it does not forbid a grounded factual repair or an explicitly attributed user assessment.
+
+### 12.2 Disagreement and attribution
 
 Disagreement belongs to a question, scope and time. Preserve alternatives and grounds;
 select the cheapest discriminating observation. Voting is not evidence. Predictions
@@ -542,36 +802,19 @@ revision and later qualified context. Keep these facts separate:
 | Criterion outcome | Exact criterion version, evaluated target/resource version and attributable result. A tool's exit/result and host acceptance of the task are separate observations. |
 | Comparative benefit | An explicit comparison with its conditions and limitations. One success after advice does not establish that the advice caused it or outperformed an alternative. |
 
-For repeat accounting, resolve the original action attempt from the admitted native
-execution identity or canonical action-start observation; pair it with the exact criterion
-source/version. Reports, transcript copies and later summaries of that pair remain source
-records, but contribute one assessed attempt, not independent successes. Additional
-criteria or method associations do not multiply physical trials. A real separately
-observed execution is a new attempt even with equal input/output; repeated capture is not.
-Without stable correlation, retain the qualified report and unknown association rather
-than minting trial identities from report IDs, text similarity or timestamps.
+Resolve one attempt from its native execution/action-start identity and exact criterion
+version. Copies, summaries, additional criteria or method associations do not multiply
+physical trials; a distinct real execution does, even with equal bytes. Missing correlation
+remains unknown rather than being inferred from text or timestamps. Attribute late results
+to the method actually offered/used, not its newer revision. Preserve conflicting results;
+arrival order, votes and a changed criterion cannot turn them into a prior success.
+Missing outcomes/acceptance remain unknown; model self-report cannot supply owner acceptance.
+Known partial results remain useful. Post-hoc comparisons are labelled retrospective.
 
-Bind method credit to the revision actually offered/used, not the latest revision at
-settlement. Preserve conflicting results and distinguish an attributable correction from
-an unrelated newer report; arrival order, report count and a majority do not resolve the
-conflict. Revise the assessment with its exact sources rather than adding another success.
-A missing result, uncertain effect or missing acceptance is unknown, not evidence of
-failure, success or cancellation. Owner acceptance cannot be inferred from a model's
-self-report; a task's known partial result remains useful without accepting the whole task.
-Predictions/comparisons keep the criterion chosen before action; post-hoc criteria remain
-labelled retrospective, not evidence of a successful prior prediction.
-
-When connecting the existing job/revision/context path, inspect: three reports of one
-action versus two real attempts; conflicting criterion results; a criterion changed after
-action; a method revised before a late result; and a frozen three-source input with one
-unavailable source. Expected results are one assessed attempt, separate real attempts,
-qualified conflict/retrospective/old-method attribution, and incomplete coverage—not a
-fabricated all-success report. These are semantic cases, not an additional test system.
-
-Improvement identifies the failed edge/revision, retains a counterexample, changes
-conditions/body or scoped negative memory, preserves history and checks that later
-context/request actually consumes the revision. No intelligence score or separate
-self-improvement registry substitutes for that path.
+On the connected path, inspect duplicate reports versus distinct attempts, contradictory
+results, changed criteria/methods, an unavailable selected input and a later context that
+actually uses the repair. A stale prepared answer must not hide the counterexample while
+refresh runs. These are local semantic checks, not a new benchmark or success registry.
 
 Automatic changes may revise methods or non-security parameters only within owner-
 configured bounds, through the existing revision writer and a named consumer. They
@@ -632,8 +875,8 @@ before Base. Each uses existing observations, revisions, finite jobs and exact o
 | Project views | Explicit question/scope/cut → versioned answer with source coverage → context or exact view open | Failed/partial refresh retains the prior qualified view and exposes its age/gaps, not an empty successful refresh. |
 | Cross-project methods | Attributable episode/outcome → provisional generalization with conditions and origin → authorized project retrieval | Shared label is not broad efficacy or permission. Selected membership must be persisted/enforced before that mode is enabled. |
 | Documents/media | Permitted original → versioned external conversion with hierarchy and page/span/time locators → retrieval and exact representation open | Conversion failure preserves allowed raw access and states unsupported/partial; no invented text or flattened loss of provenance. |
-| Embeddings | Exact source revision plus query/document role and compatible model/space → individually mapped vectors → optional retrieval arm | Missing, mismatched or failed input has no fabricated zero/aggregate vector; exact/lexical Base remains available. |
-| Research | Explicit finite acquisition request through the configured external owner → retained result, sources and terminal/partial status → ordinary interpretation | Unavailable source or failed request is not no-findings; Memory does not add another research executor. |
+| Embeddings | Exact source revision plus query/document role and compatible model/space → individually mapped vectors → optional retrieval arm | Each vector stays bound to its indexed revision; never relabel stale content as current. Missing/mismatched/failed input has no fabricated vector; exact/lexical lookup continues during refresh. |
+| Research | Agent question/follow-up → §8.3 Dreamer job → concise answer/view and exact sources → agent/context; external acquisition only through its configured owner | Distinct questions survive; local analysis remains usable without external acquisition. Partial/unknown is not no-findings; no second research executor. |
 
 Self-inspection uses the same source/open/status paths for Eliot's own documents and
 operations; it does not create a separate self-model registry.
