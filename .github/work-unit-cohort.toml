@@ -94,7 +94,7 @@ prerequisites = []
 [[row]]
 issue = 5348
 unit = "V3-CONTEXT-DENSITY"
-body_sha256 = "2f1dbbafdea608237732d4651d93a178f66c77cc4d9e62a5a65d2a0cdd9a79fa"
+body_sha256 = "5ce991c5eaf38dcfb19653c17612bb0c8ccd0cbf635d608c2730b798cee38d47"
 disposition = "blocked"
 prerequisites = []
 
@@ -108,10 +108,10 @@ planned = 0
 nonexecutable = 2
 superseded = 2
 accepted_historical = 2
-sha256 = "2c7a2076f8e5a95e325b43a8c566d07607d9b7bcdfcb34ac90285a32fd54eb14"
+sha256 = "46771a74048bf57dca3c73d2619762b00cdddeb25d76446d0c0f5b8d8c0178a0"
 
 [provenance]
-base_commit = "4b63f0b7791677192085342e84b48715cf8c36e0"
-acquired_at = "2026-11-06T23:12:02Z"
-acquisition = "GitHub API issue #5348 exact body readback after extending documentation scope to docs/v3/README.md; inherited catalogue and descriptor inventory at 4b63f0b7791677192085342e84b48715cf8c36e0"
-note = "Update only #5348 scope binding; retain its blocked disposition and the other 12 rows field-for-field. Prior acquisition provenance is retained in .github/work-unit-cohort.toml at 4b63f0b7791677192085342e84b48715cf8c36e0. No inherited row is freshly qualified; coverage is the selected catalogue and unchanged descriptor inventory, not all GitHub issues or runtime acceptance."
+base_commit = "f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa"
+acquired_at = "2026-11-07T02:28:57Z"
+acquisition = "GitHub API issue #5348 exact body readback after adding .gitattributes LF normalization for the reproduced documentation-evidence mismatch; inherited catalogue and descriptor inventory at f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa"
+note = "Update only #5348 scope binding; retain its blocked disposition and the other 12 rows field-for-field. Prior acquisition provenance is retained in .github/work-unit-cohort.toml at f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa. No inherited row is freshly qualified; coverage is the selected catalogue and unchanged descriptor inventory, not all GitHub issues or runtime acceptance."

@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Implementation
 
-**Revision 1.0-draft.60 · 2026-11-06 · design for the greenfield rewrite.**
+**Revision 1.0-draft.61 · 2026-11-06 · design for the greenfield rewrite.**
 
 This document owns runtime, Store, physical maintenance and implementation order.
 [Architecture](ARCHITECTURE.md) owns purpose/invariants; [Cognition](COGNITION.md) owns
@@ -1576,13 +1576,14 @@ scope and current-notice checks. Do not turn the whole Base completion list into
 before connecting capture → work reconstruction → context → exact open.
 
 At that connection, record warm/cold latency, emitted UTF-8 bytes (tokens only with a real
-counter), Store/model call counts and omitted decision-critical facts. Inspect one fresh
+counter), Store/model calls, decision-critical omissions and obsolete/inapplicable guidance
+presented as current. Qualified historical failures remain useful evidence. Inspect one fresh
 resume, a tool loop with a previous failed attempt, a changed premise and compaction:
-can the agent identify the right next action/query and open its evidence without repeated
-unchanged context? Later compare brief versus
-flat/raw retrieval at equal context budget, including write/refresh cost. A smaller packet
-that increases wrong actions or repeated failures is a regression. Use existing observations;
-no new scoring service or test campaign is required before writing this path.
+can the agent choose the right next action/query and open its evidence without repeated
+unchanged context? Later compare brief versus flat/raw retrieval at equal context budget,
+including write/refresh cost. Smaller packets that increase wrong actions, stale advice or
+repeated failures regress. Use existing observations; no new scoring service or test campaign
+is required before writing this path.
 
 ### 11.1 Source placement and handoff
 
