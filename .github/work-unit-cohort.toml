@@ -94,7 +94,7 @@ prerequisites = []
 [[row]]
 issue = 5348
 unit = "V3-CONTEXT-DENSITY"
-body_sha256 = "5ce991c5eaf38dcfb19653c17612bb0c8ccd0cbf635d608c2730b798cee38d47"
+body_sha256 = "86f6a1fe532f11bd20a922bcd45034042ace8df700cb0c4c68bb3a5d0e4ebb66"
 disposition = "blocked"
 prerequisites = []
 
@@ -108,10 +108,10 @@ planned = 0
 nonexecutable = 2
 superseded = 2
 accepted_historical = 2
-sha256 = "46771a74048bf57dca3c73d2619762b00cdddeb25d76446d0c0f5b8d8c0178a0"
+sha256 = "b1d6bfe7882842d8fa6c3fca4aca7b3b32f441c49b28671c05b55748f0d0f55c"
 
 [provenance]
-base_commit = "f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa"
-acquired_at = "2026-11-07T02:28:57Z"
-acquisition = "GitHub API issue #5348 exact body readback after adding .gitattributes LF normalization for the reproduced documentation-evidence mismatch; inherited catalogue and descriptor inventory at f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa"
-note = "Update only #5348 scope binding; retain its blocked disposition and the other 12 rows field-for-field. Prior acquisition provenance is retained in .github/work-unit-cohort.toml at f7ff5bdc0af52dbc393cdaeb0be06cda7fd436aa. No inherited row is freshly qualified; coverage is the selected catalogue and unchanged descriptor inventory, not all GitHub issues or runtime acceptance."
+base_commit = "4d841b13ae8698aeb16f5948a55595577eec08ff"
+acquired_at = "2026-11-13T10:27:58Z"
+acquisition = "GitHub exact issue #5348 body readback after adding the authorized #5350 legacy-lessons and direct-navigation scope; inherited 13-row catalogue and actual descriptor directory"
+note = "Refresh only #5348 body binding; retain its blocked disposition and the other 12 rows field-for-field. Prior provenance remains in .github/work-unit-cohort.toml at 4d841b13ae8698aeb16f5948a55595577eec08ff. Inherited rows are historical catalogue inputs, not reopened work or newly qualified issues. Coverage is the existing 13-row catalogue and actual descriptor inventory, not runtime acceptance."
