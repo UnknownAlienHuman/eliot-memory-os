@@ -91,20 +91,27 @@ body_sha256 = "020be359b5d07de99dc55ef1472f3a6a96c49b9cd8b10af48b1b58c223d56e1e"
 disposition = "blocked"
 prerequisites = []
 
+[[row]]
+issue = 5348
+unit = "V3-CONTEXT-DENSITY"
+body_sha256 = "27dcb507d7a2db021dc372943246dcb69cdd03ca2a2408bb7f0c29e5ec45af29"
+disposition = "blocked"
+prerequisites = []
+
 [aggregate]
-issues = [728, 748, 750, 818, 838, 839, 843, 846, 859, 974, 994, 5324]
+issues = [728, 748, 750, 818, 838, 839, 843, 846, 859, 974, 994, 5324, 5348]
 numeric_descriptors = []
 matrix_cases = 0
 assigned = 0
-blocked = 6
+blocked = 7
 planned = 0
 nonexecutable = 2
 superseded = 2
 accepted_historical = 2
-sha256 = "842457314bbf6696861ae56f070170c3d463797a6ba146914e6f2c79e07c1806"
+sha256 = "714bcd866ef072e4b56cd9de035b3bc83e072687e15c5d7f3f5e189a4bb0aae3"
 
 [provenance]
-base_commit = "4af7df71959d50ae431761e3989040e2d1870aef"
-acquired_at = "2026-10-30T20:42:28Z"
-acquisition = "GitHub connector: exact catalogue blob c7c657c3944fb530f50f6bc59185c4424d702467, work-units tree 699c8a87ebd195bdfb7d2174f77d56fa683ea74a, and issue #5324 owner update/readback; scope comments 6532944200 and 6533001109"
-note = "D6 catalogue extension at 4af7df7. Only #5324 was acquired live (issue updated_at 2026-10-30T20:42:22Z); its blocked disposition is declared by the root-owned assignment. The other 11 rows are byte-for-field retained from blob c7c657c3944fb530f50f6bc59185c4424d702467, whose observations date to 2026-09-25/26 at base 46d645f2c6ece125842e8deefdb661797c0fa0e9; they are not freshly qualified. Active numeric descriptors are empty after removing the exact duplicate of the retained #837 testdata fixture. Catalogue integrity does not imply task completion, current full-project authority or runtime acceptance."
+base_commit = "6a6617120aba17ff0dc119ccc3579c70ae365f0b"
+acquired_at = "2026-11-13T10:39:09Z"
+acquisition = "GitHub exact issue #5348 body readback after including LF normalization for the two reproduced shared-reading input mismatches; inherited 13-row catalogue and actual descriptor directory"
+note = "Refresh only #5348 body binding; retain its blocked disposition and the other 12 rows field-for-field. Prior provenance remains in .github/work-unit-cohort.toml at 6a6617120aba17ff0dc119ccc3579c70ae365f0b. Inherited rows are historical catalogue inputs, not reopened work or newly qualified issues. Coverage is the existing 13-row catalogue and actual descriptor inventory, not runtime acceptance."

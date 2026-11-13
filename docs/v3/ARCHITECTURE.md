@@ -1,6 +1,6 @@
 # Eliot Memory OS V3 — Architecture
 
-**Revision 1.0-draft.20 · 2026-10-28 · design for the greenfield rewrite, not implemented behavior.**
+**Revision 1.0-draft.25 · 2026-11-06 · design for the greenfield rewrite, not implemented behavior.**
 
 V1/V2 Memory implementations are donors. This document owns purpose, responsibility
 and invariants. [Implementation](IMPLEMENTATION.md) owns runtime, Store, maintenance
@@ -10,35 +10,41 @@ and build order; [Cognition](COGNITION.md) owns algorithms; the
 
 ## 0. External dependency
 
-Controller foundation and Memory inference are different capabilities. The inspected
-controller has an implemented foundation but lacks the Memory principal and inference
-handlers; exact source and adaptation requirements are maintained in
-[Inference §0](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
-
-Base has no controller dependency. Model-assisted learning requires the scoped inference
-extension, not another implementation of controller L0/L1 or an Agent-binding programme.
-Never route around missing inference through owner credentials, Agent tasks or legacy V1.
+Base works locally without a controller. Only model-assisted jobs depend on the scoped
+[Memory inference extension](INFERENCE-CONTRACT.md#0-authority-and-prerequisites).
 
 ## 1. Purpose and completion
 
-Eliot makes accumulated experience useful at the next decision:
+Eliot reconstructs the smallest useful model of the work: **goal/criterion, how the
+relevant part works, current state, attempts/results, uncertainty and next step**.
+The agent should recover why a decision follows, what would change it and where to
+check it. Retain concrete objects, critical values and conditions; links expose supporting detail.
 
-```text
-preserve exact observation
-→ reconstruct current work
-→ supply applicable context
-→ observe action/result
-→ revise memory or method
-→ use the revision later
-```
+| Agent problem | Required behavior |
+|---|---|
+| Context lost after compaction, restart or handoff | Rebuild the current goal, decisions, attempts and next step from retained sources. |
+| Context fills with repeated or unrelated material | Keep a small active view; inject useful changes at the next decision boundary and open detail on demand. |
+| The agent does not know what to recall | A touched artifact, error, result or changed premise activates prepared knowledge and relevant counterexamples. |
+| A familiar failure recurs | Supply its conditions, attempted repair and what would justify a different next attempt. |
+| Old knowledge survives a code/API/goal change | Requalify the affected model and advice; expose the current fact and unresolved conflict. |
+| Experience accumulates without improving work | Revise the knowledge or processing method actually consumed by later decisions. |
 
-Value means restored work without invented state, remembered failures and exceptions,
-explicit unknowns, learning from outcomes and preserved source/history. Optional
-inference must not be necessary for ordinary capture, retrieval or context.
+Committed capture preserves events as [observations](IMPLEMENTATION.md#72-capture-command-commit-and-replay).
+Direct edits and Dreamer publish [memory revisions](IMPLEMENTATION.md#74-direct-revision-and-lost-replies).
+Base assembles prepared knowledge, current observations and exact links into
+[decision context](COGNITION.md#6-retrieval-and-context), without inference. The agent
+reasons, the host acts, and captured outcomes inform later revisions.
+[Exact open](IMPLEMENTATION.md#73-exact-open-and-byte-ranges) supplies supporting detail.
 
-Add a mechanism only for a named caller, owner, durable result or typed unknown and
-actual consumer. Completion includes restart/readback where persistence matters.
-A type, port, fixture, receipt, report, branch or passing compile alone is intermediate.
+Agent-authored revisions remain useful without Dreamer. Explanations and predicted
+consequences remain attributed hypotheses until supported; missing understanding stays
+a named question. Measure correct continuation and avoided repeated mistakes against total
+preparation/read/use cost, not recall or compressed word count alone.
+
+Completion connects a caller, existing owner, result/unknown and actual consumer,
+including restart/readback for persistent effects. [Cognition §2](COGNITION.md#2-current-work-reconstruction)
+defines the working model; [the research map](AUDIT-MAP.md#5-из-исследований-в-реализацию)
+records its evidence and limits.
 
 ## 2. Ownership
 
@@ -47,12 +53,8 @@ A type, port, fixture, receipt, report, branch or passing compile alone is inter
 | Goals, permissions and acceptance | Human and host/controller |
 | Agent/task/tool execution | Host/controller |
 | Event translation and actual context emission | Narrow host relay |
-| Observations, revisions, retrieval, context, outcomes and finite jobs | Memory daemon |
-| Store mutations, replay and quiesce | Memory daemon |
-| External-call serialization and backup dependency checks | Daemon controller-mutation owner |
-| Backup records, transitions, bounded restore leases and cleanup | Daemon backup-set owner |
+| Memory, retrieval/context, finite learning jobs, mutations/replay and backup dependency/record operations | One Memory daemon; ordinary modules own these operations |
 | Executable/root identity, Store root/Owner credentials, migration, candidate and cutover | Supervisor/installer |
-| Interpretation, consolidation and method improvement | Memory learning handlers |
 | Scoped one-shot call, provider execution/readback and private inference copies | Controller extension |
 | Persistence, indexes and transactions | Private SurrealDB Store |
 
@@ -61,14 +63,13 @@ one inherited typed channel. Supervisor independently resolves approved resource
 it does not accept arbitrary SQL, argv, endpoint, path or secret from the daemon.
 Daemon never receives root or Owner credentials.
 
-Dreamer is a role performed for one finite semantic job, not a permanent process,
-provider stack, scheduler, special database or canonical writer. A controller call is
-not an Agent/session/Goal lifecycle. Memory links external work but does not own it.
+Dreamer is the semantic role of finite jobs in the existing daemon: prepare/revise useful
+knowledge and answer agent research turns. Dialogue is linked requests/results, not a
+permanent process, separate chat store or canonical writer. A controller call is not an
+Agent/session/Goal lifecycle. Memory links external work but does not own it.
 
-Stable client identity, credential version and call identity remain separate. Rotation
-or rollback cannot authorize a second uncertain effect. The send owner controls actual
-profile/destination/credentials; a profile name is not permission for silent fallback.
-Detailed identities and readback belong to the inference contract, not a second model here.
+The [inference contract](INFERENCE-CONTRACT.md) owns client/credential/call identity,
+destination and uncertain-effect readback; rotation/rollback never authorizes a duplicate call.
 
 ## 3. Product shape
 
@@ -96,18 +97,22 @@ prerequisites for starting the first capture/open increment.
 
 ### 3.2 Additive learning
 
-The first learning loop turns a retained episode and exact processing method into one
-controller call, then a Memory revision consumed by later context. Cleanup and backup
-continuity are part of enabling that call, not claims inferred from a returned model body.
-Vectors, views, documents, Research and other hosts reuse the same records/jobs/revisions.
+Dreamer prepares changed work and reusable mechanisms/procedures for a real consumer;
+an agent can also ask a question or follow-up without a failed lookup. Outcomes/tests/
+corrections revise knowledge, retrieval cues or the processing recipe. External
+self-learning requires later context/jobs to consume that revision
+([Cognition §12](COGNITION.md#12-consolidation-disagreement-and-improvement)).
+Calls include cleanup and backup continuity. Local Research needs no web acquisition;
+optional acquisition/vectors/documents reuse existing owners and records.
 
 ### 3.3 First host is narrow
 
-The first Claude profile selects SessionStart, UserPromptSubmit, PostToolUse,
-PostToolUseFailure, Stop, SubagentStop, PostCompact and SessionEnd. Verify the installed
-host contract before enabling each event. Host JSON is adapter input, not domain state.
-Session/prompt boundaries emit actual context; final messages are retained directly;
-compact summaries are derived representations. Enforcement hooks are outside Base.
+The first Claude relay captures host events and supplies context at start/resume/compact,
+user prompts and supported tool-result boundaries. One batch update is preferred to
+duplicate per-tool injections. Final messages are retained directly; compaction summaries
+are derived. [Cognition §6.5.1](COGNITION.md#651-first-claude-output-boundary) owns the exact mapping.
+Additional hosts translate the same operations; their event names do not alter domain state.
+Memory failure withholds unavailable context and leaves host execution available.
 
 ## 4. Identity and memory invariants
 
@@ -129,22 +134,28 @@ reintroduction/inventory/restore claims; none is physical deletion proof.
 
 ## 5. Retrieval, context and learning
 
-Address current work before similarity search. Union independently bounded direct,
-address, exact-cue, lexical, optional vector, grounds/relation and method candidates
-before final selection. Apply scope before arm limits.
+Start with addressed work and the current event's exact artifact/error cues. Follow known
+decision dependencies and failed attempts, even when their wording differs from the query.
+Expand lexical/relations/methods and optional vectors for a remaining question. Scope before
+limits and select from the union; rank is neither truth nor applicability.
 
-Lexical ranking uses one bounded statement snapshot, not a durable BM25 cursor across
-corpus changes. Score orders candidates but proves neither truth nor applicability.
+A new or uncertain context gets a self-contained work model; an ongoing context gets
+useful changes and necessary premises. Preserve mechanisms/attempts, corrections,
+commitments, exceptions and unresolved evidence that change the action, expected
+consequence or verification. Show meaningful qualifications and exact source handles;
+keep internal defaults, backend inventories and diagnostic bookkeeping out of the prompt.
 
-A packet preserves current goal/progress, exact corrections, open commitments,
-applicable methods with exceptions, relevant episodes, dissent/unknowns and exact
-source handles. Negation, version and contraindications travel with the value.
-Prepared, emitted, action-associated, used and successful are different facts.
+[Cognition §6](COGNITION.md#6-retrieval-and-context) owns selection and packing,
+[§6.2.1](COGNITION.md#621-proactive-attention-without-repeated-context) repeat suppression,
+and [§6.5](COGNITION.md#65-handoff) handoff. Validate sources before output; optional
+telemetry failure cannot withhold valid context. Prepared, emitted, used and successful
+remain distinct observations.
 
-A project view is a versioned answer over examined scope. Failed refresh leaves the
-previous qualified view and exact source access available. No-change requires completed
-cognitive work on supplied input; rejection, missing/malformed/truncated output or
-unknown execution is not no-change. Cleanup is separate from cognitive outcome.
+Missing evidence, low similarity or an optional backend failure affects only the dependent
+claims; independent useful context and exact open remain available. A pending/failed refresh
+leaves applicable prior knowledge plus newer evidence visible with preparation limits.
+Changed premises requalify affected advice; only completed cognitive work can yield
+`no_change` ([§9.2](COGNITION.md#92-result-and-cognitive-states)).
 
 ## 6. Store and schema authority
 
@@ -208,11 +219,9 @@ model call. Reuse an existing owner before creating a new one.
 
 ## 10. Product evidence and order
 
-Build the connected increments in
-[Implementation §11](IMPLEMENTATION.md#11-implementation-sequence); it alone owns their
-order. Start with capture → durable Store/spool → replay/restart → exact open, then host
-context and Base maintenance. Complete the inference boundary before enabling learning.
-A complete backup/crash/load campaign is not a condition for writing the first path.
+[Implementation §11](IMPLEMENTATION.md#11-implementation-sequence) owns the connected
+increments and their observable exits. The first capture/open path does not wait for
+backup/crash/load qualification; model-assisted learning waits for its inference boundary.
 
 Preserve safety checks at the boundary that needs them: no unverified credentials sent,
 no false durable capture, no unleased restore/cutover, no uncertain external effect retried.

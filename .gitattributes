@@ -1,5 +1,8 @@
 * text=auto
 .gitattributes text eol=lf
+Justfile text eol=lf
+scripts/docs_router.py text eol=lf
+scripts/docs_shards.py text eol=lf
 *.rs text eol=lf
 *.toml text eol=lf
 *.md text eol=lf whitespace=-trailing-space

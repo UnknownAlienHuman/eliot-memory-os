@@ -7,19 +7,22 @@ own unresolved work. This directory is navigation, not a second executable SQL p
 
 ## Source candidate, not a working Store
 
-The current review target is
-[PR #5327](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5327), owned by
-[issue #5326](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5326):
+The source inspected on 2026-11-04 belongs to
+[PR #5327](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5327) /
+[issue #5326](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5326).
+Their [current disposition](../ANALYSIS-REGISTRY.md#implementation-handoff) is maintained
+in the existing registry; these pinned links provide historical evidence:
 
 - [Schema package at a040bd4](https://github.com/UnknownAlienHuman/eliot-memory-os/tree/a040bd408be39afa9789561595d2cac8bef177b3/crates/storage/eliot-v3-store-schema)
   owns DDL, one wrapper, source catalog metadata and their digests.
 - [Fixed queries](https://github.com/UnknownAlienHuman/eliot-memory-os/blob/a040bd408be39afa9789561595d2cac8bef177b3/crates/storage/eliot-v3-store-schema/src/queries.rs)
   are source fragments, not complete capture/revision/job operations or a connected client.
 
-That PR is separate and unmerged at this review. Naming its package as the sole asset
-owner does not approve its current bytes. Imports, unsupported FOR UPDATE targets,
+The package is a separate, unmerged candidate. Naming it as the sole asset owner does not
+approve its bytes. The inspected snapshot raised imports, unsupported FOR UPDATE targets,
 byte budgets, representations, claim-time freeze, catalog evidence and full transaction/
-readback remain recorded defects. Correct them in the owning source task; do not copy
+readback findings. Compare later candidate changes before assigning a repair; historical
+findings are not a claim that every defect remains. In separately assigned source work, do not copy
 its files into the documentation branch or create a third schema/query catalogue.
 
 ## Retired design inputs
@@ -32,15 +35,16 @@ equally current formats. Do not restore or dynamically load them as a fallback.
 
 ## Next source increment
 
-Use the contracts on current `main`. The root first reconciles that baseline into
-the existing open source PR; the package has one writer, not a new competing branch.
-Pinned links above identify the source inspected on 2026-11-04, not a frozen implementation
-base. Inspect the live head and preserve changes made since that observation.
+For a new source assignment, use contracts and a fresh branch from current `main`.
+The root inspects retained candidates and any current writer before selecting reusable
+changes. Pinned links above identify the source inspected on 2026-11-04, not a current
+implementation base or permission to resume its retired branch.
 
-The immediate #5326 assignment is **asset-package repair**, not all of Slice 0:
+When a new assignment selects Store work, begin with **asset-package repair**; this
+does not assign all of Slice 0:
 
-1. Correct the missing constant imports in `src/queries.rs`, format the package and
-   run its [package-local checks](../DEVELOPMENT.md#rust-source). Report actual failures;
+1. Check which historical compiler repairs the selected candidate already includes;
+   correct only remaining defects and run its [package-local checks](../DEVELOPMENT.md#rust-source). Report actual failures;
    a compile fix does not close the remaining schema/semantic findings.
 2. Align DDL, complete operation statements/projections, validators, catalog and digests with
    [R-174 and R-182–R-188](../ANALYSIS-REGISTRY.md#store-reconciliation). The selected

@@ -1,35 +1,31 @@
 # Eliot Memory OS V3
 
-**Documentation baseline on `main`; PR #5325 is merged. Not a qualified runtime.**
+**V3 design baseline; not a qualified runtime.**
 
-Memory preserves observations, revises knowledge and supplies useful context.
-Hosts/controllers execute tasks and own permissions/acceptance. Base capture,
-replay, exact/lexical retrieval and context must work without inference. Learning
-later uses the same records and produces a revision consumed by a real caller.
+Eliot retains evidence and reconstructs a compact
+[working model](ARCHITECTURE.md#1-purpose-and-completion): goal/criterion, mechanism, state,
+attempts/results, uncertainty and next step. Base captures and assembles context without
+inference; Dreamer prepares reusable knowledge and answers explicit Research questions.
+Hosts/controllers execute tasks and own permissions/acceptance.
 
-Choose one route below. For file locations, a bounded assignment, exact check commands
-and companion updates, use the [development guide](DEVELOPMENT.md). It is a task
-reference, not another required book. Documentation work uses the
-[existing stages](ANALYSIS-REGISTRY.md#documentation-stages); implementation order belongs
-to [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence). The
-[version boundary](../ARCHITECTURE_CONTRACT.md) identifies document precedence.
+Choose one task route below. The [development guide](DEVELOPMENT.md) gives file scope,
+checks and companion updates; the [registry](ANALYSIS-REGISTRY.md#documentation-stages)
+tracks work; the [version boundary](../ARCHITECTURE_CONTRACT.md) defines precedence.
 
-Start implementation with [the connected sequence](IMPLEMENTATION.md#11-implementation-sequence):
-repair the existing Store asset owner, then inline capture → commit/replay identity →
-exact open. [Source placement](IMPLEMENTATION.md#111-source-placement-and-handoff)
-distinguishes the existing proposal from the not-yet-created runtime. V2 validator and
-archive migration are not prerequisites for that path.
+For the first runtime increment, follow [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence):
+repair the Store asset owner, then inline capture → commit/replay identity → exact open.
+[Source placement](IMPLEMENTATION.md#111-source-placement-and-handoff) separates the
+existing proposal from the planned runtime. V2 validator/archive migration is not a prerequisite.
 
 ## Task routes
 
-Root and applicable inherited instructions apply once under
-[AGENTS](../../AGENTS.md#select-the-version-and-task). Select the row for the actual
-change, not every row mentioning the same subsystem. Read the linked section and the
-definitions it uses; expand along changed data/effects, not every outgoing link.
+Apply [AGENTS](../../AGENTS.md#select-the-version-and-task) and inherited instructions.
+Select the actual change; read its owner and required definitions. Expand only along
+affected data/effects; unrelated links do not add reading requirements.
 
 | Change | Start here | Expand for this dependency |
 |---|---|---|
-| Entry pages, navigation or registry | [Authority](../ARCHITECTURE_CONTRACT.md), affected instruction/index/registry row | Follow the route to its named owner/source/check; read product rules only when their meaning changes. |
+| Entry pages, navigation or registry | [Authority](../ARCHITECTURE_CONTRACT.md), affected entry | Check that entry's owner/source/check route; expand into product rules only when their meaning changes. |
 | Local source repair with unchanged behavior, such as a missing import | Applicable source instructions, failing symbol and its definition/caller; [package checks](DEVELOPMENT.md#rust-source) | Any changed field, query, public behavior or dependency selects its operation row below. A compile repair alone needs no whole Store book. |
 | Product boundary or new mechanism | [Architecture §1–3](ARCHITECTURE.md#1-purpose-and-completion) | Follow the mechanism into its owning operation; do not create an owner per noun. |
 | Startup, processes or Windows IPC | Relevant subsection of [Implementation §1–3](IMPLEMENTATION.md#1-runtime-and-installation) | [Architecture ownership](ARCHITECTURE.md#2-ownership) for moved responsibility; credentials, shutdown or restore only when crossed. |
@@ -46,52 +42,36 @@ definitions it uses; expand along changed data/effects, not every outgoing link.
 | Controller inference | [Prerequisites](INFERENCE-CONTRACT.md#0-authority-and-prerequisites), affected interface clause and [dependency finding](ANALYSIS-REGISTRY.md#controller-dependency) | Verify the live controller API/source before changing its adapter; do not substitute a historical claim. |
 | Requirements or donor reuse | Relevant [AUDIT-MAP](AUDIT-MAP.md) item, then its pinned source | Open [AUDIT](AUDIT.md) only for disputed rationale, not as a default prompt. |
 
-Use [one applicable check](DEVELOPMENT.md#checks) and the directly affected
-[companion updates](DEVELOPMENT.md#change-propagation). Record inspected sections and
-actual results in the existing PR. These human task routes do not change the machine
-reader's required set or waive [integration evidence](DEVELOPMENT.md#documentation-integration).
+Use the [applicable check](DEVELOPMENT.md#checks) and
+[companion updates](DEVELOPMENT.md#change-propagation); record inspected sections and
+actual results in the existing PR. Human routes do not waive the machine reader or
+[integration evidence](DEVELOPMENT.md#documentation-integration).
 
 ## Small implementation rule
 
-A change must connect a real caller → owning operation → durable result or typed
-unknown → actual consumer/readback, including restart where persistence matters.
-A standalone type, schema, port, receipt or passing compile is an intermediate
-artifact, not completed product behavior.
+Connect caller → owning operation → durable result/typed unknown → consumer/readback,
+including restart for persistent effects. Scaffolding or compilation alone is incomplete.
+Prefer existing functions/modules and storage owners; a new process/crate/table/protocol/
+dependency needs a caller the existing owner cannot serve. No parallel task/proof/report machinery.
 
-Prefer an ordinary function/module and existing storage owner. A new process,
-crate, table, protocol or dependency needs a concrete caller and a reason the
-existing owner cannot serve it. Do not add parallel task/proof/report machinery.
-
-The owner selects runtime work separately from this documentation task. For that
-work, write production code first and run formatting/minimum changed-package
-Clippy. Broad campaigns follow the assembled product; claims must still match
-actual checks. The [registry stages](ANALYSIS-REGISTRY.md#documentation-stages)
-are documentation work, not an alternative runtime scheduler.
+Runtime work is separately assigned. Write production code first, then formatting/minimum
+changed-package Clippy; broad campaigns follow the assembled product. Follow the
+[source checks](DEVELOPMENT.md#rust-source) for that increment, not documentation stages.
 
 ## Design assets and dependencies
 
-[Store source ownership](store/README.md) identifies one executable asset owner.
-Verify its separate source PR and current code; merging documentation does not
-admit that Store implementation. The former docs SQL copies are retired; their exact historical
-links and unresolved differences remain available. Do not dynamically load docs
-or import a stale pack instead of fixing the owning source.
+[Store source ownership](store/README.md) identifies the executable asset owner and
+retired SQL copies. Check its retained candidate and [assignment disposition](ANALYSIS-REGISTRY.md#implementation-handoff); docs approval is not implementation
+acceptance. Fix owning source rather than loading docs or importing a stale pack.
 
-Controller foundation and Memory inference are different capabilities. Do not
-copy a historical controller SHA or unchecked-roadmap claim into a current task.
-Use the [pinned observation](ANALYSIS-REGISTRY.md#controller-dependency); missing
-inference does not justify an Agent/Goal/owner-token fallback or block Base.
+The [controller observation](ANALYSIS-REGISTRY.md#controller-dependency) is pinned, not
+current capability proof. Foundation and Memory inference differ; missing inference
+does not justify Agent/Goal/owner-token fallback or block Base.
 
 ## Maintaining these documents
 
-Correct the owner rule, update its direct consumers, then update the existing
-registry row with remaining work and evidence. Indexes contain links and purpose,
-not duplicated schema, backup algorithms, revision lists or CI status. Keep
-chronology in Git and issue/PR discussion. No second ledger or errata document.
-Use the [retirement recipe](DEVELOPMENT.md#retiring-documentation) before removing legacy material;
-file count is not a reason to delete a real input or retain an orphan projection.
-
-Use the [change-propagation map](DEVELOPMENT.md#change-propagation) to update only affected
-owners, source projections and references. [Checks](DEVELOPMENT.md#checks) give exact
-commands, their limits and failure actions. [Documentation integration](DEVELOPMENT.md#documentation-integration)
-separates merge evidence from unfinished product work; existing CI and independent
-review still apply under [WORKFLOW](../../WORKFLOW.md).
+Correct the owner and direct consumers; update the existing registry row with remaining
+work and evidence. Indexes link to contracts; chronology stays in Git/PR discussion.
+No second ledger. Follow the [retirement recipe](DEVELOPMENT.md#retiring-documentation)
+before deleting legacy material: check real consumers, not file counts.
+Existing CI and independent review still apply under [WORKFLOW](../../WORKFLOW.md).
