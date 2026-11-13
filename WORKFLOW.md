@@ -13,8 +13,9 @@ New changes use a fresh issue-numbered branch. For an existing open implementati
 PR, the root reconciles current `main` into that same writer branch before continuing;
 do not create an overlapping PR or overwrite concurrent work.
 Retained V2 source and `workstreams/ACTIVE.toml` do not assign V3 implementation.
-The source issue defines its scope: #5326 / PR #5327 repairs the Store asset package,
-not the later network client or an entire daemon rewrite.
+The assigned source issue defines its scope; an asset-package repair does not assign
+the later network client or an entire daemon rewrite. Current assignment dispositions
+belong in the [existing registry](docs/v3/ANALYSIS-REGISTRY.md#implementation-handoff).
 
 ## One bounded change
 

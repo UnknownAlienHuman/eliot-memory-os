@@ -61,7 +61,7 @@ changed-package Clippy; broad campaigns follow the assembled product. Follow the
 ## Design assets and dependencies
 
 [Store source ownership](store/README.md) identifies the executable asset owner and
-retired SQL copies. Verify its current code/source PR; docs approval is not implementation
+retired SQL copies. Check its retained candidate and [assignment disposition](ANALYSIS-REGISTRY.md#implementation-handoff); docs approval is not implementation
 acceptance. Fix owning source rather than loading docs or importing a stale pack.
 
 The [controller observation](ANALYSIS-REGISTRY.md#controller-dependency) is pinned, not

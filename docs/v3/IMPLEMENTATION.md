@@ -1562,7 +1562,7 @@ Runtime work remains separately authorized; documentation changes do not impleme
 
 | Increment | Connected change | Observable exit / do not include yet |
 |---|---|---|
-| Asset repair (#5326/#5327) | Fix existing schema/query owner, selected codecs and bounds; replace capture primitives with a complete transaction and exact-open projection | Package fmt/Clippy and embedded inspection pass; still **not** a working Store. Do not add network/provider/backup machinery to `inspect`. |
+| Asset repair, when assigned | Fix existing schema/query owner, selected codecs and bounds; replace capture primitives with a complete transaction and exact-open projection | Package fmt/Clippy and embedded inspection pass; still **not** a working Store. Do not add network/provider/backup machinery to `inspect`. |
 | Slice 0 — inline capture/open | Verified Store startup/admission → one bounded client → §7.2 transaction → §7.3 exact open | Disposable caller retains the command for direct readback/retry. Same command changes nothing; changed input conflicts. Inline-only; no production-host crash-custody claim until Slice 1. No model/backup prerequisite. |
 | Slice 1 — durable ingress/restart | §7.5 publish before send → single replay owner → Store/open → retire pending | Input survives restart and lost notification/reply under the same ID. Full quota does not evict old input; interrupted cleanup does not destroy pending custody. Native-event identity alone permits redelivery deduplication; equal bytes from distinct occurrences remain distinct. |
 | Slice 2 — useful context and corrections | Host event → addressed/artifact/error cues → compact baseline or useful update → emission; thin note/correction → §7.4 → later history/context | Agent recovers goal, model/state, attempts, unknowns and next step where supported. Resume/compact rebuilds; tool results activate prepared knowledge; unchanged reads add nothing. Source/qualification changes pass dedup; optional receipt failure does not suppress context. No model required. |
@@ -1587,9 +1587,10 @@ is required before writing this path.
 
 ### 11.1 Source placement and handoff
 
-The only existing proposed V3 package is `crates/storage/eliot-v3-store-schema` in the
-separate source PR; it owns executable assets/digests. It is not present on this docs
-baseline. Reconcile current main into that existing writer branch, do not fork its owner.
+The retained V3 source candidate is `crates/storage/eliot-v3-store-schema`; it owns
+executable assets/digests and is not present on this docs baseline. [Store ownership](store/README.md)
+links its provenance and assignment disposition. Separately assigned source work starts
+from current main, with one writer and reviewed donor reuse; do not revive a retired branch.
 For the first runnable path use one planned package `bins/eliot-v3` (package `eliot-v3`,
 binary `eliot`) with an ordinary Rust library and modules. **It does not exist yet.**
 Create it with Slice 0's actual caller, not an empty architecture scaffold. Existing

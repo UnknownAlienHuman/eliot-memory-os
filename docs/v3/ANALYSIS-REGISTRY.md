@@ -1,6 +1,6 @@
 # Eliot V3 — реестр анализа
 
-**2026-11-06. Действующий план документации и открытых разрывов. Реализация не принята.**
+**2026-11-13. Действующий план документации и открытых разрывов. Реализация не принята.**
 
 Это единственный реестр V3. Правила — в [четырёх контрактах](../ARCHITECTURE_CONTRACT.md),
 исходники/команды — в [DEVELOPMENT](DEVELOPMENT.md), требования — в [AUDIT-MAP](AUDIT-MAP.md).
@@ -21,14 +21,18 @@
 | D1. Вход и маршруты | `SCOPED_CHECK / REVIEW_IN_PR` | [Вход V3](README.md) уплотнён: суть → операция → owner/check. Начальный runtime increment отделён от локальной правки; сохранены operation routes и конец навигации. Независимое review — в PR; прочие source families и machine evidence не объявлены проверенными. |
 | D2. Controller | `DESIGN / EXTERNAL_OPEN` | Предложенный Memory API отделён от существующей foundation. Issuance/DTO/adapter решает controller owner перед inference, не перед Base. |
 | D3. Простая реализация | `DECIDED / SOURCE_OPEN` для первого пути | [Implementation §11](IMPLEMENTATION.md#11-implementation-sequence): один рабочий путь, один runtime package при появлении caller, никаких пустых будущих слоёв. |
-| D4. Store | `DESIGN_UPDATED / SOURCE_OPEN` | Реализовать выбранные capture/replay/open/revision и byte bounds в #5326/#5327. Проверки схемы не подменяют работающий клиент. |
+| D4. Store | `DESIGN_UPDATED / SOURCE_OPEN`, прежнее поручение снято | Capture/replay/open/revision и byte bounds остаются требованиями. #5326/#5327 сохранены как исторический source candidate; продолжение требует нового поручения от текущего main. Проверки схемы не подменяют работающий клиент. |
 | D5. Сценарии | `DESIGN_UPDATED / SOURCE_OPEN` | [#5348 / PR #5349](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5349): working model, Dreamer/research, injection и learning. Проверены missing view, неоднозначность, correction/follow-up; [§11](IMPLEMENTATION.md#11-implementation-sequence) различает пропущенное нужное и устаревшее как текущий совет. История ошибок сохраняется; опора — [Memora и другие исследования](AUDIT-MAP.md#52-dreamer-prepared-knowledge-and-learning-from-outcomes). Runtime/измерения открыты. |
 | D6. Интеграция | `MERGED / CHECKS_OPEN` для предыдущих правок | Общий CI и независимая приёмка не становятся PASS от слияния. Проверять изменённый текст/ссылки и фактический результат CI без нового proof framework. |
 
 ### Implementation handoff
 
-Первым остаётся [#5326 / Store PR #5327](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5327):
-assets + minimum fmt/Clippy, затем [inline capture → open](IMPLEMENTATION.md#72-capture-command-commit-and-replay).
+[#5326 / Store PR #5327](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5327)
+сняты с активного плана по решению владельца в [#5350](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5350).
+Это не приёмка assets и не отмена требований. При новом поручении проверить сохранённый
+candidate и переносить только подходящие изменения в одну свежую ветку от текущего main;
+закрытый writer не возобновлять. Порядок остаётся: assets + minimum fmt/Clippy, затем
+[inline capture → open](IMPLEMENTATION.md#72-capture-command-commit-and-replay).
 Production ingress — [durable-before-send](IMPLEMENTATION.md#75-durable-ingress-and-replay);
 disposable путь не ждёт inference/backup/R-207. Далее [§11](IMPLEMENTATION.md#11-implementation-sequence):
 Slice 2 revision/work/context, Slice 3 notices/backup. Не расширять asset scope и не создавать
@@ -65,6 +69,52 @@ R-126 переиспользует SQLite commands/writes. R-178/R-179/R-180 о�
 | R-203 | `f7ff5bd`, [run 42310610159](https://github.com/UnknownAlienHuman/eliot-memory-os/actions/runs/42310610159): `ROUTE_RECEIPT_MISMATCH` точно воспроизведён через `core.autocrlf=true`. `git archive` меняет optional `Justfile`: 10,141 LF → 10,360 CRLF bytes; остальные records совпадают. `.gitattributes` фиксирует LF. Final-tree/remote checks остаются обязательными; checker/CI не менялись. |
 | R-205/R-206 | Убраны ненужные V2 reading inputs и 56 дублирующих индексов. Не повторять эти патчи. |
 | R-207 | Обслуживание V2 tooling отложено; исправлять только доказанный blocker текущего V3 increment. |
+
+### Legacy issue lessons
+
+**Область разбора — #5350, 2026-11-13.** Прочитаны 599 открытых Issue и 8 PR;
+для PR проверены изменяемые файлы, для причин сбоев поставки — обсуждения #5305 и #327.
+Из этого снимка сохранены #5348/#5349 о документации V3. Остальные 598 Issue
+закрыты как `not_planned`, 7 PR закрыты без слияния; результат перечитан в GitHub.
+Учёт этого поручения #5350 создан после снимка и не входит в эти количества. В снятую группу входят
+исходниковые #5326/#5327: принадлежность к V3 сама по себе не делает их документацией.
+История, ветки и исходники сохраняются. Закрытие не означает исправление или отсутствие
+риска при повторном использовании доноров. Новый runtime-аудит и полный пересмотр всех
+ранее закрытых Issue/PR здесь не проводились; ссылки ниже — свидетельства своего времени.
+
+**Главный причинный вывод:** граница локальной готовности не всегда совпадала с
+границей объявленного результата. Промежуточные типы, пакеты, проверки или labels
+получали слишком сильный статус, пока production consumer и окончательная судьба
+ветки оставались открыты. Стыки, повторные попытки и актуальность исправлялись следующими
+Issue. Параллельные исполнители добавляли пересекающиеся PR, а сложность чтения и допуска
+порождала ещё одну очередь исправлений процесса. Поэтапная разработка сама по себе
+правильна: asset-only #5326/#5327 явно объявлен промежуточным результатом и не является
+примером ложной готовности. Это вывод по зафиксированным случаям, не
+утверждение, что каждый старый Issue ошибочен или каждый дефект сохраняется в V3.
+Прямые примеры: [очередь повторных PR](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5305#issuecomment-6097900528),
+[обход единого назначения](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5305#issuecomment-6098546513),
+[отозванный code-complete](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/327#issuecomment-5919618194).
+
+| Повторявшаяся причина | Конкретное свидетельство | Как не повторить в V3 |
+|---|---|---|
+| Деталь готова, рабочего пути нет | [#43](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/43), [#456](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/456): типизированный компонент не подключён к production mapper/readback. | В поручении назвать caller → существующий owner → результат/unknown → consumer. Промежуточный код допустим, но не закрывает весь путь. Использовать [ограниченную задачу](DEVELOPMENT.md#one-bounded-task). |
+| Дублирование владельцев и представлений | [#19](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/19): старый writer обходит выбранную цепочку; [#2984](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/2984): локальные копии BackupOperationKind. | Один owner состояния/операции; адаптер передаёт его контракт. При изменении поля проверить writer, wire, decoder, reader и сохранённый формат вместе; не заводить параллельный enum, SQL pack или журнал. |
+| Потерянный ответ принят за отсутствие эффекта | [#5313](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5313): pending удалён до receipt, lost oneshot не доказывает non-commit; [#78](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/78): после restart создаётся новая identity. | Сохранить исходные ID и payload до эффекта; при unknown читать исходный результат. Не повторять под новым ID, не удалять pending до подтверждения. Владелец — [command/replay](IMPLEMENTATION.md#7-core-operations-and-host). |
+| Неполная identity или неоднозначный digest | [#2705](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/2705), [#2738](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/2738): не весь proposal/cutover body связан с допущенной операцией. | Зафиксировать семантический tuple, scope и версию encoding; считать и сверять одни поля на обеих сторонах. Равные bytes не доказывают одну occurrence; transport request ID не заменяет durable operation ID. |
+| Решение и mutation относятся к разным состояниям | [#5312](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5312): обработанная dirty revision очищается без сравнения с наблюдавшимся состоянием. | Exact target/revision входят в mutation/CAS; verify и effect разделяют один transaction/fence. Позднее обновление остаётся pending. Использовать [transaction owner](IMPLEMENTATION.md#6-transactions-and-durable-files). |
+| Ограниченная выборка выдана за полный набор | [#5312](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5312): первые 512 строк не доказывают отсутствия target; [#2798](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/2798): страницы recovery должны принадлежать одному окну. | Exact lookup для точного адреса; у scan явные continuation и coverage. Empty, unavailable, partial и complete различать; при restart не менять окно или знаменатель молча. |
+| Лимиты reader и writer не согласованы | [#5285](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5285): writer допускает receipt store, который следующий startup отвергает; [#5289](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5289): aggregate inputs ограничиваются слишком поздно. | Один сквозной bound до allocation/effect с учётом aggregate, временных файлов и encoding. Reader должен принимать всё, что законно публикует writer. Переполнение даёт явный отказ без удаления unresolved evidence. |
+| Success/zero/PASS шире наблюдения | [#5314](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5314): отсутствующий cohort и неизмеренные counters выглядят измеренными; [#5296](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5296): aggregate Passed при non-passing case. | Передавать status и coverage; unknown не равен нулю. Compile, process exit, semantic result и product acceptance — разные утверждения. Пропущенную проверку не записывать как PASS. |
+| Документация и процесс стали самостоятельным бесконечным фронтом | [#5320](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5320): узкая правка требует широкого reading bundle; [#5305](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5305): дешёвый deterministic gate failure обнаруживается после дорогой подготовки. | Завершать маршрутизацию при известном owner/scope/check; исправлять конкретный blocker существующего инструмента. Не создавать второй каталог, receipt framework или кампанию миграции ради локальной задачи. Required checks сохраняются. |
+| Параллельная работа без сверки очереди | [PR #5316](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5316), [#5317](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5317), [#5322](https://github.com/UnknownAlienHuman/eliot-memory-os/pull/5322): пересекающиеся conformance-правки. | Перед назначением сверить открытый owner и изменяемые файлы. Один writer на файл, один worktree у manager; независимые чтения делегировать отдельно. Root доводит candidate до явного решения, не накапливает варианты. |
+| Исторический дефект продолжает назначаться как текущий | [#7](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/7) ограничивает старые логи их версиями; поздние [уточнения #5305](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/5305#issuecomment-6218343215) меняют прежние назначения. | Перед новой задачей проверить текущие bytes/head и уже сделанные изменения. Сохранять условие применимости урока и pinned evidence, но не переносить старый backlog автоматически. Исправленный import или прежний CI failure не чинить повторно по старому тексту. |
+
+Эти строки используются при выборе владельца и review конкретного изменения;
+они не новый gate, обязательный reading tour или план реализации всех старых Issue.
+Производственный код пишется первым, затем минимальные fmt/Clippy; широкие тесты —
+после собранного продукта по порядку владельца. При повторении случая дополнять строку
+точной причиной и источником; новое поручение требуется только для подтверждённого
+разрыва текущего V3, а не для восстановления снятой очереди.
 
 ## Legacy consumer migration
 
@@ -103,7 +153,7 @@ Owner — [Implementation §4–7](IMPLEMENTATION.md#4-migration-0001-and-schema
 | ID | Выбрано / что требуется в исходниках |
 |---|---|
 | R-171 | `DECIDED / SOURCE_OPEN`: [§7.2–7.5](IMPLEMENTATION.md#72-capture-command-commit-and-replay). Реализовать complete transaction, source-field mapping, decoder и custody/readback. |
-| R-174/R-182 | [§6](IMPLEMENTATION.md#6-transactions-and-durable-files): исправить imports/table-target FOR UPDATE; record-ID перепроверять внутри transaction. UNIQUE/CAS не predicate lock. |
+| R-174/R-182 | [§6](IMPLEMENTATION.md#6-transactions-and-durable-files): согласовать table-target FOR UPDATE; record-ID перепроверять внутри transaction. Исторический import repair сначала сверить с выбранным source candidate. UNIQUE/CAS не predicate lock. |
 | R-183/R-186 | `DECIDED / SOURCE_OPEN`: [§7.4.1](IMPLEMENTATION.md#741-command-body-and-revision-projection). Открыты atomic transaction, согласованные DTO/DDL/current/history/hash/backup и consumer. |
 | R-184 | [Cognition §4/9.2](COGNITION.md#4-episode-membership-and-coverage) владеет coverage/no_change. Claim/settle и purpose codecs ещё реализовать; replay не новый опыт. |
 | R-185 | `DECIDED / SOURCE_OPEN`: Base [bounds](IMPLEMENTATION.md#451-first-base-limits), [change body](IMPLEMENTATION.md#741-command-body-and-revision-projection), [backup](IMPLEMENTATION.md#84-bounds-outcomes-and-connected-check) выбраны. Job/inference aggregate limits открыты. |
@@ -112,8 +162,9 @@ Owner — [Implementation §4–7](IMPLEMENTATION.md#4-migration-0001-and-schema
 
 ### R-174: exact Store follow-up
 
-Менять assets в существующем `crates/storage/eliot-v3-store-schema`: imports/Clippy,
-затем согласованно migration/wrapper/query/decoder/bounds/digests. Source caps были меньше
+При новом source-поручении проверить сохранённый `crates/storage/eliot-v3-store-schema`,
+затем согласованно менять migration/wrapper/query/decoder/bounds/digests. Не повторять
+исторический import repair без сверки candidate. Source caps были меньше
 body/history/frozen input; QuerySpec сам их не ограничивает. Live catalog, wrapper, ASSERT
 и concurrency не квалифицированы; `inspect` не запускает сетевой Store.
 

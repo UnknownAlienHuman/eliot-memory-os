@@ -39,7 +39,7 @@ empty crates, adapters or modules merely to fill this table.
 
 ### Store package files
 
-Resolve the current source PR through [Store ownership](store/README.md). Within
+Resolve source provenance and assignment through [Store ownership](store/README.md). Within
 `crates/storage/eliot-v3-store-schema/`, the inspected candidate contains:
 
 | Path | Responsibility | Change together with |
